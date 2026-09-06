@@ -47,12 +47,6 @@ if exist "%ROOT%\bin\php.exe" (
 ) else (
   php "%ROOT%\warmup-ipc.php" >nul 2>&1
 )
-echo This window will close. The server keeps running in the background.
-rem Keep the window open briefly so the URLs can be read, then close
-rem automatically. Use a PowerShell sleep instead of `timeout` because
-rem `timeout` requires console input and hangs on "press a key to continue"
-rem when run from a non-console context (e.g. VS Code terminal).
-powershell -NoProfile -Command "Start-Sleep -Seconds 8"
 endlocal
 goto :eof
 

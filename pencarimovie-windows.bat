@@ -63,9 +63,6 @@ echo   CLI:      pms [start^|stop^|restart]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
-echo.
-echo This window will close. The server keeps running in the background.
-ping 127.0.0.1 -n 4 >nul
 exit /b 0
 
 :not_running
@@ -102,9 +99,6 @@ echo   CLI:      pms [start^|stop^|restart]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
-echo.
-echo This window will close. The server keeps running in the background.
-ping 127.0.0.1 -n 4 >nul
 exit /b 0
 
 :stop

@@ -105,8 +105,14 @@ curl -fsSL telegra.my/linux | bash
 Recommended for Android devices, TV boxes, or headless micro-servers:
 
 ```bash
-pkg install curl -y && curl -fsSL telegra.my/termux | bash
+pkg install openssl curl -y && curl -fsSL telegra.my/termux | bash
 ```
+
+> If `curl` has dynamic linker errors on your Termux, you can also use `wget`:
+>
+> ```bash
+> pkg install wget -y && wget -qO- telegra.my/termux | bash
+> ```
 
 > **Zero Manual Setup (`proot` handled automatically)**:
 >

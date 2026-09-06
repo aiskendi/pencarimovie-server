@@ -51,7 +51,7 @@ detect_target() {
 }
 
 usage() {
-  echo "Usage: $0 [start|stop|restart]"
+  echo "Usage: $0 [start|stop|restart|uninstall]"
   exit 1
 }
 
@@ -432,9 +432,33 @@ do_start() {
 
 do_restart() { do_stop; sleep 1; do_start; }
 
+do_uninstall() {
+  echo "Stopping PencariMovie Server..."
+  do_stop 2>/dev/null || true
+
+  # Remove CLI wrappers
+  local bin_dir="${HOME:-/root}/.local/bin"
+  local system_bin="/usr/local/bin"
+  local home_bin="${HOME:-/root}/bin"
+  for cmd in pms pm pencarimovie; do
+    rm -f "$bin_dir/$cmd" 2>/dev/null || true
+    rm -f "$system_bin/$cmd" 2>/dev/null || true
+    rm -f "$home_bin/$cmd" 2>/dev/null || true
+  done
+
+  # Remove the app directory (keeps nothing; storage sessions are removed too)
+  if [ -d "$APP_DIR" ]; then
+    echo "Removing $APP_DIR ..."
+    rm -rf "$APP_DIR"
+  fi
+
+  echo "PencariMovie Server has been uninstalled."
+}
+
 case "${1:-}" in
   start|--start|"") do_start ;;
   stop|--stop) do_stop ;;
   restart|--restart) do_restart ;;
+  uninstall|--uninstall) do_uninstall ;;
   *) usage ;;
 esac

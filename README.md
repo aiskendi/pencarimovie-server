@@ -224,15 +224,15 @@ Need to stream to Stremio or Nuvio when away from home, or need a valid HTTPS ma
 
 ---
 
-## 🛠️ Easy CLI Commands (Start / Stop / Restart)
+## 🛠️ Easy CLI Commands (Start / Stop / Restart / Uninstall)
 
-Managing the server is as simple as running `start`, `stop`, or `restart`:
+Managing the server is as simple as running `start`, `stop`, `restart`, or `uninstall`:
 
-| Platform    | Start       | Stop       | Restart       | Shortcut / Global CLI                           |
-| :---------- | :---------- | :--------- | :------------ | :---------------------------------------------- |
-| **Windows** | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in CMD/PowerShell) |
-| **Linux**   | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in bash/zsh)       |
-| **Termux**  | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in Termux)         |
+| Platform    | Start       | Stop       | Restart       | Uninstall       | Shortcut / Global CLI                           |
+| :---------- | :---------- | :--------- | :------------ | :-------------- | :---------------------------------------------- |
+| **Windows** | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in CMD/PowerShell) |
+| **Linux**   | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in bash/zsh)       |
+| **Termux**  | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in Termux)         |
 
 The installers automatically register `pms` (PencariMovie Server), `pm`, and `pencarimovie` into your environment `$PATH`, allowing you to manage the background server from **any directory** without needing to know the installation folder:
 
@@ -240,7 +240,10 @@ The installers automatically register `pms` (PencariMovie Server), `pm`, and `pe
 pms start       # Starts the server in the background
 pms stop        # Stops the server and clean up processes
 pms restart     # Restarts the server
+pms uninstall   # Stops the server, removes CLI commands, and deletes the app folder
 ```
+
+> ⚠️ **`pms uninstall`** stops the server, removes the `pms`/`pm`/`pencarimovie` commands, and deletes the entire installation folder (including saved bot sessions in `storage/`). This cannot be undone.
 
 _(Legacy `.\pencarimovie-windows.bat`, `--start`, `--stop`, and `--restart` flags remain supported as well)._
 

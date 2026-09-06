@@ -24,8 +24,10 @@ if "%1"=="--restart" goto restart
 if "%1"=="restart" goto restart
 if "%1"=="--start" goto start
 if "%1"=="start" goto start
+if "%1"=="--uninstall" goto uninstall
+if "%1"=="uninstall" goto uninstall
 if not "%1"=="" (
-    echo Usage: %~nx0 [start^|stop^|restart]
+    echo Usage: %~nx0 [start^|stop^|restart^|uninstall]
     pause
     exit /b 1
 )
@@ -105,6 +107,21 @@ exit /b 0
 echo Stopping PencariMovie Server on 0.0.0.0:%PORT%...
 call :stop_quiet
 echo Server stopped.
+exit /b 0
+
+:uninstall
+echo Stopping PencariMovie Server...
+call :stop_quiet
+rem Remove CLI wrappers
+del /q "%USERPROFILE%\pencarimovie-server\pm.cmd" 2>nul
+del /q "%USERPROFILE%\pencarimovie-server\pms.cmd" 2>nul
+del /q "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
+rem Remove the app directory
+if exist "%APP_DIR%" (
+    echo Removing %APP_DIR% ...
+    rmdir /s /q "%APP_DIR%" 2>nul
+)
+echo PencariMovie Server has been uninstalled.
 exit /b 0
 
 :restart

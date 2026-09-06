@@ -294,7 +294,7 @@ EOF
   for cmd in pms pm pencarimovie; do
     cat <<EOF > "$bin_dir/$cmd"
 #!/usr/bin/env bash
-exec "$launcher" "\$@"
+exec bash "$launcher" "\$@"
 EOF
     chmod +x "$bin_dir/$cmd" 2>/dev/null || true
 

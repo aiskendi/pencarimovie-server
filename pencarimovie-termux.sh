@@ -271,10 +271,10 @@ download_extract() {
 
 # Returns 0 if files were installed/updated, 1 if already up to date.
 install_or_update() {
-  if command -v pkg >/dev/null 2>&1; then
-    if ! command -v wget >/dev/null 2>&1; then
-      echo "Installing wget..."
-      pkg install -y wget
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    if command -v pkg >/dev/null 2>&1; then
+      echo "Installing curl..."
+      pkg install -y curl
     fi
   fi
 

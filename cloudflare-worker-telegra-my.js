@@ -62,7 +62,7 @@ export default {
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "no-cache",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
         },
       });
     }

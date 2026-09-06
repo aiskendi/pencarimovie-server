@@ -198,8 +198,33 @@ if not exist "%APP_PATH%" (
     timeout /t 1 /nobreak >nul
 )
 
-powershell -NoProfile -Command "& { param($appDir,$tag,$repo) $ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $url = 'https://github.com/' + $repo + '/releases/download/' + $tag + '/pencarimovie-downloader-windows-x86_64.zip'; $tmp = Join-Path $env:TEMP ('pencarimovie-ota-' + [guid]::NewGuid().ToString()); New-Item -ItemType Directory -Path (Join-Path $tmp 'extract') | Out-Null; Write-Host ('Downloading ' + $url); Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp 'pencarimovie.zip') -UseBasicParsing; Expand-Archive -Path (Join-Path $tmp 'pencarimovie.zip') -DestinationPath (Join-Path $tmp 'extract') -Force; $found = Get-ChildItem -Path (Join-Path $tmp 'extract') -Recurse -Filter 'backend.php' | Select-Object -First 1; if ($found) { $src = $found.DirectoryName } else { $src = Join-Path $tmp 'extract' }; if (-not (Test-Path $appDir)) { New-Item -ItemType Directory -Path $appDir | Out-Null }; Get-ChildItem -LiteralPath $src | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { $dest = Join-Path $appDir $_.Name; if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; Copy-Item $_.FullName $dest -Recurse -Force }; [System.IO.File]::WriteAllText((Join-Path $appDir '.release-tag'), $tag + [char]10, [System.Text.Encoding]::ASCII); Remove-Item $tmp -Recurse -Force }" "%APP_PATH%" "!LATEST!" "%REPO%"
-if errorlevel 1 (
+set "OTA_SCRIPT=%TEMP%\pencarimovie-ota-%RANDOM%.ps1"
+(
+    echo param($appDir, $tag, $repo)
+    echo $ErrorActionPreference = 'Stop'
+    echo [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    echo $url = "https://github.com/$repo/releases/download/$tag/pencarimovie-downloader-windows-x86_64.zip"
+    echo $tmp = Join-Path $env:TEMP ("pencarimovie-ota-" + [guid]::NewGuid().ToString())
+    echo New-Item -ItemType Directory -Path (Join-Path $tmp 'extract') -Force ^| Out-Null
+    echo Write-Host "Downloading $url"
+    echo Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp 'pencarimovie.zip') -UseBasicParsing
+    echo Expand-Archive -Path (Join-Path $tmp 'pencarimovie.zip') -DestinationPath (Join-Path $tmp 'extract') -Force
+    echo $found = Get-ChildItem -Path (Join-Path $tmp 'extract') -Recurse -Filter 'backend.php' ^| Select-Object -First 1
+    echo if ($found) { $src = $found.DirectoryName } else { $src = Join-Path $tmp 'extract' }
+    echo if (-not (Test-Path $appDir)) { New-Item -ItemType Directory -Path $appDir -Force ^| Out-Null }
+    echo Get-ChildItem -LiteralPath $src ^| Where-Object { $_.Name -ne 'storage' } ^| ForEach-Object {
+    echo     $dest = Join-Path $appDir $_.Name
+    echo     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    echo     Copy-Item $_.FullName $dest -Recurse -Force
+    echo }
+    echo [System.IO.File]::WriteAllText((Join-Path $appDir '.release-tag'), $tag + [char]10, [System.Text.Encoding]::ASCII)
+    echo Remove-Item $tmp -Recurse -Force
+) > "!OTA_SCRIPT!"
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "!OTA_SCRIPT!" -appDir "%APP_PATH%" -tag "!LATEST!" -repo "%REPO%"
+set "PS_ERR=!ERRORLEVEL!"
+del /q "!OTA_SCRIPT!" 2>nul
+if not "!PS_ERR!"=="0" (
     echo Update download/extract failed.
     pause
     exit /b 1

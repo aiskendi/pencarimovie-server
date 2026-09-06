@@ -118,6 +118,17 @@ fi
 
 started=0
 
+# If the server is already listening on the port, do not start a second instance.
+if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "Server is already running on port $PORT."
+  echo "  Local:    http://127.0.0.1:$PORT"
+  if [ -n "${LAN_IP:-}" ]; then
+    echo "  Network:  http://$LAN_IP:$PORT"
+  fi
+  echo "  Stop:     pms stop"
+  exit 0
+fi
+
 # Start Addon server in background (port 8089)
 ADDON_LOG="$ROOT_DIR/addon.log"
 ADDON_PID_FILE="$ROOT_DIR/.addon.pid"

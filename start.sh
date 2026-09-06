@@ -69,6 +69,17 @@ print_urls() {
   echo ""
 }
 
+# If the server is already listening on the port, do not start a second instance.
+if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "Server is already running on port $PORT."
+  echo "  Local:    http://127.0.0.1:$PORT"
+  if [ -n "$LAN_IP" ]; then
+    echo "  Network:  http://$LAN_IP:$PORT"
+  fi
+  echo "  Stop:     pms stop"
+  exit 0
+fi
+
 # Ensure the IPC worker wrapper and runtime are executable. Windows-created
 # tarballs often lose the +x bit, which makes ProcessRunner fail with
 # "Permission denied" when it spawns bin/php.

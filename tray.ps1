@@ -212,7 +212,7 @@ function Start-HiddenProcess {
     $resolved = Resolve-LaunchPath $FileName
     $argLine = ConvertTo-CommandLine $Arguments
     $useNul = $true
-    if ($resolved -match '(?i)[\\/]?(powershell|pwsh|powershell_ise)\.exe$') {
+    if ($resolved -match '(?i)[\\/]?(powershell|pwsh|powershell_ise|addon|bun|node)\.exe$') {
         $useNul = $false
     }
     $childPid = [PencariMovieHiddenStart]::Start($resolved, $argLine, $WorkingDirectory, $useNul)
@@ -303,6 +303,30 @@ function Test-ServerListening {
 }
 
 function Start-AppServer {
+    # Start Bun Addon in background if available
+    $addonExe = Join-Path $root 'bin\addon.exe'
+    $addonJs = Join-Path $root 'addon.js'
+    if (Test-Path -LiteralPath $addonExe) {
+        Write-TrayLog "starting hidden addon $addonExe"
+        Start-HiddenProcess -FileName $addonExe -Arguments @()
+    }
+    elseif (Test-Path -LiteralPath $addonJs) {
+        $bun = Get-Command bun -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($bun) {
+            $bunPath = if ($bun.Source) { $bun.Source } else { $bun.Path }
+            Write-TrayLog "starting addon via bun $bunPath"
+            Start-HiddenProcess -FileName $bunPath -Arguments @($addonJs)
+        }
+        else {
+            $node = Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($node) {
+                $nodePath = if ($node.Source) { $node.Source } else { $node.Path }
+                Write-TrayLog "starting addon via node $nodePath"
+                Start-HiddenProcess -FileName $nodePath -Arguments @($addonJs)
+            }
+        }
+    }
+
     if (Test-ServerListening) {
         Write-TrayLog "server already listening on $Port"
         return
@@ -337,6 +361,9 @@ function Start-AppServer {
 }
 
 function Stop-AppServer {
+    # Stop Addon processes
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*addon*' -or ($_.CommandLine -and $_.CommandLine -like '*addon.js*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
     if ($script:serverProc) {
         try {
             if (-not $script:serverProc.HasExited) {

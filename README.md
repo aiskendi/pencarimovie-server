@@ -60,51 +60,74 @@ Everything runs locally on your own machine (PC, Android, TV Box, or Server). No
 
 ## 🚀 Quick Start & Installation
 
-### 1️⃣ Android Standalone App (APK)
+You can install and launch PencariMovie Server in one command using our short domain **`telegra.my`**:
+
+### 1️⃣ Windows (10 / 11)
+
+Open **PowerShell** and run:
+
+```powershell
+irm telegra.my/win | iex
+```
+
+> **Manual / Alternative:**
+>
+> ```powershell
+> Invoke-RestMethod -Uri "https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-windows.bat" -OutFile "pencarimovie-windows.bat"; .\pencarimovie-windows.bat
+> ```
+
+- Runs in the background with a **System Tray** helper icon.
+- Double-click the tray icon to open the web dashboard.
+- Control anytime: `.\pencarimovie-windows.bat [start|stop|restart]`
+
+---
+
+### 2️⃣ Linux (Ubuntu, Debian, Arch, Fedora)
+
+Open your terminal and run:
+
+```bash
+curl -fsSL telegra.my/linux | bash
+```
+
+> **Manual / Alternative:**
+>
+> ```bash
+> curl -fsSL -o pencarimovie-linux.sh https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-linux.sh && bash pencarimovie-linux.sh
+> ```
+
+- Control anytime: `bash pencarimovie-linux.sh [start|stop|restart]`
+
+---
+
+### 3️⃣ Android via Termux
+
+Recommended for Android devices, TV boxes, or headless micro-servers:
+
+```bash
+pkg install wget -y && curl -fsSL telegra.my/termux | bash
+```
+
+> **Important**: Use the [Official Termux GitHub Release](https://github.com/termux/termux-app/releases) (Google Play version is outdated). Tap **"More details"** → **"Install anyway"** if prompted by Play Protect.
+>
+> **Manual / Alternative:**
+>
+> ```bash
+> curl -fsSL -o pencarimovie-termux.sh https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-termux.sh && bash pencarimovie-termux.sh
+> ```
+
+- Control anytime: `bash pencarimovie-termux.sh [start|stop|restart]`
+
+---
+
+### 4️⃣ Android Standalone App (APK)
 
 Install the standalone Android application with built-in background service and native process manager:
 
-- **[📥 Download APK (ARM64-v8a)](https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie_arm64-v8a.apk)**
+- **Direct Download Shortcut**: **[📥 telegra.my/apk](https://telegra.my/apk)** (or [GitHub Releases](https://github.com/aiskendi/pencarimovie-server/releases/latest))
 
 > ⚠️ **Google Play Protect Notice**:
-> Because this APK is downloaded outside the Play Store and contains terminal/server utilities, Android / Google Play Protect may show a warning: **"Blocked by Play Protect"** or **"Unrecognized app"**.
-> ➡️ Tap **"More details"** and select **"Install anyway"** to continue.
-
-_Note: On launch, the APK verifies updates from GitHub Releases, downloads the latest application core if needed, and starts the server in a battery-optimized background service._
-
----
-
-### 2️⃣ Android via Termux
-
-Recommended for advanced Android users, TV boxes, or headless setups.
-
-> **Important**: Use the [Official Termux GitHub Release](https://github.com/termux/termux-app/releases) (the Google Play version is deprecated). If prompted by Play Protect during Termux installation, tap **"More details"** → **"Install anyway"**.
-
-```bash
-pkg install wget proot -y && wget https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie-termux.sh && bash pencarimovie-termux.sh
-```
-
----
-
-### 3️⃣ Windows (10 / 11)
-
-Run the following in **PowerShell**:
-
-```powershell
-Invoke-WebRequest -Uri "https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie-windows.bat" -OutFile "pencarimovie-windows.bat" -UseBasicParsing; .\pencarimovie-windows.bat
-```
-
-- Launches in the background with a **System Tray** helper icon.
-- Double-click the tray icon to open the web dashboard.
-- Right-click the tray icon for **Open** / **Stop Server**.
-
----
-
-### 4️⃣ Linux (Ubuntu, Debian, Arch, Fedora)
-
-```bash
-curl -L -o pencarimovie-linux.sh https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie-linux.sh && bash pencarimovie-linux.sh
-```
+> Tap **"More details"** and select **"Install anyway"** if warned by Play Protect.
 
 ---
 
@@ -112,10 +135,10 @@ curl -L -o pencarimovie-linux.sh https://github.com/aiskendi/pencarimovie-downlo
 
 ```bash
 # For Apple Silicon (M1/M2/M3/M4):
-mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.2/pencarimovie-downloader-mac-arm64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
+mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-mac-arm64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
 
 # For Intel Mac:
-mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.2/pencarimovie-downloader-mac-x86_64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
+mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-mac-x86_64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
 ```
 
 ---
@@ -191,15 +214,25 @@ Need to stream to Stremio or Nuvio when away from home, or need a valid HTTPS ma
 
 ---
 
-## 🛠️ CLI Commands & Process Control
+## 🛠️ Easy CLI Commands (Start / Stop / Restart)
 
-Each platform script provides intuitive control flags:
+Managing the server is as simple as running `start`, `stop`, or `restart`:
 
-| Platform    | Start                         | Stop                                 | Restart                                 |
-| :---------- | :---------------------------- | :----------------------------------- | :-------------------------------------- |
-| **Windows** | `.\pencarimovie-windows.bat`  | `.\pencarimovie-windows.bat --stop`  | `.\pencarimovie-windows.bat --restart`  |
-| **Linux**   | `bash pencarimovie-linux.sh`  | `bash pencarimovie-linux.sh --stop`  | `bash pencarimovie-linux.sh --restart`  |
-| **Termux**  | `bash pencarimovie-termux.sh` | `bash pencarimovie-termux.sh --stop` | `bash pencarimovie-termux.sh --restart` |
+| Platform    | Start                               | Stop                               | Restart                               | Shortcut / Global CLI                     |
+| :---------- | :---------------------------------- | :--------------------------------- | :------------------------------------ | :---------------------------------------- |
+| **Windows** | `pm start`                          | `pm stop`                          | `pm restart`                          | `pm` (works anywhere in CMD & PowerShell) |
+| **Linux**   | `bash pencarimovie-linux.sh start`  | `bash pencarimovie-linux.sh stop`  | `bash pencarimovie-linux.sh restart`  | `pencarimovie-linux.sh [command]`         |
+| **Termux**  | `bash pencarimovie-termux.sh start` | `bash pencarimovie-termux.sh stop` | `bash pencarimovie-termux.sh restart` | `pencarimovie-termux.sh [command]`        |
+
+On Windows, the installer automatically registers `pms` (PencariMovie Server), `pm`, and `pencarimovie` to your user PATH, so you can control the server from **any Command Prompt (`cmd`) or PowerShell** without navigating to any folder:
+
+```cmd
+pms start       (or: pm start / pencarimovie start)
+pms stop        (or: pm stop)
+pms restart     (or: pm restart)
+```
+
+_(Legacy `.\pencarimovie-windows.bat`, `--start`, `--stop`, and `--restart` flags remain supported as well)._
 
 ### Custom Port Configuration
 

@@ -22,6 +22,17 @@ PencariMovie Downloader is designed as a local/LAN downloader. The default launc
 
 Do not expose port `8088` directly to the public internet. Anyone who can reach the app may interact with the local downloader endpoints.
 
+## Optional Cloudflare quick tunnel
+
+Settings can start an official Cloudflare TryCloudflare quick tunnel (`cloudflared tunnel --url http://127.0.0.1:<port>`). That publishes a public `https://*.trycloudflare.com` URL to this local server.
+
+Treat that URL as a capability token:
+
+- Anyone with the URL can browse the catalog, resolve files, and stream/download through `/api/download`.
+- Tunnel enable/disable, bot login, bot add/remove, and logout stay restricted to the real local dashboard. Cloudflare connections are not treated as localhost even though `cloudflared` proxies as `127.0.0.1`.
+- Tunneled `/api/session` omits `api_secret`.
+- Disable the tunnel from Settings, or run `stop.bat` / `./stop.sh`, when you no longer need public access. Hostnames rotate on each enable.
+
 ## Secrets
 
 Treat these files and values as private:

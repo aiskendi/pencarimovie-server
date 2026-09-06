@@ -7,6 +7,7 @@ PencariMovie Downloader bundles or can be packaged with third-party software. Ea
 - FrankenPHP / Caddy runtime binaries may be bundled in `bin/` for release packages. See the license files included with the FrankenPHP distribution and the files copied into `bin/`, including `bin/license.txt`, `bin/README.md`, and `bin/readme-redist-bins.txt` when present.
 - PHP runtime binaries and DLLs may be bundled in `bin/` for Windows packages. See the PHP license files included in the bundled runtime directory.
 - OpenSSL, curl, zlib, libzip, and other native libraries may be bundled transitively with the runtime. Their notices are included in the runtime distribution files where available.
+- Optional Cloudflare Tunnel downloads the official [`cloudflared`](https://github.com/cloudflare/cloudflared) client from GitHub Releases into `storage/bin/` at enable time (or reuses a `cloudflared` already on `PATH`). `cloudflared` is Apache License 2.0 software from Cloudflare, Inc. It is not bundled in the default app package.
 
 ## PHP dependencies
 

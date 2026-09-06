@@ -88,15 +88,23 @@
           </p>
           <div class="settings-gate__field">
             <label for="botTokenInput" class="settings-gate__label"
-              >Bot Token</label
+              >Bot Token(s)</label
             >
-            <input
-              type="password"
+            <textarea
               id="botTokenInput"
               class="settings-gate__input"
-              placeholder="1234567890:ABCdefGHIjklMNO..."
+              style="
+                height: 72px;
+                font-size: 0.85rem;
+                font-family: monospace;
+                resize: vertical;
+                box-sizing: border-box;
+                padding: 8px 10px;
+                line-height: 1.4;
+              "
+              placeholder="Enter 1 or more bot tokens (one per line)..."
               autocomplete="off"
-            />
+            ></textarea>
           </div>
           <div id="settingsStatus" class="settings-gate__status"></div>
           <div class="settings-gate__actions">
@@ -115,9 +123,11 @@
           id="settingsConnectedSection"
           class="settings-gate__connected-info hidden"
         >
-          <h2 class="settings-gate__title" style="margin-bottom: 12px;">
+          <h2 class="settings-gate__title" style="margin-bottom: 8px;">
             ⚙️ Settings
           </h2>
+
+          <div id="settingsConnectedStatus" class="settings-gate__status" style="margin: 0 0 10px 0; text-align: center;"></div>
 
           <!-- Multi-Bot Manager UI -->
           <div class="settings-gate__bots-container">
@@ -194,7 +204,7 @@
           </div>
 
           <div class="settings-gate__addon-box" style="margin-top: 14px">
-            <span>📺 Want to stream in Nuvio?</span>
+            <span>📺 Want to stream in Nuvio or Stremio?</span>
             <button
               type="button"
               id="settingsOpenAddonBtn"
@@ -207,8 +217,51 @@
                 font-family: inherit;
               "
             >
-              View Nuvio Addon <i class="fas fa-external-link-alt"></i>
+              View Nuvio / Stremio Addon <i class="fas fa-external-link-alt"></i>
             </button>
+          </div>
+
+          <div class="settings-gate__addon-box settings-gate__tunnel-box">
+            <span>☁️ Cloudflare Tunnel</span>
+            <p class="settings-gate__tunnel-desc" id="tunnelDescText">
+              Expose this local server at a public
+              <code id="tunnelSubdomainPlaceholder">https://{bot}-tunnel.pencarimovie.com</code> URL. No Cloudflare account needed.
+              Anyone with the URL can browse and stream.
+            </p>
+            <div class="settings-gate__tunnel-status" id="tunnelStatusText">
+              Tunnel is off.
+            </div>
+            <div class="settings-gate__tunnel-url-row hidden" id="tunnelUrlRow">
+              <input
+                type="text"
+                id="tunnelUrlInput"
+                class="settings-gate__input"
+                readonly
+                value=""
+              />
+              <button type="button" id="copyTunnelUrlBtn" class="settings-gate__btn">
+                📋 Copy
+              </button>
+            </div>
+
+            <div class="settings-gate__tunnel-actions" id="tunnelLocalActions" style="margin-top: 10px;">
+              <button type="button" id="enableTunnelBtn" class="settings-gate__btn">
+                Enable Tunnel
+              </button>
+              <button
+                type="button"
+                id="disableTunnelBtn"
+                class="settings-gate__btn settings-gate__btn--danger hidden"
+              >
+                Disable
+              </button>
+            </div>
+            <div
+              class="settings-gate__tunnel-remote-note hidden"
+              id="tunnelRemoteNote"
+            >
+              Enable and disable from this device's local dashboard only.
+            </div>
           </div>
         </div>
       </div>
@@ -226,8 +279,8 @@
             <button
               id="addonBtn"
               class="stream-nav__search-btn"
-              aria-label="Nuvio Addon"
-              title="Nuvio Addon"
+              aria-label="Nuvio / Stremio Addon"
+              title="Nuvio / Stremio Addon"
             >
               <i class="fas fa-puzzle-piece"></i>
             </button>
@@ -410,9 +463,9 @@
       </div>
     </div>
 
-    <!-- ─── Nuvio Addon Modal Card ─────────────────────────────── -->
+    <!-- ─── Nuvio / Stremio Addon Modal Card ───────────────────── -->
     <div id="addonModal" class="settings-gate hidden" aria-hidden="true">
-      <div class="settings-gate__card">
+      <div class="settings-gate__card settings-gate__card--addon">
         <button
           id="addonModalClose"
           class="settings-gate__close"
@@ -421,9 +474,9 @@
           ✕
         </button>
 
-        <h2 class="settings-gate__title">🧩 Nuvio Addon</h2>
-        <p class="settings-gate__desc">
-          Stream movies, series from Telegram server directly in Nuvio
+        <h2 class="settings-gate__title" id="addonModalTitle">🧩 Nuvio / Stremio Addon</h2>
+        <p class="settings-gate__desc" id="addonModalDesc">
+          Install this addon in Stremio or copy the manifest URL.
         </p>
 
         <!-- Wi-Fi / LAN Manifest Field (Recommended for External Devices) -->
@@ -452,7 +505,7 @@
                 border-radius: 6px;
                 font-weight: 600;
               "
-              >Recommended</span
+              >Remote</span
             >
           </div>
           <div style="display: flex; gap: 8px">
@@ -532,12 +585,161 @@
           </div>
         </div>
 
+        <div class="settings-gate__field hidden" id="addonTunnelField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestTunnelInput"
+              style="margin-bottom: 0"
+            >
+              ☁️ Cloudflare Tunnel Manifest
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: rgba(255, 107, 53, 0.18);
+                color: #ff8a5b;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Public</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestTunnelInput"
+              class="settings-gate__input"
+              style="color: #ff8a5b; font-family: monospace; font-size: 0.88rem"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestTunnelBtn"
+              class="settings-gate__btn"
+              style="
+                white-space: nowrap;
+                padding: 10px 16px;
+                font-size: 0.88rem;
+              "
+            >
+              📋 Copy
+            </button>
+          </div>
+          <a
+            id="addonStremioDirectBtn"
+            class="settings-gate__btn hidden"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 8px;
+              width: 100%;
+              margin-top: 10px;
+              padding: 10px 16px;
+              text-decoration: none;
+              font-weight: 600;
+              background: #ff6b35;
+              color: #fff;
+              box-sizing: border-box;
+            "
+          >
+            🎬 Add to Stremio
+          </a>
+        </div>
+
         <div id="addonCopiedStatus" class="settings-gate__status ok hidden">
           ✓ Copied to clipboard!
         </div>
 
+        <div class="addon-stremio-sync" id="addonStremioSync">
+          <div class="addon-stremio-sync__title">
+            🎬 Install in Stremio (HTTP API Sync)
+          </div>
+          <p class="addon-stremio-sync__desc">
+            Stremio Web blocks HTTP addon URLs. This sends the selected HTTP
+            manifest to your Stremio account from the browser. Credentials go
+            only to
+            <code>api.strem.io</code> — nothing is stored on this server.
+          </p>
+
+          <div class="addon-mode-toggle" role="radiogroup" aria-label="Manifest address">
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLan"
+                value="lan"
+                checked
+              />
+              <span>📡 Wi-Fi / LAN</span>
+            </label>
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLocal"
+                value="localhost"
+              />
+              <span>💻 Localhost</span>
+            </label>
+          </div>
+          <div class="addon-stremio-sync__url" id="stremioSyncUrlPreview"></div>
+
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncEmail">Stremio Email</label>
+            <input
+              type="email"
+              id="stremioSyncEmail"
+              class="settings-gate__input"
+              autocomplete="username"
+              placeholder="you@example.com"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncPassword">Stremio Password</label>
+            <input
+              type="password"
+              id="stremioSyncPassword"
+              class="settings-gate__input"
+              autocomplete="current-password"
+              placeholder="Your Stremio password"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncAuthKey">Auth Key (optional)</label>
+            <input
+              type="password"
+              id="stremioSyncAuthKey"
+              class="settings-gate__input"
+              autocomplete="off"
+              placeholder="Paste instead of email/password"
+            />
+            <p class="addon-stremio-sync__hint">
+              From Stremio Web DevTools:
+              <code>JSON.parse(localStorage.getItem("profile")).auth.key</code>
+            </p>
+          </div>
+          <button type="button" id="stremioSyncInstallBtn" class="settings-gate__btn addon-stremio-sync__btn">
+            Install via Stremio API Sync
+          </button>
+          <div id="stremioSyncStatus" class="settings-gate__status hidden"></div>
+        </div>
+
         <div
           class="instructions"
+          id="addonNuvioInstructions"
           style="
             margin-top: 18px;
             text-align: left;

@@ -6,14 +6,9 @@ cd "$ROOT_DIR"
 
 echo "Installing Termux helpers for PencariMovie Server..."
 
-if ! command -v proot >/dev/null 2>&1; then
-  if command -v pkg >/dev/null 2>&1; then
-    echo "Installing proot with pkg..."
-    pkg install -y proot
-  else
-    echo "proot is required but pkg was not found. Install proot manually, then rerun this script."
-    exit 1
-  fi
+if command -v pkg >/dev/null 2>&1; then
+  echo "Ensuring required Termux packages (proot, nodejs, openssl, ca-certificates)..."
+  pkg install -y proot nodejs openssl ca-certificates 2>/dev/null || true
 fi
 
 mkdir -p tmp

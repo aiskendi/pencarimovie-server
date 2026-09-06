@@ -1,0 +1,198 @@
+diff --git a/src/Exception.php b/src/Exception.php
+index e4271ec..5c49236 100644
+--- a/src/Exception.php
++++ b/src/Exception.php
+@@ -85,12 +85,15 @@ class Exception extends \Exception
+         $errfileReplaced = $errfile ?? '';
+         // If error is suppressed with @, don't throw an exception
+         if (error_reporting() === 0
++            || !(error_reporting() & $errno)
+             || strpos($errstr, 'headers already sent')
+             || str_contains($errstr, 'Creation of dynamic property')
+             || str_contains($errstr, 'Legacy nullable type detected')
+             || str_contains($errstr, '$tdMethods is deprecated')
++            || str_contains($errstr, 'The operation completed successfully')
+             || $errfileReplaced && (
+                 str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'amphp'.DIRECTORY_SEPARATOR)
++                || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'danog'.DIRECTORY_SEPARATOR.'ipc')
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'league'.DIRECTORY_SEPARATOR)
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'phpseclib'.DIRECTORY_SEPARATOR)
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'symfony'.DIRECTORY_SEPARATOR)
+diff --git a/src/Ipc/Runner/ProcessRunner.php b/src/Ipc/Runner/ProcessRunner.php
+index fd59432..26efa69 100644
+--- a/src/Ipc/Runner/ProcessRunner.php
++++ b/src/Ipc/Runner/ProcessRunner.php
+@@ -113,7 +113,33 @@ final class ProcessRunner extends RunnerAbstract
+             }
+         }
+         $envVars = array_merge(
+-            array_filter($_SERVER, static fn ($v, $k): bool => \is_string($v) && !\in_array($k, self::CGI_VARS, true), ARRAY_FILTER_USE_BOTH),
++            // On Windows, build a minimal allow-list to avoid proc_open "Command conversion failed".
++            // On Linux / Android Termux, preserve standard environment variables (PREFIX, LD_LIBRARY_PATH, HOME, etc.)
++            // so native CLI PHP and its dynamic libraries link and execute properly.
++            (static function (): array {
++                $envVars = [];
++                $isWindows = strncasecmp(PHP_OS, 'WIN', 3) === 0;
++                $allowed = $isWindows ? [
++                    'PATH', 'SystemRoot', 'TEMP', 'TMP', 'ComSpec', 'PATHEXT',
++                    'HOMEDRIVE', 'HOMEPATH', 'USERPROFILE', 'SystemDrive',
++                    'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
++                    'APPDATA', 'LOCALAPPDATA', 'NUMBER_OF_PROCESSORS',
++                    'PROCESSOR_ARCHITECTURE', 'OS', 'COMPUTERNAME', 'USERNAME', 'windir'
++                ] : [
++                    'PATH', 'PREFIX', 'LD_LIBRARY_PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP',
++                    'USER', 'SHELL', 'LANG', 'LC_ALL', 'PHP_INI_SCAN_DIR', 'PHPRC', 'TERM',
++                    'ANDROID_DATA', 'ANDROID_ROOT'
++                ];
++
++                foreach ($allowed as $envName) {
++                    if (isset($_SERVER[$envName]) && \is_string($_SERVER[$envName])) {
++                        $envVars[$envName] = $_SERVER[$envName];
++                    } elseif (isset($_ENV[$envName]) && \is_string($_ENV[$envName])) {
++                        $envVars[$envName] = $_ENV[$envName];
++                    }
++                }
++                return $envVars;
++            })(),
+             [
+                 'QUERY_STRING' => http_build_query($params),
+                 'absoluteRootDir' => $root,
+@@ -165,13 +191,37 @@ final class ProcessRunner extends RunnerAbstract
+     {
+         $executable = strncasecmp(PHP_OS, 'WIN', 3) === 0 ? 'php.exe' : 'php';
+ 
+-        $paths = array_filter(explode(PATH_SEPARATOR, getenv('PATH') ?: ''));
++        // 1. Check known Termux / custom Android prefix first
++        $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
++        if ($prefix !== '' && is_file($prefix . '/bin/' . $executable) && is_executable($prefix . '/bin/' . $executable)) {
++            return self::$binaryPath = $prefix . '/bin/' . $executable;
++        }
++
++        $candidates = [
++            '/data/data/com.pencarimovie.downloader/files/usr/bin/' . $executable,
++            '/data/data/com.termux/files/usr/bin/' . $executable,
++        ];
++        foreach ($candidates as $cand) {
++            if (is_file($cand) && is_executable($cand)) {
++                return self::$binaryPath = $cand;
++            }
++        }
++
++        // 2. Check bundled bin/php wrapper or binary
++        $bundled = realpath(__DIR__ . '/../../../../../../bin/' . $executable);
++        if ($bundled && file_exists($bundled)) {
++            return self::$binaryPath = $bundled;
++        }
++
++        // 3. Fall back to PATH scan
++        $envPath = $_SERVER['PATH'] ?? ($_ENV['PATH'] ?? getenv('PATH') ?: '');
++        $paths = array_filter(explode(PATH_SEPARATOR, $envPath));
+         $paths[] = PHP_BINDIR;
+         $paths = array_unique($paths);
+ 
+         foreach ($paths as $path) {
+             $path .= DIRECTORY_SEPARATOR.$executable;
+-            if (is_executable($path)) {
++            if (is_file($path) && is_executable($path)) {
+                 return self::$binaryPath = $path;
+             }
+         }
+diff --git a/src/Ipc/Runner/WebRunner.php b/src/Ipc/Runner/WebRunner.php
+index c2ce84e..3f37dfe 100644
+--- a/src/Ipc/Runner/WebRunner.php
++++ b/src/Ipc/Runner/WebRunner.php
+@@ -48,36 +48,10 @@ final class WebRunner extends RunnerAbstract
+     #[\Override]
+     public static function start(string $session, int $startupId): bool
+     {
+-        if (!isset($_SERVER['SERVER_NAME']) || !$_SERVER['SERVER_NAME']) {
+-            return false;
+-        }
+-
+-        if (!self::$runPath) {
+-            $absoluteRootDir = self::getAbsoluteRootDir();
+-            $runPath = self::getScriptPath($absoluteRootDir);
+-
+-            if (substr($runPath, 0, \strlen($absoluteRootDir)) === $absoluteRootDir) { // Process runner is within readable document root
+-                self::$runPath = substr($runPath, \strlen($absoluteRootDir)-1);
+-            } else {
+-                throw new AssertionError("$runPath is not within absolute document root $absoluteRootDir!");
+-            }
+-
+-            self::$runPath = str_replace(DIRECTORY_SEPARATOR, '/', self::$runPath);
+-            self::$runPath = str_replace('//', '/', self::$runPath);
+-        }
+-
+-        $params = [
+-            'argv' => ['madeline-ipc', $session, $startupId],
+-            'cwd' => Magic::getcwd(),
+-            'MadelineSelfRestart' => 1,
+-        ];
+-        if (\function_exists('memprof_enabled') && memprof_enabled()) {
+-            $params['MEMPROF_PROFILE'] = '1';
+-        }
+-
+-        self::selfStart(self::$runPath.'?'.http_build_query($params));
+-
+-        return true;
++        // WebRunner attempts HTTP loopback self-calls which fail under custom routers,
++        // rewrite rules (/api/*), FrankenPHP, and mobile environments (0.0.0.0 bind / TLS timeouts).
++        // Return false so MadelineProto exclusively relies on CLI ProcessRunner / fd_ensure_ipc_worker().
++        return false;
+     }
+ 
+     private static ?string $absoluteRootDir = null;
+diff --git a/src/Logger.php b/src/Logger.php
+index d69cbf5..89b63ea 100644
+--- a/src/Logger.php
++++ b/src/Logger.php
+@@ -371,7 +371,11 @@ final class Logger
+     {
+         foreach (self::$closePromises as [$stdout, $promise]) {
+             $stdout->close();
+-            $promise->await();
++            try {
++                $promise->await();
++            } catch (\Throwable) {
++                // Ignore driver suspension / cancellation errors on shutdown
++            }
+         }
+     }
+     /**
+diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
+index 0ba694d..27180d9 100644
+--- a/src/Settings/Ipc.php
++++ b/src/Settings/Ipc.php
+@@ -34,6 +34,8 @@ final class Ipc extends SettingsAbstract
+      */
+     public function getSlow(): bool
+     {
+-        return Magic::$isIpcWorker || \PHP_OS_FAMILY === 'Windows';
++        // Force full boot only when executing inside the spawned CLI IPC worker itself
++        // or during a fresh bot login before any session file exists.
++        return Magic::$isIpcWorker || defined('MADELINE_WORKER') || !empty($GLOBALS['FD_FORCE_FULL_BOOT']);
+     }
+ }
+diff --git a/src/Shutdown.php b/src/Shutdown.php
+index 05e2406..a873ea5 100644
+--- a/src/Shutdown.php
++++ b/src/Shutdown.php
+@@ -56,9 +56,15 @@ final class Shutdown
+         if (\defined('STDIN')) {
+             getStdin()->unreference();
+         }
+-        API::finalize();
+-        MTProto::serializeAll();
+-        Logger::finalize();
++        try {
++            API::finalize();
++        } catch (\Throwable) {}
++        try {
++            MTProto::serializeAll();
++        } catch (\Throwable) {}
++        try {
++            Logger::finalize();
++        } catch (\Throwable) {}
+         if (class_exists(Installer::class)) {
+             Installer::unlock();
+         }

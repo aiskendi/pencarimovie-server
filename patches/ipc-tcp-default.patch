@@ -1,0 +1,31 @@
+diff --git a/lib/IpcServer.php b/lib/IpcServer.php
+index 93441c7..88ff266 100644
+--- a/lib/IpcServer.php
++++ b/lib/IpcServer.php
+@@ -52,22 +52,21 @@ class IpcServer
+                 throw new \RuntimeException("Cannot use FIFOs and UNIX sockets on windows");
+             }
+         } elseif ($type === self::TYPE_AUTO) {
+-            $types = [];
++            $types = [self::TYPE_TCP];
+             if (\strlen($uri) <= 104) {
+                 $types []= self::TYPE_UNIX;
+             }
+             if ($isLinux) {
+                 $types []= self::TYPE_FIFO;
+             }
+-            $types []= self::TYPE_TCP;
+         } else {
+             $types = [];
+-            if ($type & self::TYPE_UNIX && \strlen($uri) <= 104) {
+-                $types []= self::TYPE_UNIX;
+-            }
+             if ($type & self::TYPE_TCP) {
+                 $types []= self::TYPE_TCP;
+             }
++            if ($type & self::TYPE_UNIX && \strlen($uri) <= 104) {
++                $types []= self::TYPE_UNIX;
++            }
+             if ($type & self::TYPE_FIFO && $isLinux) {
+                 $types []= self::TYPE_FIFO;
+             }

@@ -1,22 +1,69 @@
 #!/bin/sh
-# Wrapper: calls FrankenPHP's embedded PHP CLI
-# MadelineProto's ProcessRunner needs a standalone 'php' binary on PATH.
-# This wrapper provides one using the bundled frankenphp php-cli command.
+# Wrapper: calls PHP CLI for MadelineProto's ProcessRunner IPC worker.
 #
-# frankenphp php-cli treats the first positional argument as the PHP file
-# to run, and does NOT support PHP CLI flags like -d. We strip those flags
-# here since the corresponding ini values are set in bin/php.ini.
+# ProcessRunner invokes this as:
+#   bin/php -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1 entry.php madeline-ipc ...
+#
+# Priority:
+#   1. Native Termux / system PHP (accepts -d flags normally).
+#   2. FrankenPHP's own php-cli (bin/frankenphp php-cli). FrankenPHP's php-cli
+#      does NOT accept -d flags (it treats them as a script path), so we strip
+#      them before exec.
+#
+# We must never recurse into this wrapper when scanning PATH.
 
-cd "$(dirname "$0")" || exit 1
-
-# Filter out -d options; they are configured in bin/php.ini
-# MadelineProto's ProcessRunner passes -d flags before the script path.
-# Use POSIX-compatible shift (no bash arrays needed).
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -d*) shift ;;
-    *) break ;;
+# Resolve the directory containing this wrapper (follow symlinks).
+SELF="$0"
+while [ -h "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *) SELF="$(dirname "$SELF")/$LINK" ;;
   esac
 done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+APP_DIR="$(dirname "$BIN_DIR")"
 
-exec ./frankenphp php-cli "$@"
+# 1. Native Termux PHP via PREFIX.
+if [ -n "$PREFIX" ] && [ -x "$PREFIX/bin/php" ]; then
+  exec "$PREFIX/bin/php" "$@"
+fi
+
+# 2. Known Termux / custom Android app data directories.
+if [ -x "/data/data/com.pencarimovie.downloader/files/usr/bin/php" ]; then
+  export PREFIX="/data/data/com.pencarimovie.downloader/files/usr"
+  export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
+  exec "$PREFIX/bin/php" "$@"
+fi
+
+if [ -x "/data/data/com.termux/files/usr/bin/php" ]; then
+  export PREFIX="/data/data/com.termux/files/usr"
+  export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
+  exec "$PREFIX/bin/php" "$@"
+fi
+
+# 3. System php on PATH — but never recurse into this wrapper.
+if command -v php >/dev/null 2>&1; then
+  REAL_PHP="$(command -v php)"
+  if [ "$REAL_PHP" != "$SELF" ] && [ "$REAL_PHP" != "$BIN_DIR/php" ]; then
+    exec "$REAL_PHP" "$@"
+  fi
+fi
+
+# 4. FrankenPHP php-cli (last resort). FrankenPHP's php-cli does not accept -d
+#    flags, so strip any leading -d* options before exec.
+FP="$BIN_DIR/frankenphp"
+[ -x "$FP" ] || FP="$APP_DIR/frankenphp"
+if [ -x "$FP" ]; then
+  # Remove leading -d* options (they are always first, added by ProcessRunner).
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -d*) shift ;;
+      *) break ;;
+    esac
+  done
+  exec "$FP" php-cli "$@"
+fi
+
+echo "bin/php: could not locate a usable PHP CLI" >&2
+exit 1

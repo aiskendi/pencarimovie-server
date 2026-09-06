@@ -1,0 +1,9 @@
+name = "telegra-my"
+main = "cloudflare-worker-telegra-my.js"
+compatibility_date = "2026-03-01"
+workers_dev = true
+
+routes = [
+  { pattern = "telegra.my/*", zone_name = "telegra.my" },
+  { pattern = "www.telegra.my/*", zone_name = "telegra.my" }
+]

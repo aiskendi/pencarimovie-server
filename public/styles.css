@@ -200,6 +200,103 @@
   position: relative;
 }
 
+.settings-gate__card--addon {
+  width: min(520px, 100%);
+  text-align: left;
+}
+
+.addon-stremio-sync {
+  margin-top: 8px;
+  padding: 14px 16px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  text-align: left;
+}
+
+.addon-stremio-sync__title {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 6px;
+}
+
+.addon-stremio-sync__desc {
+  margin: 0 0 12px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.addon-stremio-sync__desc code {
+  font-size: 0.74rem;
+  color: #ff8a5b;
+}
+
+.addon-mode-toggle {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.addon-mode-toggle__option {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.addon-mode-toggle__option:has(input:checked) {
+  border-color: var(--accent, #ff6b35);
+  background: rgba(255, 107, 53, 0.14);
+  color: #fff;
+}
+
+.addon-mode-toggle__option:has(input:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.addon-mode-toggle__option input {
+  margin: 0;
+}
+
+.addon-stremio-sync__url {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  color: #00d26a;
+  word-break: break-all;
+  margin-bottom: 12px;
+  min-height: 1.2em;
+}
+
+.addon-stremio-sync__hint {
+  margin: 6px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.addon-stremio-sync__hint code {
+  font-size: 0.68rem;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.addon-stremio-sync__btn {
+  width: 100%;
+  margin-top: 4px;
+  padding: 12px 16px;
+}
+
 /* ─── Connected-info section (overlay mode) ───────────────────── */
 
 .settings-gate__connected-info {
@@ -271,6 +368,71 @@
 .settings-gate__btn--danger {
   background: #e03131;
   min-width: 180px;
+}
+
+.settings-gate__tunnel-box {
+  align-items: stretch;
+  text-align: left;
+}
+
+.settings-gate__tunnel-desc {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.settings-gate__tunnel-desc code {
+  font-size: 0.74rem;
+  color: #ff8a5b;
+}
+
+.settings-gate__tunnel-status {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.settings-gate__tunnel-status.is-on {
+  color: #00d26a;
+}
+
+.settings-gate__tunnel-status.is-busy {
+  color: #ffb020;
+}
+
+.settings-gate__tunnel-status.is-error {
+  color: #ff6b6b;
+}
+
+.settings-gate__tunnel-url-row,
+.settings-gate__tunnel-actions {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.settings-gate__tunnel-url-row .settings-gate__input {
+  font-family: monospace;
+  font-size: 0.82rem;
+  color: #ff8a5b;
+}
+
+.settings-gate__tunnel-url-row .settings-gate__btn,
+.settings-gate__tunnel-actions .settings-gate__btn {
+  white-space: nowrap;
+  min-width: unset;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+}
+
+.settings-gate__tunnel-actions .settings-gate__btn--danger {
+  flex: 0 0 auto;
+}
+
+.settings-gate__tunnel-remote-note {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.45);
 }
 
 .settings-gate__btn--danger:hover {

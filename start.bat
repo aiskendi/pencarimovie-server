@@ -41,12 +41,40 @@ call :print_urls
 echo   Stop:     "%~dp0stop.bat"
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
+echo Warming up IPC workers...
+if exist "%ROOT%\bin\php.exe" (
+  "%ROOT%\bin\php.exe" "%ROOT%\warmup-ipc.php" >nul 2>&1
+) else (
+  php "%ROOT%\warmup-ipc.php" >nul 2>&1
+)
 echo This window will close. The server keeps running in the background.
-timeout /t 8
+rem Keep the window open briefly so the URLs can be read, then close
+rem automatically. Use a PowerShell sleep instead of `timeout` because
+rem `timeout` requires console input and hangs on "press a key to continue"
+rem when run from a non-console context (e.g. VS Code terminal).
+powershell -NoProfile -Command "Start-Sleep -Seconds 8"
 endlocal
 goto :eof
 
 :start_server_hidden
+if exist "%ROOT%\bin\addon.exe" (
+  if exist "%ROOT%\start-hidden.ps1" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath "%ROOT%\bin\addon.exe" -CommandLine ""
+  ) else (
+    start "PencariMovie Addon" /MIN "%ROOT%\bin\addon.exe"
+  )
+) else if exist "%ROOT%\addon.js" (
+  bun --version >nul 2>nul
+  if not errorlevel 1 (
+    start "PencariMovie Addon" /MIN bun "%ROOT%\addon.js"
+  ) else (
+    node --version >nul 2>nul
+    if not errorlevel 1 (
+      start "PencariMovie Addon" /MIN node "%ROOT%\addon.js"
+    )
+  )
+)
+
 if exist "%FRANKENPHP_EXE%" (
   if exist "%ROOT%\start-hidden.ps1" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath "%FRANKENPHP_EXE%" -CommandLine "php-server --listen %HOST%:%PORT% --root ""%ROOT%"""

@@ -24,6 +24,10 @@ bin/pharcommand.phar
 .release-tag
 storage/tray.pid
 storage/tray.log
+storage/tunnel/
+storage/bin/cloudflared
+storage/bin/cloudflared.exe
+storage/bin/cloudflared*
 storage/config.json
 storage/api_credentials.json
 storage/api_secret.key
@@ -34,6 +38,23 @@ storage/.secret.key
 storage/session.madeline/
 storage/session.madeline*
 storage/*.madeline
+storage/sessions/
+storage/bot_pool.json
+storage/resolve_cache_*.json
+storage/rr_bot_index.txt
+storage/cat-*.json
+storage/stream-*.json
+storage/aiostreams/
+.bun-cache/
+stremio_kb.txt
+errors_db.txt
+*.zip
+*.tar
+*.tar.gz
+*.deb
+*.apk
+5])
+9000014421])
 storage/*.madeline.lock
 storage/*.madeline.safe.php
 
@@ -77,6 +98,7 @@ pencarimovie*
 !pencarimovie-linux.sh
 !pencarimovie-termux.sh
 !pencarimovie-windows.bat
+!pencarimovie-windows.ps1
 proot*
 libtalloc*
 libtirpc*

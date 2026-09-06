@@ -3,36 +3,43 @@ setlocal enabledelayedexpansion
 title PencariMovie Server
 call :print_banner
 
-set "APP_DIR=pencarimovie-server"
-set "REPO=aiskendi/pencarimovie-downloader"
+set "REPO=aiskendi/pencarimovie-server"
 set "FALLBACK_TAG=v1.0.0"
 set "PORT=8088"
 set "HAD_APP=0"
 set "UPDATED=0"
 set "IN_PLACE=0"
 if exist "%~dp0backend.php" if exist "%~dp0start.bat" (
-    set "APP_DIR=."
+    set "APP_DIR=%~dp0"
+    set "APP_DIR=!APP_DIR:~0,-1!"
     set "IN_PLACE=1"
+) else (
+    set "APP_DIR=%USERPROFILE%\pencarimovie-server"
 )
 
 if "%1"=="--stop" goto stop
+if "%1"=="stop" goto stop
 if "%1"=="--restart" goto restart
-if not "%1"=="" if not "%1"=="--start" (
-    echo Usage: %~nx0 [--start^|--stop^|--restart]
+if "%1"=="restart" goto restart
+if "%1"=="--start" goto start
+if "%1"=="start" goto start
+if not "%1"=="" (
+    echo Usage: %~nx0 [start^|stop^|restart]
     pause
     exit /b 1
 )
 
 :start
-if exist "%~dp0pencarimovie-downloader" if not "%APP_DIR%"=="pencarimovie-downloader" (
-    if exist "%~dp0pencarimovie-downloader\storage" if not exist "%~dp0%APP_DIR%\storage" (
-        mkdir "%~dp0%APP_DIR%" 2>nul
-        robocopy "%~dp0pencarimovie-downloader\storage" "%~dp0%APP_DIR%\storage" /e /np /nfl /ndl /njh /njs >nul 2>nul
+if exist "%USERPROFILE%\pencarimovie-downloader" (
+    if exist "%USERPROFILE%\pencarimovie-downloader\storage" if not exist "%APP_DIR%\storage" (
+        mkdir "%APP_DIR%" 2>nul
+        robocopy "%USERPROFILE%\pencarimovie-downloader\storage" "%APP_DIR%\storage" /e /np /nfl /ndl /njh /njs >nul 2>nul
     )
-    rmdir /s /q "%~dp0pencarimovie-downloader" 2>nul
+    rmdir /s /q "%USERPROFILE%\pencarimovie-downloader" 2>nul
 )
-if exist "%~dp0%APP_DIR%" set "HAD_APP=1"
+if exist "%APP_DIR%" set "HAD_APP=1"
 call :install_or_update
+call :register_cmd_path
 
 >nul 2>nul curl -s -o nul http://127.0.0.1:%PORT%
 if not errorlevel 1 goto port_busy
@@ -51,7 +58,9 @@ goto not_running
 echo Server is already running on port %PORT%.
 call :start_tray 1
 call :print_urls
-echo   Stop:     "%~f0" --stop
+echo   CLI:      pm [start|stop|restart]
+echo   Stop:     pm stop
+echo   Restart:  pm restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
 echo This window will close. The server keeps running in the background.
@@ -59,12 +68,12 @@ timeout /t 8
 exit /b 0
 
 :not_running
-if not exist "%~dp0%APP_DIR%" (
+if not exist "%APP_DIR%" (
     echo App directory was not installed.
     pause
     exit /b 1
 )
-cd /d "%~dp0%APP_DIR%"
+cd /d "%APP_DIR%"
 echo Starting PencariMovie Server in the background...
 if exist "%cd%\tray.ps1" (
     call :start_tray 1
@@ -88,7 +97,9 @@ if exist "%cd%\tray.ps1" (
 echo.
 echo PencariMovie Server is running in the background.
 call :print_urls
-echo   Stop:     "%~f0" --stop
+echo   CLI:      pm [start|stop|restart]
+echo   Stop:     pm stop
+echo   Restart:  pm restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
 echo This window will close. The server keeps running in the background.
@@ -108,33 +119,37 @@ timeout /t 2 /nobreak >nul
 goto start
 
 :stop_quiet
-netstat -ano 2>nul | findstr "0.0.0.0:%PORT%" | findstr "LISTENING" >nul 2>nul
-if not errorlevel 1 (
-    for /f "tokens=5" %%P in ('netstat -ano ^| findstr "0.0.0.0:%PORT%" ^| findstr "LISTENING"') do (
-        taskkill /PID %%P /F >nul 2>nul
-        echo Killed PID %%P
-    )
+rem Kill port 8089 (Addon)
+for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:8089 127.0.0.1:8089 [::]:8089" ^| findstr "LISTENING"') do (
+    taskkill /PID %%P /F >nul 2>nul
 )
+
+rem Kill port %PORT% (Server)
+for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:%PORT% 127.0.0.1:%PORT% [::]:%PORT%" ^| findstr "LISTENING"') do (
+    taskkill /PID %%P /F >nul 2>nul
+)
+
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*addon*' -or ($_.CommandLine -and ($_.CommandLine -like '*addon.js*' -or $_.CommandLine -like '*addon.exe*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 call :stop_tray
 goto :eof
 
 :start_tray
-if not exist "%~dp0%APP_DIR%\tray.ps1" goto :eof
-if not exist "%~dp0%APP_DIR%\start-hidden.ps1" (
-    start "PencariMovie Tray" /MIN powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0%APP_DIR%\tray.ps1" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat "%~dp0%APP_DIR%\stop.bat" -StartServer
+if not exist "%APP_DIR%\tray.ps1" goto :eof
+if not exist "%APP_DIR%\start-hidden.ps1" (
+    start "PencariMovie Tray" /MIN powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%APP_DIR%\tray.ps1" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat "%APP_DIR%\stop.bat" -StartServer
     goto :eof
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%~dp0%APP_DIR%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%~dp0%APP_DIR%\stop.bat"" -StartServer"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%APP_DIR%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%APP_DIR%\stop.bat"" -StartServer"
 goto :eof
 
 :stop_tray
 powershell -NoProfile -Command "try { $e = New-Object System.Threading.EventWaitHandle $false, ([System.Threading.EventResetMode]::AutoReset), 'Global\PencariMovieServerTrayStop'; $e.Set() | Out-Null; $e.Dispose() } catch {}" >nul 2>nul
 timeout /t 1 /nobreak >nul
-if exist "%~dp0%APP_DIR%\storage\tray.pid" (
-    for /f "usebackq delims=" %%P in ("%~dp0%APP_DIR%\storage\tray.pid") do (
+if exist "%APP_DIR%\storage\tray.pid" (
+    for /f "usebackq delims=" %%P in ("%APP_DIR%\storage\tray.pid") do (
         if not "%%P"=="" taskkill /PID %%P /F >nul 2>nul
     )
-    del /q "%~dp0%APP_DIR%\storage\tray.pid" >nul 2>nul
+    del /q "%APP_DIR%\storage\tray.pid" >nul 2>nul
 )
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine -match 'pencarimovie.+tray\.ps1' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 goto :eof
@@ -152,7 +167,7 @@ if "%IN_PLACE%"=="1" (
     echo Starting from this folder; skipping GitHub extract.
     goto :eof
 )
-set "APP_PATH=%~dp0%APP_DIR%"
+set "APP_PATH=%APP_DIR%"
 set "CURRENT="
 if exist "%APP_PATH%\.release-tag" (
     for /f "usebackq delims=" %%A in ("%APP_PATH%\.release-tag") do set "CURRENT=%%A"
@@ -190,6 +205,27 @@ if errorlevel 1 (
     exit /b 1
 )
 set "UPDATED=1"
+
+:: Register pm.cmd and add to User PATH so user can type `pm` anywhere
+call :register_cmd_path
+goto :eof
+
+:register_cmd_path
+if not exist "%USERPROFILE%\pencarimovie-server" mkdir "%USERPROFILE%\pencarimovie-server" 2>nul
+(
+    echo @echo off
+    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+) > "%USERPROFILE%\pencarimovie-server\pm.cmd" 2>nul
+(
+    echo @echo off
+    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+) > "%USERPROFILE%\pencarimovie-server\pms.cmd" 2>nul
+(
+    echo @echo off
+    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+) > "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server'; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>nul
 goto :eof
 
 :print_banner

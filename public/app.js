@@ -13,6 +13,7 @@ class PencariMovieApp {
     // ── Config ──
     this.localApiBase = window.location.origin;
     this.wpApiBase = 'https://pencarimovie.com/wp-json/fastdownloader/v1';
+    this.wpAjaxUrl = 'https://pencarimovie.com/wp-admin/admin-ajax.php';
     this.siteName = 'PencariMovie';
 
     // ── State ──
@@ -52,6 +53,10 @@ class PencariMovieApp {
     this.apiSecret = '';
     this.hasSession = false;
     this.lanIp = '';
+    this.listenPort = 8088;
+    this.tunnelUrl = '';
+    this.tunnelEnabled = false;
+    this._tunnelBusy = false;
     this._updateAddonModalUrls = () => {};
     this._restoreCachedSession();
 
@@ -75,6 +80,7 @@ class PencariMovieApp {
     try {
       const versionInfo = await this.checkVersion();
       if (versionInfo && versionInfo.update_needed) {
+        this._hideLoadingScreen();
         this.showUpdateRequired(versionInfo);
         return; // Stop — overlay blocks all interaction
       }
@@ -206,6 +212,9 @@ class PencariMovieApp {
         if (input) input.value = tokenAddResult.token;
       }
     }
+
+    // Start the periodic tunnel watchdog (revives cloudflared if it dies).
+    this._startTunnelWatchdog();
   }
 
   detectTelegram() {
@@ -314,17 +323,30 @@ class PencariMovieApp {
       });
     }
 
-    // ── Nuvio Addon Modal Card ──
+    // ── Nuvio / Stremio Addon Modal Card ──
     const addonModal = this.$('#addonModal');
     const addonBtn = this.$('#addonBtn');
     const addonClose = this.$('#addonModalClose');
+    const addonModalTitle = this.$('#addonModalTitle');
+    const addonModalDesc = this.$('#addonModalDesc');
     const copyAddonBtn = this.$('#copyAddonManifestBtn');
     const copyAddonLanBtn = this.$('#copyAddonManifestLanBtn');
+    const copyAddonTunnelBtn = this.$('#copyAddonManifestTunnelBtn');
     const manifestInput = this.$('#addonManifestInput');
     const manifestLanInput = this.$('#addonManifestLanInput');
+    const manifestTunnelInput = this.$('#addonManifestTunnelInput');
     const addonLanField = this.$('#addonLanField');
     const addonLocalField = this.$('#addonLocalField');
+    const addonTunnelField = this.$('#addonTunnelField');
+    const addonStremioDirectBtn = this.$('#addonStremioDirectBtn');
+    const addonStremioSync = this.$('#addonStremioSync');
+    const addonNuvioInstructions = this.$('#addonNuvioInstructions');
     const copiedStatus = this.$('#addonCopiedStatus');
+    const stremioSyncUrlPreview = this.$('#stremioSyncUrlPreview');
+    const stremioSyncModeLan = this.$('#stremioSyncModeLan');
+    const stremioSyncModeLocal = this.$('#stremioSyncModeLocal');
+    const stremioSyncInstallBtn = this.$('#stremioSyncInstallBtn');
+    const stremioSyncStatus = this.$('#stremioSyncStatus');
 
     const isUsableLanHost = (host) => {
       const value = String(host || '').trim();
@@ -344,15 +366,64 @@ class PencariMovieApp {
       return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
     };
 
-    const updateAddonModalUrls = () => {
-      const port = window.location.port ? `:${window.location.port}` : '';
-      const protocol = window.location.protocol;
-      const localUrl = `${protocol}//127.0.0.1${port}/manifest.json`;
+    const getAddonManifestUrls = () => {
+      // Always HTTP for LAN/localhost so Stremio API sync can store a
+      // non-HTTPS transportUrl. Tunnel pages have no :8088 in location.port.
+      const listenPort = Number(this.listenPort) > 0 ? Number(this.listenPort) : 8088;
+      const onTunnel = this._isCloudflareTunnelPage();
+      const pagePort = Number(window.location.port);
+      const httpPort = (!onTunnel && pagePort > 0) ? pagePort : listenPort;
+      const portSuffix = httpPort && httpPort !== 80 ? `:${httpPort}` : '';
+      const localUrl = `http://127.0.0.1${portSuffix}/manifest.json`;
       const pageHost = window.location.hostname;
       const lanHost = isUsableLanHost(this.lanIp)
         ? this.lanIp
         : (isUsableLanHost(pageHost) ? pageHost : '');
-      const lanUrl = lanHost ? `${protocol}//${lanHost}${port}/manifest.json` : '';
+      const lanUrl = lanHost ? `http://${lanHost}${portSuffix}/manifest.json` : '';
+      let tunnelUrl = String(this.tunnelUrl || '').replace(/\/+$/, '');
+      if (onTunnel) {
+        const activeBot = (this.botUsername || '').toLowerCase().trim();
+        const customSubdomain = activeBot ? `https://${activeBot}-tunnel.pencarimovie.com` : '';
+        if (customSubdomain) {
+          tunnelUrl = customSubdomain;
+        } else if (!tunnelUrl) {
+          tunnelUrl = window.location.origin.replace(/\/+$/, '');
+        }
+      }
+      const tunnelManifest = tunnelUrl ? `${tunnelUrl}/manifest.json` : '';
+      return { localUrl, lanUrl, tunnelManifest, lanHost };
+    };
+
+    const getSelectedStremioSyncUrl = () => {
+      const urls = getAddonManifestUrls();
+      const wantLan = !!(stremioSyncModeLan && stremioSyncModeLan.checked);
+      if (wantLan && urls.lanUrl) {
+        return { url: urls.lanUrl, mode: 'lan', label: 'Wi-Fi / LAN' };
+      }
+      return { url: urls.localUrl, mode: 'localhost', label: 'Localhost' };
+    };
+
+    const updateStremioSyncPreview = () => {
+      const selected = getSelectedStremioSyncUrl();
+      if (stremioSyncUrlPreview) {
+        stremioSyncUrlPreview.textContent = selected.url
+          ? `${selected.label}: ${selected.url}`
+          : '';
+      }
+      if (stremioSyncModeLan) {
+        const urls = getAddonManifestUrls();
+        const lanMissing = !urls.lanUrl;
+        stremioSyncModeLan.disabled = lanMissing;
+        if (lanMissing && stremioSyncModeLocal) {
+          stremioSyncModeLocal.checked = true;
+        }
+      }
+    };
+
+    const updateAddonModalUrls = () => {
+      const { localUrl, lanUrl, tunnelManifest } = getAddonManifestUrls();
+      const pageHost = window.location.hostname;
+      const isTunnelPage = this._isCloudflareTunnelPage();
 
       if (manifestInput) {
         manifestInput.value = localUrl;
@@ -362,14 +433,51 @@ class PencariMovieApp {
         manifestLanInput.value = lanUrl || localUrl;
       }
 
-      if (addonLanField) {
-        addonLanField.classList.toggle('hidden', !lanUrl);
+      if (manifestTunnelInput) {
+        manifestTunnelInput.value = tunnelManifest;
       }
 
-      if (addonLocalField) {
-        const openedViaLan = isUsableLanHost(pageHost);
-        addonLocalField.classList.toggle('hidden', openedViaLan);
+      if (addonStremioDirectBtn) {
+        if (tunnelManifest) {
+          const stremioDeepLink = tunnelManifest.replace(/^https?:\/\//i, 'stremio://');
+          addonStremioDirectBtn.href = stremioDeepLink;
+          addonStremioDirectBtn.classList.remove('hidden');
+        } else {
+          addonStremioDirectBtn.href = '#';
+          addonStremioDirectBtn.classList.add('hidden');
+        }
       }
+
+      if (isTunnelPage) {
+        if (addonModalTitle) addonModalTitle.textContent = '🧩 Stremio Addon';
+        if (addonModalDesc) addonModalDesc.textContent = 'Add this addon directly to Stremio or copy the manifest URL.';
+        if (addonLanField) addonLanField.classList.add('hidden');
+        if (addonLocalField) addonLocalField.classList.add('hidden');
+        if (addonStremioSync) addonStremioSync.classList.add('hidden');
+        if (addonNuvioInstructions) addonNuvioInstructions.classList.add('hidden');
+        if (addonTunnelField) addonTunnelField.classList.remove('hidden');
+      } else {
+        if (addonModalTitle) addonModalTitle.textContent = '🧩 Nuvio / Stremio Addon';
+        if (addonModalDesc) addonModalDesc.textContent = 'Copy a manifest URL for Nuvio, or install an HTTP address into Stremio via API sync.';
+        if (addonLanField) {
+          addonLanField.classList.toggle('hidden', !lanUrl);
+        }
+        if (addonLocalField) {
+          const openedViaLan = isUsableLanHost(pageHost);
+          addonLocalField.classList.toggle('hidden', openedViaLan);
+        }
+        if (addonTunnelField) {
+          addonTunnelField.classList.toggle('hidden', !tunnelManifest);
+        }
+        if (addonStremioSync) {
+          addonStremioSync.classList.remove('hidden');
+        }
+        if (addonNuvioInstructions) {
+          addonNuvioInstructions.classList.remove('hidden');
+        }
+      }
+
+      updateStremioSyncPreview();
     };
 
     this._updateAddonModalUrls = updateAddonModalUrls;
@@ -378,6 +486,9 @@ class PencariMovieApp {
     const openAddonModal = () => {
       if (addonModal) {
         this.loadLanIp().finally(() => {
+          updateAddonModalUrls();
+        });
+        this.loadTunnelStatus().finally(() => {
           updateAddonModalUrls();
         });
         updateAddonModalUrls();
@@ -429,6 +540,163 @@ class PencariMovieApp {
         showCopiedFeedback('✓ Copied Localhost URL to clipboard!');
       });
     }
+
+    if (copyAddonTunnelBtn && manifestTunnelInput) {
+      copyAddonTunnelBtn.addEventListener('click', () => {
+        manifestTunnelInput.select();
+        navigator.clipboard.writeText(manifestTunnelInput.value);
+        showCopiedFeedback('✓ Copied Cloudflare tunnel URL to clipboard!');
+      });
+    }
+
+    const setStremioSyncStatus = (message, kind = '') => {
+      if (!stremioSyncStatus) return;
+      stremioSyncStatus.textContent = message || '';
+      stremioSyncStatus.classList.toggle('hidden', !message);
+      stremioSyncStatus.classList.toggle('error', kind === 'error');
+      stremioSyncStatus.classList.toggle('ok', kind === 'ok');
+    };
+
+    const stremioApiPost = async (path, body) => {
+      const response = await fetch(`https://api.strem.io/api/${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let data = {};
+      try {
+        data = await response.json();
+      } catch (e) {
+        throw new Error(`Stremio API ${path} returned invalid JSON.`);
+      }
+      if (data.error) {
+        const err = data.error;
+        throw new Error(typeof err === 'string' ? err : (err.message || `Stremio API ${path} failed.`));
+      }
+      if (!response.ok) {
+        throw new Error(`Stremio API ${path} failed (${response.status}).`);
+      }
+      return data;
+    };
+
+    const installStremioAddonViaApi = async () => {
+      const selected = getSelectedStremioSyncUrl();
+      const transportUrl = String(selected.url || '').trim();
+      if (!transportUrl) {
+        throw new Error('No HTTP manifest URL selected.');
+      }
+
+      const authKeyInput = this.$('#stremioSyncAuthKey');
+      const emailInput = this.$('#stremioSyncEmail');
+      const passwordInput = this.$('#stremioSyncPassword');
+      let authKey = String(authKeyInput?.value || '').trim();
+
+      if (!authKey) {
+        const email = String(emailInput?.value || '').trim();
+        const password = String(passwordInput?.value || '');
+        if (!email || !password) {
+          throw new Error('Enter Stremio email and password, or paste an auth key.');
+        }
+        const loginRes = await stremioApiPost('login', {
+          email,
+          password,
+          type: 'Login',
+        });
+        authKey = String(loginRes.result?.authKey || '').trim();
+        if (!authKey) {
+          throw new Error('Login failed. Check your Stremio email and password.');
+        }
+      }
+
+      const collectionRes = await stremioApiPost('addonCollectionGet', {
+        type: 'AddonCollectionGet',
+        authKey,
+        update: true,
+      });
+      const existingAddons = Array.isArray(collectionRes.result?.addons)
+        ? collectionRes.result.addons
+        : [];
+
+      // HTTPS dashboard cannot fetch http:// LAN URLs (mixed content).
+      // Pull the labeled JSON from this origin, then store the HTTP transportUrl.
+      const manifestFetchUrl = window.location.protocol === 'https:'
+        ? `${window.location.origin}/manifest.json?mode=${encodeURIComponent(selected.mode)}`
+        : transportUrl;
+      const manifestRes = await fetch(manifestFetchUrl);
+      if (!manifestRes.ok) {
+        throw new Error(`Failed to fetch ${selected.label} manifest.`);
+      }
+      const manifest = await manifestRes.json();
+      if (!manifest || typeof manifest !== 'object' || !manifest.id) {
+        throw new Error('Invalid addon manifest.');
+      }
+
+      const newAddon = {
+        transportUrl,
+        transportName: '',
+        flags: { official: false, protected: false },
+        manifest,
+      };
+
+      const addonId = String(manifest.id || '');
+      const updatedAddons = [];
+      let replaced = false;
+      existingAddons.forEach((addon) => {
+        const sameUrl = addon && addon.transportUrl === transportUrl;
+        const sameId = addon && addon.manifest && String(addon.manifest.id || '') === addonId;
+        if (sameUrl || sameId) {
+          if (!replaced) {
+            updatedAddons.push(newAddon);
+            replaced = true;
+          }
+          return;
+        }
+        updatedAddons.push(addon);
+      });
+      if (!replaced) {
+        updatedAddons.push(newAddon);
+      }
+
+      await stremioApiPost('addonCollectionSet', {
+        type: 'AddonCollectionSet',
+        authKey,
+        addons: updatedAddons,
+      });
+
+      return `${manifest.name || selected.label} installed. Restart Stremio if it is already open.`;
+    };
+
+    [stremioSyncModeLan, stremioSyncModeLocal].forEach((radio) => {
+      if (!radio) return;
+      radio.addEventListener('change', () => {
+        updateStremioSyncPreview();
+        setStremioSyncStatus('');
+      });
+    });
+
+    if (stremioSyncInstallBtn) {
+      stremioSyncInstallBtn.addEventListener('click', async () => {
+        stremioSyncInstallBtn.disabled = true;
+        const original = stremioSyncInstallBtn.textContent;
+        stremioSyncInstallBtn.textContent = 'Installing...';
+        setStremioSyncStatus('Logging in and syncing addon collection...');
+        try {
+          const message = await installStremioAddonViaApi();
+          setStremioSyncStatus(message, 'ok');
+          const passwordInput = this.$('#stremioSyncPassword');
+          const authKeyInput = this.$('#stremioSyncAuthKey');
+          if (passwordInput) passwordInput.value = '';
+          if (authKeyInput) authKeyInput.value = '';
+        } catch (err) {
+          setStremioSyncStatus(err.message || 'Failed to install addon.', 'error');
+        } finally {
+          stremioSyncInstallBtn.disabled = false;
+          stremioSyncInstallBtn.textContent = original;
+        }
+      });
+    }
+
+    this.bindTunnelControls();
 
     // Allow Enter key on token input
     this.$('#botTokenInput').addEventListener('keydown', (e) => {
@@ -574,12 +842,267 @@ class PencariMovieApp {
     try {
       const data = await this.requestJson(`${this.localApiBase}/api/lan-ip`);
       const lanIp = String(data?.lan_ip || '').trim();
+      const port = Number(data?.port);
+      if (port > 0 && port < 65536) {
+        this.listenPort = port;
+      }
       if (lanIp && lanIp !== '127.0.0.1') {
         this.lanIp = lanIp;
-        this._updateAddonModalUrls();
       }
+      this._updateAddonModalUrls();
     } catch (e) {
       // Non-fatal — never tied to bot session.
+    }
+  }
+
+  _isCloudflareTunnelPage() {
+    const host = String(window.location.hostname || '').toLowerCase();
+    return host.endsWith('.trycloudflare.com') || host === 'trycloudflare.com' || host.endsWith('.tunnel.pencarimovie.com') || host.endsWith('-tunnel.pencarimovie.com') || host === 'tunnel.pencarimovie.com';
+  }
+
+  bindTunnelControls() {
+    const enableBtn = this.$('#enableTunnelBtn');
+    const disableBtn = this.$('#disableTunnelBtn');
+    const copyBtn = this.$('#copyTunnelUrlBtn');
+    const input = this.$('#tunnelUrlInput');
+
+    if (enableBtn) {
+      enableBtn.addEventListener('click', () => {
+        this.enableTunnel().catch((err) => {
+          this.renderTunnelStatus({
+            enabled: false,
+            message: err.message || 'Failed to enable tunnel.',
+            error: true,
+          });
+        });
+      });
+    }
+
+    if (disableBtn) {
+      disableBtn.addEventListener('click', () => {
+        this.disableTunnel().catch((err) => {
+          this.renderTunnelStatus({
+            enabled: this.tunnelEnabled,
+            tunnel_url: this.tunnelUrl,
+            message: err.message || 'Failed to disable tunnel.',
+            error: true,
+          });
+        });
+      });
+    }
+
+    if (copyBtn && input) {
+      copyBtn.addEventListener('click', () => {
+        const value = String(input.value || '').trim();
+        if (!value) return;
+        input.select();
+        navigator.clipboard.writeText(value).catch(() => {});
+        const original = copyBtn.textContent;
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => {
+          copyBtn.textContent = original || '📋 Copy';
+        }, 1600);
+      });
+    }
+
+    this.renderTunnelStatus({
+      enabled: this.tunnelEnabled,
+      tunnel_url: this.tunnelUrl,
+      message: this.tunnelEnabled ? 'Cloudflare tunnel is running.' : 'Tunnel is off.',
+    });
+  }
+
+  renderTunnelStatus(data = {}) {
+    const statusEl = this.$('#tunnelStatusText');
+    const urlRow = this.$('#tunnelUrlRow');
+    const input = this.$('#tunnelUrlInput');
+    const enableBtn = this.$('#enableTunnelBtn');
+    const disableBtn = this.$('#disableTunnelBtn');
+    const localActions = this.$('#tunnelLocalActions');
+    const remoteNote = this.$('#tunnelRemoteNote');
+    const addBotsBtn = this.$('#toggleAddBotsBtn');
+    const addBotsSection = this.$('#addBotsSection');
+    const disconnectBtn = this.$('#settingsDisconnectBtn');
+    const viaTunnel = this._isCloudflareTunnelPage();
+    const enabled = Boolean(data.enabled);
+    const publicUrl = String(data.public_url || '').replace(/\/+$/, '');
+    const quickUrl = String(data.tunnel_url || '').replace(/\/+$/, '');
+    const displayUrl = publicUrl || quickUrl;
+    const busy = Boolean(this._tunnelBusy);
+    const error = Boolean(data.error);
+
+    this.tunnelEnabled = enabled;
+    this.tunnelUrl = displayUrl;
+    this._updateAddonModalUrls();
+
+    if (statusEl) {
+      statusEl.classList.remove('is-on', 'is-busy', 'is-error');
+      if (error) {
+        statusEl.classList.add('is-error');
+        statusEl.textContent = data.message || 'Tunnel error.';
+      } else if (busy) {
+        statusEl.classList.add('is-busy');
+        statusEl.textContent = data.message || 'Working...';
+      } else if (enabled && displayUrl) {
+        statusEl.classList.add('is-on');
+        statusEl.textContent = data.message || `Live: ${displayUrl}`;
+      } else {
+        statusEl.textContent = data.message || 'Tunnel is off.';
+      }
+    }
+
+    const descPlaceholder = this.$('#tunnelSubdomainPlaceholder');
+    if (descPlaceholder) {
+      const activeBotUsername = (this.botUsername || '').toLowerCase().trim();
+      const exampleSubdomain = activeBotUsername
+        ? `https://${activeBotUsername}-tunnel.pencarimovie.com`
+        : 'https://{bot_username}-tunnel.pencarimovie.com';
+      descPlaceholder.textContent = exampleSubdomain;
+    }
+
+    if (input) input.value = displayUrl;
+    if (urlRow) urlRow.classList.toggle('hidden', !displayUrl);
+    if (localActions) localActions.classList.toggle('hidden', viaTunnel);
+    if (remoteNote) remoteNote.classList.toggle('hidden', !viaTunnel);
+    if (addBotsBtn) addBotsBtn.classList.toggle('hidden', viaTunnel);
+    if (viaTunnel && addBotsSection) addBotsSection.classList.add('hidden');
+    if (disconnectBtn) disconnectBtn.classList.toggle('hidden', viaTunnel);
+
+    if (enableBtn) {
+      enableBtn.disabled = busy || enabled || viaTunnel;
+      enableBtn.textContent = busy && !enabled ? 'Starting...' : 'Enable Tunnel';
+      enableBtn.classList.toggle('hidden', enabled);
+    }
+    if (disableBtn) {
+      disableBtn.disabled = busy || !enabled || viaTunnel;
+      disableBtn.textContent = busy && enabled ? 'Stopping...' : 'Disable';
+      disableBtn.classList.toggle('hidden', !enabled);
+    }
+  }
+
+  async loadTunnelStatus() {
+    try {
+      const data = await this.requestJson(`${this.localApiBase}/api/tunnel/status`);
+      this.renderTunnelStatus(data || {});
+      return data;
+    } catch (e) {
+      if (!this._tunnelBusy) {
+        this.renderTunnelStatus({
+          enabled: this.tunnelEnabled,
+          tunnel_url: this.tunnelUrl,
+          message: e.message || 'Could not read tunnel status.',
+          error: true,
+        });
+      }
+      return null;
+    }
+  }
+
+  // Lightweight periodic watchdog: polls /api/tunnel/status so the backend's
+  // auto-restart revives cloudflared if it died (e.g. Android/Termux killed it).
+  // Only runs while a session exists and the page is open.
+  _startTunnelWatchdog() {
+    if (this._tunnelWatchdogStarted) return;
+    this._tunnelWatchdogStarted = true;
+    this._tunnelWatchdogTimer = setInterval(async () => {
+      if (!this.hasSession) return;
+      try {
+        await this.requestJson(`${this.localApiBase}/api/tunnel/status`);
+      } catch (_) {
+        // Ignore transient errors; the next poll will retry.
+      }
+    }, 30000);
+  }
+
+  async enableTunnel() {
+    if (this._tunnelBusy || this._isCloudflareTunnelPage()) return;
+    this._tunnelBusy = true;
+    this.renderTunnelStatus({
+      enabled: false,
+      message: 'Starting Cloudflare tunnel...',
+    });
+
+    let pollTimer = null;
+    let pollFinished = false;
+
+    const startPolling = () => {
+      pollTimer = setInterval(async () => {
+        if (pollFinished) return;
+        try {
+          const status = await this.requestJson(`${this.localApiBase}/api/tunnel/status`);
+          if (pollFinished) return;
+          if (status && status.enabled && status.tunnel_url) {
+            pollFinished = true;
+            if (pollTimer) clearInterval(pollTimer);
+            this._tunnelBusy = false;
+            this.renderTunnelStatus(status);
+          }
+        } catch (_) {}
+      }, 1500);
+    };
+
+    startPolling();
+
+    try {
+      const data = await this.requestJson(`${this.localApiBase}/api/tunnel/enable`, {
+        method: 'POST',
+        body: '{}',
+      });
+      pollFinished = true;
+      if (pollTimer) clearInterval(pollTimer);
+      this._tunnelBusy = false;
+      this.renderTunnelStatus(data || {});
+      return data;
+    } catch (e) {
+      // Check if status is actually running despite any request timeout/error
+      try {
+        const check = await this.requestJson(`${this.localApiBase}/api/tunnel/status`);
+        if (check && check.enabled && check.tunnel_url) {
+          pollFinished = true;
+          if (pollTimer) clearInterval(pollTimer);
+          this._tunnelBusy = false;
+          this.renderTunnelStatus(check);
+          return check;
+        }
+      } catch (_) {}
+
+      pollFinished = true;
+      if (pollTimer) clearInterval(pollTimer);
+      this._tunnelBusy = false;
+      this.renderTunnelStatus({
+        enabled: false,
+        message: e.message || 'Failed to enable tunnel.',
+        error: true,
+      });
+      throw e;
+    }
+  }
+
+  async disableTunnel() {
+    if (this._tunnelBusy || this._isCloudflareTunnelPage()) return;
+    this._tunnelBusy = true;
+    this.renderTunnelStatus({
+      enabled: this.tunnelEnabled,
+      tunnel_url: this.tunnelUrl,
+      message: 'Stopping Cloudflare tunnel...',
+    });
+    try {
+      const data = await this.requestJson(`${this.localApiBase}/api/tunnel/disable`, {
+        method: 'POST',
+        body: '{}',
+      });
+      this._tunnelBusy = false;
+      this.renderTunnelStatus(data || { enabled: false });
+      return data;
+    } catch (e) {
+      this._tunnelBusy = false;
+      this.renderTunnelStatus({
+        enabled: this.tunnelEnabled,
+        tunnel_url: this.tunnelUrl,
+        message: e.message || 'Failed to disable tunnel.',
+        error: true,
+      });
+      throw e;
     }
   }
 
@@ -664,11 +1187,19 @@ class PencariMovieApp {
         return;
       }
 
+      const viaTunnel = this._isCloudflareTunnelPage();
       listEl.innerHTML = resp.bots.map(b => {
         const isAct = b.is_active;
         const bId = this.escapeHtml(String(b.bot_id || ''));
         const bUser = this.escapeHtml(String(b.bot_username || ''));
         const bName = this.escapeHtml(String(b.bot_name || bId));
+        let actions = isAct ? '<span class="bot-pool-item__badge">Primary</span>' : '';
+        if (!viaTunnel) {
+          if (!isAct) {
+            actions += `<button type="button" class="set-active-bot-btn bot-pool-item__set-btn" data-bot-id="${bId}">Set Primary</button>`;
+          }
+          actions += `<button type="button" class="remove-bot-btn bot-pool-item__remove-btn" data-bot-id="${bId}" title="Remove bot"><i class="fas fa-trash-alt"></i></button>`;
+        }
 
         return `
           <div class="bot-pool-item">
@@ -680,8 +1211,7 @@ class PencariMovieApp {
               </div>
             </div>
             <div class="bot-pool-item__actions">
-              ${isAct ? '<span class="bot-pool-item__badge">Primary</span>' : `<button type="button" class="set-active-bot-btn bot-pool-item__set-btn" data-bot-id="${bId}">Set Primary</button>`}
-              <button type="button" class="remove-bot-btn bot-pool-item__remove-btn" data-bot-id="${bId}" title="Remove bot"><i class="fas fa-trash-alt"></i></button>
+              ${actions}
             </div>
           </div>
         `;
@@ -760,14 +1290,20 @@ class PencariMovieApp {
 
   _isReloginRequired(message) {
     const text = String(message || '').toLowerCase();
-    return text.includes('not allowed')
-      || text.includes('bot_id not found')
+    // Do NOT trigger logout on channel permission errors ("not allowed", "forbidden", etc.)
+    // Only trigger re-login when explicitly told the token/secret is invalid or bot_id not found
+    return text.includes('bot_id not found')
       || text.includes('reset and enter')
       || text.includes('enter new bot token')
       || text.includes('enter new one');
   }
 
   promptBotRelogin(message) {
+    // Login/logout stay local-dashboard-only. A tunneled visitor cannot
+    // enter a bot token, and prompting would look like a broken file page.
+    if (this._isCloudflareTunnelPage()) {
+      return;
+    }
     const msg = String(message || '').trim()
       || 'Bot ID not found. Please enter your bot token again.';
     this.clearSession().then(() => {
@@ -813,11 +1349,23 @@ class PencariMovieApp {
       if (connectedSection) connectedSection.classList.remove('hidden');
       if (closeBtn) closeBtn.style.display = 'flex';
 
+      // Always reload and render current bot pool in connected mode
+      this.loadBotPool();
+      this.loadTunnelStatus();
+
       // Fill bot info
       const nameEl = this.$('#settingsBotName');
       const usernameEl = this.$('#settingsBotUsername');
       if (nameEl) nameEl.textContent = this.botName || 'Connected';
       if (usernameEl) usernameEl.textContent = this.botUsername ? '@' + this.botUsername : '';
+
+      const descPlaceholder = this.$('#tunnelSubdomainPlaceholder');
+      if (descPlaceholder) {
+        const activeBotUsername = (this.botUsername || '').toLowerCase().trim();
+        descPlaceholder.textContent = activeBotUsername
+          ? `https://${activeBotUsername}-tunnel.pencarimovie.com`
+          : 'https://{bot_username}-tunnel.pencarimovie.com';
+      }
     } else {
       // ── Setup / re-login mode ──
       // Hide streamApp underneath
@@ -837,21 +1385,25 @@ class PencariMovieApp {
       if (input) setTimeout(() => input.focus(), 100);
     }
 
-    if (statusEl) {
+    const connectedStatusEl = this.$('#settingsConnectedStatus');
+    const updateStatus = (el) => {
+      if (!el) return;
       if (options.message) {
-        statusEl.textContent = options.message;
+        el.textContent = options.message;
         if (options.messageType === 'success') {
-          statusEl.style.color = '#51cf66';
+          el.style.color = '#51cf66';
         } else if (options.messageType === 'error') {
-          statusEl.style.color = '#ff6b6b';
+          el.style.color = '#ff6b6b';
         } else {
-          statusEl.style.color = '';
+          el.style.color = '';
         }
       } else {
-        statusEl.textContent = '';
-        statusEl.style.color = '';
+        el.textContent = '';
+        el.style.color = '';
       }
-    }
+    };
+    updateStatus(statusEl);
+    updateStatus(connectedStatusEl);
 
     // Hide file detail page if open
     const filePage = this.$('#fileDetailPage');
@@ -917,19 +1469,58 @@ class PencariMovieApp {
   async saveSettings(providedToken = null) {
     const input = this.$('#botTokenInput');
     const statusEl = this.$('#settingsStatus');
-    const botToken = providedToken ? providedToken.trim() : (input ? input.value.trim() : '');
+    const rawTokens = providedToken ? providedToken.trim() : (input ? input.value.trim() : '');
 
-    if (!botToken) {
+    if (!rawTokens) {
       if (statusEl) statusEl.textContent = 'Bot Token is required.';
       return;
     }
 
-    if (statusEl) statusEl.textContent = 'Validating bot token...';
+    const tokens = rawTokens.split(/[\r\n\s,]+/).map(t => t.trim()).filter(Boolean);
+    if (tokens.length === 0) {
+      if (statusEl) statusEl.textContent = 'Please enter at least one valid bot token.';
+      return;
+    }
+
+    const primaryToken = tokens[0];
+    const extraTokens = tokens.slice(1);
+
+    if (statusEl) statusEl.textContent = tokens.length > 1
+      ? `Validating primary bot (1/${tokens.length})...`
+      : 'Validating bot token...';
 
     try {
+      // 1. Direct browser handshake to WordPress to avoid DNS/cURL issues on local device runtime
+      let wpHandshake = null;
+      try {
+        const wpResp = await fetch(`${this.wpApiBase}/save-bot-token`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-App-Version': this.version || '1.4.0'
+          },
+          body: JSON.stringify({ bot_token: primaryToken })
+        });
+        if (wpResp.ok) {
+          wpHandshake = await wpResp.json();
+        }
+      } catch (wpErr) {
+        console.warn('Direct browser WordPress save-bot-token call skipped/failed, falling back to local backend proxy:', wpErr);
+      }
+
+      // 2. Post to local backend (forwarding WordPress encrypted credentials if browser obtained them)
+      const loginPayload = { bot_token: primaryToken };
+      if (wpHandshake && wpHandshake.ok && wpHandshake.encrypted_credentials) {
+        loginPayload.encrypted_credentials = wpHandshake.encrypted_credentials;
+        loginPayload.encryption_iv = wpHandshake.encryption_iv;
+        if (wpHandshake.api_secret) {
+          loginPayload.api_secret = wpHandshake.api_secret;
+        }
+      }
+
       const loginResp = await this.requestJson(`${this.localApiBase}/api/botlogin`, {
         method: 'POST',
-        body: JSON.stringify({ bot_token: botToken })
+        body: JSON.stringify(loginPayload)
       });
 
       if (loginResp?.ok !== 1) {
@@ -947,6 +1538,19 @@ class PencariMovieApp {
       this.botName = botName;
       this.hasSession = true;
       this._persistCachedSession();
+
+      // If multiple tokens were supplied, connect the rest into the bot pool in background/sequentially
+      if (extraTokens.length > 0) {
+        if (statusEl) statusEl.textContent = `Connecting ${extraTokens.length} extra bot(s)...`;
+        try {
+          await this.requestJson(`${this.localApiBase}/api/bots/add`, {
+            method: 'POST',
+            body: JSON.stringify({ tokens: extraTokens })
+          });
+        } catch (addErr) {
+          console.warn('Failed to add extra bots during initial setup:', addErr);
+        }
+      }
 
       this.hideSettingsGate();
       this.updateBotBadge();
@@ -1038,15 +1642,18 @@ class PencariMovieApp {
     return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 
-  buildDownloadUrl(fileId, fileSize, fileName, fileMime) {
+  buildDownloadUrl(fileId, fileSize, fileName, fileMime, botId = null) {
     const url = new URL(`${this.localApiBase}/api/download`);
-    url.searchParams.set('d', this.encodeDownloadPayload({
+    const payload = {
       file_id: fileId,
       file_size: fileSize,
       file_name: fileName,
-      mime: fileMime,
-      bot_id: this.botId
-    }));
+      mime: fileMime
+    };
+    if (botId) {
+      payload.bot_id = botId;
+    }
+    url.searchParams.set('d', this.encodeDownloadPayload(payload));
     return url.toString();
   }
 
@@ -1633,6 +2240,40 @@ class PencariMovieApp {
    * Extracted so both fetchStream() and background refresh can share the same logic.
    */
   async _rawFetchStream(action, params) {
+    // 1. Direct browser call to WordPress admin-ajax (no local device DNS/cURL dependency)
+    try {
+      const directUrl = new URL(this.wpAjaxUrl || 'https://pencarimovie.com/wp-admin/admin-ajax.php');
+      directUrl.searchParams.set('action', `stream_${action}`);
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== '') {
+          directUrl.searchParams.set(key, value);
+        }
+      });
+
+      const ctrl = new AbortController();
+      const tId = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        const resp = await fetch(directUrl.toString(), {
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-App-Version': this.version || '1.4.0'
+          },
+          signal: ctrl.signal
+        });
+        if (resp.ok) {
+          const directData = await resp.json();
+          if (directData?.success && directData?.data !== undefined) return directData.data;
+          if (directData?.data !== undefined) return directData.data;
+          if (directData) return directData;
+        }
+      } finally {
+        clearTimeout(tId);
+      }
+    } catch (err) {
+      console.warn(`Direct stream fetch failed for "${action}", falling back to local backend proxy:`, err);
+    }
+
+    // 2. Fallback to local backend proxy route (/api/proxy-stream)
     const url = new URL(`${this.localApiBase}/api/proxy-stream`);
     url.searchParams.set('action', action);
     Object.entries(params).forEach(([key, value]) => {
@@ -1643,8 +2284,8 @@ class PencariMovieApp {
 
     const data = await this.requestJson(url.toString());
     // WP AJAX returns {success: true, data: ...}
-    if (data?.success) return data.data;
-    if (data?.data) return data.data;
+    if (data?.success && data?.data !== undefined) return data.data;
+    if (data?.data !== undefined) return data.data;
     return data;
   }
 
@@ -2481,39 +3122,95 @@ class PencariMovieApp {
         return;
       }
 
-      // Resolve short_code via WordPress REST API (with 3x retry)
-      const resolveUrl = new URL(`${this.wpApiBase}/resolve-file`);
-      resolveUrl.searchParams.set('short_code', shortCode);
-      if (this.botId) resolveUrl.searchParams.set('bot_id', this.botId);
-
-      // 15-second timeout per attempt to prevent hanging on unresponsive API
-      const FETCH_TIMEOUT_MS = 15000;
-
-      // Build headers — include API secret for authenticated WordPress endpoints
-      const wpHeaders = {};
+      // 1. Try direct browser call to WordPress first if apiSecret is available in browser
+      let data = null;
       if (this.apiSecret) {
-        wpHeaders['X-API-Secret'] = this.apiSecret;
+        try {
+          const wpResolveUrl = new URL(`${this.wpApiBase}/resolve-file`);
+          wpResolveUrl.searchParams.set('short_code', shortCode);
+          if (this.botId) {
+            wpResolveUrl.searchParams.set('bot_id', this.botId);
+          }
+          const ctrl = new AbortController();
+          const tId = setTimeout(() => ctrl.abort(), 6000);
+          try {
+            const res = await fetch(wpResolveUrl.toString(), {
+              headers: {
+                'X-API-Secret': this.apiSecret,
+                'X-App-Version': this.version || '1.4.0'
+              },
+              signal: ctrl.signal
+            });
+            if (res.ok) {
+              const resData = await res.json();
+              if (resData && resData.ok) {
+                data = resData;
+              }
+            }
+          } finally {
+            clearTimeout(tId);
+          }
+        } catch (err) {
+          console.warn('Browser direct shortcode resolve skipped/failed, trying JS addon/backend proxy:', err);
+        }
       }
 
-      let data = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      // 2. Try local Bun JS addon engine proxy on port 8089 (with built-in DoH stack)
+      if (!data || !data.ok) {
         try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+          const addonResolveUrl = new URL('http://127.0.0.1:8089/resolve-file');
+          addonResolveUrl.searchParams.set('short_code', shortCode);
+          if (this.botId) addonResolveUrl.searchParams.set('bot_id', this.botId);
+          const ctrl = new AbortController();
+          const tId = setTimeout(() => ctrl.abort(), 6000);
           try {
-            data = await this.requestJson(resolveUrl.toString(), {
-              signal: controller.signal,
-              headers: wpHeaders,
+            const res = await fetch(addonResolveUrl.toString(), {
+              headers: {
+                'X-API-Secret': this.apiSecret || '',
+                'X-App-Version': this.version || '1.4.0'
+              },
+              signal: ctrl.signal
             });
+            if (res.ok) {
+              const resData = await res.json();
+              if (resData && resData.ok) {
+                data = resData;
+              }
+            }
           } finally {
-            clearTimeout(timeoutId);
+            clearTimeout(tId);
           }
-          if (data && data.ok) break;
-        } catch (e) {
-          if (attempt >= 3) throw e;
+        } catch (err) {
+          // Ignore and fallback to local PHP backend
         }
-        // Wait before retry (increasing delay)
-        await new Promise(r => setTimeout(r, attempt * 1000));
+      }
+
+      // 3. Fallback to local backend proxy if browser-direct didn't resolve
+      if (!data || !data.ok) {
+        const resolveUrl = new URL(`${this.localApiBase}/api/resolve-shortcode`);
+        resolveUrl.searchParams.set('short_code', shortCode);
+
+        // 15-second timeout per attempt to prevent hanging on unresponsive API
+        const FETCH_TIMEOUT_MS = 15000;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            try {
+              data = await this.requestJson(resolveUrl.toString(), {
+                signal: controller.signal,
+              });
+            } finally {
+              clearTimeout(timeoutId);
+            }
+            if (data && data.ok) break;
+          } catch (e) {
+            if (attempt >= 3) throw e;
+          }
+          // Wait before retry (increasing delay)
+          await new Promise(r => setTimeout(r, attempt * 1000));
+        }
       }
 
       // Resolving complete — hide spinner
@@ -2537,8 +3234,8 @@ class PencariMovieApp {
 
     } catch (error) {
       const isTimeout = error.name === 'AbortError';
-      const msg = isTimeout ? 'Request timed out. The WordPress API is not responding.' : error.message;
-      console.warn('[resolve-file] Failed after 3 retries:', isTimeout ? 'timeout' : error.message);
+      const msg = isTimeout ? 'Request timed out. The file resolver is not responding.' : error.message;
+      console.warn('[resolve-shortcode] Failed after 3 retries:', isTimeout ? 'timeout' : error.message);
       this._endResolving(false);
       this.$('#fileDetailTitle').textContent = 'Error resolving file';
       this.$('#fileDetailTags').innerHTML = `<span style="color:var(--accent)">${this.escapeHtml(msg)}</span>`;
@@ -2594,7 +3291,7 @@ class PencariMovieApp {
 
     if (isEmbeddable && fileId && fileSize > 0) {
       // Build local download URL as video/audio source
-      const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType);
+      const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id);
 
       if (mediaType === 'video') {
         if (videoEl) {
@@ -2625,7 +3322,7 @@ class PencariMovieApp {
 
     // Download button: build local download URL
     if (fileId && fileSize > 0) {
-      const downloadUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType);
+      const downloadUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id);
       this.$('#fileDetailDownloadBtn').setAttribute('data-url', downloadUrl);
       this.$('#fileDetailDownloadBtn').disabled = false;
       this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> Download';
@@ -2888,6 +3585,10 @@ class PencariMovieApp {
 }
 
 // ─── Boot ──────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    window.app = new PencariMovieApp();
+  });
+} else {
   window.app = new PencariMovieApp();
-});
+}

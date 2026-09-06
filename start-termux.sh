@@ -72,13 +72,7 @@ get_lan_ip() {
   '
 }
 
-echo "Preparing Termux/proot runtime..."
-
-if ! command -v proot >/dev/null 2>&1; then
-  echo "proot is required on Termux for the bundled FrankenPHP runtime."
-  echo "Install it with: pkg install proot"
-  exit 1
-fi
+echo "Preparing Termux runtime..."
 
 mkdir -p "$TMP_DIR"
 chmod 700 "$TMP_DIR" 2>/dev/null || true
@@ -95,8 +89,10 @@ chmod 644 "$TMP_DIR/resolv.conf" 2>/dev/null || true
 for FILE in \
   "$FRANKENPHP_BIN" \
   "$ROOT_DIR/bin/php" \
+  "$ROOT_DIR/bin/addon" \
   "$ROOT_DIR/bin/php.ini.unix" \
   "$ROOT_DIR/backend.php" \
+  "$ROOT_DIR/addon.js" \
   "$ROOT_DIR/index.php" \
   "$ROOT_DIR/router.php" \
   "$ROOT_DIR/start.sh" \
@@ -112,25 +108,6 @@ do
   fi
 done
 
-if [ ! -x "$FRANKENPHP_BIN" ]; then
-  echo "FrankenPHP was not found or is not executable: $FRANKENPHP_BIN"
-  echo "Use the linux-aarch64 release on Android/Termux, then run: bash install-termux.sh"
-  exit 1
-fi
-
-# Install Composer dependencies if missing (same as pencarimovie-termux.sh)
-if [ ! -f "$ROOT_DIR/vendor/autoload.php" ]; then
-  bash "$ROOT_DIR/install-termux.sh"
-fi
-
-echo "Starting PencariMovie Server with FrankenPHP through proot..."
-echo "Log file: $LOG_FILE"
-
-# Use Unix-optimised php.ini (static build — no dynamic extension loading)
-if [ -f "$ROOT_DIR/bin/php.ini.unix" ]; then
-  cp "$ROOT_DIR/bin/php.ini.unix" "$ROOT_DIR/bin/php.ini"
-fi
-
 LAN_IP="$(get_lan_ip || true)"
 mkdir -p "$ROOT_DIR/storage"
 if [ -n "${LAN_IP}" ]; then
@@ -139,28 +116,123 @@ else
   rm -f "$ROOT_DIR/storage/lan_ip.txt"
 fi
 
-# ----- Start FrankenPHP through proot -----
-# PHPRC must point to bin/ so FrankenPHP loads bin/php.ini (which was copied
-# from bin/php.ini.unix above). Without PHPRC, static FrankenPHP builds may
-# not find any php.ini, leaving display_errors=1 and breaking JSON responses.
-proot --link2symlink -0 \
-  -w "$ROOT_DIR" \
-  -b "$ROOT_DIR:$ROOT_DIR" \
-  -b "$TMP_DIR:/tmp" \
-  -b "$TMP_DIR/resolv.conf:/etc/resolv.conf" \
-  /bin/sh -c 'export PATH="$1/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export LAN_IP="$6"; exec "$2" php-server --listen "$3:$4" --root "$5"' \
-  sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" >>"$LOG_FILE" 2>&1 &
-PID="$!"
+started=0
 
-echo "$PID" > "$PID_FILE" 2>/dev/null || true
+# Start Addon server in background (port 8089)
+ADDON_LOG="$ROOT_DIR/addon.log"
+ADDON_PID_FILE="$ROOT_DIR/.addon.pid"
 
-sleep 2
-
-if ! kill -0 "$PID" 2>/dev/null; then
-  echo "FrankenPHP exited during startup. Last log lines:"
-  tail -n 50 "$LOG_FILE" 2>/dev/null || true
-  exit 1
+echo "Checking Addon service..."
+ADDON_CMD=""
+if [ -f "$ROOT_DIR/addon.js" ]; then
+  if command -v bun >/dev/null 2>&1; then
+    ADDON_CMD="bun \"$ROOT_DIR/addon.js\""
+  elif command -v node >/dev/null 2>&1; then
+    ADDON_CMD="node \"$ROOT_DIR/addon.js\""
+  elif [ -x "$ROOT_DIR/bin/addon" ] && ! command -v getprop >/dev/null 2>&1; then
+    ADDON_CMD="\"$ROOT_DIR/bin/addon\""
+  else
+    if command -v pkg >/dev/null 2>&1; then
+      echo "Installing nodejs and openssl for Addon service..."
+      pkg install -y openssl nodejs || true
+      if command -v node >/dev/null 2>&1; then
+        ADDON_CMD="node \"$ROOT_DIR/addon.js\""
+      fi
+    fi
+  fi
+elif [ -x "$ROOT_DIR/bin/addon" ]; then
+  ADDON_CMD="\"$ROOT_DIR/bin/addon\""
 fi
+
+if [ -n "$ADDON_CMD" ]; then
+  echo "Starting Addon service ($ADDON_CMD)..."
+  nohup sh -c "$ADDON_CMD" >"$ADDON_LOG" 2>&1 &
+  echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
+  sleep 1
+
+  if command -v curl >/dev/null 2>&1 && curl -s -m 2 http://127.0.0.1:8089/ >/dev/null 2>&1; then
+    echo "✓ Addon service is running on http://127.0.0.1:8089"
+  else
+    if [ -f "$ADDON_LOG" ]; then
+      echo "Notice: Addon service log output:"
+      cat "$ADDON_LOG"
+    fi
+  fi
+else
+  echo "Warning: Neither nodejs nor bun found. Addon service not started."
+fi
+
+# ── Primary: Attempt FrankenPHP with proot (small download size) ───────────
+if [ -x "$FRANKENPHP_BIN" ]; then
+  if ! command -v proot >/dev/null 2>&1 && command -v pkg >/dev/null 2>&1; then
+    echo "Installing proot for FrankenPHP..."
+    pkg install -y proot 2>/dev/null || true
+  fi
+
+  if command -v proot >/dev/null 2>&1; then
+    echo "Starting PencariMovie Server with FrankenPHP through proot..."
+    echo "Log file: $LOG_FILE"
+
+    # Use Unix-optimised php.ini (static build — no dynamic extension loading)
+    if [ -f "$ROOT_DIR/bin/php.ini.unix" ]; then
+      cp "$ROOT_DIR/bin/php.ini.unix" "$ROOT_DIR/bin/php.ini"
+    fi
+
+    proot --link2symlink -0 \
+      -w "$ROOT_DIR" \
+      -b "$ROOT_DIR:$ROOT_DIR" \
+      -b "$TMP_DIR:/tmp" \
+      -b "$TMP_DIR/resolv.conf:/etc/resolv.conf" \
+      /bin/sh -c 'export PATH="$1/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export LAN_IP="$6"; exec "$2" php-server --listen "$3:$4" --root "$5"' \
+      sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" >>"$LOG_FILE" 2>&1 &
+    PID="$!"
+
+    echo "$PID" > "$PID_FILE" 2>/dev/null || true
+    sleep 2
+
+    if kill -0 "$PID" 2>/dev/null; then
+      started=1
+    else
+      echo "FrankenPHP/proot failed to run (e.g. Samsung/seccomp restriction)."
+      rm -f "$PID_FILE"
+    fi
+  fi
+fi
+
+# ── Fallback: Native Termux PHP (no proot) ─────────────────────────────────
+if [ "$started" -eq 0 ]; then
+  echo "Falling back to native Termux PHP..."
+  if ! command -v php >/dev/null 2>&1 || ! php -m 2>/dev/null | grep -qi '^gd$'; then
+    if command -v pkg >/dev/null 2>&1; then
+      echo "Installing native Termux PHP and extensions (php, php-gd)..."
+      pkg install -y php php-gd
+    else
+      echo "PHP is missing and pkg is not available."
+      exit 1
+    fi
+  fi
+
+  PHP_LOG="$ROOT_DIR/php-server.log"
+  PHP_PID_FILE="$ROOT_DIR/.php-server.pid"
+  echo "Starting PencariMovie Server with native Termux PHP (no proot)..."
+  echo "Log file: $PHP_LOG"
+
+  export LAN_IP="${LAN_IP:-}"
+  nohup php -S "$HOST:$PORT" "$ROOT_DIR/router.php" >>"$PHP_LOG" 2>&1 &
+  PID="$!"
+
+  echo "$PID" > "$PHP_PID_FILE" 2>/dev/null || true
+  sleep 2
+
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "Native PHP server exited during startup. Last log lines:"
+    tail -n 50 "$PHP_LOG" 2>/dev/null || true
+    exit 1
+  fi
+fi
+
+echo "Warming up IPC workers..."
+php "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
 
 echo ""
 echo "PencariMovie Server is running"

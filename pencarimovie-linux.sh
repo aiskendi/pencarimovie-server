@@ -342,9 +342,6 @@ do_start() {
       echo "  CLI:      pms [start|stop|restart]"
       echo "  Stop:     pms stop"
       echo "  Restart:  pms restart"
-      echo ""
-      echo "  If 'pms' is not found in your current terminal:"
-      echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."

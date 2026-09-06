@@ -72,14 +72,14 @@ export default {
       return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-windows.bat`, 302);
     }
 
-    // Linux script redirect
+    // Linux script redirect (with cache buster to avoid stale Fastly/Varnish raw cache)
     if (path === "/linux" || path === "/linux.sh" || path === "/sh") {
-      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-linux.sh`, 302);
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-linux.sh?t=${Date.now()}`, 302);
     }
 
-    // Termux script redirect
+    // Termux script redirect (with cache buster)
     if (path === "/termux" || path === "/termux.sh") {
-      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-termux.sh`, 302);
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-termux.sh?t=${Date.now()}`, 302);
     }
 
     // Android APK download

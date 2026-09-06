@@ -221,7 +221,7 @@ set "OTA_SCRIPT=%TEMP%\pencarimovie-ota-%RANDOM%.ps1"
     echo Remove-Item $tmp -Recurse -Force
 ) > "!OTA_SCRIPT!"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "!OTA_SCRIPT!" -appDir "%APP_PATH%" -tag "!LATEST!" -repo "%REPO%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "!OTA_SCRIPT!" "%APP_PATH%" "!LATEST!" "%REPO%"
 set "PS_ERR=!ERRORLEVEL!"
 del /q "!OTA_SCRIPT!" 2>nul
 if not "!PS_ERR!"=="0" (

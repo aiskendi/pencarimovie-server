@@ -63,9 +63,10 @@ print_urls() {
   if [ -n "$LAN_IP" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
   fi
-  echo "  CLI:      pms [start|stop|restart]"
+  echo "  CLI:      pms [start|stop|restart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
+  echo "  Uninstall: pms uninstall"
   echo ""
 }
 
@@ -76,7 +77,10 @@ if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/d
   if [ -n "$LAN_IP" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
   fi
+  echo "  CLI:      pms [start|stop|restart|uninstall]"
   echo "  Stop:     pms stop"
+  echo "  Restart:  pms restart"
+  echo "  Uninstall: pms uninstall"
   exit 0
 fi
 

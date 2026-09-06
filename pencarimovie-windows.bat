@@ -9,10 +9,11 @@ set "PORT=8088"
 set "HAD_APP=0"
 set "UPDATED=0"
 set "IN_PLACE=0"
-if exist "%~dp0backend.php" if exist "%~dp0start.bat" (
-    set "APP_DIR=%~dp0"
-    set "APP_DIR=!APP_DIR:~0,-1!"
-    set "IN_PLACE=1"
+set "IN_PLACE=0"
+if exist "%~dp0backend.php" if exist "%~dp0start.bat" set "IN_PLACE=1"
+
+if "%IN_PLACE%"=="1" (
+    set "APP_DIR=%~dp0."
 ) else (
     set "APP_DIR=%USERPROFILE%\pencarimovie-server"
 )
@@ -33,7 +34,7 @@ if not "%1"=="" (
 if exist "%USERPROFILE%\pencarimovie-downloader" (
     if exist "%USERPROFILE%\pencarimovie-downloader\storage" if not exist "%APP_DIR%\storage" (
         mkdir "%APP_DIR%" 2>nul
-        robocopy "%USERPROFILE%\pencarimovie-downloader\storage" "%APP_DIR%\storage" /e /np /nfl /ndl /njh /njs >nul 2>nul
+        robocopy "%USERPROFILE%\pencarimovie-downloader\storage" "%APP_DIR%\storage" /e /np /nfl /ndl /njh /njs >nul 2>&1
     )
     rmdir /s /q "%USERPROFILE%\pencarimovie-downloader" 2>nul
 )
@@ -41,9 +42,9 @@ if exist "%APP_DIR%" set "HAD_APP=1"
 call :install_or_update
 call :register_cmd_path
 
->nul 2>nul curl -s -o nul http://127.0.0.1:%PORT%
+curl -s -o nul http://127.0.0.1:%PORT% >nul 2>&1
 if not errorlevel 1 goto port_busy
->nul 2>nul powershell -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1:%PORT%' -Method HEAD -TimeoutSec 2; exit 0 } catch { exit 1 }"
+powershell -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1:%PORT%' -Method HEAD -TimeoutSec 2; exit 0 } catch { exit 1 }" >nul 2>&1
 if not errorlevel 1 goto port_busy
 goto not_running
 
@@ -51,20 +52,20 @@ goto not_running
 if "%HAD_APP%"=="1" if "%UPDATED%"=="0" goto already_running
 echo Port %PORT% is already in use; stopping leftover process...
 call :stop_quiet
-timeout /t 1 /nobreak >nul
+ping 127.0.0.1 -n 2 >nul
 goto not_running
 
 :already_running
 echo Server is already running on port %PORT%.
 call :start_tray 1
 call :print_urls
-echo   CLI:      pm [start|stop|restart]
-echo   Stop:     pm stop
-echo   Restart:  pm restart
+echo   CLI:      pms [start^|stop^|restart]
+echo   Stop:     pms stop
+echo   Restart:  pms restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
 echo This window will close. The server keeps running in the background.
-timeout /t 8
+ping 127.0.0.1 -n 4 >nul
 exit /b 0
 
 :not_running
@@ -97,37 +98,32 @@ if exist "%cd%\tray.ps1" (
 echo.
 echo PencariMovie Server is running in the background.
 call :print_urls
-echo   CLI:      pm [start|stop|restart]
-echo   Stop:     pm stop
-echo   Restart:  pm restart
+echo   CLI:      pms [start^|stop^|restart]
+echo   Stop:     pms stop
+echo   Restart:  pms restart
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
 echo This window will close. The server keeps running in the background.
-timeout /t 8
+ping 127.0.0.1 -n 4 >nul
 exit /b 0
 
 :stop
 echo Stopping PencariMovie Server on 0.0.0.0:%PORT%...
 call :stop_quiet
 echo Server stopped.
-pause
 exit /b 0
 
 :restart
 call :stop_quiet
-timeout /t 2 /nobreak >nul
+ping 127.0.0.1 -n 3 >nul
 goto start
 
 :stop_quiet
 rem Kill port 8089 (Addon)
-for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:8089 127.0.0.1:8089 [::]:8089" ^| findstr "LISTENING"') do (
-    taskkill /PID %%P /F >nul 2>nul
-)
+powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8089 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 
 rem Kill port %PORT% (Server)
-for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:%PORT% 127.0.0.1:%PORT% [::]:%PORT%" ^| findstr "LISTENING"') do (
-    taskkill /PID %%P /F >nul 2>nul
-)
+powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*addon*' -or ($_.CommandLine -and ($_.CommandLine -like '*addon.js*' -or $_.CommandLine -like '*addon.exe*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 call :stop_tray
@@ -144,10 +140,10 @@ goto :eof
 
 :stop_tray
 powershell -NoProfile -Command "try { $e = New-Object System.Threading.EventWaitHandle $false, ([System.Threading.EventResetMode]::AutoReset), 'Global\PencariMovieServerTrayStop'; $e.Set() | Out-Null; $e.Dispose() } catch {}" >nul 2>nul
-timeout /t 1 /nobreak >nul
+ping 127.0.0.1 -n 2 >nul
 if exist "%APP_DIR%\storage\tray.pid" (
     for /f "usebackq delims=" %%P in ("%APP_DIR%\storage\tray.pid") do (
-        if not "%%P"=="" taskkill /PID %%P /F >nul 2>nul
+        if not "%%P"=="" powershell -NoProfile -Command "Stop-Process -Id %%P -Force -ErrorAction SilentlyContinue" >nul 2>nul
     )
     del /q "%APP_DIR%\storage\tray.pid" >nul 2>nul
 )
@@ -156,10 +152,7 @@ goto :eof
 
 :print_urls
 echo   Local:    http://127.0.0.1:%PORT%
-for /f "tokens=4" %%i in ('route print -4 0.0.0.0 ^| findstr /R /C:" 0\.0\.0\.0[ ]*0\.0\.0\.0"') do (
-    if not defined LAN_IP set "LAN_IP=%%i"
-)
-if defined LAN_IP echo   Network:  http://%LAN_IP%:%PORT%
+powershell -NoProfile -Command "& { $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Wi-Fi*','Ethernet*','vEthernet*' -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress); if ($ip) { Write-Host ('  Network:  http://' + $ip + ':%PORT%') } }" 2>nul
 goto :eof
 
 :install_or_update
@@ -167,71 +160,46 @@ if "%IN_PLACE%"=="1" (
     echo Starting from this folder; skipping GitHub extract.
     goto :eof
 )
-set "APP_PATH=%APP_DIR%"
+set "APP_PATH=!APP_DIR!"
 set "CURRENT="
-if exist "%APP_PATH%\.release-tag" (
-    for /f "usebackq delims=" %%A in ("%APP_PATH%\.release-tag") do set "CURRENT=%%A"
+if exist "!APP_PATH!\.release-tag" (
+    for /f "usebackq delims=" %%A in ("!APP_PATH!\.release-tag") do set "CURRENT=%%A"
 )
-if exist "%APP_PATH%" if not defined CURRENT (
+if exist "!APP_PATH!" if not defined CURRENT (
     set "CURRENT=%FALLBACK_TAG%"
-    >"%APP_PATH%\.release-tag" echo %FALLBACK_TAG%
+    >"!APP_PATH!\.release-tag" echo %FALLBACK_TAG%
 )
 
 set "LATEST="
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='pencarimovie-server'}; if ($r.tag_name -match '^v[0-9]') { $r.tag_name; exit 0 } } catch {}; $req = [System.Net.HttpWebRequest]::Create('https://github.com/%REPO%/releases/latest'); $req.AllowAutoRedirect = $true; $req.Method = 'GET'; $req.UserAgent = 'pencarimovie-server'; try { $resp = $req.GetResponse(); $loc = [string]$resp.ResponseUri; $resp.Close(); $tag = ($loc.TrimEnd('/') -split '/')[-1]; if ($tag -match '^v[0-9]') { $tag; exit 0 } } catch {}; exit 1"`) do set "LATEST=%%i"
 
 if not defined LATEST (
-    if exist "%APP_PATH%" (
+    if exist "!APP_PATH!" (
         echo Could not check GitHub for updates; using installed copy.
         goto :eof
     )
     set "LATEST=%FALLBACK_TAG%"
 )
 
-if exist "%APP_PATH%" if /I "!CURRENT!"=="!LATEST!" goto :eof
+if exist "!APP_PATH!" if /I "!CURRENT!"=="!LATEST!" goto :eof
 
-if not exist "%APP_PATH%" (
+if not exist "!APP_PATH!" (
     echo Downloading PencariMovie Server !LATEST!...
 ) else (
     echo Updating PencariMovie Server !CURRENT! -^> !LATEST!...
     call :stop_quiet
-    timeout /t 1 /nobreak >nul
+    ping 127.0.0.1 -n 2 >nul
 )
 
-set "OTA_SCRIPT=%TEMP%\pencarimovie-ota-%RANDOM%.ps1"
-(
-    echo param($appDir, $tag, $repo)
-    echo $ErrorActionPreference = 'Stop'
-    echo [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    echo $url = "https://github.com/$repo/releases/download/$tag/pencarimovie-downloader-windows-x86_64.zip"
-    echo $tmp = Join-Path $env:TEMP ("pencarimovie-ota-" + [guid]::NewGuid().ToString())
-    echo New-Item -ItemType Directory -Path (Join-Path $tmp 'extract') -Force ^| Out-Null
-    echo Write-Host "Downloading $url"
-    echo Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp 'pencarimovie.zip') -UseBasicParsing
-    echo Expand-Archive -Path (Join-Path $tmp 'pencarimovie.zip') -DestinationPath (Join-Path $tmp 'extract') -Force
-    echo $found = Get-ChildItem -Path (Join-Path $tmp 'extract') -Recurse -Filter 'backend.php' ^| Select-Object -First 1
-    echo if ($found) { $src = $found.DirectoryName } else { $src = Join-Path $tmp 'extract' }
-    echo if (-not (Test-Path $appDir)) { New-Item -ItemType Directory -Path $appDir -Force ^| Out-Null }
-    echo Get-ChildItem -LiteralPath $src ^| Where-Object { $_.Name -ne 'storage' } ^| ForEach-Object {
-    echo     $dest = Join-Path $appDir $_.Name
-    echo     if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-    echo     Copy-Item $_.FullName $dest -Recurse -Force
-    echo }
-    echo [System.IO.File]::WriteAllText((Join-Path $appDir '.release-tag'), $tag + [char]10, [System.Text.Encoding]::ASCII)
-    echo Remove-Item $tmp -Recurse -Force
-) > "!OTA_SCRIPT!"
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "!OTA_SCRIPT!" "%APP_PATH%" "!LATEST!" "%REPO%"
+set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { param($appDir, $tag, $url) $ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $tmp = Join-Path $env:TEMP ('pencarimovie-ota-' + [guid]::NewGuid().ToString()); New-Item -ItemType Directory -Path (Join-Path $tmp 'extract') -Force | Out-Null; Write-Host ('Downloading ' + $url); Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp 'pencarimovie.zip') -UseBasicParsing; Expand-Archive -Path (Join-Path $tmp 'pencarimovie.zip') -DestinationPath (Join-Path $tmp 'extract') -Force; $found = Get-ChildItem -Path (Join-Path $tmp 'extract') -Recurse -Filter 'backend.php' | Select-Object -First 1; if ($found) { $src = $found.DirectoryName } else { $src = Join-Path $tmp 'extract' }; if (-not (Test-Path -LiteralPath $appDir)) { New-Item -ItemType Directory -Path $appDir -Force | Out-Null }; Get-ChildItem -LiteralPath $src | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { $dest = Join-Path $appDir $_.Name; if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }; Copy-Item $_.FullName $dest -Recurse -Force }; [System.IO.File]::WriteAllText((Join-Path $appDir '.release-tag'), $tag + [char]10, [System.Text.Encoding]::ASCII); Remove-Item $tmp -Recurse -Force }" -appDir "%APP_DIR%" -tag "!LATEST!" -url "!OTA_URL!"
 set "PS_ERR=!ERRORLEVEL!"
-del /q "!OTA_SCRIPT!" 2>nul
 if not "!PS_ERR!"=="0" (
     echo Update download/extract failed.
     pause
     exit /b 1
 )
 set "UPDATED=1"
-
-:: Register pm.cmd and add to User PATH so user can type `pm` anywhere
 call :register_cmd_path
 goto :eof
 
@@ -250,7 +218,7 @@ if not exist "%USERPROFILE%\pencarimovie-server" mkdir "%USERPROFILE%\pencarimov
     echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
 ) > "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server'; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server'; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
 goto :eof
 
 :print_banner

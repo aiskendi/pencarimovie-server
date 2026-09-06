@@ -105,10 +105,14 @@ curl -fsSL telegra.my/linux | bash
 Recommended for Android devices, TV boxes, or headless micro-servers:
 
 ```bash
-pkg install wget -y && curl -fsSL telegra.my/termux | bash
+pkg install curl -y && curl -fsSL telegra.my/termux | bash
 ```
 
-> **Important**: Use the [Official Termux GitHub Release](https://github.com/termux/termux-app/releases) (Google Play version is outdated). Tap **"More details"** → **"Install anyway"** if prompted by Play Protect.
+> **Zero Manual Setup (`proot` handled automatically)**:
+>
+> - The installer automatically installs `proot` to run FrankenPHP on Android.
+> - If `proot` fails (e.g. Samsung One UI / Knox seccomp restrictions), it automatically falls back to native Termux PHP (`php -S`).
+> - Use the [Official Termux GitHub Release](https://github.com/termux/termux-app/releases) (Google Play version is outdated). Tap **"More details"** → **"Install anyway"** if prompted by Play Protect.
 >
 > **Manual / Alternative:**
 >
@@ -116,7 +120,7 @@ pkg install wget -y && curl -fsSL telegra.my/termux | bash
 > curl -fsSL -o pencarimovie-termux.sh https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-termux.sh && bash pencarimovie-termux.sh
 > ```
 
-- Control anytime: `bash pencarimovie-termux.sh [start|stop|restart]`
+- Control anytime: `pms [start|stop|restart]`
 
 ---
 
@@ -206,18 +210,18 @@ Need to stream to Stremio or Nuvio when away from home, or need a valid HTTPS ma
 
 Managing the server is as simple as running `start`, `stop`, or `restart`:
 
-| Platform    | Start                               | Stop                               | Restart                               | Shortcut / Global CLI                     |
-| :---------- | :---------------------------------- | :--------------------------------- | :------------------------------------ | :---------------------------------------- |
-| **Windows** | `pm start`                          | `pm stop`                          | `pm restart`                          | `pm` (works anywhere in CMD & PowerShell) |
-| **Linux**   | `bash pencarimovie-linux.sh start`  | `bash pencarimovie-linux.sh stop`  | `bash pencarimovie-linux.sh restart`  | `pencarimovie-linux.sh [command]`         |
-| **Termux**  | `bash pencarimovie-termux.sh start` | `bash pencarimovie-termux.sh stop` | `bash pencarimovie-termux.sh restart` | `pencarimovie-termux.sh [command]`        |
+| Platform    | Start       | Stop       | Restart       | Shortcut / Global CLI                           |
+| :---------- | :---------- | :--------- | :------------ | :---------------------------------------------- |
+| **Windows** | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in CMD/PowerShell) |
+| **Linux**   | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in bash/zsh)       |
+| **Termux**  | `pms start` | `pms stop` | `pms restart` | `pms` / `pm` (works anywhere in Termux)         |
 
-On Windows, the installer automatically registers `pms` (PencariMovie Server), `pm`, and `pencarimovie` to your user PATH, so you can control the server from **any Command Prompt (`cmd`) or PowerShell** without navigating to any folder:
+The installers automatically register `pms` (PencariMovie Server), `pm`, and `pencarimovie` into your environment `$PATH`, allowing you to manage the background server from **any directory** without needing to know the installation folder:
 
-```cmd
-pms start       (or: pm start / pencarimovie start)
-pms stop        (or: pm stop)
-pms restart     (or: pm restart)
+```bash
+pms start       # Starts the server in the background
+pms stop        # Stops the server and clean up processes
+pms restart     # Restarts the server
 ```
 
 _(Legacy `.\pencarimovie-windows.bat`, `--start`, `--stop`, and `--restart` flags remain supported as well)._

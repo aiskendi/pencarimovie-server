@@ -62,9 +62,10 @@ print_urls() {
   echo "  Local:    http://127.0.0.1:$PORT"
   if [ -n "$LAN_IP" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
-    echo ""
-    echo "  Other devices on your network can connect using the Network URL above."
   fi
+  echo "  CLI:      pms [start|stop|restart]"
+  echo "  Stop:     pms stop"
+  echo "  Restart:  pms restart"
   echo ""
 }
 

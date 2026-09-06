@@ -318,7 +318,24 @@ install_or_update() {
   fi
 
   download_extract "$target" "$latest"
+  register_cli
   return 0
+}
+
+register_cli() {
+  local bin_dir="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+  local launcher="$APP_DIR/pencarimovie-termux.sh"
+
+  if [ -d "$bin_dir" ] && [ -f "$launcher" ]; then
+    chmod +x "$launcher" 2>/dev/null || true
+    for cmd in pms pm pencarimovie; do
+      cat <<EOF > "$bin_dir/$cmd"
+#!/usr/bin/env bash
+exec "$launcher" "\$@"
+EOF
+      chmod +x "$bin_dir/$cmd" 2>/dev/null || true
+    done
+  fi
 }
 
 do_start() {
@@ -335,7 +352,9 @@ do_start() {
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
       print_urls
-      echo "  Use '$0 stop' to stop or '$0 restart' to restart."
+      echo "  CLI:      pms [start|stop|restart]"
+      echo "  Stop:     pms stop"
+      echo "  Restart:  pms restart"
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."

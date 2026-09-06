@@ -267,7 +267,40 @@ install_or_update() {
   fi
 
   download_extract "$target" "$latest"
+  register_cli
   return 0
+}
+
+register_cli() {
+  local bin_dir="${HOME:-/root}/.local/bin"
+  mkdir -p "$bin_dir" 2>/dev/null || true
+
+  # Also install to /usr/local/bin if writable
+  local system_bin="/usr/local/bin"
+  local launcher="$APP_DIR/pencarimovie-linux.sh"
+  if [ -f "$launcher" ]; then
+    chmod +x "$launcher" 2>/dev/null || true
+    for cmd in pms pm pencarimovie; do
+      cat <<EOF > "$bin_dir/$cmd"
+#!/usr/bin/env bash
+exec "$launcher" "\$@"
+EOF
+      chmod +x "$bin_dir/$cmd" 2>/dev/null || true
+
+      if [ -w "$system_bin" ]; then
+        cp -f "$bin_dir/$cmd" "$system_bin/$cmd" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # Ensure ~/.local/bin is in PATH in profile files if not already
+  local rc_file=""
+  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.profile"; do
+    if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+    fi
+  done
+  export PATH="${HOME:-/root}/.local/bin:$PATH"
 }
 
 do_start() {
@@ -284,7 +317,9 @@ do_start() {
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
       print_urls
-      echo "  Use '$0 stop' to stop or '$0 restart' to restart."
+      echo "  CLI:      pms [start|stop|restart]"
+      echo "  Stop:     pms stop"
+      echo "  Restart:  pms restart"
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."
@@ -361,7 +396,16 @@ do_start() {
     echo "Warning: Neither bin/addon nor nodejs/bun found. Addon service not started."
   fi
 
-  PENCARIMOVIE_NO_BANNER=1 bash start.sh
+  register_cli
+  if [ -t 1 ]; then
+    PENCARIMOVIE_NO_BANNER=1 bash start.sh
+  else
+    # In piped execution (curl | bash), spawn start.sh detached so stdout closes cleanly
+    nohup bash -c 'cd "'"$APP_DIR"'" && PENCARIMOVIE_NO_BANNER=1 ./start.sh' >/dev/null 2>&1 &
+    sleep 1
+    print_urls
+    echo "PencariMovie Server started in the background."
+  fi
 }
 
 do_restart() { do_stop; sleep 1; do_start; }

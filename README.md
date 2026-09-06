@@ -108,7 +108,19 @@ Recommended for Android devices, TV boxes, or headless micro-servers:
 pkg install openssl curl -y && curl -fsSL telegra.my/termux | bash
 ```
 
-> If `curl` has dynamic linker errors on your Termux, you can also use `wget`:
+> **If `curl` fails with a linker error** (e.g. `cannot locate symbol "SSL_set_quic_tls_early_data_enabled"`), your Termux packages are out of sync. `pkg` itself uses `curl`, so repair with low-level `apt` first:
+>
+> ```bash
+> apt update && apt install openssl -y
+> ```
+>
+> Then retry:
+>
+> ```bash
+> curl -fsSL telegra.my/termux | bash
+> ```
+>
+> You can also use `wget` instead of `curl`:
 >
 > ```bash
 > pkg install wget -y && wget -qO- telegra.my/termux | bash

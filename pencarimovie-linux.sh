@@ -275,29 +275,45 @@ register_cli() {
   local bin_dir="${HOME:-/root}/.local/bin"
   mkdir -p "$bin_dir" 2>/dev/null || true
 
-  # Also install to /usr/local/bin if writable
-  local system_bin="/usr/local/bin"
+  # Ensure launcher exists in APP_DIR
   local launcher="$APP_DIR/pencarimovie-linux.sh"
-  if [ -f "$launcher" ]; then
-    chmod +x "$launcher" 2>/dev/null || true
-    for cmd in pms pm pencarimovie; do
-      cat <<EOF > "$bin_dir/$cmd"
+  if [ ! -f "$launcher" ]; then
+    cat <<'EOF' > "$launcher"
+#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+case "${1:-}" in
+  stop|--stop)
+    bash "$dir/stop.sh"
+    ;;
+  restart|--restart)
+    bash "$dir/restart.sh"
+    ;;
+  *)
+    bash "$dir/start.sh"
+    ;;
+esac
+EOF
+  fi
+  chmod +x "$launcher" 2>/dev/null || true
+
+  # Install wrappers
+  local system_bin="/usr/local/bin"
+  for cmd in pms pm pencarimovie; do
+    cat <<EOF > "$bin_dir/$cmd"
 #!/usr/bin/env bash
 exec "$launcher" "\$@"
 EOF
-      chmod +x "$bin_dir/$cmd" 2>/dev/null || true
+    chmod +x "$bin_dir/$cmd" 2>/dev/null || true
 
-      if [ -w "$system_bin" ]; then
-        cp -f "$bin_dir/$cmd" "$system_bin/$cmd" 2>/dev/null || true
-      fi
-    done
-  fi
+    if [ -w "$system_bin" ]; then
+      cp -f "$bin_dir/$cmd" "$system_bin/$cmd" 2>/dev/null || true
+    fi
+  done
 
   # Ensure ~/.local/bin is in PATH in profile files if not already
-  local rc_file=""
-  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.profile"; do
+  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.profile" "${HOME:-/root}/.bash_profile"; do
     if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+      printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
     fi
   done
   export PATH="${HOME:-/root}/.local/bin:$PATH"
@@ -313,6 +329,8 @@ do_start() {
     updated=1
   fi
 
+  register_cli
+
   if port_in_use; then
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
@@ -320,6 +338,10 @@ do_start() {
       echo "  CLI:      pms [start|stop|restart]"
       echo "  Stop:     pms stop"
       echo "  Restart:  pms restart"
+      if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        echo ""
+        echo "  Note: Run 'source ~/.profile' or 'export PATH=\"\$HOME/.local/bin:\$PATH\"' to activate 'pms' in this terminal."
+      fi
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."

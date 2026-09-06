@@ -326,8 +326,26 @@ register_cli() {
   local bin_dir="${PREFIX:-/data/data/com.termux/files/usr}/bin"
   local launcher="$APP_DIR/pencarimovie-termux.sh"
 
-  if [ -d "$bin_dir" ] && [ -f "$launcher" ]; then
-    chmod +x "$launcher" 2>/dev/null || true
+  if [ ! -f "$launcher" ]; then
+    cat <<'EOF' > "$launcher"
+#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+case "${1:-}" in
+  stop|--stop)
+    bash "$dir/stop.sh"
+    ;;
+  restart|--restart)
+    bash "$dir/restart.sh"
+    ;;
+  *)
+    bash "$dir/start-termux.sh"
+    ;;
+esac
+EOF
+  fi
+  chmod +x "$launcher" 2>/dev/null || true
+
+  if [ -d "$bin_dir" ]; then
     for cmd in pms pm pencarimovie; do
       cat <<EOF > "$bin_dir/$cmd"
 #!/usr/bin/env bash
@@ -349,6 +367,8 @@ do_start() {
   fi
 
   if port_in_use; then
+    register_cli
+  
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
       print_urls

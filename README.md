@@ -131,18 +131,6 @@ Install the standalone Android application with built-in background service and 
 
 ---
 
-### 5️⃣ macOS (Apple Silicon & Intel)
-
-```bash
-# For Apple Silicon (M1/M2/M3/M4):
-mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-mac-arm64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
-
-# For Intel Mac:
-mkdir -p pencarimovie-server && cd pencarimovie-server && curl -L -o pencarimovie.tar.gz https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-mac-x86_64.tar.gz && tar -xzf pencarimovie.tar.gz && bash start.sh
-```
-
----
-
 ## ⚙️ Initial Setup & Bot Authentication
 
 Once the server is running, open your browser at:
@@ -239,7 +227,7 @@ _(Legacy `.\pencarimovie-windows.bat`, `--start`, `--stop`, and `--restart` flag
 By default, the server binds to port `8088`. You can change the port using the `PORT` environment variable:
 
 ```bash
-# Linux / macOS / Termux
+# Linux / Termux
 PORT=9090 bash pencarimovie-linux.sh
 
 # Windows Command Prompt

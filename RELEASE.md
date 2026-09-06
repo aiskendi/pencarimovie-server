@@ -12,10 +12,8 @@ Each package contains the same app code, but a different FrankenPHP runtime in `
 - `pencarimovie-downloader-linux-x86_64-mimalloc.tar.gz`
 - `pencarimovie-downloader-linux-aarch64.tar.gz`
 - `pencarimovie-downloader-linux-aarch64-gnu.tar.gz`
-- `pencarimovie-downloader-mac-arm64.tar.gz`
-- `pencarimovie-downloader-mac-x86_64.tar.gz`
 - `pencarimovie-downloader-android-arm64.apk` — Standalone Android APK (no Termux required)
-- `pencarimovie-linux.sh` — Linux/macOS one-file installer (start-time OTA)
+- `pencarimovie-linux.sh` — Linux one-file installer (start-time OTA)
 - `pencarimovie-termux.sh` — Termux one-file installer (start-time OTA)
 - `pencarimovie-windows.bat` — Windows one-file installer (start-time OTA)
 
@@ -68,8 +66,6 @@ Examples:
 ./scripts/package-unix.sh frankenphp-linux-x86_64 /path/to/frankenphp-linux-x86_64
 ./scripts/package-unix.sh frankenphp-linux-aarch64 /path/to/frankenphp-linux-aarch64
 ./scripts/package-unix.sh frankenphp-linux-aarch64-gnu /path/to/frankenphp-linux-aarch64-gnu
-./scripts/package-unix.sh frankenphp-mac-arm64 /path/to/frankenphp-mac-arm64
-./scripts/package-unix.sh frankenphp-mac-x86_64 /path/to/frankenphp-mac-x86_64
 ```
 
 Outputs:
@@ -78,8 +74,6 @@ Outputs:
 dist/pencarimovie-downloader-linux-x86_64.tar.gz
 dist/pencarimovie-downloader-linux-aarch64.tar.gz
 dist/pencarimovie-downloader-linux-aarch64-gnu.tar.gz
-dist/pencarimovie-downloader-mac-arm64.tar.gz
-dist/pencarimovie-downloader-mac-x86_64.tar.gz
 ```
 
 ### Unix package contents
@@ -97,8 +91,6 @@ Target mapping:
 - `frankenphp-linux-x86_64-mimalloc` -> `pencarimovie-downloader-linux-x86_64-mimalloc.tar.gz`
 - `frankenphp-linux-aarch64` -> `pencarimovie-downloader-linux-aarch64.tar.gz`
 - `frankenphp-linux-aarch64-gnu` -> `pencarimovie-downloader-linux-aarch64-gnu.tar.gz`
-- `frankenphp-mac-arm64` -> `pencarimovie-downloader-mac-arm64.tar.gz`
-- `frankenphp-mac-x86_64` -> `pencarimovie-downloader-mac-x86_64.tar.gz`
 
 ## OS-specific script separation
 
@@ -114,7 +106,7 @@ The `index.php` FrankenPHP entrypoint (which loads `backend.php`) is included in
 ## GitHub release flow
 
 1. Run Composer once before packaging if `vendor/` is missing.
-2. Run [`scripts/build-release.bat`](scripts/build-release.bat) on Windows or [`scripts/build-release.sh`](scripts/build-release.sh) on Unix/macOS.
+2. Run [`scripts/build-release.bat`](scripts/build-release.bat) on Windows or [`scripts/build-release.sh`](scripts/build-release.sh) on Linux.
 3. The script produces every release archive automatically:
    - **Windows**: Extracts `bin/` from `frankenphp-windows-x86_64.zip`, copies `.bat` scripts only
    - **Unix**: Renames `php.ini.unix` → `php.ini`, copies `bin/php`, copies `.sh` scripts only

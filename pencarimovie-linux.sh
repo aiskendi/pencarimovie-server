@@ -43,17 +43,10 @@ detect_target() {
       case "$arch" in
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
-        *) echo "Unsupported: $arch"; exit 1 ;;
+        *) echo "Unsupported architecture: $arch"; exit 1 ;;
       esac
       ;;
-    Darwin)
-      case "$arch" in
-        arm64|aarch64) echo "mac-arm64" ;;
-        x86_64|amd64)  echo "mac-x86_64" ;;
-        *) echo "Unsupported: $arch"; exit 1 ;;
-      esac
-      ;;
-    *) echo "Unsupported OS: $os"; exit 1 ;;
+    *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, Android (Termux/APK), and Windows."; exit 1 ;;
   esac
 }
 

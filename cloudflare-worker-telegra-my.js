@@ -35,15 +35,10 @@ if (-not (Test-Path -LiteralPath $installDir)) {
 }
 
 $batFile = Join-Path $installDir "pencarimovie-windows.bat"
-$url = "https://raw.githubusercontent.com/aiskendi/pencarimovie-downloader/main/pencarimovie-windows.bat"
+$url = "https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-windows.bat"
 
 Write-Host "PencariMovie Server: $installDir" -ForegroundColor Cyan
-try {
-    Invoke-RestMethod -Uri $url -OutFile $batFile
-} catch {
-    $fallbackUrl = "https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-windows.bat"
-    Invoke-RestMethod -Uri $fallbackUrl -OutFile $batFile
-}
+Invoke-RestMethod -Uri $url -OutFile $batFile
 
 Push-Location $installDir
 try {
@@ -53,8 +48,7 @@ try {
 }
 `;
 
-const GITHUB_TARGET = "aiskendi/pencarimovie-downloader";
-const GITHUB_FALLBACK = "aiskendi/pencarimovie-server";
+const GITHUB_TARGET = "aiskendi/pencarimovie-server";
 
 export default {
   async fetch(request) {
@@ -68,7 +62,7 @@ export default {
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "public, max-age=60",
+          "Cache-Control": "no-cache",
         },
       });
     }
@@ -90,7 +84,7 @@ export default {
 
     // Android APK download
     if (path === "/apk" || path === "/app") {
-      return Response.redirect(`https://github.com/${GITHUB_FALLBACK}/releases/latest/download/pencarimovie_arm64-v8a.apk`, 302);
+      return Response.redirect(`https://github.com/${GITHUB_TARGET}/releases/latest/download/pencarimovie_arm64-v8a.apk`, 302);
     }
 
     // GitHub Repo

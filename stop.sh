@@ -24,9 +24,12 @@ if command -v pkill >/dev/null 2>&1 && [ -n "$TUNNEL_CONFIG" ]; then
 fi
 rm -f "$ROOT_DIR/storage/tunnel/state.json" 2>/dev/null || true
 
+echo "Stopping Addon service on 0.0.0.0:8089..."
+
 if [ -f "$ROOT_DIR/.addon.pid" ]; then
   ADDON_PID="$(cat "$ROOT_DIR/.addon.pid" 2>/dev/null || true)"
   if [ -n "${ADDON_PID:-}" ] && kill -0 "$ADDON_PID" 2>/dev/null; then
+    echo "Killing Addon process PID $ADDON_PID"
     kill "$ADDON_PID" 2>/dev/null || true
     kill -9 "$ADDON_PID" 2>/dev/null || true
   fi

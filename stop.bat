@@ -5,6 +5,7 @@ set PORT=8088
 for %%I in ("%~dp0.") do set "ROOT=%%~fI"
 
 echo Stopping PencariMovie Server on %HOST%:%PORT%...
+echo Stopping Addon service on 0.0.0.0:8089...
 
 rem Stop Addon on port 8089 if running
 for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:8089 127.0.0.1:8089 [::]:8089" ^| findstr "LISTENING"') do (

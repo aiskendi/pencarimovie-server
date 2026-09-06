@@ -317,32 +317,30 @@ install_or_update() {
 
 register_cli() {
   local bin_dir="${PREFIX:-/data/data/com.termux/files/usr}/bin"
-  local launcher="$APP_DIR/pencarimovie-termux.sh"
-
-  if [ ! -f "$launcher" ]; then
-    cat <<'EOF' > "$launcher"
-#!/usr/bin/env bash
-dir="$(cd "$(dirname "$0")" && pwd)"
-case "${1:-}" in
-  stop|--stop)
-    bash "$dir/stop.sh"
-    ;;
-  restart|--restart)
-    bash "$dir/restart.sh"
-    ;;
-  *)
-    bash "$dir/start-termux.sh"
-    ;;
-esac
-EOF
-  fi
-  chmod +x "$launcher" 2>/dev/null || true
 
   if [ -d "$bin_dir" ]; then
     for cmd in pms pm pencarimovie; do
       cat <<EOF > "$bin_dir/$cmd"
 #!/usr/bin/env bash
-exec bash "$launcher" "\$@"
+# PencariMovie Server CLI launcher
+APP_DIR="$APP_DIR"
+case "\${1:-}" in
+  stop|--stop)
+    bash "\$APP_DIR/stop.sh"
+    ;;
+  restart|--restart)
+    bash "\$APP_DIR/restart.sh"
+    ;;
+  uninstall|--uninstall)
+    bash "\$APP_DIR/stop.sh" 2>/dev/null || true
+    rm -f "\$PREFIX/bin/pms" "\$PREFIX/bin/pm" "\$PREFIX/bin/pencarimovie" 2>/dev/null || true
+    rm -rf "\$APP_DIR"
+    echo "PencariMovie Server has been uninstalled."
+    ;;
+  *)
+    bash "\$APP_DIR/start-termux.sh"
+    ;;
+esac
 EOF
       chmod +x "$bin_dir/$cmd" 2>/dev/null || true
     done

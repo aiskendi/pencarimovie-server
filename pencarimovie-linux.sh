@@ -268,33 +268,33 @@ register_cli() {
   local bin_dir="${HOME:-/root}/.local/bin"
   mkdir -p "$bin_dir" 2>/dev/null || true
 
-  # Ensure launcher exists in APP_DIR
-  local launcher="$APP_DIR/pencarimovie-linux.sh"
-  if [ ! -f "$launcher" ]; then
-    cat <<'EOF' > "$launcher"
-#!/usr/bin/env bash
-dir="$(cd "$(dirname "$0")" && pwd)"
-case "${1:-}" in
-  stop|--stop)
-    bash "$dir/stop.sh"
-    ;;
-  restart|--restart)
-    bash "$dir/restart.sh"
-    ;;
-  *)
-    bash "$dir/start.sh"
-    ;;
-esac
-EOF
-  fi
-  chmod +x "$launcher" 2>/dev/null || true
-
-  # Install wrappers
+  # Install self-contained wrappers (independent of the OTA installer file)
   local system_bin="/usr/local/bin"
+  local home_bin="${HOME:-/root}/bin"
   for cmd in pms pm pencarimovie; do
     cat <<EOF > "$bin_dir/$cmd"
 #!/usr/bin/env bash
-exec bash "$launcher" "\$@"
+# PencariMovie Server CLI launcher
+APP_DIR="$APP_DIR"
+case "\${1:-}" in
+  stop|--stop)
+    bash "\$APP_DIR/stop.sh"
+    ;;
+  restart|--restart)
+    bash "\$APP_DIR/restart.sh"
+    ;;
+  uninstall|--uninstall)
+    bash "\$APP_DIR/stop.sh" 2>/dev/null || true
+    rm -f "\$HOME/.local/bin/pms" "\$HOME/.local/bin/pm" "\$HOME/.local/bin/pencarimovie" 2>/dev/null || true
+    rm -f "/usr/local/bin/pms" "/usr/local/bin/pm" "/usr/local/bin/pencarimovie" 2>/dev/null || true
+    rm -f "\$HOME/bin/pms" "\$HOME/bin/pm" "\$HOME/bin/pencarimovie" 2>/dev/null || true
+    rm -rf "\$APP_DIR"
+    echo "PencariMovie Server has been uninstalled."
+    ;;
+  *)
+    bash "\$APP_DIR/start.sh"
+    ;;
+esac
 EOF
     chmod +x "$bin_dir/$cmd" 2>/dev/null || true
 
@@ -302,6 +302,10 @@ EOF
       cp -f "$bin_dir/$cmd" "$system_bin/$cmd" 2>/dev/null || true
     elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
       sudo cp -f "$bin_dir/$cmd" "$system_bin/$cmd" 2>/dev/null || true
+    fi
+    if [ -d "$home_bin" ] || [[ ":$PATH:" == *":${HOME:-/root}/bin:"* ]]; then
+      mkdir -p "$home_bin" 2>/dev/null || true
+      ln -sf "$bin_dir/$cmd" "$home_bin/$cmd" 2>/dev/null || cp -f "$bin_dir/$cmd" "$home_bin/$cmd" 2>/dev/null || true
     fi
   done
 
@@ -312,15 +316,6 @@ EOF
     fi
   done
   export PATH="${HOME:-/root}/.local/bin:$PATH"
-
-  # Also symlink into $HOME/bin if that directory already exists or is in PATH
-  local home_bin="${HOME:-/root}/bin"
-  if [ -d "$home_bin" ] || [[ ":$PATH:" == *":${HOME:-/root}/bin:"* ]]; then
-    mkdir -p "$home_bin" 2>/dev/null || true
-    for cmd in pms pm pencarimovie; do
-      ln -sf "$bin_dir/$cmd" "$home_bin/$cmd" 2>/dev/null || cp -f "$bin_dir/$cmd" "$home_bin/$cmd" 2>/dev/null || true
-    done
-  fi
 }
 
 do_start() {

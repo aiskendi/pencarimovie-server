@@ -78,6 +78,12 @@ plans/
 # Internal release build scripts
 scripts/
 
+# Cloudflare infrastructure / internal deploy files
+cloudflare-worker*.js
+wrangler*.toml
+.wrangler/
+static-build.Dockerfile
+
 # Build extracts, bootstrap sources, and temporary sub-repos
 libtalloc_extract/
 php_extract/

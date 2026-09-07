@@ -114,16 +114,13 @@ exit /b 0
 :uninstall
 echo Stopping PencariMovie Server...
 call :stop_quiet
-rem Remove CLI wrappers
-del /q "%USERPROFILE%\pencarimovie-server\pm.cmd" 2>nul
-del /q "%USERPROFILE%\pencarimovie-server\pms.cmd" 2>nul
-del /q "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
-rem Remove the app directory
-if exist "%APP_DIR%" (
-    echo Removing %APP_DIR% ...
-    rmdir /s /q "%APP_DIR%" 2>nul
-)
+rem Remove from User PATH if registered
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:APP_PATH; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
+echo Removing %APP_DIR% ...
 echo PencariMovie Server has been uninstalled.
+set "TARGET_DIR=%APP_DIR%"
+rem Spawn a detached background process to remove the directory after cmd.exe releases the batch file handle
+start /b "" powershell.exe -NoProfile -WindowStyle Hidden -Command "& { $d = $env:TARGET_DIR; Start-Sleep -Milliseconds 600; for ($i=0; $i -lt 15; $i++) { try { if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction Stop }; break } catch { Start-Sleep -Milliseconds 500 } } }"
 exit /b 0
 
 :restart

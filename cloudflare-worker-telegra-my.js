@@ -1,0 +1,102 @@
+/**
+ * Cloudflare Worker for telegra.my
+ *
+ * Provides ultra-short installation and download shortcuts for PencariMovie:
+ *
+ * Installation Shortcuts:
+ *   - telegra.my/win    -> Windows installer script (.bat)
+ *   - telegra.my/linux  -> Linux installer script (.sh)
+ *   - telegra.my/termux -> Termux Android installer script (.sh)
+ *   - telegra.my/apk    -> Standalone Android APK download
+ *   - telegra.my/github -> GitHub repository
+ *
+ * Usage examples in terminal:
+ *   Windows (PowerShell):
+ *     irm telegra.my/win | iex
+ *
+ *   Linux:
+ *     curl -fsSL telegra.my/linux | bash
+ *
+ *   Termux:
+ *     curl -fsSL telegra.my/termux | bash
+ */
+
+// Inline script contents to serve directly with 200 OK (no redirect hops or GitHub raw dependencies)
+
+const PS1_SCRIPT = `# PencariMovie Server - Windows One-Line Installer & Launcher
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+$homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+$installDir = Join-Path $homeDir "pencarimovie-server"
+
+if (-not (Test-Path -LiteralPath $installDir)) {
+    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+}
+
+$batFile = Join-Path $installDir "pencarimovie-windows.bat"
+$url = "https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-windows.bat?t=" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+Write-Host "PencariMovie Server: $installDir" -ForegroundColor Cyan
+$raw = Invoke-RestMethod -Uri $url
+$crlf = [char]13 + [char]10
+[System.IO.File]::WriteAllText($batFile, (($raw -split '\r?\n') -join $crlf), [System.Text.Encoding]::ASCII)
+
+Push-Location $installDir
+try {
+    & $batFile @args
+} finally {
+    Pop-Location
+}
+`;
+
+const GITHUB_TARGET = "aiskendi/pencarimovie-server";
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname.toLowerCase().replace(/\/+$/, "");
+
+    // Direct inline serving for Windows PowerShell one-liner
+    if (path === "/win" || path === "/win.ps1" || path === "/windows") {
+      return new Response(PS1_SCRIPT, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+        },
+      });
+    }
+
+    // Windows .bat redirect
+    if (path === "/win.bat") {
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-windows.bat`, 302);
+    }
+
+    // Linux script redirect (with cache buster to avoid stale Fastly/Varnish raw cache)
+    if (path === "/linux" || path === "/linux.sh" || path === "/sh") {
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-linux.sh?t=${Date.now()}`, 302);
+    }
+
+    // Termux script redirect (with cache buster)
+    if (path === "/termux" || path === "/termux.sh") {
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-termux.sh?t=${Date.now()}`, 302);
+    }
+
+    // Android APK download
+    if (path === "/apk" || path === "/app") {
+      return Response.redirect(`https://github.com/${GITHUB_TARGET}/releases/latest/download/pencarimovie_arm64-v8a.apk`, 302);
+    }
+
+    // GitHub Repo
+    if (path === "" || path === "/" || path === "/github" || path === "/repo") {
+      return Response.redirect(`https://github.com/${GITHUB_TARGET}`, 302);
+    }
+
+    return new Response("Not found. Available shortcuts: /win, /linux, /termux, /apk, /github\n", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  },
+};

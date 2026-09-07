@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#141414" />
+    <title>PencariMovie — Stream & Download</title>
+    <link rel="stylesheet" href="stream-theme.css" />
+    <link rel="stylesheet" href="styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+  </head>
+  <body class="stream-dark">
+    <!-- ─── Loading Screen (shown during session check) ───────── -->
+    <div id="loadingScreen" class="loading-screen" aria-hidden="false">
+      <div class="loading-screen__spinner"></div>
+      <p class="loading-screen__text">Connecting...</p>
+    </div>
+
+    <!-- ─── Update Required Overlay ──────────────────────────── -->
+    <div
+      id="updateRequiredOverlay"
+      class="update-required hidden"
+      aria-hidden="true"
+    >
+      <div class="update-required__card">
+        <div class="update-required__icon">&#x26A0;&#xFE0F;</div>
+        <h2 class="update-required__title">Update Required</h2>
+        <p class="update-required__desc">
+          Your app version is outdated. Please update to continue using
+          PencariMovie Downloader.
+        </p>
+        <div class="update-required__details">
+          <span
+            >Current:
+            <strong class="update-required__version-current"
+              >0.0.0</strong
+            ></span
+          >
+          <span
+            >Minimum:
+            <strong class="update-required__version-minimum"
+              >0.0.0</strong
+            ></span
+          >
+        </div>
+        <a class="update-required__link" href="#" target="_blank" rel="noopener"
+          >Download Update</a
+        >
+      </div>
+    </div>
+
+    <!-- ─── Settings Gate (bot login) ────────────────────────── -->
+    <div id="settingsGate" class="settings-gate hidden" aria-hidden="true">
+      <div class="settings-gate__card">
+        <!-- Close button — visible in overlay mode (has session) -->
+        <button
+          id="settingsClose"
+          class="settings-gate__close"
+          aria-label="Close settings"
+        >
+          ✕
+        </button>
+
+        <!-- Token input section — shown in setup mode (no session) -->
+        <div id="settingsTokenSection">
+          <div class="settings-gate__header-wrap">
+            <h2 id="settingsTitle" class="settings-gate__title">⚙️ Settings</h2>
+            <span
+              id="settingsVersion"
+              class="settings-gate__version-badge"
+            ></span>
+          </div>
+          <p id="settingsDesc" class="settings-gate__desc">
+            Enter your Telegram Bot Token to connect.
+            <br /><small
+              >Get one from
+              <a
+                href="https://t.me/CreateNewTelegramBot?start=localserver"
+                target="_blank"
+                rel="noopener"
+                >@CreateNewTelegramBot</a
+              ></small
+            >
+          </p>
+          <div class="settings-gate__field">
+            <label for="botTokenInput" class="settings-gate__label"
+              >Bot Token(s)</label
+            >
+            <textarea
+              id="botTokenInput"
+              class="settings-gate__input"
+              style="
+                height: 72px;
+                font-size: 0.85rem;
+                font-family: monospace;
+                resize: vertical;
+                box-sizing: border-box;
+                padding: 8px 10px;
+                line-height: 1.4;
+              "
+              placeholder="Enter 1 or more bot tokens (one per line)..."
+              autocomplete="off"
+            ></textarea>
+          </div>
+          <div id="settingsStatus" class="settings-gate__status"></div>
+          <div class="settings-gate__actions">
+            <button id="connectBtn" class="settings-gate__btn">Connect</button>
+          </div>
+          <p class="settings-gate__hint">
+            Already connected?
+            <button id="logoutBtn" class="settings-gate__link">
+              Disconnect
+            </button>
+          </p>
+        </div>
+
+        <!-- Connected info section — shown in overlay mode (has session) -->
+        <div
+          id="settingsConnectedSection"
+          class="settings-gate__connected-info hidden"
+        >
+          <div class="settings-gate__header-wrap" style="margin-bottom: 8px">
+            <h2 class="settings-gate__title" style="margin-bottom: 0">
+              ⚙️ Settings
+            </h2>
+            <span
+              id="settingsConnectedVersion"
+              class="settings-gate__version-badge"
+            ></span>
+          </div>
+
+          <div
+            id="settingsConnectedStatus"
+            class="settings-gate__status"
+            style="margin: 0 0 10px 0; text-align: center"
+          ></div>
+
+          <!-- Multi-Bot Manager UI -->
+          <div class="settings-gate__bots-container">
+            <div class="settings-gate__bots-header">
+              <span class="settings-gate__bots-title"
+                >🤖 Bot Pool (<span id="botPoolCount">1</span>)</span
+              >
+              <button
+                type="button"
+                id="toggleAddBotsBtn"
+                class="settings-gate__link"
+                style="
+                  font-size: 0.8rem;
+                  color: var(--accent);
+                  cursor: pointer;
+                  white-space: nowrap;
+                "
+              >
+                + Add More Bots
+              </button>
+            </div>
+
+            <!-- Bot token bulk adder (collapsible) -->
+            <div
+              id="addBotsSection"
+              class="hidden"
+              style="margin-bottom: 12px; width: 100%; box-sizing: border-box"
+            >
+              <textarea
+                id="bulkBotTokensInput"
+                class="settings-gate__input"
+                style="
+                  height: 65px;
+                  font-size: 0.78rem;
+                  font-family: monospace;
+                  resize: vertical;
+                  box-sizing: border-box;
+                "
+                placeholder="Paste 1 or more bot tokens (one per line)..."
+              ></textarea>
+              <div
+                style="
+                  display: flex;
+                  gap: 6px;
+                  margin-top: 6px;
+                  width: 100%;
+                  box-sizing: border-box;
+                "
+              >
+                <button
+                  type="button"
+                  id="submitAddBotsBtn"
+                  class="settings-gate__btn"
+                  style="padding: 6px 12px; font-size: 0.8rem; flex: 1"
+                >
+                  Connect Bots
+                </button>
+                <button
+                  type="button"
+                  id="cancelAddBotsBtn"
+                  class="settings-gate__btn"
+                  style="
+                    padding: 6px 12px;
+                    font-size: 0.8rem;
+                    background: rgba(255, 255, 255, 0.1);
+                    color: #ccc;
+                  "
+                >
+                  Cancel
+                </button>
+              </div>
+              <div
+                id="addBotsStatus"
+                style="
+                  font-size: 0.78rem;
+                  margin-top: 4px;
+                  color: #ff6b35;
+                  word-break: break-word;
+                "
+              ></div>
+            </div>
+
+            <div id="botPoolList" class="settings-gate__bots-list">
+              <!-- Bot items rendered dynamically -->
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 8px; margin-top: 14px">
+            <button
+              id="settingsDisconnectBtn"
+              class="settings-gate__btn settings-gate__btn--danger"
+              style="flex: 1"
+            >
+              Disconnect All
+            </button>
+          </div>
+
+          <div class="settings-gate__addon-box" style="margin-top: 14px">
+            <span>📺 Want to stream in Nuvio or Stremio?</span>
+            <button
+              type="button"
+              id="settingsOpenAddonBtn"
+              class="settings-gate__addon-link"
+              style="
+                background: none;
+                border: none;
+                cursor: pointer;
+                font-size: inherit;
+                font-family: inherit;
+              "
+            >
+              View Nuvio / Stremio Addon
+              <i class="fas fa-external-link-alt"></i>
+            </button>
+          </div>
+
+          <div class="settings-gate__addon-box settings-gate__tunnel-box">
+            <span>☁️ Cloudflare Tunnel</span>
+            <p class="settings-gate__tunnel-desc" id="tunnelDescText">
+              Expose this local server at a public
+              <code id="tunnelSubdomainPlaceholder"
+                >https://{deviceId}-tunnel.pencarimovie.com</code
+              >
+              URL. No Cloudflare account needed. Anyone with the URL can browse
+              and stream.
+            </p>
+            <div class="settings-gate__tunnel-status" id="tunnelStatusText">
+              Tunnel is off.
+            </div>
+            <div class="settings-gate__tunnel-url-row hidden" id="tunnelUrlRow">
+              <input
+                type="text"
+                id="tunnelUrlInput"
+                class="settings-gate__input"
+                readonly
+                value=""
+              />
+              <button
+                type="button"
+                id="copyTunnelUrlBtn"
+                class="settings-gate__btn"
+              >
+                📋 Copy
+              </button>
+            </div>
+
+            <div
+              class="settings-gate__tunnel-actions"
+              id="tunnelLocalActions"
+              style="margin-top: 10px"
+            >
+              <button
+                type="button"
+                id="enableTunnelBtn"
+                class="settings-gate__btn"
+              >
+                Enable Tunnel
+              </button>
+              <button
+                type="button"
+                id="disableTunnelBtn"
+                class="settings-gate__btn settings-gate__btn--danger hidden"
+              >
+                Disable
+              </button>
+            </div>
+            <div
+              class="settings-gate__tunnel-remote-note hidden"
+              id="tunnelRemoteNote"
+            >
+              Enable and disable from this device's local dashboard only.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Main Streaming App ───────────────────────────────── -->
+    <div id="streamApp" class="stream-app hidden" aria-hidden="true">
+      <!-- NavBar -->
+      <nav class="stream-nav" id="streamNav">
+        <div class="stream-nav__inner">
+          <a class="stream-nav__logo" href="/">PencariMovie</a>
+          <div class="stream-nav__links" id="streamNavLinks"></div>
+          <div class="stream-nav__actions">
+            <span id="botStatusBadge" class="bot-status">○ Disconnected</span>
+            <button
+              id="addonBtn"
+              class="stream-nav__search-btn"
+              aria-label="Nuvio / Stremio Addon"
+              title="Nuvio / Stremio Addon"
+            >
+              <i class="fas fa-puzzle-piece"></i>
+            </button>
+            <button
+              id="settingsBtn"
+              class="stream-nav__search-btn"
+              aria-label="Settings"
+              title="Settings"
+            >
+              <i class="fas fa-cog"></i>
+            </button>
+            <button
+              id="streamSearchBtn"
+              class="stream-nav__search-btn"
+              aria-label="Search"
+            >
+              <i class="fas fa-search"></i>
+            </button>
+            <button
+              id="streamHamburger"
+              class="stream-nav__hamburger"
+              aria-label="Menu"
+            >
+              <i class="fas fa-bars"></i>
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      <!-- Hero Banner -->
+      <section class="stream-hero" id="streamHero">
+        <div class="stream-hero__backdrop" id="heroBackdrop"></div>
+        <div
+          class="stream-hero__backdrop stream-hero__backdrop--next"
+          id="heroBackdropNext"
+        ></div>
+        <div class="stream-hero__gradient"></div>
+        <div class="stream-hero__content" id="heroContent">
+          <h1 class="stream-hero__title" id="heroTitle">Loading…</h1>
+          <p class="stream-hero__excerpt" id="heroExcerpt"></p>
+          <button class="stream-hero__cta" id="heroCta">
+            <i class="fas fa-play"></i> Browse
+          </button>
+        </div>
+        <div class="stream-hero__dots" id="heroDots"></div>
+      </section>
+
+      <!-- Trending Pills -->
+      <section class="stream-trending" id="streamTrending">
+        <div class="stream-trending__pills" id="trendingPills"></div>
+      </section>
+
+      <!-- Content Rows -->
+      <main class="stream-content" id="streamContent"></main>
+
+      <!-- Loading Spinner -->
+      <div class="stream-loading hidden" id="streamLoading">
+        <div class="stream-loading__spinner"></div>
+      </div>
+    </div>
+
+    <!-- ─── Category Page ──────────────────────────────────── -->
+    <div id="categoryPage" class="category-page hidden" aria-hidden="true">
+      <div class="category-page__header">
+        <button id="categoryPageBack" class="category-page__back-btn">
+          <i class="fas fa-arrow-left"></i> Back
+        </button>
+        <h1 class="category-page__title" id="categoryPageTitle"></h1>
+      </div>
+      <div class="category-page__grid" id="categoryPageGrid"></div>
+      <div class="category-page__loading hidden" id="categoryPageLoading">
+        <div class="stream-loading__spinner"></div>
+        <span>Loading more...</span>
+      </div>
+      <div class="category-page__sentinel" id="categoryPageSentinel"></div>
+    </div>
+
+    <!-- ─── File Detail Page ─────────────────────────────────── -->
+    <div id="fileDetailPage" class="file-detail-page hidden" aria-hidden="true">
+      <div class="file-detail__backdrop" id="fileDetailBackdrop"></div>
+      <div class="file-detail__content">
+        <button id="fileDetailBack" class="file-detail__back-btn">
+          <i class="fas fa-arrow-left"></i> Back
+        </button>
+        <div class="file-detail__info">
+          <div class="file-detail__thumb" id="fileDetailThumb">
+            <img src="" alt="" id="fileDetailThumbImg" loading="lazy" />
+          </div>
+          <div class="file-detail__meta">
+            <h1 class="file-detail__title" id="fileDetailTitle"></h1>
+            <div class="file-detail__tags" id="fileDetailTags"></div>
+            <div class="file-detail__size" id="fileDetailSize"></div>
+            <!-- ─── Resolving spinner (shown while fetching resolve-file API) ─── -->
+            <div class="file-detail__resolving hidden" id="fileDetailResolving">
+              <div class="file-detail__resolving-spinner"></div>
+              <p class="file-detail__resolving-text">Resolving file info...</p>
+            </div>
+            <div class="file-detail__actions" id="fileDetailActions">
+              <button id="fileDetailStreamBtn" class="file-detail__stream-btn">
+                <i class="fas fa-play"></i> Stream
+              </button>
+              <button
+                id="fileDetailDownloadBtn"
+                class="file-detail__download-btn"
+              >
+                <i class="fas fa-download"></i> Download
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- Embedded video/audio player -->
+        <div class="file-detail__player hidden" id="fileDetailPlayer">
+          <video
+            id="fileDetailVideo"
+            class="file-detail__video"
+            controls
+            preload="metadata"
+            playsinline
+          ></video>
+          <audio
+            id="fileDetailAudio"
+            class="file-detail__audio hidden"
+            controls
+            preload="metadata"
+          ></audio>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Search Overlay ───────────────────────────────────── -->
+    <div id="streamSearchOverlay" class="stream-search-overlay">
+      <div class="stream-search-overlay__header">
+        <button
+          id="searchOverlayBack"
+          class="stream-search-overlay__back"
+          aria-label="Close search"
+        >
+          <i class="fas fa-arrow-left"></i>
+        </button>
+        <div class="stream-search-overlay__input-wrap">
+          <i class="fas fa-search stream-search-overlay__icon"></i>
+          <input
+            type="text"
+            id="searchInput"
+            class="stream-search-overlay__input"
+            placeholder="Search movies, files…"
+            autocomplete="off"
+          />
+        </div>
+      </div>
+      <div class="stream-search-overlay__body" id="searchBody">
+        <div class="stream-search-overlay__suggestions" id="searchSuggestions">
+          <div class="stream-search-overlay__suggestions-title">Trending</div>
+          <div class="stream-search-overlay__chips" id="searchChips"></div>
+        </div>
+        <div
+          class="stream-search-overlay__results hidden"
+          id="searchResults"
+        ></div>
+        <div class="stream-search-overlay__empty hidden" id="searchEmpty">
+          <i class="fas fa-search"></i>
+          <p>No results found</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Detail Modal ─────────────────────────────────────── -->
+    <div id="streamModal" class="stream-modal">
+      <div class="stream-modal__backdrop" id="modalBackdrop"></div>
+      <div class="stream-modal__content" id="modalContent">
+        <button
+          id="modalClose"
+          class="stream-modal__close"
+          aria-label="Close modal"
+        >
+          <i class="fas fa-times"></i>
+        </button>
+        <div class="stream-modal__hero" id="modalHero"></div>
+        <div class="stream-modal__body" id="modalBody"></div>
+      </div>
+    </div>
+
+    <!-- ─── Nuvio / Stremio Addon Modal Card ───────────────────── -->
+    <div id="addonModal" class="settings-gate hidden" aria-hidden="true">
+      <div class="settings-gate__card settings-gate__card--addon">
+        <button
+          id="addonModalClose"
+          class="settings-gate__close"
+          aria-label="Close"
+        >
+          ✕
+        </button>
+
+        <h2 class="settings-gate__title" id="addonModalTitle">
+          🧩 Nuvio / Stremio Addon
+        </h2>
+        <p class="settings-gate__desc" id="addonModalDesc">
+          Install this addon in Stremio or copy the manifest URL.
+        </p>
+
+        <!-- Wi-Fi / LAN Manifest Field (Recommended for External Devices) -->
+        <div class="settings-gate__field" id="addonLanField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestLanInput"
+              style="margin-bottom: 0"
+            >
+              📡 Wi-Fi / LAN Manifest (TV, Phone, Tablet)
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: rgba(0, 210, 106, 0.15);
+                color: #00d26a;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Remote</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestLanInput"
+              class="settings-gate__input"
+              style="color: #00d26a; font-family: monospace; font-size: 0.88rem"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestLanBtn"
+              class="settings-gate__btn"
+              style="
+                white-space: nowrap;
+                padding: 10px 16px;
+                font-size: 0.88rem;
+              "
+            >
+              📋 Copy
+            </button>
+          </div>
+        </div>
+
+        <!-- Localhost Manifest Field (This PC Only) -->
+        <div class="settings-gate__field" id="addonLocalField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestInput"
+              style="margin-bottom: 0"
+            >
+              💻 Localhost Manifest (This Device Only)
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: rgba(255, 255, 255, 0.08);
+                color: #aaa;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Local</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestInput"
+              class="settings-gate__input"
+              style="color: #bbb; font-family: monospace; font-size: 0.88rem"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestBtn"
+              class="settings-gate__btn"
+              style="
+                background: rgba(255, 255, 255, 0.1);
+                color: #ddd;
+                white-space: nowrap;
+                padding: 10px 16px;
+                font-size: 0.88rem;
+              "
+            >
+              📋 Copy
+            </button>
+          </div>
+        </div>
+
+        <div class="settings-gate__field hidden" id="addonTunnelField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestTunnelInput"
+              style="margin-bottom: 0"
+            >
+              ☁️ Cloudflare Tunnel Manifest
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: rgba(255, 107, 53, 0.18);
+                color: #ff8a5b;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Public</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestTunnelInput"
+              class="settings-gate__input"
+              style="color: #ff8a5b; font-family: monospace; font-size: 0.88rem"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestTunnelBtn"
+              class="settings-gate__btn"
+              style="
+                white-space: nowrap;
+                padding: 10px 16px;
+                font-size: 0.88rem;
+              "
+            >
+              📋 Copy
+            </button>
+          </div>
+          <a
+            id="addonStremioDirectBtn"
+            class="settings-gate__btn hidden"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 8px;
+              width: 100%;
+              margin-top: 10px;
+              padding: 10px 16px;
+              text-decoration: none;
+              font-weight: 600;
+              background: #ff6b35;
+              color: #fff;
+              box-sizing: border-box;
+            "
+          >
+            🎬 Add to Stremio
+          </a>
+        </div>
+
+        <div id="addonCopiedStatus" class="settings-gate__status ok hidden">
+          ✓ Copied to clipboard!
+        </div>
+
+        <div class="addon-stremio-sync" id="addonStremioSync">
+          <div class="addon-stremio-sync__title">
+            🎬 Install in Stremio (HTTP API Sync)
+          </div>
+          <p class="addon-stremio-sync__desc">
+            Stremio Web blocks HTTP addon URLs. This sends the selected HTTP
+            manifest to your Stremio account from the browser. Credentials go
+            only to
+            <code>api.strem.io</code> — nothing is stored on this server.
+          </p>
+
+          <div
+            class="addon-mode-toggle"
+            role="radiogroup"
+            aria-label="Manifest address"
+          >
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLan"
+                value="lan"
+                checked
+              />
+              <span>📡 Wi-Fi / LAN</span>
+            </label>
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLocal"
+                value="localhost"
+              />
+              <span>💻 Localhost</span>
+            </label>
+          </div>
+          <div class="addon-stremio-sync__url" id="stremioSyncUrlPreview"></div>
+
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncEmail"
+              >Stremio Email</label
+            >
+            <input
+              type="email"
+              id="stremioSyncEmail"
+              class="settings-gate__input"
+              autocomplete="username"
+              placeholder="you@example.com"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncPassword"
+              >Stremio Password</label
+            >
+            <input
+              type="password"
+              id="stremioSyncPassword"
+              class="settings-gate__input"
+              autocomplete="current-password"
+              placeholder="Your Stremio password"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncAuthKey"
+              >Auth Key (optional)</label
+            >
+            <input
+              type="password"
+              id="stremioSyncAuthKey"
+              class="settings-gate__input"
+              autocomplete="off"
+              placeholder="Paste instead of email/password"
+            />
+            <p class="addon-stremio-sync__hint">
+              From Stremio Web DevTools:
+              <code>JSON.parse(localStorage.getItem("profile")).auth.key</code>
+            </p>
+          </div>
+          <button
+            type="button"
+            id="stremioSyncInstallBtn"
+            class="settings-gate__btn addon-stremio-sync__btn"
+          >
+            Install via Stremio API Sync
+          </button>
+          <div
+            id="stremioSyncStatus"
+            class="settings-gate__status hidden"
+          ></div>
+        </div>
+
+        <div
+          class="instructions"
+          id="addonNuvioInstructions"
+          style="
+            margin-top: 18px;
+            text-align: left;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 14px 16px;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+          "
+        >
+          <div
+            style="
+              font-size: 0.88rem;
+              font-weight: 700;
+              color: #fff;
+              margin-bottom: 8px;
+            "
+          >
+            🚀 How to install in Nuvio:
+          </div>
+          <ol
+            style="
+              margin-left: 18px;
+              color: #aaa;
+              font-size: 0.82rem;
+              line-height: 1.5;
+            "
+          >
+            <li style="margin-bottom: 4px">
+              Connect your Android TV, phone, or tablet to the
+              <strong>same Wi-Fi network</strong>.
+            </li>
+            <li style="margin-bottom: 4px">
+              Open the <strong>Nuvio</strong> app.
+            </li>
+            <li style="margin-bottom: 4px">
+              Go to <strong>profile</strong> &rarr;
+              <strong>content & discovery</strong> &rarr;
+              <strong>addons</strong>.
+            </li>
+            <li>
+              Paste the <strong>Wi-Fi / LAN Manifest URL</strong> and click
+              <strong>Install addon</strong>.
+            </li>
+          </ol>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── Mobile Nav ───────────────────────────────────────── -->
+    <div id="mobileNavOverlay" class="stream-mobile-nav__overlay"></div>
+    <div id="mobileNav" class="stream-mobile-nav">
+      <div class="stream-mobile-nav__header">
+        <button
+          id="mobileNavClose"
+          class="stream-mobile-nav__close"
+          aria-label="Close menu"
+        >
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <div class="stream-mobile-nav__links" id="mobileNavLinks"></div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

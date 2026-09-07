@@ -1,0 +1,12 @@
+target/
+.git/
+android/
+termux-packages/
+libtalloc_extract/
+php_extract/
+proot/
+storage/*
+!storage/.gitkeep
+*.zip
+*.deb
+*.apk

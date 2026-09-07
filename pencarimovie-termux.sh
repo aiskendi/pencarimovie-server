@@ -22,7 +22,9 @@ EOF
 print_banner
 
 # Fixed installation path under $HOME (like 9router) unless already running inside the project root
-if [ -f "./backend.php" ] && [ -f "./start.sh" ]; then
+# Fixed installation path under $HOME (like 9router).
+# Only treat as a developer in-place checkout if .git exists in the current directory.
+if [ -f "./backend.php" ] && [ -f "./start.sh" ] && [ -d "./.git" ]; then
   APP_DIR="."
   OLD_APP_DIR="pencarimovie-downloader"
 else
@@ -338,7 +340,11 @@ case "\${1:-}" in
     echo "PencariMovie Server has been uninstalled."
     ;;
   *)
-    bash "\$APP_DIR/start-termux.sh"
+    if [ -f "\$APP_DIR/pencarimovie-termux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-termux.sh" start
+    else
+      bash "\$APP_DIR/start-termux.sh"
+    fi
     ;;
 esac
 EOF

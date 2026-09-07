@@ -22,7 +22,9 @@ EOF
 print_banner
 
 # Fixed installation path under $HOME (like 9router) unless already running inside the project root
-if [ -f "./backend.php" ] && [ -f "./start.sh" ]; then
+# Fixed installation path under $HOME (like 9router).
+# Only treat as a developer in-place checkout if .git exists in the current directory.
+if [ -f "./backend.php" ] && [ -f "./start.sh" ] && [ -d "./.git" ]; then
   APP_DIR="."
   OLD_APP_DIR="pencarimovie-downloader"
 else
@@ -292,7 +294,12 @@ case "\${1:-}" in
     echo "PencariMovie Server has been uninstalled."
     ;;
   *)
-    bash "\$APP_DIR/start.sh"
+    # Run the OTA installer so it checks GitHub for updates before starting.
+    if [ -f "\$APP_DIR/pencarimovie-linux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-linux.sh" start
+    else
+      bash "\$APP_DIR/start.sh"
+    fi
     ;;
 esac
 EOF

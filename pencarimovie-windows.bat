@@ -9,8 +9,10 @@ set "PORT=8088"
 set "HAD_APP=0"
 set "UPDATED=0"
 set "IN_PLACE=0"
-set "IN_PLACE=0"
-if exist "%~dp0backend.php" if exist "%~dp0start.bat" set "IN_PLACE=1"
+rem IN_PLACE = running from the developer git repo (has .git). Installed app
+rem folders also contain backend.php/start.bat but must still auto-update, so
+rem only treat a git checkout as "in place" (skip OTA).
+if exist "%~dp0backend.php" if exist "%~dp0start.bat" if exist "%~dp0.git" set "IN_PLACE=1"
 
 if "%IN_PLACE%"=="1" (
     set "APP_DIR=%~dp0."

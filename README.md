@@ -96,11 +96,25 @@ curl -fsSL telegra.my/linux | bash
 > curl -fsSL -o pencarimovie-linux.sh https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/pencarimovie-linux.sh && bash pencarimovie-linux.sh
 > ```
 
-- Control anytime: `bash pencarimovie-linux.sh [start|stop|restart]`
+- Control anytime: `pms [start|stop|restart|uninstall]`
 
 ---
 
-### 3️⃣ Android via Termux
+### 3️⃣ macOS (Apple Silicon M1/M2/M3/M4 & Intel)
+
+Open Terminal and run:
+
+```bash
+curl -fsSL telegra.my/mac | bash
+```
+
+_(or `curl -fsSL telegra.my/linux | bash` — both automatically detect Apple Silicon or Intel Mac)_
+
+- Control anytime: `pms [start|stop|restart|uninstall]`
+
+---
+
+### 4️⃣ Android via Termux
 
 Recommended for Android devices, TV boxes, or headless micro-servers:
 
@@ -142,7 +156,7 @@ pkg install openssl curl -y && curl -fsSL telegra.my/termux | bash
 
 ---
 
-### 4️⃣ Android Standalone App (APK)
+### 5️⃣ Android Standalone App (APK)
 
 Install the standalone Android application with built-in background service and native process manager:
 
@@ -232,6 +246,7 @@ Managing the server is as simple as running `start`, `stop`, `restart`, or `unin
 | :---------- | :---------- | :--------- | :------------ | :-------------- | :---------------------------------------------- |
 | **Windows** | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in CMD/PowerShell) |
 | **Linux**   | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in bash/zsh)       |
+| **macOS**   | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in zsh/bash)       |
 | **Termux**  | `pms start` | `pms stop` | `pms restart` | `pms uninstall` | `pms` / `pm` (works anywhere in Termux)         |
 
 The installers automatically register `pms` (PencariMovie Server), `pm`, and `pencarimovie` into your environment `$PATH`, allowing you to manage the background server from **any directory** without needing to know the installation folder:

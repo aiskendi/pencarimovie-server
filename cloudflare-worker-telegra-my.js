@@ -79,6 +79,11 @@ export default {
       return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-linux.sh?t=${Date.now()}`, 302);
     }
 
+    // macOS script redirect (runs pencarimovie-linux.sh which supports Darwin)
+    if (path === "/mac" || path === "/macos" || path === "/darwin" || path === "/osx") {
+      return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-linux.sh?t=${Date.now()}`, 302);
+    }
+
     // Termux script redirect (with cache buster)
     if (path === "/termux" || path === "/termux.sh") {
       return Response.redirect(`https://raw.githubusercontent.com/${GITHUB_TARGET}/main/pencarimovie-termux.sh?t=${Date.now()}`, 302);
@@ -94,7 +99,7 @@ export default {
       return Response.redirect(`https://github.com/${GITHUB_TARGET}`, 302);
     }
 
-    return new Response("Not found. Available shortcuts: /win, /linux, /termux, /apk, /github\n", {
+    return new Response("Not found. Available shortcuts: /win, /linux, /mac, /termux, /apk, /github\n", {
       status: 404,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });

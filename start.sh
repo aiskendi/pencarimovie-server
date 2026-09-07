@@ -34,6 +34,11 @@ if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/d
   LAN_IP=$(powershell.exe -Command "route print -4 0.0.0.0 | Select-String '0.0.0.0\s+0.0.0.0' | ForEach-Object { (\$_ -split '\s+')[4] }" 2>/dev/null | tr -d '\r' | head -1)
 fi
 
+# macOS: use ipconfig getifaddr en0 or en1
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+fi
+
 # Standard Linux / Libwrt: use ip route get (avoids listing all adapters)
 if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
   LAN_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')

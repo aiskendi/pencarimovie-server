@@ -48,7 +48,14 @@ detect_target() {
         *) echo "Unsupported architecture: $arch"; exit 1 ;;
       esac
       ;;
-    *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, Android (Termux/APK), and Windows."; exit 1 ;;
+    Darwin)
+      case "$arch" in
+        arm64|aarch64) echo "mac-arm64" ;;
+        x86_64|amd64)  echo "mac-x86_64" ;;
+        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+      esac
+      ;;
+    *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, macOS, Android (Termux/APK), and Windows."; exit 1 ;;
   esac
 }
 
@@ -59,7 +66,10 @@ usage() {
 
 get_lan_ip() {
   local ip=""
-  if command -v ip >/dev/null 2>&1; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+  fi
+  if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
     ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
   fi
   if [ -z "$ip" ] && command -v hostname >/dev/null 2>&1; then

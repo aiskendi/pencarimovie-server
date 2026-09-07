@@ -118,6 +118,9 @@ print_urls() {
   lan_ip="$(get_lan_ip)"
   echo "  Local:    http://127.0.0.1:$PORT"
   [ -n "$lan_ip" ] && echo "  Network:  http://$lan_ip:$PORT"
+  echo "  CLI:      pms [start|stop|restart|uninstall]"
+  echo "  Stop:     pms stop"
+  echo "  Restart:  pms restart"
 }
 
 port_in_use() {
@@ -179,18 +182,33 @@ download_file() {
   fi
 }
 
-# Follow GitHub /releases/latest and return the tag (e.g. v1.0.1).
+# Query GitHub releases API (or redirect location) and return the tag (e.g. v1.6.0).
 fetch_latest_tag() {
-  local loc=""
+  local tag=""
+  # Method 1: GitHub REST API (most reliable across all curl/wget versions)
   if command -v curl >/dev/null 2>&1; then
+    tag="$(curl -fsSL -H "User-Agent: pencarimovie-server" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  fi
+
+  # Method 2: Redirect follow via curl %{url_effective}
+  if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
+    local loc=""
     loc="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
-  elif command -v wget >/dev/null 2>&1; then
+    loc="${loc%$'\r'}"
+    loc="${loc%/}"
+    tag="${loc##*/}"
+  fi
+
+  # Method 3: wget fallback
+  if [ -z "$tag" ] && command -v wget >/dev/null 2>&1; then
+    local loc=""
     loc="$(wget -q --max-redirect=0 --server-response "https://github.com/$REPO/releases/latest" -O /dev/null 2>&1 \
       | awk 'BEGIN{IGNORECASE=1} /^  Location:/{print $2; exit}' | tr -d '\r' || true)"
+    loc="${loc%$'\r'}"
+    loc="${loc%/}"
+    tag="${loc##*/}"
   fi
-  loc="${loc%$'\r'}"
-  loc="${loc%/}"
-  local tag="${loc##*/}"
+
   case "$tag" in
     v[0-9]*) echo "$tag" ;;
     *) return 1 ;;
@@ -369,9 +387,6 @@ do_start() {
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
       print_urls
-      echo "  CLI:      pms [start|stop|restart]"
-      echo "  Stop:     pms stop"
-      echo "  Restart:  pms restart"
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."

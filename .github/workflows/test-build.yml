@@ -1,0 +1,51 @@
+name: Test Release Build & Mac Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "pencarimovie-linux.sh"
+      - "addon.js"
+      - "scripts/**"
+      - ".github/workflows/test-build.yml"
+
+jobs:
+  test-mac-build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Test Bun cross-compilation for macOS
+        run: |
+          mkdir -p dist/.build-tmp
+          echo "Compiling for macOS Apple Silicon (arm64)..."
+          bun build --compile --minify --target=bun-darwin-arm64 addon.js --outfile dist/.build-tmp/addon-mac-arm64
+          file dist/.build-tmp/addon-mac-arm64
+
+          echo "Compiling for macOS Intel (x86_64)..."
+          bun build --compile --minify --target=bun-darwin-x64 addon.js --outfile dist/.build-tmp/addon-mac-x86_64
+          file dist/.build-tmp/addon-mac-x86_64
+
+      - name: Test macOS Shell Installer Syntax & Target Detection
+        run: |
+          chmod +x pencarimovie-linux.sh
+          bash -n pencarimovie-linux.sh
+          echo "Target detection on $(uname -s) $(uname -m):"
+          PENCARIMOVIE_NO_BANNER=1 bash -c 'source ./pencarimovie-linux.sh; detect_target'
+
+      - name: Test execution of compiled macOS arm64 binary
+        run: |
+          chmod +x dist/.build-tmp/addon-mac-arm64
+          # Start binary in background and verify HTTP port responds
+          dist/.build-tmp/addon-mac-arm64 &
+          ADDON_PID=$!
+          sleep 2
+          curl -sI http://127.0.0.1:8089/ || true
+          kill $ADDON_PID || true

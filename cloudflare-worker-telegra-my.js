@@ -6,6 +6,7 @@
  * Installation Shortcuts:
  *   - telegra.my/win    -> Windows installer script (.bat)
  *   - telegra.my/linux  -> Linux installer script (.sh)
+ *   - telegra.my/mac    -> macOS installer script (.sh)
  *   - telegra.my/termux -> Termux Android installer script (.sh)
  *   - telegra.my/apk    -> Standalone Android APK download
  *   - telegra.my/github -> GitHub repository
@@ -16,6 +17,9 @@
  *
  *   Linux:
  *     curl -fsSL telegra.my/linux | bash
+ *
+ *   macOS:
+ *     curl -fsSL telegra.my/mac | bash
  *
  *   Termux:
  *     curl -fsSL telegra.my/termux | bash

@@ -93,6 +93,9 @@ fi
 # tarballs often lose the +x bit, which makes ProcessRunner fail with
 # "Permission denied" when it spawns bin/php.
 chmod u+x "$FRANKENPHP_BIN" "$ROOT_DIR/bin/php" "$ROOT_DIR/bin/addon" 2>/dev/null || true
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  xattr -rd com.apple.quarantine "$ROOT_DIR/bin" 2>/dev/null || true
+fi
 
 ADDON_LOG="$ROOT_DIR/addon.log"
 ADDON_PID_FILE="$ROOT_DIR/.addon.pid"

@@ -65,9 +65,6 @@ if command -v lsof >/dev/null 2>&1; then
   PIDS="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN || true)"
 elif command -v fuser >/dev/null 2>&1; then
   PIDS="$(fuser "$PORT"/tcp 2>/dev/null || true)"
-else
-  echo "Install lsof or fuser to stop by port automatically."
-  exit 1
 fi
 
 if [ -z "${PIDS:-}" ]; then

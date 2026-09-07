@@ -253,6 +253,10 @@ download_extract() {
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"
   strip_crlf "$APP_DIR"
+  # On macOS, clear quarantine flags from downloaded binaries
+  if [ "$(uname -s)" = "Darwin" ]; then
+    xattr -rd com.apple.quarantine "$APP_DIR" 2>/dev/null || true
+  fi
   printf '%s\n' "$tag" > "$APP_DIR/.release-tag"
   rm -rf "$tmp"
 }
@@ -346,10 +350,13 @@ EOF
     fi
   done
 
-  # Ensure ~/.local/bin is in PATH in profile files if not already
-  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.profile" "${HOME:-/root}/.bash_profile"; do
+  # Ensure ~/.local/bin is in PATH in shell profile files if not already
+  for rc in "${HOME:-/root}/.bashrc" "${HOME:-/root}/.profile" "${HOME:-/root}/.bash_profile" "${HOME:-/root}/.zshrc"; do
     if [ -f "$rc" ] && ! grep -q '\.local/bin' "$rc" 2>/dev/null; then
       printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+    elif [ ! -f "$rc" ] && [ "$(basename "$rc")" = ".zshrc" ] && [ "$(uname -s)" = "Darwin" ]; then
+      # macOS default shell is zsh; ensure ~/.zshrc has PATH even if file did not exist
+      printf 'export PATH="$HOME/.local/bin:$PATH"\n' > "$rc" 2>/dev/null || true
     fi
   done
   export PATH="${HOME:-/root}/.local/bin:$PATH"
@@ -456,6 +463,9 @@ do_start() {
     sleep 1
     print_urls
     echo "PencariMovie Server started in the background."
+    if [ "$(uname -s)" = "Darwin" ]; then
+      open "http://127.0.0.1:$PORT" 2>/dev/null || true
+    fi
   fi
 }
 

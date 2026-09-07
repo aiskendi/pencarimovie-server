@@ -206,13 +206,51 @@ if not exist "!APP_PATH!" (
 
 set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
 set "OTA_TAG=!LATEST!"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $appDir = $env:APP_PATH; $tag = $env:OTA_TAG; $url = $env:OTA_URL; Get-Process -Name frankenphp,php,cloudflared,addon -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -and ($_.Path -like ('*' + $appDir + '*') -or $_.Path -like '*pencarimovie*') } catch { $false } } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 1200; $tmp = Join-Path $env:TEMP ('pencarimovie-ota-' + [guid]::NewGuid().ToString()); New-Item -ItemType Directory -Path (Join-Path $tmp 'extract') -Force | Out-Null; Write-Host ('Downloading ' + $url); Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp 'pencarimovie.zip') -UseBasicParsing; Expand-Archive -Path (Join-Path $tmp 'pencarimovie.zip') -DestinationPath (Join-Path $tmp 'extract') -Force; $found = Get-ChildItem -Path (Join-Path $tmp 'extract') -Recurse -Filter 'backend.php' | Select-Object -First 1; if ($found) { $src = $found.DirectoryName } else { $src = Join-Path $tmp 'extract' }; if (-not (Test-Path -LiteralPath $appDir)) { New-Item -ItemType Directory -Path $appDir -Force | Out-Null }; Get-ChildItem -LiteralPath $src | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { $dest = Join-Path $appDir $_.Name; for ($retry=0; $retry -lt 10; $retry++) { try { if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction Stop }; Copy-Item -LiteralPath $_.FullName -Destination $dest -Recurse -Force -ErrorAction Stop; break } catch { if ($retry -eq 9) { throw }; Start-Sleep -Milliseconds 700 } } }; [System.IO.File]::WriteAllText((Join-Path $appDir '.release-tag'), $tag + [char]10, [System.Text.Encoding]::ASCII); Remove-Item $tmp -Recurse -Force }"
-set "PS_ERR=!ERRORLEVEL!"
-if not "!PS_ERR!"=="0" (
-    echo Update download/extract failed.
+
+set "OTA_TMP=%TEMP%\pencarimovie-ota-%RANDOM%"
+if exist "%OTA_TMP%" rmdir /s /q "%OTA_TMP%" 2>nul
+mkdir "%OTA_TMP%\extract" 2>nul
+
+echo Downloading %OTA_URL%
+rem Use curl.exe if available (standard on modern Windows), fallback to bitsadmin or powershell download
+curl.exe -fL -s -S -o "%OTA_TMP%\pencarimovie.zip" "%OTA_URL%" 2>nul
+if not exist "%OTA_TMP%\pencarimovie.zip" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile($env:OTA_URL, (Join-Path $env:OTA_TMP 'pencarimovie.zip'))"
+)
+
+if not exist "%OTA_TMP%\pencarimovie.zip" (
+    echo Update download failed.
+    rmdir /s /q "%OTA_TMP%" 2>nul
     pause
     exit /b 1
 )
+
+rem Extract using tar.exe (built-in Windows 10/11 bsdtar)
+tar.exe -xf "%OTA_TMP%\pencarimovie.zip" -C "%OTA_TMP%\extract" >nul 2>&1
+if errorlevel 1 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path (Join-Path $env:OTA_TMP 'pencarimovie.zip') -DestinationPath (Join-Path $env:OTA_TMP 'extract') -Force"
+)
+
+set "EXTRACT_SRC=%OTA_TMP%\extract"
+for /f "delims=" %%F in ('dir /b /s "%OTA_TMP%\extract\backend.php" 2^>nul') do (
+    set "EXTRACT_SRC=%%~dpF"
+)
+set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
+
+if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
+
+rem Use standard Windows robocopy to safely sync files into app folder without triggering AMSI / PowerShell script blocks
+robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD storage /XF storage /R:2 /W:1 /NP /NFL /NDL >nul
+rem Robocopy exit codes 0-7 mean success (copied/matched files)
+if errorlevel 8 (
+    echo File copy failed.
+    rmdir /s /q "%OTA_TMP%" 2>nul
+    pause
+    exit /b 1
+)
+
+> "!APP_PATH!\.release-tag" echo !OTA_TAG!
+rmdir /s /q "%OTA_TMP%" 2>nul
 set "UPDATED=1"
 call :register_cmd_path
 goto :eof

@@ -1,0 +1,38 @@
+{
+    "name": "danog/tg-dialog-id",
+    "description": "A library to work with Telegram bot API dialog IDs",
+    "type": "library",
+    "license": "Apache-2.0",
+    "autoload": {
+        "psr-4": {
+            "danog\\DialogId\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "danog\\TestDialogId\\": "test/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Daniil Gentili",
+            "email": "daniil@daniil.it"
+        }
+    ],
+    "require": {
+        "php-64bit": ">=8.1"
+    },
+    "require-dev": {
+        "vimeo/psalm": "dev-master",
+        "phpunit/phpunit": "^11.0.9|^10",
+        "amphp/php-cs-fixer-config": "^2.0.1",
+        "infection/infection": "^0.28.1",
+        "danog/phpdoc": "^0.1.22",
+        "amphp/file": "^3.1"
+    },
+    "config": {
+        "allow-plugins": {
+            "infection/extension-installer": true
+        }
+    }
+}

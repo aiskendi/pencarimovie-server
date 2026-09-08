@@ -1,0 +1,11 @@
+infection/
+coverage
+*.mp4
+.vscode
+build
+composer.lock
+vendor
+.php_cs.cache
+coverage
+.phpunit*
+*.cache

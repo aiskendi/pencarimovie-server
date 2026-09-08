@@ -58,6 +58,10 @@ function fd_get_storage_dir(): string
     // FrankenPHP can extract PHP into a temp folder, so __DIR__/storage
     // would lose the Madeline session on restart / next worker.
     $candidates = [];
+    // If running in serverless / Vercel environment where /tmp is the only writable directory
+    if (!empty($_ENV['VERCEL']) || !empty($_SERVER['VERCEL']) || (is_dir('/tmp') && !is_writable(__DIR__))) {
+        $candidates[] = '/tmp/storage';
+    }
     $docRoot = (string) ($_SERVER['DOCUMENT_ROOT'] ?? '');
     if ($docRoot !== '') {
         $candidates[] = rtrim($docRoot, '/\\') . DIRECTORY_SEPARATOR . 'storage';
@@ -140,6 +144,7 @@ define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
 define('FD_DEVICE_ID_PATH', fd_storage_path('storage/device_id.txt'));
 define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));
 define('FD_BOT_POOL_PATH', fd_storage_path('storage/bot_pool.json'));
+define('FD_CATALOG_SETTINGS_PATH', fd_storage_path('storage/catalog_settings.json'));
 
 /**
  * Optional DNS resolution mapping for curl (e.g. "example.com:443:1.2.3.4").
@@ -500,6 +505,78 @@ function fd_pick_pool_bot(): array
     $picked = $validBots[$rrIndex % count($validBots)];
     @file_put_contents($rrFile, (string) (($rrIndex + 1) % count($validBots)), LOCK_EX);
     return $picked;
+}
+
+function fd_auto_provision_guest(): ?array
+{
+    fd_ensure_autoload();
+    $provisionUrl = FD_WP_API_BASE . '/provision-session?_nocache=' . time();
+    $resp = fd_http_json($provisionUrl, [], 'GET', 15);
+
+    if (empty($resp['ok']) || empty($resp['bot_token'])) {
+        fd_log('provision endpoint returned error or incomplete payload', ['resp' => $resp]);
+        return null;
+    }
+
+    $botToken = trim((string) $resp['bot_token']);
+
+    if (!empty($resp['api_secret'])) {
+        fd_save_api_secret((string) $resp['api_secret']);
+    }
+
+    // Forward the encrypted API credentials so fd_boot_madeline decrypts them using $botToken
+    $overrides = [];
+    if (!empty($resp['encrypted_credentials']) && !empty($resp['credentials_iv'])) {
+        $overrides['encrypted_credentials'] = $resp['encrypted_credentials'];
+        $overrides['encryption_iv'] = $resp['credentials_iv'];
+    }
+
+    $targetBotId = !empty($resp['bot_id']) ? (string) $resp['bot_id'] : '';
+
+    // Clean any stale session for this bot before initial login
+    if ($targetBotId !== '') {
+        fd_clear_session($targetBotId);
+    }
+
+    // Capture stray output before boot
+    $diagObLevel = ob_get_level();
+    while (ob_get_level() > 0) {
+        ob_get_clean();
+    }
+    while (ob_get_level() < $diagObLevel) {
+        ob_start();
+    }
+
+    [$madeline, $error] = fd_boot_madeline($botToken, $overrides, $targetBotId);
+
+    if (!$madeline) {
+        fd_log('auto provision fd_boot_madeline failed', ['error' => $error]);
+        return null;
+    }
+
+    try {
+        $self = $madeline->getSelf();
+        $botId = (string) ($self['id'] ?? $targetBotId);
+        $botUsername = (string) ($self['username'] ?? '');
+        $botName = (string) ($self['first_name'] ?? '');
+
+        fd_save_session_meta($botId, $botUsername, $botName);
+        fd_add_pool_bot([
+            'bot_id' => $botId,
+            'bot_username' => $botUsername,
+            'bot_name' => $botName,
+        ]);
+
+        return [
+            'bot_id' => $botId,
+            'bot_username' => $botUsername,
+            'bot_name' => $botName,
+            'madeline' => $madeline,
+        ];
+    } catch (Throwable $e) {
+        fd_log('auto provision getSelf failed', ['error' => $e->getMessage()]);
+        return null;
+    }
 }
 
 function fd_is_cloudflare_tunnel_request(): bool
@@ -1123,6 +1200,7 @@ function fd_resolve_shortcode(string $shortCode, string $botId = ''): array
 function fd_load_madeline_autoload(): ?string
 {
     $candidates = [
+        __DIR__ . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php',
         fd_storage_path('vendor/autoload.php'),
         fd_storage_path('vendor/madelineproto/autoload.php'),
         fd_storage_path('storage/vendor/autoload.php'),
@@ -2338,6 +2416,11 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
             $queryParams['bot_id'] = $activeBotId;
         }
     }
+    // Cloudflare country header detection: pencarimovie.com automatically receives
+    // $_SERVER['HTTP_CF_IPCOUNTRY'] from Cloudflare. If client passes ?country= or CF header exists, forward it.
+    if (empty($queryParams['country']) && !empty($_SERVER['HTTP_CF_IPCOUNTRY'])) {
+        $queryParams['country'] = sanitize_text_field($_SERVER['HTTP_CF_IPCOUNTRY']);
+    }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
     // 1. Try local Bun addon helper proxy on port 8089 (DoH + custom DNS)
@@ -3396,6 +3479,244 @@ function fd_get_device_id(): string
     return $id;
 }
 
+/**
+ * Check if a topkeyword is valid for catalog display (rejecting filler and NSFW words like 'new', 'movie', 'sex', etc.).
+ */
+function fd_is_topkeyword_valid(string $keyword): bool
+{
+    $kw = strtolower(trim($keyword));
+    if ($kw === '' || mb_strlen($kw, 'UTF-8') < 3) {
+        return false;
+    }
+
+    static $banned = [
+        // Generic filler words
+        'new',
+        'movie',
+        'movies',
+        'film',
+        'filem',
+        'music',
+        'song',
+        'songs',
+        'mp3',
+        'latest',
+        'baru',
+        'naya',
+        'putiya',
+        'list',
+        'lists',
+        'start',
+        'search',
+        'audio',
+        'video',
+        'videos',
+        'download',
+        'free',
+        'full',
+        'hd',
+        'online',
+        'watch',
+        'streaming',
+        'series',
+        'episode',
+        'season',
+        'part',
+        'chapter',
+        'test',
+        'bot',
+        'admin',
+        'help',
+        'hi',
+        'hello',
+        'hey',
+        'hai',
+        'helo',
+        'ok',
+        // Adult / NSFW tokens
+        'sex',
+        'sexy',
+        'porn',
+        'bokep',
+        'lucah',
+        'ngentot',
+        'xxx',
+        'hentai',
+        'jav',
+        'adult',
+        'nsfw',
+        'naked',
+        'nude',
+        'colmek',
+        'sange',
+        'tetek',
+    ];
+
+    if (in_array($kw, $banned, true)) {
+        return false;
+    }
+
+    // Also reject if keyword matches single banned token exactly
+    foreach ($banned as $b) {
+        if ($kw === $b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Default catalog definitions that can be toggled on/off or customized.
+ */
+function fd_get_default_catalog_options(): array
+{
+    $options = [
+        // Special catalogs: Popular, Search, Telegram Files enabled by default
+        'top' => ['type' => 'movie', 'group' => 'special', 'name' => 'Popular (Movies)', 'default' => true],
+        'year' => ['type' => 'movie', 'group' => 'special', 'name' => 'New (Movies)', 'default' => false],
+        'pm_search_movie' => ['type' => 'movie', 'group' => 'special', 'name' => 'Search Movies', 'default' => true],
+        'pm_series_top' => ['type' => 'series', 'group' => 'special', 'name' => 'Popular (Series)', 'default' => true],
+        'pm_series_year' => ['type' => 'series', 'group' => 'special', 'name' => 'New (Series)', 'default' => false],
+        'pm_search_series' => ['type' => 'series', 'group' => 'special', 'name' => 'Search Series', 'default' => true],
+        'pm_files_year' => ['type' => 'other', 'group' => 'special', 'name' => 'New (Telegram Files)', 'default' => true],
+        'pm_search_files' => ['type' => 'other', 'group' => 'special', 'name' => 'Telegram Files (Search)', 'default' => true],
+        'pm_trending_keywords' => ['type' => 'other', 'group' => 'special', 'name' => 'Trending Keywords (Files)', 'default' => true],
+        // Movies country/category (default disabled)
+        'pm_movies_malay' => ['type' => 'movie', 'group' => 'country', 'name' => 'Malaysia (Movie)', 'default' => false],
+        'pm_movies_indo' => ['type' => 'movie', 'group' => 'country', 'name' => 'Indonesia (Movie)', 'default' => false],
+        'pm_movies_korean' => ['type' => 'movie', 'group' => 'country', 'name' => 'Korea (Movie)', 'default' => false],
+        'pm_movies_japan' => ['type' => 'movie', 'group' => 'country', 'name' => 'Japan (Movie)', 'default' => false],
+        'pm_movies_anime' => ['type' => 'movie', 'group' => 'country', 'name' => 'Anime (Movie)', 'default' => false],
+        'pm_movies_chinese' => ['type' => 'movie', 'group' => 'country', 'name' => 'China / HK (Movie)', 'default' => false],
+        'pm_movies_thai' => ['type' => 'movie', 'group' => 'country', 'name' => 'Thailand (Movie)', 'default' => false],
+        'pm_movies_bollywood' => ['type' => 'movie', 'group' => 'country', 'name' => 'Bollywood (Movie)', 'default' => false],
+        'pm_movies_philippines' => ['type' => 'movie', 'group' => 'country', 'name' => 'Philippines (Movie)', 'default' => false],
+        'pm_movies_english' => ['type' => 'movie', 'group' => 'country', 'name' => 'English (Movie)', 'default' => false],
+        // Series country/category (default disabled)
+        'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => false],
+        'pm_series_anime' => ['type' => 'series', 'group' => 'country', 'name' => 'Anime (Series)', 'default' => false],
+        'pm_series_japan' => ['type' => 'series', 'group' => 'country', 'name' => 'J-Drama (Series)', 'default' => false],
+        'pm_series_malay' => ['type' => 'series', 'group' => 'country', 'name' => 'Malaysia (Series)', 'default' => false],
+        'pm_series_cdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'C-Drama (Series)', 'default' => false],
+        'pm_series_thai' => ['type' => 'series', 'group' => 'country', 'name' => 'Thailand (Series)', 'default' => false],
+        'pm_series_philippines' => ['type' => 'series', 'group' => 'country', 'name' => 'Philippines (Series)', 'default' => false],
+        'pm_series_english' => ['type' => 'series', 'group' => 'country', 'name' => 'English (Series)', 'default' => false],
+        'pm_series_indo' => ['type' => 'series', 'group' => 'country', 'name' => 'Indonesia (Series)', 'default' => false],
+    ];
+
+    return $options;
+}
+
+/**
+ * Load catalog settings from disk.
+ * Returns:
+ * [
+ *   'catalogs_enabled' => bool (true = catalogs active, false = disable catalogs, streams list only from tt),
+ *   'enabled_types' => ['movie' => true, 'series' => true],
+ *   'enabled_catalogs' => ['pm_movies_latest' => true, ...]
+ * ]
+ */
+function fd_load_catalog_settings(): array
+{
+    $defaults = [
+        'catalogs_enabled' => true,
+        'enabled_types' => [
+            'movie' => true,
+            'series' => true,
+            'other' => true,
+        ],
+        'enabled_catalogs' => [],
+    ];
+    $catalogOptions = fd_get_default_catalog_options();
+    foreach ($catalogOptions as $id => $info) {
+        $defaults['enabled_catalogs'][$id] = !empty($info['default']);
+    }
+
+    $path = FD_CATALOG_SETTINGS_PATH;
+    if (is_file($path)) {
+        $data = json_decode((string) @file_get_contents($path), true);
+        if (is_array($data)) {
+            if (isset($data['catalogs_enabled'])) {
+                $defaults['catalogs_enabled'] = (bool) $data['catalogs_enabled'];
+            }
+            if (!empty($data['enabled_types']) && is_array($data['enabled_types'])) {
+                if (isset($data['enabled_types']['movie'])) {
+                    $defaults['enabled_types']['movie'] = (bool) $data['enabled_types']['movie'];
+                }
+                if (isset($data['enabled_types']['series'])) {
+                    $defaults['enabled_types']['series'] = (bool) $data['enabled_types']['series'];
+                }
+                if (isset($data['enabled_types']['other'])) {
+                    $defaults['enabled_types']['other'] = (bool) $data['enabled_types']['other'];
+                }
+            }
+            if (isset($data['enabled_catalogs']) && is_array($data['enabled_catalogs'])) {
+                foreach ($data['enabled_catalogs'] as $cid => $val) {
+                    $defaults['enabled_catalogs'][$cid] = (bool) $val;
+                }
+            }
+        }
+    }
+
+    return $defaults;
+}
+
+/**
+ * Save catalog settings to disk.
+ */
+function fd_save_catalog_settings(array $settings): bool
+{
+    $path = FD_CATALOG_SETTINGS_PATH;
+    $json = json_encode($settings, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    return @file_put_contents($path, $json, LOCK_EX) !== false;
+}
+
+/**
+ * Detect client/server country from Cloudflare headers in memory.
+ * No local json files or user_id required.
+ *
+ * @return array{country_code: string, country_name: string, source: string}
+ */
+function fd_detect_country(): array
+{
+    $code = strtoupper(trim((string) ($_SERVER['HTTP_CF_IPCOUNTRY'] ?? '')));
+    $source = 'cf-header';
+
+    if ($code === '' || $code === 'XX' || $code === 'T1' || strlen($code) !== 2) {
+        $code = 'MY';
+        $source = 'default';
+    }
+
+    $countryMap = [
+        'MY' => 'Malaysia',
+        'ID' => 'Indonesia',
+        'SG' => 'Singapore',
+        'TH' => 'Thailand',
+        'PH' => 'Philippines',
+        'VN' => 'Vietnam',
+        'KR' => 'Korea',
+        'JP' => 'Japan',
+        'CN' => 'China',
+        'HK' => 'Hong Kong',
+        'TW' => 'Taiwan',
+        'IN' => 'India',
+        'US' => 'United States',
+        'GB' => 'United Kingdom',
+        'AU' => 'Australia',
+        'DE' => 'Germany',
+        'NL' => 'Netherlands',
+        'FR' => 'France',
+        'CA' => 'Canada',
+    ];
+
+    return [
+        'country_code' => $code,
+        'country_name' => $countryMap[$code] ?? $code,
+        'source' => $source,
+    ];
+}
+
 function fd_tunnel_device_id(): string
 {
     return fd_get_device_id();
@@ -4445,9 +4766,10 @@ $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 // ─── Nuvio Addon Routes ──────────────────────────────────────────────────────
-// Support /nuvio, /stremio (alias redirect), and root level (/manifest.json, /catalog/..., /meta/..., /stream/...)
+// Support /nuvio, /stremio (alias redirect), /configure, and root level (/manifest.json, /catalog/..., /meta/..., /stream/...)
 $isNuvioRoute = ($path === '/nuvio' || str_starts_with($path, '/nuvio/')) ||
     ($path === '/stremio' || str_starts_with($path, '/stremio/')) ||
+    $path === '/configure' || $path === '/configure/' ||
     $path === '/manifest.json' ||
     preg_match('#^/(catalog|meta|stream)/#', $path);
 
@@ -4455,6 +4777,12 @@ if ($isNuvioRoute) {
     // Handle redirect for legacy /stremio to /nuvio
     if ($path === '/stremio' || $path === '/stremio/') {
         header('Location: /nuvio', true, 301);
+        exit;
+    }
+
+    // Handle Stremio's standard /configure route -> redirects directly to dashboard with #configure
+    if ($path === '/configure' || $path === '/configure/' || $addonPath === '/configure' || $addonPath === '/configure/') {
+        header('Location: /#configure', true, 302);
         exit;
     }
 
@@ -4475,7 +4803,8 @@ if ($isNuvioRoute) {
     // ── Nuvio Addon Installation / Landing Page ──
     if ($addonPath === '/' && ($path === '/nuvio' || $path === '/nuvio/')) {
         header('Content-Type: text/html; charset=utf-8');
-        $manifestUrl = $baseUrl . '/manifest.json';
+        $randSuffix = '?r=' . random_int(100000, 999999);
+        $manifestUrl = $baseUrl . '/manifest.json' . $randSuffix;
         $lanIp = fd_get_lan_ip();
         $requestHost = (string) (parse_url($baseUrl, PHP_URL_HOST) ?? ($_SERVER['SERVER_ADDR'] ?? '127.0.0.1'));
         $openedViaLan = fd_is_usable_lan_ipv4($requestHost);
@@ -4763,19 +5092,39 @@ if ($isNuvioRoute) {
             'Western',
         ];
 
+        // Release Years for Stremio / Nuvio Discover filter dropdown
+        $currentYear = (int) date('Y');
+        $allYearOptions = [];
+        for ($y = $currentYear; $y >= 2000; $y--) {
+            $allYearOptions[] = (string) $y;
+        }
+
         // Catalog order is the Nuvio/Stremio home-row order.
         // Latest Releases is first so it appears at the top of each type.
         $manifestCatalogs = [
             // Movies Catalogs
             [
                 'type' => 'movie',
-                'id' => 'pm_movies_latest',
-                'name' => 'Latest Releases',
+                'id' => 'top',
+                'name' => 'Popular',
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+            ],
+            [
+                'type' => 'movie',
+                'id' => 'year',
+                'name' => 'New',
+                'genres' => $allYearOptions,
+                'extra' => [
+                    ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
+                    ['name' => 'skip', 'isRequired' => false],
+                ],
+                'extraSupported' => ['genre', 'skip'],
+                'extraRequired' => ['genre'],
             ],
             [
                 'type' => 'movie',
@@ -4785,17 +5134,31 @@ if ($isNuvioRoute) {
                 'extra' => [
                     ['name' => 'search', 'isRequired' => true],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
             [
-                'type' => 'movie',
+                'type' => 'other',
+                'id' => 'pm_files_year',
+                'name' => 'New',
+                'genres' => $allYearOptions,
+                'extra' => [
+                    ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
+                    ['name' => 'skip', 'isRequired' => false],
+                ],
+                'extraSupported' => ['genre', 'skip'],
+                'extraRequired' => ['genre'],
+            ],
+            [
+                'type' => 'other',
                 'id' => 'pm_search_files',
                 'name' => 'Telegram Files',
                 'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
                 'extra' => [
                     ['name' => 'search', 'isRequired' => true],
                     ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4806,6 +5169,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4816,6 +5180,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4826,6 +5191,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4836,6 +5202,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4846,6 +5213,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4856,6 +5224,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4866,6 +5235,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4876,6 +5246,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4886,6 +5257,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4896,6 +5268,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4903,13 +5276,26 @@ if ($isNuvioRoute) {
             // Series Catalogs
             [
                 'type' => 'series',
-                'id' => 'pm_series_latest',
-                'name' => 'Latest Releases',
+                'id' => 'pm_series_top',
+                'name' => 'Popular',
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+            ],
+            [
+                'type' => 'series',
+                'id' => 'pm_series_year',
+                'name' => 'New',
+                'genres' => $allYearOptions,
+                'extra' => [
+                    ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
+                    ['name' => 'skip', 'isRequired' => false],
+                ],
+                'extraSupported' => ['genre', 'skip'],
+                'extraRequired' => ['genre'],
             ],
             [
                 'type' => 'series',
@@ -4919,6 +5305,7 @@ if ($isNuvioRoute) {
                 'extra' => [
                     ['name' => 'search', 'isRequired' => true],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4929,6 +5316,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4939,6 +5327,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4949,6 +5338,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4959,6 +5349,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4969,6 +5360,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4979,6 +5371,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4989,6 +5382,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -4999,6 +5393,7 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
@@ -5009,47 +5404,116 @@ if ($isNuvioRoute) {
                 'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
             ],
         ];
 
+        // Add top keyword catalogs to $manifestCatalogs if trending keywords are available
+        try {
+            $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
+            if (is_array($trending)) {
+                foreach ($trending as $item) {
+                    $kw = trim((string) ($item['keyword'] ?? ''));
+                    if (!fd_is_topkeyword_valid($kw)) continue;
+                    $catId = 'pm_topkw_' . substr(md5(strtolower($kw)), 0, 10);
+                    $manifestCatalogs[] = [
+                        'type' => 'other',
+                        'id' => $catId,
+                        'name' => ucwords($kw),
+                        'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
+                        'extra' => [
+                            ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
+                            ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
+                            ['name' => 'skip', 'isRequired' => false],
+                        ],
+                    ];
+                }
+            }
+        } catch (\Throwable $e) {
+            // Silently skip if trending fetch fails
+        }
+
         $identity = fd_stremio_manifest_identity();
+
+        // Apply Catalog Settings:
+        // 1. If catalogs are disabled: empty catalogs array, remove catalog resource (streams list only from tt).
+        // 2. If enabled: filter catalogs by enabled types (movie/series) and individual category/country selections.
+        $catSettings = fd_load_catalog_settings();
+        $filteredCatalogs = [];
+        $resources = [];
+
+        if (!empty($catSettings['catalogs_enabled'])) {
+            $enabledTypes = $catSettings['enabled_types'] ?? ['movie' => true, 'series' => true, 'other' => true];
+            $enabledCatalogMap = $catSettings['enabled_catalogs'] ?? [];
+
+            $topkwEnabled = !isset($enabledCatalogMap['pm_trending_keywords']) || !empty($enabledCatalogMap['pm_trending_keywords']);
+
+            foreach ($manifestCatalogs as $cat) {
+                $cType = $cat['type'] ?? '';
+                $cId = $cat['id'] ?? '';
+
+                // If this is a top-keyword catalog, check the master toggle 'pm_trending_keywords'
+                if (str_starts_with($cId, 'pm_topkw_')) {
+                    if (!$topkwEnabled) {
+                        continue;
+                    }
+                }
+
+                // Check if media type (movie or series or other) is enabled
+                if (!empty($enabledTypes[$cType])) {
+                    // Check if specific catalog is enabled (defaulting to true if not set)
+                    if (!isset($enabledCatalogMap[$cId]) || !empty($enabledCatalogMap[$cId])) {
+                        $filteredCatalogs[] = $cat;
+                    }
+                }
+            }
+
+            // Determine active types based on enabled catalogs/types
+            $activeTypes = [];
+            if (!empty($enabledTypes['movie'])) $activeTypes[] = 'movie';
+            if (!empty($enabledTypes['series'])) $activeTypes[] = 'series';
+            if (!empty($enabledTypes['other'])) $activeTypes[] = 'other';
+            if (empty($activeTypes)) $activeTypes = ['movie', 'series', 'other'];
+
+            if (!empty($filteredCatalogs)) {
+                $resources[] = [
+                    'name' => 'catalog',
+                    'types' => $activeTypes,
+                ];
+            }
+            $resources[] = [
+                'name' => 'meta',
+                'types' => $activeTypes,
+                'idPrefixes' => ['pm_', 'pm:'],
+            ];
+            $resources[] = [
+                'name' => 'stream',
+                'types' => ['movie', 'series', 'other'],
+                'idPrefixes' => ['pm_', 'pm:', 'tt'],
+            ];
+        } else {
+            // Catalogs disabled: only stream resource remains for tt IDs (and pm_ if directly linked)
+            $filteredCatalogs = [];
+            $resources[] = [
+                'name' => 'stream',
+                'types' => ['movie', 'series', 'other'],
+                'idPrefixes' => ['pm_', 'pm:', 'tt'],
+            ];
+        }
+
         $manifest = [
             'id' => $identity['id'],
             'version' => FD_APP_VERSION,
             'name' => $identity['name'],
             'description' => $identity['description'],
-            // AIOStreams / Stremio 5: put idPrefixes on meta+stream resources so
-            // pm:file: and tt IDs are actually queried. String resources inherit
-            // top-level prefixes on older clients.
-            //
-            // IMPORTANT: 'tt' (IMDb) is intentionally NOT in the meta resource
-            // idPrefixes. Cinemeta owns IMDb metadata; if we claim 'tt' for meta,
-            // Stremio queries OUR /meta/series/ttXXXX.json which returns null and
-            // shows "No metadata was found!". We only claim 'tt' for STREAMS so
-            // Cinemeta provides the detail page and we provide the playable links.
-            'resources' => [
-                [
-                    'name' => 'catalog',
-                    'types' => ['movie', 'series'],
-                ],
-                [
-                    'name' => 'meta',
-                    'types' => ['movie', 'series'],
-                    'idPrefixes' => ['pm_', 'pm:'],
-                ],
-                [
-                    'name' => 'stream',
-                    'types' => ['movie', 'series'],
-                    'idPrefixes' => ['pm_', 'pm:', 'tt'],
-                ],
-            ],
-            'types' => ['movie', 'series'],
+            'resources' => $resources,
+            'types' => ['movie', 'series', 'other'],
             'idPrefixes' => ['pm_', 'pm:', 'tt'],
-            'catalogs' => $manifestCatalogs,
+            'catalogs' => $filteredCatalogs,
             'behaviorHints' => [
-                'configurable' => false,
+                'configurable' => true,
                 'configurationRequired' => false,
                 'adult' => false,
                 'p2p' => false,
@@ -5081,13 +5545,27 @@ if ($isNuvioRoute) {
                 }
             }
         }
-        // Also support query string parameters (?skip=...&genre=...&search=...)
+        // Also support query string parameters (?skip=...&genre=...&year=...&search=...)
         if (isset($_GET['search'])) $extra['search'] = (string)$_GET['search'];
         if (isset($_GET['genre'])) $extra['genre'] = (string)$_GET['genre'];
+        if (isset($_GET['year'])) $extra['year'] = (string)$_GET['year'];
         if (isset($_GET['skip'])) $extra['skip'] = (int)$_GET['skip'];
 
         $searchQuery = $extra['search'] ?? '';
         $genre = $extra['genre'] ?? '';
+        $year = $extra['year'] ?? '';
+
+        // If catalog is a Year catalog (like Cinemeta's year catalog) where 'genre' is a 4-digit year,
+        // map it to $year and default to the current year (2026) when not specified.
+        $isYearCatalog = ($catalogId === 'year' || $catalogId === 'pm_series_year' || $catalogId === 'pm_files_year');
+        if ($isYearCatalog) {
+            if ($year === '' && preg_match('/^\d{4}$/', $genre)) {
+                $year = $genre;
+                $genre = '';
+            } elseif ($year === '') {
+                $year = (string) date('Y');
+            }
+        }
         $skip = (int) ($extra['skip'] ?? 0);
         $limit = ($searchQuery !== '') ? 60 : 24;
 
@@ -5176,16 +5654,113 @@ if ($isNuvioRoute) {
                         $pillLine = !empty($pills) ? implode(' · ', $pills) : 'Ready to stream';
                         $genres = array_values(array_unique(array_merge(['Direct File'], $pills)));
 
+                        // Apply genre/quality filter if selected (e.g. 4K, 1080p, 720p, BluRay, WEB-DL, HEVC)
+                        if ($genre !== '' && !in_array($genre, $genres, true)) {
+                            continue;
+                        }
+
+                        // Apply year filter if selected (e.g. 2026)
+                        if ($year !== '' && !str_contains($fTitle, $year)) {
+                            continue;
+                        }
+
                         $metas[] = [
                             'id' => 'pm_file_' . $fCode,
-                            'type' => 'movie',
+                            'type' => 'other',
                             'name' => $fTitle,
                             'poster' => $fThumb,
-                            'posterShape' => 'landscape',
+                            'posterShape' => 'poster',
                             'description' => "⚡ Direct Telegram File · {$pillLine}\n\n{$fTitle}",
                             'genres' => $genres,
                         ];
                     }
+                }
+            }
+        } elseif ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest' || str_starts_with($catalogId, 'pm_topkw_')) {
+            // ── Telegram Files Catalogs (Year Files / Top Keywords) ──
+            $searchFiles = [];
+            // When a quality or year filter is active, fetch extra candidate files to filter down
+            $fileFetchLimit = ($genre !== '' || $year !== '') ? 100 : 50;
+
+            if ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest') {
+                // Fetch newest files from tg_file_new (or search by year if selected)
+                $latestSearchTerm = ($year !== '') ? $year : '__latest__';
+                $searchFiles = fd_fetch_stream_ajax('search_files', [
+                    'search' => $latestSearchTerm,
+                    'limit' => $fileFetchLimit,
+                    'offset' => $skip,
+                ]);
+            } else {
+                $keywordToSearch = '';
+                if (str_starts_with($catalogId, 'pm_topkw_')) {
+                    // Look up keyword from options
+                    $catOptions = fd_get_default_catalog_options();
+                    if (isset($catOptions[$catalogId]['keyword'])) {
+                        $keywordToSearch = $catOptions[$catalogId]['keyword'];
+                    }
+                }
+
+                if ($keywordToSearch !== '') {
+                    // Fetch files for this specific keyword
+                    $queryTerm = $keywordToSearch;
+                    $searchFiles = fd_fetch_stream_ajax('search_files', [
+                        'search' => $queryTerm,
+                        'limit' => $fileFetchLimit,
+                        'offset' => $skip,
+                    ]);
+                }
+            }
+
+            if (is_array($searchFiles) && isset($searchFiles['files']) && is_array($searchFiles['files'])) {
+                foreach ($searchFiles['files'] as $file) {
+                    $fCode = $file['short_code'] ?? '';
+                    if ($fCode === '') continue;
+                    $fTitle = $file['title'] ?? 'Telegram File';
+                    $fThumb = $file['thumbnail_url'] ?? '';
+                    $fSize = (int) ($file['file_size'] ?? 0);
+
+                    // Extract resolution & format tags
+                    $pills = [];
+                    if (preg_match('/\b(2160p|4[kK]|uhd)\b/i', $fTitle)) $pills[] = '4K';
+                    elseif (preg_match('/\b(1080p|fhd)\b/i', $fTitle)) $pills[] = '1080p';
+                    elseif (preg_match('/\b(720p|hd)\b/i', $fTitle)) $pills[] = '720p';
+                    elseif (preg_match('/\b(480p|360p|sd)\b/i', $fTitle)) $pills[] = 'SD';
+
+                    if (preg_match('/\b(bluray|blu-ray|remux)\b/i', $fTitle)) $pills[] = 'BluRay';
+                    elseif (preg_match('/\b(web-?dl|webrip)\b/i', $fTitle)) $pills[] = 'WEB-DL';
+                    if (preg_match('/\b(hevc|x265|h265)\b/i', $fTitle)) $pills[] = 'HEVC';
+
+                    if ($fSize > 0) $pills[] = fd_format_bytes($fSize);
+
+                    $pillLine = !empty($pills) ? implode(' · ', $pills) : 'Ready to stream';
+                    $primaryLabel = ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest') ? 'Year' : 'Trending File';
+                    $genres = array_values(array_unique(array_merge([$primaryLabel], $pills)));
+
+                    // Apply genre/quality filter if selected (e.g. 4K, 1080p, 720p, BluRay, WEB-DL, HEVC)
+                    if ($genre !== '' && !in_array($genre, $genres, true)) {
+                        continue;
+                    }
+
+                    // Apply year filter if selected (e.g. 2026)
+                    if ($year !== '' && !str_contains($fTitle, $year)) {
+                        continue;
+                    }
+
+                    $descriptionPrefix = match (true) {
+                        $catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest' => "📅 File",
+                        str_starts_with($catalogId, 'pm_topkw_') => "Trending File",
+                        default => "⚡ Direct Telegram File",
+                    };
+
+                    $metas[] = [
+                        'id' => 'pm_file_' . $fCode,
+                        'type' => 'other',
+                        'name' => $fTitle,
+                        'poster' => $fThumb,
+                        'posterShape' => 'poster',
+                        'description' => "{$descriptionPrefix} · {$pillLine}\n\n{$fTitle}",
+                        'genres' => $genres,
+                    ];
                 }
             }
         } else {
@@ -5224,7 +5799,14 @@ if ($isNuvioRoute) {
                 'pm_series_indo' => 'indonesian',
             ];
 
-            if ($catalogId === 'pm_movies_latest' || $catalogId === 'pm_series_latest') {
+            if ($catalogId === 'top' || $catalogId === 'pm_series_top') {
+                // Popular releases - derived from top search keywords filtered by user country
+                $params['category'] = 'popular';
+                $detectedCountry = fd_detect_country();
+                if (!empty($detectedCountry['country_code'])) {
+                    $params['country'] = $detectedCountry['country_code'];
+                }
+            } elseif ($catalogId === 'year' || $catalogId === 'pm_movies_latest' || $catalogId === 'pm_series_year' || $catalogId === 'pm_series_latest') {
                 // Latest releases - no country filter; genre extra still applies.
                 $params['category'] = '';
             } elseif (isset($catalogCategoryMap[$catalogId])) {
@@ -5237,6 +5819,9 @@ if ($isNuvioRoute) {
 
             if ($genre !== '') {
                 $params['genre'] = $genre;
+            }
+            if ($year !== '') {
+                $params['year'] = $year;
             }
 
             $posts = fd_fetch_stream_ajax('posts', $params);
@@ -5354,10 +5939,10 @@ if ($isNuvioRoute) {
 
             $meta = [
                 'id' => $itemId,
-                'type' => 'movie',
+                'type' => 'other',
                 'name' => $cleanTitle,
                 'poster' => $thumb,
-                'posterShape' => 'landscape',
+                'posterShape' => 'poster',
                 'background' => $thumb,
                 'logo' => $thumb,
                 'description' => "⚡ Direct Telegram Cloud File\n" . $pillLine . "\n\n📄 File: " . $cleanTitle,
@@ -5608,14 +6193,20 @@ if ($isNuvioRoute) {
             fd_stremio_json(['streams' => $streams]);
         }
 
-        // If no bot is connected / bot is disconnected, return instructional connect stream card
+        // If no bot is connected / bot is disconnected, attempt auto-provisioning first
         if (!$hasSession || $botIdStr === '') {
-            $streams[] = [
-                'name' => 'PencariMovie',
-                'description' => "Telegram bot not connected\nOpen the dashboard and paste a bot token",
-                'externalUrl' => $baseUrl . '/#settings',
-            ];
-            fd_stremio_json(['streams' => $streams]);
+            $autoProv = fd_auto_provision_guest();
+            if ($autoProv && !empty($autoProv['bot_id'])) {
+                $hasSession = true;
+                $botIdStr = (string) $autoProv['bot_id'];
+            } else {
+                $streams[] = [
+                    'name' => 'PencariMovie',
+                    'description' => "Telegram bot not connected\nOpen the dashboard and paste a bot token",
+                    'externalUrl' => $baseUrl . '/#settings',
+                ];
+                fd_stremio_json(['streams' => $streams]);
+            }
         }
 
         // Collect all target files to stream
@@ -6172,6 +6763,8 @@ if (str_starts_with($path, '/api/')) {
         '/api/bots',
         '/api/tunnel/status',
         '/api/provision',
+        '/api/catalog-settings',
+        '/api/country',
     ];
     if (!in_array($path, $alwaysPublicApi, true)) {
         $allowViaTunnel = fd_is_cloudflare_tunnel_request() && in_array($path, $tunnelReadableApi, true);
@@ -6208,6 +6801,60 @@ if (str_starts_with($path, '/api/')) {
         fd_json(fd_disable_tunnel());
     }
 
+    // ── Catalog settings API ──
+    if ($path === '/api/catalog-settings' && $method === 'GET') {
+        $settings = fd_load_catalog_settings();
+        $catalogOptions = fd_get_default_catalog_options();
+        fd_json([
+            'ok' => 1,
+            'settings' => $settings,
+            'catalog_options' => $catalogOptions,
+        ]);
+    }
+
+    if ($path === '/api/catalog-settings' && $method === 'POST') {
+        $input = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($input)) {
+            fd_json(['ok' => 0, 'error' => 'Invalid JSON input'], 400);
+        }
+
+        $current = fd_load_catalog_settings();
+        if (isset($input['catalogs_enabled'])) {
+            $current['catalogs_enabled'] = (bool) $input['catalogs_enabled'];
+        }
+        if (isset($input['enabled_types']) && is_array($input['enabled_types'])) {
+            if (isset($input['enabled_types']['movie'])) {
+                $current['enabled_types']['movie'] = (bool) $input['enabled_types']['movie'];
+            }
+            if (isset($input['enabled_types']['series'])) {
+                $current['enabled_types']['series'] = (bool) $input['enabled_types']['series'];
+            }
+            if (isset($input['enabled_types']['other'])) {
+                $current['enabled_types']['other'] = (bool) $input['enabled_types']['other'];
+            }
+        }
+        if (isset($input['enabled_catalogs']) && is_array($input['enabled_catalogs'])) {
+            foreach ($input['enabled_catalogs'] as $cid => $val) {
+                $current['enabled_catalogs'][$cid] = (bool) $val;
+            }
+        }
+
+        $saved = fd_save_catalog_settings($current);
+        fd_json([
+            'ok' => $saved ? 1 : 0,
+            'settings' => $current,
+            'message' => $saved ? 'Catalog settings updated successfully' : 'Failed to save settings',
+        ]);
+    }
+
+
+    // ── Country Detection API (reads Cloudflare header in-memory, zero disk footprint) ──
+    if ($path === '/api/country' && $method === 'GET') {
+        fd_json([
+            'ok' => 1,
+            'country' => fd_detect_country(),
+        ]);
+    }
 
     if ($path === '/api/session') {
         $botId = fd_get_bot_id();
@@ -6235,79 +6882,23 @@ if (str_starts_with($path, '/api/')) {
 
     // ── POST /api/provision — auto-provision a guest bot session on the fly ───
     if ($path === '/api/provision' && $method === 'POST') {
-        fd_ensure_autoload();
-        $provisionUrl = FD_WP_API_BASE . '/provision-session?_nocache=' . time();
-        $resp = fd_http_json($provisionUrl, [], 'GET', 15);
-
-        if (empty($resp['ok']) || empty($resp['bot_token'])) {
-            fd_log('provision endpoint returned error or incomplete payload', ['resp' => $resp]);
+        $provisioned = fd_auto_provision_guest();
+        if (!$provisioned) {
             fd_json([
                 'ok' => 0,
-                'message' => $resp['message'] ?? 'Could not obtain guest bot session from server.',
-            ], 404);
+                'message' => 'Could not obtain guest bot session from server.',
+            ], 500);
         }
 
-        $botToken = trim((string) $resp['bot_token']);
-
-        if (!empty($resp['api_secret'])) {
-            fd_save_api_secret((string) $resp['api_secret']);
-        }
-
-        // Forward the encrypted API credentials so fd_boot_madeline decrypts them using $botToken
-        $overrides = [];
-        if (!empty($resp['encrypted_credentials']) && !empty($resp['credentials_iv'])) {
-            $overrides['encrypted_credentials'] = $resp['encrypted_credentials'];
-            $overrides['encryption_iv'] = $resp['credentials_iv'];
-        }
-
-        $targetBotId = !empty($resp['bot_id']) ? (string) $resp['bot_id'] : '';
-
-        // Clean any stale session for this bot before initial login
-        if ($targetBotId !== '') {
-            fd_clear_session($targetBotId);
-        }
-
-        // Capture stray output before boot
-        $diagObLevel = ob_get_level();
-        while (ob_get_level() > 0) {
-            ob_get_clean();
-        }
-        while (ob_get_level() < $diagObLevel) {
-            ob_start();
-        }
-
-        [$madeline, $error] = fd_boot_madeline($botToken, $overrides, $targetBotId);
-
-        if (!$madeline) {
-            fd_log('provision fd_boot_madeline failed', ['error' => $error]);
-            fd_json(['ok' => 0, 'message' => $error ?: 'Failed to initialize guest bot session.'], 500);
-        }
-
-        try {
-            $self = $madeline->getSelf();
-            $botId = (string) ($self['id'] ?? $targetBotId);
-            $botUsername = (string) ($self['username'] ?? '');
-            $botName = (string) ($self['first_name'] ?? '');
-
-            fd_save_session_meta($botId, $botUsername, $botName);
-            fd_add_pool_bot([
-                'bot_id' => $botId,
-                'bot_username' => $botUsername,
-                'bot_name' => $botName,
-            ]);
-
-            fd_json([
-                'ok' => 1,
-                'message' => 'Guest bot session initialized successfully.',
-                'bot_id' => $botId,
-                'bot_username' => $botUsername,
-                'bot_name' => $botName,
-                'api_secret' => fd_get_api_secret(),
-                'pool' => fd_get_bot_pool(),
-            ]);
-        } catch (Throwable $e) {
-            fd_json(['ok' => 0, 'message' => 'Validation failed: ' . $e->getMessage()], 500);
-        }
+        fd_json([
+            'ok' => 1,
+            'message' => 'Guest bot session initialized successfully.',
+            'bot_id' => $provisioned['bot_id'],
+            'bot_username' => $provisioned['bot_username'],
+            'bot_name' => $provisioned['bot_name'],
+            'api_secret' => fd_get_api_secret(),
+            'pool' => fd_get_bot_pool(),
+        ]);
     }
 
     // ── GET /api/bots — list all configured bots in the pool ─────────────────
@@ -6759,6 +7350,12 @@ if (str_starts_with($path, '/api/')) {
                 $queryParams['bot_id'] = $activeBotId;
             }
         }
+        if (empty($queryParams['country'])) {
+            $c = fd_detect_country();
+            if (!empty($c['country_code'])) {
+                $queryParams['country'] = $c['country_code'];
+            }
+        }
         $wpUrl .= '?' . http_build_query($queryParams);
 
         try {
@@ -6820,18 +7417,26 @@ if (str_starts_with($path, '/api/')) {
             'ob_level' => ob_get_level(),
         ]);
 
-        // Fast-fail if Telegram Bot is not connected or disconnected
+        // If Telegram Bot is not connected or session missing, attempt auto-provisioning
         $activeBotId = fd_get_bot_id();
         if (!fd_has_local_session()) {
-            header('Cache-Control: no-cache, no-store, must-revalidate');
-            header('Connection: close');
-            fd_json([
-                'ok' => 0,
-                'message' => 'Telegram Bot is not connected. Please connect your bot token in dashboard settings to stream.',
-                'hint' => 'Open dashboard settings and connect your bot token.',
-                'short_code' => $shortCode,
-                'bot_id' => $botId,
-            ], 403);
+            $autoProv = fd_auto_provision_guest();
+            if ($autoProv && !empty($autoProv['bot_id'])) {
+                $activeBotId = (string) $autoProv['bot_id'];
+                if ($botId === '') {
+                    $botId = $activeBotId;
+                }
+            } else {
+                header('Cache-Control: no-cache, no-store, must-revalidate');
+                header('Connection: close');
+                fd_json([
+                    'ok' => 0,
+                    'message' => 'Telegram Bot is not connected. Please connect your bot token in dashboard settings to stream.',
+                    'hint' => 'Open dashboard settings and connect your bot token.',
+                    'short_code' => $shortCode,
+                    'bot_id' => $botId,
+                ], 403);
+            }
         }
 
         // Build candidate bot list from pool and active bot
@@ -6903,6 +7508,35 @@ if (str_starts_with($path, '/api/')) {
                 }
             }
 
+            // If resolve failed for current candidates, retry with a fresh auto-provisioned guest bot
+            if ($fileId === '' && empty($madeline)) {
+                $retryProv = fd_auto_provision_guest();
+                if ($retryProv && !empty($retryProv['bot_id'])) {
+                    $retryBotId = (string) $retryProv['bot_id'];
+                    $retryRes = fd_resolve_shortcode($shortCode, $retryBotId);
+                    $retryFileId = trim((string) ($retryRes['file_id_mt'] ?? $retryRes['file_id'] ?? ''));
+                    if ($retryFileId !== '') {
+                        [$retryBooted, $retryErr] = fd_boot_madeline(null, [], $retryBotId);
+                        if ($retryBooted) {
+                            $madeline = $retryBooted;
+                            $fileId = $retryFileId;
+                            $fileSize = (int) ($retryRes['file_size'] ?? $fileSize);
+                            $resolvedName = trim((string) ($retryRes['title'] ?? $retryRes['file_name'] ?? ''));
+                            if ($resolvedName !== '') {
+                                $fileName = $resolvedName;
+                            }
+                            $resolvedMime = trim((string) ($retryRes['mime'] ?? ''));
+                            $resolvedType = trim((string) ($retryRes['file_type'] ?? ''));
+                            $fileMime = fd_guess_video_mime(
+                                $fileName,
+                                $resolvedMime !== '' ? $resolvedMime : ($fileMime !== '' ? $fileMime : $resolvedType)
+                            );
+                            $botId = $retryBotId;
+                        }
+                    }
+                }
+            }
+
             if ($fileId === '' && empty($madeline)) {
                 $errMsg = !empty($resolved['message'])
                     ? (string) $resolved['message']
@@ -6950,6 +7584,14 @@ if (str_starts_with($path, '/api/')) {
             [$madeline, $error] = fd_boot_madeline(null, [], $botId);
             if (!$madeline && $botId !== $activeBotId) {
                 [$madeline, $error] = fd_boot_madeline(null, [], '');
+            }
+            if (!$madeline) {
+                // Retry by provisioning a fresh guest session
+                $retryProv = fd_auto_provision_guest();
+                if ($retryProv && !empty($retryProv['bot_id'])) {
+                    $botId = (string) $retryProv['bot_id'];
+                    [$madeline, $error] = fd_boot_madeline(null, [], $botId);
+                }
             }
         }
 

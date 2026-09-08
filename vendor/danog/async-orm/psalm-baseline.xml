@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<files psalm-version="dev-master@02b64e98082db34b325814d4cc98fb65b0908721">
+  <file src="src/Driver/DriverArray.php">
+    <ImplementedParamTypeMismatch>
+      <code><![CDATA[$previous]]></code>
+    </ImplementedParamTypeMismatch>
+    <ImplementedReturnTypeMismatch>
+      <code><![CDATA[DbArray<TTKey, TTValue>]]></code>
+    </ImplementedReturnTypeMismatch>
+  </file>
+  <file src="src/Driver/MemoryArray.php">
+    <DocblockTypeContradiction>
+      <code><![CDATA[$previous instanceof self]]></code>
+    </DocblockTypeContradiction>
+  </file>
+  <file src="src/Internal/Driver/CachedArray.php">
+    <DocblockTypeContradiction>
+      <code><![CDATA[$previous instanceof self]]></code>
+    </DocblockTypeContradiction>
+  </file>
+  <file src="src/Internal/Driver/ObjectArray.php">
+    <DocblockTypeContradiction>
+      <code><![CDATA[$previous instanceof self]]></code>
+    </DocblockTypeContradiction>
+    <MixedArgumentTypeCoercion>
+      <code><![CDATA[$new::getInstance($config, null)]]></code>
+    </MixedArgumentTypeCoercion>
+    <MixedPropertyTypeCoercion>
+      <code><![CDATA[$new::getInstance($config, $previous->cache->inner)]]></code>
+    </MixedPropertyTypeCoercion>
+  </file>
+</files>

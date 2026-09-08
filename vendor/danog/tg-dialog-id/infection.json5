@@ -1,0 +1,22 @@
+{
+    "$schema": "vendor/infection/infection/resources/schema.json",
+    "source": {
+        "directories": [
+            "src"
+        ]
+    },
+    "timeout": 10,
+    "logs": {
+        "text": "infection/infection.log",
+        "html": "infection/infection.html",
+        "summary": "infection/summary.log",
+        "perMutator": "infection/per-mutator.md",
+        "stryker": {
+            "badge": "master"
+        }
+    },
+    "tmpDir": ".infection-cache",
+    "mutators": {
+        "@default": true
+    }
+}

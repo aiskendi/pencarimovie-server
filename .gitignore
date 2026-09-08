@@ -1,7 +1,7 @@
 AGENTS.md
 
 # Dependencies installed locally; release artifacts may bundle vendor/ separately.
-vendor/
+# vendor/
 
 # Bundled native runtime binaries (distributed via GitHub releases, not committed directly)
 bin/*.exe

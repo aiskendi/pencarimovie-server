@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "framework": null,
+  "buildCommand": "echo 'Preparing for Vercel deployment...'",
+  "outputDirectory": "public",
+  "functions": {
+    "api/**/*.php": {
+      "runtime": "vercel-php@0.7.3"
+    },
+    "index.php": {
+      "runtime": "vercel-php@0.7.3"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/manifest\\.json",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/stream/(.*)",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/catalog/(.*)",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/meta/(.*)",
+      "dest": "/index.php"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/public/$1"
+    }
+  ]
+}

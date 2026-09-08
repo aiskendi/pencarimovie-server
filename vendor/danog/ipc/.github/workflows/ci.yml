@@ -1,0 +1,60 @@
+name: Continuous Integration
+
+on:
+  - push
+  - pull_request
+
+jobs:
+  tests:
+    strategy:
+      matrix:
+        include:
+          - operating-system: 'ubuntu-latest'
+            php-version: '8.1'
+
+          - operating-system: 'ubuntu-latest'
+            php-version: '8.2'
+
+          - operating-system: 'ubuntu-latest'
+            php-version: '8.3'
+
+          - operating-system: 'ubuntu-latest'
+            php-version: '8.4'
+
+          - operating-system: 'windows-latest'
+            php-version: '8.1'
+            job-description: 'on Windows'
+
+          - operating-system: 'macos-latest'
+            php-version: '8.1'
+            job-description: 'on macOS'
+
+    name: PHP ${{ matrix.php-version }} ${{ matrix.job-description }}
+
+    runs-on: ${{ matrix.operating-system }}
+
+    steps:
+      - name: Set git to use LF
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+
+      - name: Run tests
+        run: composer update && vendor/bin/phpunit ${{ matrix.phpunit-flags }} --debug
+
+      - name: Run psalm
+        run: vendor/bin/psalm.phar
+
+      - name: Run style fixer
+        env:
+          PHP_CS_FIXER_IGNORE_ENV: 1
+        run: vendor/bin/php-cs-fixer --diff --dry-run -v fix
+        if: runner.os != 'Windows'

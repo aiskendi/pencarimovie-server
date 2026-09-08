@@ -1,0 +1,152 @@
+{
+    "name": "danog/madelineproto",
+    "description": "Async PHP client API for the telegram MTProto protocol.",
+    "type": "library",
+    "license": "AGPL-3.0-only",
+    "homepage": "https://docs.madelineproto.xyz",
+    "keywords": [
+        "telegram",
+        "mtproto",
+        "protocol",
+        "bytes",
+        "messenger",
+        "client",
+        "PHP",
+        "video",
+        "stickers",
+        "audio",
+        "files",
+        "GB"
+    ],
+    "conflict": {
+        "krakjoe/pthreads-polyfill": "*",
+        "ext-pthreads": "*"
+    },
+    "require": {
+        "php-64bit": ">=8.2",
+        "danog/primemodule": "^1.0.13",
+        "symfony/polyfill-mbstring": ">=1.32",
+        "ext-json": "*",
+        "ext-xml": "*",
+        "ext-dom": "*",
+        "ext-filter": "*",
+        "ext-hash": "*",
+        "ext-zlib": "*",
+        "ext-fileinfo": "*",
+        "amphp/amp": "^3.1.1",
+        "amphp/http-client": "^5.3.4",
+        "amphp/websocket-client": "^2.0.2",
+        "amphp/http": "^2.1.2",
+        "amphp/socket": "^2.3.1",
+        "amphp/dns": "^2.4.0",
+        "amphp/byte-stream": "^2.1.2",
+        "amphp/file": "^3.2.0",
+        "amphp/mysql": "^3",
+        "amphp/postgres": "^2.1.1",
+        "danog/dns-over-https": "^1.0.1",
+        "amphp/http-client-cookies": "^2",
+        "danog/tg-file-decoder": "^1.0.2",
+        "league/uri": "^7.5.1",
+        "danog/ipc": "^1.0.1",
+        "amphp/log": "^2",
+        "danog/loop": "^1.1.1",
+        "phpseclib/phpseclib": "^3.0.47",
+        "amphp/redis": "^2.0.3",
+        "psr/http-factory": "^1.1.0",
+        "psr/log": "^3.0.2",
+        "webmozart/assert": "^1.12.1",
+        "bacon/bacon-qr-code": "^3.0.1",
+        "nikic/php-parser": "^5.6.2",
+        "revolt/event-loop": "^1.0.7",
+        "danog/async-orm": "^1.1.4",
+        "danog/telegram-entities": "^1.0.5",
+        "danog/better-prometheus": "^0.1.1",
+        "amphp/http-server": "^3.4.3",
+        "danog/tg-dialog-id": "^2",
+        "symfony/polyfill-php83": "^1.32"
+    },
+    "require-dev": {
+        "quasarstream/webrtc": "^1.0",
+        "ext-ctype": "*",
+        "danog/phpdoc": "^0.1.24",
+        "phpunit/phpunit": "^9.6.29",
+        "amphp/phpunit-util": "^3",
+        "bamarni/composer-bin-plugin": "1.8.2",
+        "symfony/yaml": "^6.4.26",
+        "revolt/event-loop-adapter-react": "^1.1.1",
+        "dg/bypass-finals": "dev-master",
+        "brianium/paratest": "^6.11.1",
+        "vimeo/psalm": "dev-master",
+        "sebastian/diff": "^4.0"
+    },
+    "suggest": {
+        "ext-primemodule": "Install the primemodule and FFI extensions to speed up MadelineProto (https://prime.madelineproto.xyz)",
+        "ext-ffi": "Install the primemodule and FFI extensions to speed up MadelineProto (https://prime.madelineproto.xyz)",
+        "ext-pdo": "Install the pdo extension to store session data on MySQL",
+        "ext-openssl": "Install the openssl extension for faster crypto",
+        "ext-uv": "Install the uv extension to greatly speed up MadelineProto!",
+        "ext-gmp": "Install the gmp extension to speed up authorization",
+        "ext-bcmath": "Install the bcmath extension to speed up authorization"
+    },
+    "authors": [
+        {
+            "name": "Daniil Gentili",
+            "email": "daniil@daniil.it"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "danog\\MadelineProto\\": "src"
+        },
+        "files": [
+            "src/polyfill.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "danog\\MadelineProto\\Test\\": "tests/danog/MadelineProto",
+            "danog\\MadelineProto\\": "tools/"
+        },
+        "files": [
+            "tools/build_docs/schemas.php",
+            "tools/build_docs/merge.php",
+            "tools/build_docs/layerUpgrade.php"
+        ]
+    },
+    "scripts": {
+        "build": [
+            "@docs",
+            "@docs-fix",
+            "@cs-fix",
+            "@fuzz",
+            "@file_ref_map",
+            "@psalm",
+            "@test-light"
+        ],
+        "test": [
+            "@paratest"
+        ],
+        "test-light": [
+            "@paratest-light"
+        ],
+        "cs-fix": "PHP_CS_FIXER_IGNORE_ENV=1 php -d pcre.jit=0 vendor/bin/php-cs-fixer fix -v",
+        "psalm": "psalm --no-cache --threads=10",
+        "docs": "php tools/build_docs.php",
+        "fuzz": "php tools/fuzzer.php",
+        "file_ref_map": "php tools/gen_filerefmap.php",
+        "docs-fix": "tools/fix_docs.sh",
+        "paratest": "@php -dzend.assertions=1 ./vendor/bin/paratest -fv",
+        "paratest-light": "@php -dzend.assertions=1 ./vendor/bin/paratest -fvc phpunit-light.xml",
+        "bin": "echo 'bin not installed'",
+        "post-install-cmd": ["@composer bin all install --ansi"],
+        "post-update-cmd": ["@composer bin all update --ansi"]
+    },
+    "config": {
+        "allow-plugins": {
+            "bamarni/composer-bin-plugin": true,
+            "phabel/phabel": true,
+            "dealerdirect/phpcodesniffer-composer-installer": true,
+            "symfony/thanks": true
+        }
+    }
+}

@@ -23,6 +23,29 @@
       <div class="loading-screen__spinner"></div>
       <p class="loading-screen__text">Connecting...</p>
     </div>
+    <script>
+      // Immediately open configure / settings modal without waiting for scripts or network
+      (function() {
+        var h = window.location.hash;
+        if (h === '#configure' || h === '#addon') {
+          var ls = document.getElementById('loadingScreen');
+          if (ls) ls.style.display = 'none';
+          var am = document.getElementById('addonModal');
+          if (am) {
+            am.classList.remove('hidden');
+            am.setAttribute('aria-hidden', 'false');
+          }
+        } else if (h === '#settings') {
+          var ls = document.getElementById('loadingScreen');
+          if (ls) ls.style.display = 'none';
+          var sg = document.getElementById('settingsGate');
+          if (sg) {
+            sg.classList.remove('hidden');
+            sg.setAttribute('aria-hidden', 'false');
+          }
+        }
+      })();
+    </script>
 
     <!-- ─── Update Required Overlay ──────────────────────────── -->
     <div
@@ -532,6 +555,94 @@
         <p class="settings-gate__desc" id="addonModalDesc">
           Install this addon in Stremio or copy the manifest URL.
         </p>
+
+        <!-- ─── Catalog Settings Card ───────────────────────────── -->
+        <div class="addon-catalog-card" id="addonCatalogCard">
+          <div class="addon-catalog-card__header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="addon-catalog-card__title">🗂️ Catalog Configuration</span>
+              <span id="addonServerCountryBadge" class="addon-catalog-card__badge" style="background: rgba(255,255,255,0.08); color: #ccc;" title="Detected Region (no user_id)">🌍 Detecting...</span>
+            </div>
+            <span class="addon-catalog-card__badge" id="addonCatalogStatusBadge">Enabled</span>
+          </div>
+
+          <!-- Master Toggle / Radio Mode -->
+          <div class="addon-catalog-card__modes" role="radiogroup" aria-label="Catalog mode">
+            <label class="addon-catalog-mode-opt">
+              <input type="radio" name="catalogModeRadio" id="catalogModeEnabled" value="enabled" checked />
+              <div class="addon-catalog-mode-opt__info">
+                <strong>Enabled (Browse & Search)</strong>
+                <span>Home rows + Country/Genre catalogs + Streams</span>
+              </div>
+            </label>
+            <label class="addon-catalog-mode-opt">
+              <input type="radio" name="catalogModeRadio" id="catalogModeDisabled" value="disabled" />
+              <div class="addon-catalog-mode-opt__info">
+                <strong>Disable Catalogs (Streams Only)</strong>
+                <span>No home rows. Streams matched only via IMDb (tt) from Cinemeta</span>
+              </div>
+            </label>
+          </div>
+
+          <!-- Catalog Options Panel (visible when catalogs enabled) -->
+          <div class="addon-catalog-details" id="addonCatalogDetails">
+            <!-- Media Types Filter -->
+            <div class="addon-catalog-section">
+              <div class="addon-catalog-section__label">Media Types:</div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeMovies" checked />
+                  <span>🎬 Movies</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeSeries" checked />
+                  <span>📺 Series</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeOther" checked />
+                  <span>⚡ Telegram Files (Other)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Core Catalogs -->
+            <div class="addon-catalog-section">
+              <div class="addon-catalog-section__label">
+                <span>Core & Telegram Catalogs:</span>
+                <span class="addon-catalog-quick-links">
+                  <button type="button" class="addon-catalog-link-btn" id="catSelectAllSpecialBtn">All</button>
+                  <span>·</span>
+                  <button type="button" class="addon-catalog-link-btn" id="catDeselectAllSpecialBtn">None</button>
+                </span>
+              </div>
+              <div class="addon-catalog-list" id="addonCatalogSpecialList">
+                <!-- Special / Core Catalogs -->
+              </div>
+            </div>
+
+            <!-- Categories & Countries -->
+            <div class="addon-catalog-section" id="addonCatalogCountrySection">
+              <div class="addon-catalog-section__label">
+                <span>Categories & Countries:</span>
+                <span class="addon-catalog-quick-links">
+                  <button type="button" class="addon-catalog-link-btn" id="catSelectAllBtn">All</button>
+                  <span>·</span>
+                  <button type="button" class="addon-catalog-link-btn" id="catDeselectAllBtn">None</button>
+                </span>
+              </div>
+              <div class="addon-catalog-list" id="addonCatalogList">
+                <!-- Country & Category Catalogs -->
+              </div>
+            </div>
+          </div>
+
+          <div class="addon-catalog-save-row">
+            <button type="button" id="catSaveSettingsBtn" class="settings-gate__btn addon-catalog-save-btn">
+              💾 Save Catalog Settings
+            </button>
+            <span id="catSaveStatus" class="addon-catalog-status-msg hidden">Saved!</span>
+          </div>
+        </div>
 
         <!-- Wi-Fi / LAN Manifest Field (Recommended for External Devices) -->
         <div class="settings-gate__field" id="addonLanField">

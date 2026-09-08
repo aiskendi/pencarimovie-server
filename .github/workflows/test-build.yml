@@ -1,4 +1,4 @@
-name: Test Release Build & Mac Installer
+name: Test Release Build & Installers
 
 on:
   workflow_dispatch:
@@ -6,46 +6,58 @@ on:
     branches: [main, master]
     paths:
       - "pencarimovie-linux.sh"
-      - "addon.js"
+      - "pencarimovie-termux.sh"
+      - "backend.php"
       - "scripts/**"
       - ".github/workflows/test-build.yml"
 
 jobs:
-  test-mac-build:
-    runs-on: macos-latest
+  test-installers:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Test Bun cross-compilation for macOS
+      - name: Install PHP
         run: |
-          mkdir -p dist/.build-tmp
-          echo "Compiling for macOS Apple Silicon (arm64)..."
-          bun build --compile --minify --target=bun-darwin-arm64 addon.js --outfile dist/.build-tmp/addon-mac-arm64
-          file dist/.build-tmp/addon-mac-arm64
+          sudo apt-get update
+          sudo apt-get install -y php-cli php-curl php-mbstring
 
-          echo "Compiling for macOS Intel (x86_64)..."
-          bun build --compile --minify --target=bun-darwin-x64 addon.js --outfile dist/.build-tmp/addon-mac-x86_64
-          file dist/.build-tmp/addon-mac-x86_64
+      - name: Validate PHP syntax
+        run: |
+          php -l backend.php
+          php -l router.php
+          php -l index.php
 
-      - name: Test macOS Shell Installer Syntax & Target Detection
+      - name: Test Linux Shell Installer Syntax & Target Detection
         run: |
           chmod +x pencarimovie-linux.sh
           bash -n pencarimovie-linux.sh
           echo "Target detection on $(uname -s) $(uname -m):"
           PENCARIMOVIE_NO_BANNER=1 bash -c 'source ./pencarimovie-linux.sh; detect_target'
 
-      - name: Test execution of compiled macOS arm64 binary
+      - name: Test Termux Shell Installer Syntax
         run: |
-          chmod +x dist/.build-tmp/addon-mac-arm64
-          # Start binary in background and verify HTTP port responds
-          dist/.build-tmp/addon-mac-arm64 &
-          ADDON_PID=$!
-          sleep 2
-          curl -sI http://127.0.0.1:8089/ || true
-          kill $ADDON_PID || true
+          chmod +x pencarimovie-termux.sh
+          bash -n pencarimovie-termux.sh
+
+      - name: Test Server Boot & Manifest Response (Native PHP Mode)
+        run: |
+          PORT=8099 php -S 127.0.0.1:8099 router.php > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          sleep 3
+
+          echo "Testing HTTP response..."
+          HTTP_CODE=$(curl -s -o /tmp/manifest.json -w "%{http_code}" http://127.0.0.1:8099/manifest.json || echo "000")
+          echo "Response code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Server failed to return 200 OK for /manifest.json"
+            cat /tmp/server.log
+            kill $SERVER_PID || true
+            exit 1
+          fi
+
+          echo "Manifest returned successfully:"
+          head -n 20 /tmp/manifest.json
+          kill $SERVER_PID || true

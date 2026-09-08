@@ -102,7 +102,7 @@ do_stop() {
   echo "Stopping PencariMovie Server..."
 
   local pid=""
-  for pid_file in "$APP_DIR/.frankenphp.pid" "$APP_DIR/.php-server.pid" "$APP_DIR/.addon.pid"; do
+  for pid_file in "$APP_DIR/.frankenphp.pid" "$APP_DIR/.php-server.pid"; do
     if [ -f "$pid_file" ]; then
       pid="$(cat "$pid_file" 2>/dev/null || true)"
       if [ -n "$pid" ]; then
@@ -115,22 +115,15 @@ do_stop() {
 
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
-  pkill -9 -f "addon\.js" 2>/dev/null || true
-  pkill -9 -f "bin/addon" 2>/dev/null || true
-  pkill -9 -f "node.*addon" 2>/dev/null || true
-  pkill -9 -f "bun.*addon" 2>/dev/null || true
 
   if command -v lsof >/dev/null 2>&1; then
-    local pids_8089 pids_port
-    pids_8089="$(lsof -ti tcp:8089 -sTCP:LISTEN 2>/dev/null || true)"
-    [ -n "$pids_8089" ] && kill -9 $pids_8089 2>/dev/null || true
+    local pids_port
     pids_port="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
     [ -n "$pids_port" ] && kill -9 $pids_port 2>/dev/null || true
   fi
 
   if command -v fuser >/dev/null 2>&1; then
     fuser -k -9 "$PORT"/tcp 2>/dev/null || true
-    fuser -k -9 8089/tcp 2>/dev/null || true
   fi
 
   rm -f "$APP_DIR/.frankenphp.pid"
@@ -396,9 +389,7 @@ do_start() {
   for FILE in \
     "$FRANKENPHP_BIN" \
     "$ROOT_DIR/bin/php" \
-    "$ROOT_DIR/bin/addon" \
     "$ROOT_DIR/backend.php" \
-    "$ROOT_DIR/addon.js" \
     "$ROOT_DIR/index.php" \
     "$ROOT_DIR/router.php" \
     "$ROOT_DIR/start.sh" \
@@ -409,50 +400,6 @@ do_start() {
       chmod u+x "$FILE" 2>/dev/null || true
     fi
   done
-
-  # Start Addon server in background (port 8089)
-  ADDON_LOG="$ROOT_DIR/addon.log"
-  ADDON_PID_FILE="$ROOT_DIR/.addon.pid"
-
-  echo "Checking Addon service..."
-  local addon_started=0
-  if [ -x "$ROOT_DIR/bin/addon" ]; then
-    echo "Starting Addon service (bin/addon)..."
-    nohup "$ROOT_DIR/bin/addon" >"$ADDON_LOG" 2>&1 &
-    echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-    addon_started=1
-  elif [ -f "$ROOT_DIR/addon.js" ]; then
-    if command -v bun >/dev/null 2>&1; then
-      echo "Starting Addon service (bun addon.js)..."
-      nohup bun "$ROOT_DIR/addon.js" >"$ADDON_LOG" 2>&1 &
-      echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-      addon_started=1
-    elif command -v node >/dev/null 2>&1; then
-      echo "Starting Addon service (node addon.js)..."
-      nohup node "$ROOT_DIR/addon.js" >"$ADDON_LOG" 2>&1 &
-      echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-      addon_started=1
-    fi
-  fi
-
-  if [ "$addon_started" -eq 1 ]; then
-    local addon_ready=0
-    for _ in 1 2 3 4 5; do
-      if command -v curl >/dev/null 2>&1 && curl -s -m 1 http://127.0.0.1:8089/ >/dev/null 2>&1; then
-        addon_ready=1
-        break
-      fi
-      sleep 0.4
-    done
-    if [ "$addon_ready" -eq 1 ]; then
-      echo "✓ Addon service is running on http://127.0.0.1:8089"
-    elif [ -s "$ADDON_LOG" ]; then
-      echo "Notice: Addon service log output:"
-      cat "$ADDON_LOG"
-    fi
-  else
-    echo "Warning: Neither bin/addon nor nodejs/bun found. Addon service not started."
-  fi
 
   register_cli
   if [ -t 1 ]; then

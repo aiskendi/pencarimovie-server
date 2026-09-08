@@ -24,32 +24,6 @@ if command -v pkill >/dev/null 2>&1 && [ -n "$TUNNEL_CONFIG" ]; then
 fi
 rm -f "$ROOT_DIR/storage/tunnel/state.json" 2>/dev/null || true
 
-echo "Stopping Addon service on 0.0.0.0:8089..."
-
-if [ -f "$ROOT_DIR/.addon.pid" ]; then
-  ADDON_PID="$(cat "$ROOT_DIR/.addon.pid" 2>/dev/null || true)"
-  if [ -n "${ADDON_PID:-}" ] && kill -0 "$ADDON_PID" 2>/dev/null; then
-    echo "Killing Addon process PID $ADDON_PID"
-    kill "$ADDON_PID" 2>/dev/null || true
-    kill -9 "$ADDON_PID" 2>/dev/null || true
-  fi
-  rm -f "$ROOT_DIR/.addon.pid" 2>/dev/null || true
-fi
-
-pkill -9 -f "addon\.js" 2>/dev/null || true
-pkill -9 -f "bin/addon" 2>/dev/null || true
-pkill -9 -f "node.*addon" 2>/dev/null || true
-pkill -9 -f "bun.*addon" 2>/dev/null || true
-
-if command -v lsof >/dev/null 2>&1; then
-  ADDON_PIDS="$(lsof -ti tcp:8089 -sTCP:LISTEN 2>/dev/null || true)"
-  [ -n "$ADDON_PIDS" ] && kill -9 $ADDON_PIDS 2>/dev/null || true
-fi
-
-if command -v fuser >/dev/null 2>&1; then
-  fuser -k -9 8089/tcp 2>/dev/null || true
-fi
-
 for PID_FILE in "$ROOT_DIR/.frankenphp.pid" "$ROOT_DIR/.php-server.pid"; do
   if [ -f "$PID_FILE" ]; then
     PID="$(cat "$PID_FILE" 2>/dev/null || true)"

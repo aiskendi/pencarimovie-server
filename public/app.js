@@ -48,7 +48,7 @@ class PencariMovieApp {
     this._cachePrefix = 'pencarimovie_cache:';
 
     // Session state
-    this.version = '1.7.0';
+    this.version = '1.8.0';
     this.botId = '';
     this.botUsername = '';
     this.botName = '';
@@ -78,6 +78,28 @@ class PencariMovieApp {
   async init() {
     this.detectTelegram();
     this.bindGlobalEvents();
+
+    // ── Instant Modal Opening if requested by hash (zero waiting) ──
+    const initHash = window.location.hash;
+    if (initHash === '#configure' || initHash === '#addon') {
+      const loader = document.getElementById('loadingScreen');
+      if (loader) loader.style.display = 'none';
+      const addonM = document.getElementById('addonModal');
+      if (addonM) {
+        addonM.classList.remove('hidden');
+        addonM.setAttribute('aria-hidden', 'false');
+      }
+      this.openAddonModal?.();
+    } else if (initHash === '#settings') {
+      const loader = document.getElementById('loadingScreen');
+      if (loader) loader.style.display = 'none';
+      const sGate = document.getElementById('settingsGate');
+      if (sGate) {
+        sGate.classList.remove('hidden');
+        sGate.setAttribute('aria-hidden', 'false');
+      }
+      this.showSettingsGate({ forceToken: false });
+    }
 
     // ── Version check — block everything if update is required ──
     try {
@@ -193,8 +215,13 @@ class PencariMovieApp {
           if (addBotsStatus) addBotsStatus.textContent = tokenAddResult.message;
         }
       } else if (hash === '#settings') {
-        await this.loadInitialData();
+        // Instant show settings card without waiting for initial catalog/media data
         this.showSettingsGate({ forceToken: !this.botId });
+        this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
+      } else if (hash === '#configure' || hash === '#addon') {
+        // Instant show addon / configure modal immediately
+        this.openAddonModal?.();
+        this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
       } else if (hash.startsWith('#file/')) {
         const shortCode = hash.replace('#file/', '');
         // Load main page data in background so it's rendered when user goes back
@@ -352,6 +379,264 @@ class PencariMovieApp {
     const stremioSyncInstallBtn = this.$('#stremioSyncInstallBtn');
     const stremioSyncStatus = this.$('#stremioSyncStatus');
 
+    // ── Catalog settings elements ──
+    const catalogModeEnabled = this.$('#catalogModeEnabled');
+    const catalogModeDisabled = this.$('#catalogModeDisabled');
+    const addonCatalogDetails = this.$('#addonCatalogDetails');
+    const addonCatalogStatusBadge = this.$('#addonCatalogStatusBadge');
+    const catTypeMovies = this.$('#catTypeMovies');
+    const catTypeSeries = this.$('#catTypeSeries');
+    const catTypeOther = this.$('#catTypeOther');
+    const addonCatalogSpecialList = this.$('#addonCatalogSpecialList');
+    const addonCatalogList = this.$('#addonCatalogList');
+    const catSelectAllSpecialBtn = this.$('#catSelectAllSpecialBtn');
+    const catDeselectAllSpecialBtn = this.$('#catDeselectAllSpecialBtn');
+    const catSelectAllBtn = this.$('#catSelectAllBtn');
+    const catDeselectAllBtn = this.$('#catDeselectAllBtn');
+    const catSaveSettingsBtn = this.$('#catSaveSettingsBtn');
+    const catSaveStatus = this.$('#catSaveStatus');
+
+    let catalogSettingsState = {
+      catalogs_enabled: true,
+      enabled_types: { movie: true, series: true },
+      enabled_catalogs: {}
+    };
+    let catalogOptionsState = {};
+
+    const renderCatalogOptions = () => {
+      if (addonCatalogSpecialList) addonCatalogSpecialList.innerHTML = '';
+      if (addonCatalogList) addonCatalogList.innerHTML = '';
+
+      const moviesActive = !!(catTypeMovies && catTypeMovies.checked);
+      const seriesActive = !!(catTypeSeries && catTypeSeries.checked);
+      const otherActive = !!(catTypeOther && catTypeOther.checked);
+
+      Object.entries(catalogOptionsState).forEach(([id, info]) => {
+        // Filter display based on media type checkbox
+        if (info.type === 'movie' && !moviesActive) return;
+        if (info.type === 'series' && !seriesActive) return;
+        if (info.type === 'other' && !otherActive) return;
+
+        const isChecked = catalogSettingsState.enabled_catalogs[id] !== false;
+
+        const label = document.createElement('label');
+        label.className = 'addon-catalog-item';
+        label.title = info.name;
+
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.value = id;
+        chk.checked = isChecked;
+
+        chk.addEventListener('change', () => {
+          catalogSettingsState.enabled_catalogs[id] = chk.checked;
+        });
+
+        const span = document.createElement('span');
+        span.textContent = info.name;
+
+        label.appendChild(chk);
+        label.appendChild(span);
+
+        if (info.group === 'special') {
+          if (addonCatalogSpecialList) addonCatalogSpecialList.appendChild(label);
+        } else {
+          if (addonCatalogList) addonCatalogList.appendChild(label);
+        }
+      });
+    };
+
+    const updateCatalogModeUI = () => {
+      const isEnabled = catalogSettingsState.catalogs_enabled;
+      if (catalogModeEnabled) catalogModeEnabled.checked = isEnabled;
+      if (catalogModeDisabled) catalogModeDisabled.checked = !isEnabled;
+
+      if (addonCatalogDetails) {
+        addonCatalogDetails.classList.toggle('hidden', !isEnabled);
+      }
+      if (addonCatalogStatusBadge) {
+        if (isEnabled) {
+          addonCatalogStatusBadge.textContent = 'Enabled';
+          addonCatalogStatusBadge.classList.remove('disabled');
+        } else {
+          addonCatalogStatusBadge.textContent = 'Disabled (tt only)';
+          addonCatalogStatusBadge.classList.add('disabled');
+        }
+      }
+    };
+
+    const addonServerCountryBadge = this.$('#addonServerCountryBadge');
+
+    const loadServerCountry = async () => {
+      try {
+        const res = await this.requestJson(`${this.localApiBase}/api/country`);
+        if (res?.ok && res?.country) {
+          const c = res.country;
+          if (addonServerCountryBadge) {
+            addonServerCountryBadge.textContent = `🌍 ${c.country_name || c.country_code}`;
+            addonServerCountryBadge.title = `Detected region: ${c.country_name} (${c.country_code}) via ${c.source}`;
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to detect server country:', err);
+      }
+    };
+
+    const loadCatalogSettings = async () => {
+      loadServerCountry();
+      try {
+        const res = await this.requestJson(`${this.localApiBase}/api/catalog-settings`);
+        if (res?.ok) {
+          catalogSettingsState = res.settings || catalogSettingsState;
+          catalogOptionsState = res.catalog_options || catalogOptionsState;
+
+          if (catTypeMovies) {
+            catTypeMovies.checked = catalogSettingsState.enabled_types?.movie !== false;
+          }
+          if (catTypeSeries) {
+            catTypeSeries.checked = catalogSettingsState.enabled_types?.series !== false;
+          }
+          if (catTypeOther) {
+            catTypeOther.checked = catalogSettingsState.enabled_types?.other !== false;
+          }
+
+          updateCatalogModeUI();
+          renderCatalogOptions();
+        }
+      } catch (err) {
+        console.warn('Failed to load catalog settings:', err);
+      }
+    };
+
+    if (catalogModeEnabled) {
+      catalogModeEnabled.addEventListener('change', () => {
+        catalogSettingsState.catalogs_enabled = true;
+        updateCatalogModeUI();
+      });
+    }
+
+    if (catalogModeDisabled) {
+      catalogModeDisabled.addEventListener('change', () => {
+        catalogSettingsState.catalogs_enabled = false;
+        updateCatalogModeUI();
+      });
+    }
+
+    // Also support clicking anywhere on the mode option card
+    const modeOpts = document.querySelectorAll('.addon-catalog-mode-opt');
+    modeOpts.forEach((opt) => {
+      opt.addEventListener('click', (e) => {
+        const radio = opt.querySelector('input[type="radio"]');
+        if (radio && e.target !== radio) {
+          radio.checked = true;
+          catalogSettingsState.catalogs_enabled = (radio.value === 'enabled');
+          updateCatalogModeUI();
+        }
+      });
+    });
+
+    if (catTypeMovies) {
+      catTypeMovies.addEventListener('change', () => {
+        if (!catalogSettingsState.enabled_types) catalogSettingsState.enabled_types = {};
+        catalogSettingsState.enabled_types.movie = catTypeMovies.checked;
+        renderCatalogOptions();
+      });
+    }
+
+    if (catTypeSeries) {
+      catTypeSeries.addEventListener('change', () => {
+        if (!catalogSettingsState.enabled_types) catalogSettingsState.enabled_types = {};
+        catalogSettingsState.enabled_types.series = catTypeSeries.checked;
+        renderCatalogOptions();
+      });
+    }
+
+    if (catTypeOther) {
+      catTypeOther.addEventListener('change', () => {
+        if (!catalogSettingsState.enabled_types) catalogSettingsState.enabled_types = {};
+        catalogSettingsState.enabled_types.other = catTypeOther.checked;
+        renderCatalogOptions();
+      });
+    }
+
+    const bindSelectDeselect = (selectAllBtn, deselectAllBtn, container) => {
+      if (selectAllBtn) {
+        selectAllBtn.addEventListener('click', () => {
+          const checkboxes = container ? container.querySelectorAll('input[type="checkbox"]') : [];
+          checkboxes.forEach((c) => {
+            c.checked = true;
+            catalogSettingsState.enabled_catalogs[c.value] = true;
+          });
+        });
+      }
+      if (deselectAllBtn) {
+        deselectAllBtn.addEventListener('click', () => {
+          const checkboxes = container ? container.querySelectorAll('input[type="checkbox"]') : [];
+          checkboxes.forEach((c) => {
+            c.checked = false;
+            catalogSettingsState.enabled_catalogs[c.value] = false;
+          });
+        });
+      }
+    };
+
+    bindSelectDeselect(catSelectAllSpecialBtn, catDeselectAllSpecialBtn, addonCatalogSpecialList);
+    bindSelectDeselect(catSelectAllBtn, catDeselectAllBtn, addonCatalogList);
+
+    if (catSaveSettingsBtn) {
+      catSaveSettingsBtn.addEventListener('click', async () => {
+        catSaveSettingsBtn.disabled = true;
+        const origText = catSaveSettingsBtn.textContent;
+        catSaveSettingsBtn.textContent = 'Saving...';
+        try {
+          // Read state directly from radio and inputs
+          const isEnabled = catalogModeDisabled && catalogModeDisabled.checked ? false : !!(catalogModeEnabled && catalogModeEnabled.checked);
+          catalogSettingsState.catalogs_enabled = isEnabled;
+
+          const payload = {
+            catalogs_enabled: isEnabled,
+            enabled_types: {
+              movie: !!(catTypeMovies && catTypeMovies.checked),
+              series: !!(catTypeSeries && catTypeSeries.checked),
+              other: !!(catTypeOther && catTypeOther.checked)
+            },
+            enabled_catalogs: catalogSettingsState.enabled_catalogs
+          };
+          const res = await fetch(`${this.localApiBase}/api/catalog-settings`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const resData = await res.json().catch(() => null);
+          if (res.ok && resData?.ok) {
+            catalogSettingsState = resData.settings || payload;
+            updateCatalogModeUI();
+            // Trigger real-time reload of streaming app UI using the updated manifest.json
+            this.loadInitialData().catch((e) => console.warn('Failed to refresh data after catalog save:', e));
+
+            if (catSaveStatus) {
+              catSaveStatus.textContent = isEnabled ? '✓ Saved! Catalogs enabled.' : '✓ Saved! Streams only (tt).';
+              catSaveStatus.classList.remove('hidden', 'error');
+              setTimeout(() => catSaveStatus.classList.add('hidden'), 3000);
+            }
+          } else {
+            throw new Error(resData?.error || resData?.message || 'Failed to save');
+          }
+        } catch (err) {
+          console.error('Save catalog settings error:', err);
+          if (catSaveStatus) {
+            catSaveStatus.textContent = `✕ ${err.message || 'Error saving settings'}`;
+            catSaveStatus.classList.remove('hidden');
+            catSaveStatus.classList.add('error');
+            setTimeout(() => catSaveStatus.classList.add('hidden'), 3000);
+          }
+        } finally {
+          catSaveSettingsBtn.disabled = false;
+          catSaveSettingsBtn.textContent = origText;
+        }
+      });
+    }
+
     const isUsableLanHost = (host) => {
       const value = String(host || '').trim();
       if (!value || value === 'localhost' || value === '::1') {
@@ -378,12 +663,13 @@ class PencariMovieApp {
       const pagePort = Number(window.location.port);
       const httpPort = (!onTunnel && pagePort > 0) ? pagePort : listenPort;
       const portSuffix = httpPort && httpPort !== 80 ? `:${httpPort}` : '';
-      const localUrl = `http://127.0.0.1${portSuffix}/manifest.json`;
+      const randParam = `?r=${Math.floor(Math.random() * 900000 + 100000)}`;
+      const localUrl = `http://127.0.0.1${portSuffix}/manifest.json${randParam}`;
       const pageHost = window.location.hostname;
       const lanHost = isUsableLanHost(this.lanIp)
         ? this.lanIp
         : (isUsableLanHost(pageHost) ? pageHost : '');
-      const lanUrl = lanHost ? `http://${lanHost}${portSuffix}/manifest.json` : '';
+      const lanUrl = lanHost ? `http://${lanHost}${portSuffix}/manifest.json${randParam}` : '';
       let tunnelUrl = String(this.tunnelUrl || '').replace(/\/+$/, '');
       if (onTunnel) {
         if (this.tunnelPublicUrl) {
@@ -392,7 +678,7 @@ class PencariMovieApp {
           tunnelUrl = window.location.origin.replace(/\/+$/, '');
         }
       }
-      const tunnelManifest = tunnelUrl ? `${tunnelUrl}/manifest.json` : '';
+      const tunnelManifest = tunnelUrl ? `${tunnelUrl}/manifest.json${randParam}` : '';
       return { localUrl, lanUrl, tunnelManifest, lanHost };
     };
 
@@ -487,18 +773,23 @@ class PencariMovieApp {
 
     const openAddonModal = () => {
       if (addonModal) {
+        // 1. Instant reveal modal and cached/default inputs immediately
+        updateAddonModalUrls();
+        addonModal.classList.remove('hidden');
+        addonModal.setAttribute('aria-hidden', 'false');
+        if (copiedStatus) copiedStatus.classList.add('hidden');
+
+        // 2. Fetch fresh network, tunnel, and catalog states asynchronously in background
+        loadCatalogSettings();
         this.loadLanIp().finally(() => {
           updateAddonModalUrls();
         });
         this.loadTunnelStatus().finally(() => {
           updateAddonModalUrls();
         });
-        updateAddonModalUrls();
-        addonModal.classList.remove('hidden');
-        addonModal.setAttribute('aria-hidden', 'false');
-        if (copiedStatus) copiedStatus.classList.add('hidden');
       }
     };
+    this.openAddonModal = openAddonModal;
 
     if (addonBtn) {
       addonBtn.addEventListener('click', openAddonModal);
@@ -512,11 +803,19 @@ class PencariMovieApp {
       });
     }
 
-    if (addonClose && addonModal) {
-      addonClose.addEventListener('click', () => {
+    const closeAddonModal = () => {
+      if (addonModal) {
         addonModal.classList.add('hidden');
         addonModal.setAttribute('aria-hidden', 'true');
-      });
+        if (window.location.hash === '#configure' || window.location.hash === '#addon') {
+          history.replaceState(null, '', window.location.pathname);
+        }
+      }
+    };
+    this.closeAddonModal = closeAddonModal;
+
+    if (addonClose) {
+      addonClose.addEventListener('click', closeAddonModal);
     }
 
     const showCopiedFeedback = (msg = '✓ Copied to clipboard!') => {
@@ -2157,17 +2456,41 @@ class PencariMovieApp {
     if (loadingEl) loadingEl.classList.remove('hidden');
 
     try {
-      // When slug is 'latest' (the pseudo-category for "Latest Releases"),
-      // omit the category param so the backend uses direct WP_Query
-      // instead of the Manticore search path.
-      const params = {
-        limit: PAGE_SIZE,
-        offset: this._categoryOffset
-      };
-      if (this._categorySlug !== 'latest') {
-        params.category = this._categorySlug;
+      const catObj = this.categories.find(c => c.slug === this._categorySlug);
+      let posts = [];
+
+      if (catObj && catObj.is_topkw) {
+        // Direct file catalog (e.g. top keyword file row)
+        const q = catObj.search_query || '';
+        const sfRes = await this.fetchStream('search_files', {
+          search: q,
+          limit: PAGE_SIZE,
+          offset: this._categoryOffset
+        }).catch(() => null);
+
+        if (sfRes?.files && Array.isArray(sfRes.files)) {
+          posts = sfRes.files.map(f => ({
+            id: f.short_code,
+            short_code: f.short_code,
+            title: f.title || 'Telegram File',
+            thumbnail_url: f.thumbnail_url || '',
+            is_file: true,
+            file_size: f.file_size
+          }));
+        }
+      } else {
+        const params = {
+          limit: PAGE_SIZE,
+          offset: this._categoryOffset
+        };
+        if (this._categorySlug !== 'latest') {
+          params.category = this._categorySlug;
+        }
+        if (catObj?.media_type) {
+          params.media_type = catObj.media_type;
+        }
+        posts = await this.fetchStream('posts', params);
       }
-      const posts = await this.fetchStream('posts', params);
 
       if (!Array.isArray(posts) || posts.length === 0) {
         this._categoryHasMore = false;
@@ -2192,14 +2515,35 @@ class PencariMovieApp {
         newCards.forEach((card) => {
           card.setAttribute('data-bound', 'true');
           card.addEventListener('click', () => {
+            const shortCode = card.getAttribute('data-short-code');
+            if (shortCode) {
+              this.openFileDetail(shortCode);
+              return;
+            }
             const postId = card.getAttribute('data-post-id');
             if (postId) {
               const postData = posts.find((p) => String(p.id) === postId || String(p.ID) === postId);
               if (postData) {
-                this.openModal(postData);
+                if (postData.is_file || postData.short_code) {
+                  this.openFileDetail(postData.short_code || postData.id);
+                } else {
+                  this.openModal(postData);
+                }
               } else {
                 this.openModal({ id: postId, post_title: card.getAttribute('data-post-title') || 'Details' });
               }
+            }
+          });
+        });
+
+        // Also bind file cards if any
+        const newFileCards = grid.querySelectorAll('.stream-file-card:not([data-bound])');
+        newFileCards.forEach((card) => {
+          card.setAttribute('data-bound', 'true');
+          card.addEventListener('click', () => {
+            const shortCode = card.getAttribute('data-short-code');
+            if (shortCode) {
+              this.openFileDetail(shortCode);
             }
           });
         });
@@ -2223,6 +2567,9 @@ class PencariMovieApp {
    * Render a single post card for the category page grid.
    */
   _renderCategoryPostCard(item) {
+    if (item.is_file || item.short_code) {
+      return this._renderFileCard(item);
+    }
     const title = item.title || item.post_title || 'Untitled';
     const thumbnail = item.thumbnail_url || item._external_featured_image || '';
     const category = item.category || '';
@@ -2388,18 +2735,121 @@ class PencariMovieApp {
     this.showLoading(true);
 
     try {
-      const [trendingData, categoriesData, latestData] = await Promise.all([
+      // Fetch /manifest.json in parallel with WordPress streaming metadata
+      // so categories, rows, and home feeds react directly to manifest changes
+      const [trendingData, categoriesData, latestData, manifestData] = await Promise.all([
         this.fetchStream('trending', { limit: 10 }).catch(() => []),
         this.fetchStream('categories').catch(() => []),
-        this.fetchStream('posts', { limit: 12 }).catch(() => [])
+        this.fetchStream('posts', { limit: 12 }).catch(() => []),
+        this.requestJson(`${this.localApiBase}/manifest.json`).catch(() => null)
       ]);
 
+      this.manifest = manifestData && typeof manifestData === 'object' ? manifestData : null;
       this.trending = Array.isArray(trendingData) ? trendingData : [];
-      this.categories = Array.isArray(categoriesData) ? categoriesData : [];
+      
+      const defaultCategories = Array.isArray(categoriesData) ? categoriesData : [];
+
+      // If manifest is available, align app categories and rows with manifest.catalogs
+      if (this.manifest) {
+        const rawCatalogs = Array.isArray(this.manifest.catalogs) ? this.manifest.catalogs : [];
+        if (rawCatalogs.length === 0) {
+          // Catalogs disabled in manifest
+          this.categories = [];
+        } else {
+          // Build category list from enabled manifest catalogs (excluding search/telegram files)
+          const derivedCategories = [];
+          const seenSlugs = new Set();
+
+          rawCatalogs.forEach((cat) => {
+            const id = cat.id || '';
+            // Skip search, special, and telegram-only catalogs from category rows
+            if (id === 'pm_search_movie' || id === 'pm_search_series' || id === 'pm_search_files') {
+              return;
+            }
+            if (id === 'pm_files_year' || id === 'pm_files_latest') {
+              return;
+            }
+            if (id === 'year' || id === 'pm_series_year' || id === 'pm_movies_latest' || id === 'pm_series_latest') {
+              return;
+            }
+
+            // Map catalog IDs to WordPress category slugs
+            const catMap = {
+              'top': { slug: 'popular', name: 'Popular Movies' },
+              'pm_series_top': { slug: 'popular', name: 'Popular Series' },
+              'pm_movies_malay': { slug: 'malay', name: 'Malay Movies' },
+              'pm_movies_indo': { slug: 'indonesian', name: 'Indonesian Movies' },
+              'pm_movies_korean': { slug: 'korea', name: 'Korean Movies' },
+              'pm_movies_japan': { slug: 'japan', name: 'Japanese Movies' },
+              'pm_movies_anime': { slug: 'anime', name: 'Anime Movies' },
+              'pm_movies_chinese': { slug: 'china', name: 'Chinese Movies' },
+              'pm_movies_thai': { slug: 'thai', name: 'Thai Movies' },
+              'pm_movies_bollywood': { slug: 'bollywood', name: 'Bollywood Movies' },
+              'pm_movies_philippines': { slug: 'filipino', name: 'Filipino Movies' },
+              'pm_movies_english': { slug: 'english', name: 'English Movies' },
+              'pm_series_kdrama': { slug: 'korea', name: 'K-Drama' },
+              'pm_series_anime': { slug: 'anime', name: 'Anime Series' },
+              'pm_series_japan': { slug: 'japan', name: 'J-Drama' },
+              'pm_series_malay': { slug: 'malay', name: 'Malay Series' },
+              'pm_series_cdrama': { slug: 'china', name: 'C-Drama' },
+              'pm_series_thai': { slug: 'thai', name: 'Thai Series' },
+              'pm_series_philippines': { slug: 'filipino', name: 'Filipino Series' },
+              'pm_series_english': { slug: 'english', name: 'English Series' },
+              'pm_series_indo': { slug: 'indonesian', name: 'Indonesian Series' }
+            };
+
+            let info = catMap[id];
+            let isTopKw = false;
+            let topKwQuery = '';
+
+            if (!info) {
+              if (id.startsWith('pm_topkw_')) {
+                isTopKw = true;
+                topKwQuery = (cat.name || '').replace(/^🔥\s*/, '').trim();
+                info = { slug: `search_${id}`, name: cat.name || topKwQuery };
+              } else if (id === 'pm_files_year' || id === 'pm_files_latest') {
+                isTopKw = true;
+                topKwQuery = '__latest__';
+                info = { slug: 'new_files', name: cat.name || 'New' };
+              } else {
+                info = { slug: id.replace(/^pm_(movies|series)_/, ''), name: cat.name || id };
+              }
+            }
+
+            const key = `${info.slug}-${cat.type || ''}`;
+            if (!seenSlugs.has(key)) {
+              seenSlugs.add(key);
+              derivedCategories.push({
+                name: cat.name || info.name,
+                slug: info.slug,
+                media_type: cat.type,
+                catalog_id: id,
+                is_topkw: isTopKw,
+                search_query: topKwQuery
+              });
+            }
+          });
+
+          this.categories = derivedCategories.length > 0 ? derivedCategories : defaultCategories;
+        }
+      } else {
+        this.categories = defaultCategories;
+      }
 
       // Store posts by category for lazy loading
       if (Array.isArray(latestData)) {
         this.posts['latest'] = latestData;
+      }
+
+      // Check if hero/latest should be shown based on manifest
+      const manifestsHasLatest = !this.manifest || (Array.isArray(this.manifest.catalogs) && this.manifest.catalogs.some(c => c.id === 'top' || c.id === 'pm_series_top' || c.id === 'year' || c.id === 'pm_series_year' || c.id === 'pm_movies_latest' || c.id === 'pm_series_latest'));
+      const heroSection = this.$('#streamHero');
+      if (heroSection) {
+        if (!manifestsHasLatest && this.categories.length === 0) {
+          heroSection.classList.add('hidden');
+        } else {
+          heroSection.classList.remove('hidden');
+        }
       }
 
       // Render
@@ -2670,15 +3120,48 @@ class PencariMovieApp {
 
     let html = '';
 
-    // "Latest" row
-    if (Array.isArray(this.posts['latest']) && this.posts['latest'].length > 0) {
-      html += this._buildTrackHtml('latest', 'Latest Releases', this.posts['latest']);
+
+    // If catalogs are disabled in manifest and no categories exist, show minimal informative placeholder
+    if (this.manifest && Array.isArray(this.manifest.catalogs) && this.manifest.catalogs.length === 0) {
+      html += `
+        <div style="padding: 40px 20px; text-align: center; color: rgba(255,255,255,0.6);">
+          <div style="font-size: 2rem; margin-bottom: 12px;">⚡</div>
+          <h3 style="color: #fff; margin-bottom: 8px;">Catalogs are currently disabled</h3>
+          <p style="max-width: 480px; margin: 0 auto; font-size: 0.88rem; line-height: 1.5;">
+            Addon is configured for streams only via IMDb (tt) IDs from Cinemeta. You can search files or enable catalogs in Addon Settings.
+          </p>
+        </div>
+      `;
     }
 
-    // Category rows
+    // Category & Keyword rows
     for (const cat of this.categories) {
       try {
-        const posts = await this.fetchStream('posts', { category: cat.slug, limit: 10 });
+        let posts = [];
+        if (cat.is_topkw) {
+          // If this is a top-keyword files catalog, search files
+          const q = cat.search_query || '';
+          const sfRes = await this.fetchStream('search_files', { search: q, limit: 10 }).catch(() => null);
+          if (sfRes?.files && Array.isArray(sfRes.files) && sfRes.files.length > 0) {
+            posts = sfRes.files.map((f) => ({
+              id: f.short_code,
+              short_code: f.short_code,
+              title: f.title || 'Telegram File',
+              thumbnail_url: f.thumbnail_url || '',
+              thumbnail: f.thumbnail_url || '',
+              is_file: true,
+              file_size: f.file_size,
+              size: f.file_size
+            }));
+          }
+        } else {
+          const params = { category: cat.slug, limit: 10 };
+          if (cat.media_type) {
+            params.media_type = cat.media_type;
+          }
+          posts = await this.fetchStream('posts', params);
+        }
+
         if (Array.isArray(posts) && posts.length > 0) {
           this.posts[cat.slug] = posts;
           html += this._buildTrackHtml(cat.slug, cat.name, posts);
@@ -2718,15 +3201,17 @@ class PencariMovieApp {
       }
 
       // File card clicks → File Detail Page
-      const card = e.target.closest('.stream-file-card');
-      if (card) {
-        const shortCode = card.getAttribute('data-short-code');
+      const fileCard = e.target.closest('.stream-file-card, .stream-card[data-short-code]');
+      if (fileCard) {
+        const shortCode = fileCard.getAttribute('data-short-code');
         if (shortCode) {
           this.openFileDetail(shortCode);
+          return;
         }
       }
+
       // Post card clicks → Modal
-      const postCard = e.target.closest('.stream-card');
+      const postCard = e.target.closest('.stream-card:not([data-short-code])');
       if (postCard) {
         const postId = postCard.getAttribute('data-post-id');
         if (postId) {
@@ -2752,7 +3237,12 @@ class PencariMovieApp {
   }
 
   _buildTrackHtml(trackId, title, items) {
-    const cards = items.map((item) => this._renderCard(item)).join('');
+    const cards = items.map((item) => {
+      if (item && (item.is_file || item.short_code)) {
+        return this._renderFileCard(item);
+      }
+      return this._renderCard(item);
+    }).join('');
     return `
       <div class="stream-content-row" id="row-${trackId}">
         <div class="stream-content-row__header">
@@ -2806,31 +3296,27 @@ class PencariMovieApp {
     const fileSize = file.file_size || 0;
     const thumbnail = file.thumbnail_url || '';
 
-    let partBadge = '';
+    let metaParts = [];
     if (file.is_split_part) {
       const pNum = String(file.part_num).padStart(2, '0');
       const totalStr = file.total_parts ? `/${String(file.total_parts).padStart(2, '0')}` : '';
-      partBadge = `<span class="stream-file-card__badge" style="background:var(--accent,#ff6b35);color:#fff;">Part ${pNum}${totalStr}</span>`;
+      metaParts.push(`Part ${pNum}${totalStr}`);
     }
+    if (fileType) {
+      metaParts.push(fileType.toUpperCase());
+    }
+    if (fileSize > 0) {
+      metaParts.push(this.formatSize(fileSize));
+    }
+    const metaLine = metaParts.join(' · ');
 
     return `
-      <div class="stream-file-card" data-short-code="${this.escapeHtml(shortCode)}"${file.is_combined_parts ? ' data-combined="1"' : ''} title="${this.escapeHtml(title)}">
-        <div class="stream-file-card__thumb"${thumbnail ? ' style="background-image:url(' + thumbnail + ');background-size:cover;"' : ''}>
-          ${!thumbnail ? '<i class="fas fa-film"></i>' : ''}
-          <div class="stream-file-card__overlay">
-            <button class="stream-file-card__play"><i class="fas fa-play"></i></button>
-          </div>
-        </div>
-        <div class="stream-file-card__info">
-          <div class="stream-file-card__title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
-          <div class="stream-file-card__meta">
-            ${partBadge}
-            <span class="stream-file-card__badge">${this.escapeHtml(fileType || 'file')}</span>
-            <span class="stream-file-card__size">${this.formatSize(fileSize)}</span>
-          </div>
-        </div>
-        <div class="stream-file-card__action">
-          <button class="stream-file-card__btn"><i class="fas fa-chevron-right"></i></button>
+      <div class="stream-card stream-card--file" data-short-code="${this.escapeHtml(shortCode)}"${file.is_combined_parts ? ' data-combined="1"' : ''} data-post-title="${this.escapeHtml(title)}" title="${this.escapeHtml(rawTitle)}">
+        <img class="stream-card__thumb" src="${thumbnail || ''}" alt="${this.escapeHtml(title)}" loading="lazy"
+             onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22158%22><rect fill=%22%232a2a2a%22 width=%22280%22 height=%22158%22/><text fill=%22%23808080%22 x=%22140%22 y=%2279%22 text-anchor=%22middle%22 font-size=%2214%22>${this.escapeHtml(title)}</text></svg>'">
+        <div class="stream-card__overlay">
+          <div class="stream-card__title">${this.escapeHtml(title)}</div>
+          <div class="stream-card__meta">${this.escapeHtml(metaLine)}</div>
         </div>
       </div>
     `;
@@ -3276,37 +3762,7 @@ class PencariMovieApp {
         }
       }
 
-      // 2. Try local Bun JS addon engine proxy on port 8089 (with built-in DoH stack)
-      if (!data || !data.ok) {
-        try {
-          const addonResolveUrl = new URL('http://127.0.0.1:8089/resolve-file');
-          addonResolveUrl.searchParams.set('short_code', shortCode);
-          if (this.botId) addonResolveUrl.searchParams.set('bot_id', this.botId);
-          const ctrl = new AbortController();
-          const tId = setTimeout(() => ctrl.abort(), 6000);
-          try {
-            const res = await fetch(addonResolveUrl.toString(), {
-              headers: {
-                'X-API-Secret': this.apiSecret || '',
-                'X-App-Version': this.version || '1.4.0'
-              },
-              signal: ctrl.signal
-            });
-            if (res.ok) {
-              const resData = await res.json();
-              if (resData && resData.ok) {
-                data = resData;
-              }
-            }
-          } finally {
-            clearTimeout(tId);
-          }
-        } catch (err) {
-          // Ignore and fallback to local PHP backend
-        }
-      }
-
-      // 3. Fallback to local backend proxy if browser-direct didn't resolve
+      // 2. Fallback to local backend proxy if browser-direct didn't resolve
       if (!data || !data.ok) {
         const resolveUrl = new URL(`${this.localApiBase}/api/resolve-shortcode`);
         resolveUrl.searchParams.set('short_code', shortCode);
@@ -3588,7 +4044,9 @@ class PencariMovieApp {
 
   _checkHash() {
     const hash = window.location.hash;
-    if (hash === '#settings') {
+    if (hash === '#configure' || hash === '#addon') {
+      this.openAddonModal?.();
+    } else if (hash === '#settings') {
       this.showSettingsGate({ forceToken: !this.botId });
     } else if (hash.startsWith('#post/')) {
       const postId = hash.replace('#post/', '');
@@ -3611,6 +4069,9 @@ class PencariMovieApp {
       if (this._isCategoryPageOpen) this.closeCategoryPage();
       if (this.isModalOpen) this.closeModal();
       if (this.isFileDetailOpen()) this.closeFileDetail();
+      this.closeAddonModal?.();
+    } else if (hash === '#configure' || hash === '#addon') {
+      this.openAddonModal?.();
     } else if (hash === '#settings') {
       this.showSettingsGate({ forceToken: !this.botId });
     } else if (hash.startsWith('#category/')) {

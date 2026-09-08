@@ -5,14 +5,6 @@ set PORT=8088
 for %%I in ("%~dp0.") do set "ROOT=%%~fI"
 
 echo Stopping PencariMovie Server on %HOST%:%PORT%...
-echo Stopping Addon service on 0.0.0.0:8089...
-
-rem Stop Addon on port 8089 if running
-for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:8089 127.0.0.1:8089 [::]:8089" ^| findstr "LISTENING"') do (
-  echo Killing addon process PID %%P
-  taskkill /PID %%P /F >nul 2>nul
-)
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*addon*' -or ($_.CommandLine -and ($_.CommandLine -like '*addon.js*' -or $_.CommandLine -like '*addon.exe*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 
 for /f "tokens=5" %%P in ('netstat -ano 2^>nul ^| findstr "0.0.0.0:%PORT% 127.0.0.1:%PORT% [::]:%PORT%" ^| findstr "LISTENING"') do (
   echo Killing process PID %%P

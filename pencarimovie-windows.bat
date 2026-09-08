@@ -129,13 +129,8 @@ ping 127.0.0.1 -n 3 >nul
 goto start
 
 :stop_quiet
-rem Kill port 8089 (Addon)
-powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8089 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }" >nul 2>nul
-
 rem Kill port %PORT% (Server)
 powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }" >nul 2>nul
-
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*addon*' -or ($_.CommandLine -and ($_.CommandLine -like '*addon.js*' -or $_.CommandLine -like '*addon.exe*')) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 
 rem Kill any leftover FrankenPHP or PHP CLI IPC processes that may be holding DLL locks (e.g. php_curl.dll)
 powershell -NoProfile -Command "Get-Process -Name frankenphp,php -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like '*pencarimovie*' } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }" >nul 2>nul

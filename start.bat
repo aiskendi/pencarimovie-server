@@ -51,24 +51,6 @@ endlocal
 goto :eof
 
 :start_server_hidden
-if exist "%ROOT%\bin\addon.exe" (
-  if exist "%ROOT%\start-hidden.ps1" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath "%ROOT%\bin\addon.exe" -CommandLine ""
-  ) else (
-    start "PencariMovie Addon" /MIN "%ROOT%\bin\addon.exe"
-  )
-) else if exist "%ROOT%\addon.js" (
-  bun --version >nul 2>nul
-  if not errorlevel 1 (
-    start "PencariMovie Addon" /MIN bun "%ROOT%\addon.js"
-  ) else (
-    node --version >nul 2>nul
-    if not errorlevel 1 (
-      start "PencariMovie Addon" /MIN node "%ROOT%\addon.js"
-    )
-  )
-)
-
 if exist "%FRANKENPHP_EXE%" (
   if exist "%ROOT%\start-hidden.ps1" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath "%FRANKENPHP_EXE%" -CommandLine "php-server --listen %HOST%:%PORT% --root ""%ROOT%"""

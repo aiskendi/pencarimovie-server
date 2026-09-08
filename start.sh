@@ -92,30 +92,9 @@ fi
 # Ensure the IPC worker wrapper and runtime are executable. Windows-created
 # tarballs often lose the +x bit, which makes ProcessRunner fail with
 # "Permission denied" when it spawns bin/php.
-chmod u+x "$FRANKENPHP_BIN" "$ROOT_DIR/bin/php" "$ROOT_DIR/bin/addon" 2>/dev/null || true
+chmod u+x "$FRANKENPHP_BIN" "$ROOT_DIR/bin/php" 2>/dev/null || true
 if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   xattr -rd com.apple.quarantine "$ROOT_DIR/bin" 2>/dev/null || true
-fi
-
-ADDON_LOG="$ROOT_DIR/addon.log"
-ADDON_PID_FILE="$ROOT_DIR/.addon.pid"
-
-if ! command -v curl >/dev/null 2>&1 || ! curl -s -m 1 http://127.0.0.1:8089/ >/dev/null 2>&1; then
-  if [ -x "$ROOT_DIR/bin/addon" ]; then
-    echo "Starting Addon service on port 8089..."
-    nohup "$ROOT_DIR/bin/addon" >"$ADDON_LOG" 2>&1 &
-    echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-  elif [ -f "$ROOT_DIR/addon.js" ]; then
-    if command -v bun >/dev/null 2>&1; then
-      echo "Starting Addon service with bun on port 8089..."
-      nohup bun "$ROOT_DIR/addon.js" >"$ADDON_LOG" 2>&1 &
-      echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-    elif command -v node >/dev/null 2>&1; then
-      echo "Starting Addon service with node on port 8089..."
-      nohup node "$ROOT_DIR/addon.js" >"$ADDON_LOG" 2>&1 &
-      echo $! > "$ADDON_PID_FILE" 2>/dev/null || true
-    fi
-  fi
 fi
 
 if [ -x "$FRANKENPHP_BIN" ]; then

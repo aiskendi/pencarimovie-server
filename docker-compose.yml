@@ -9,7 +9,5 @@ services:
       - "8088:8088"
     environment:
       - PORT=8088
-      - ADDON_PORT=8089
-      - ADDON_HOST=127.0.0.1
     volumes:
       - ./storage:/app/storage

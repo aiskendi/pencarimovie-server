@@ -6,9 +6,8 @@ FROM debian:bookworm-slim
 
 ARG TARGETARCH
 
-# Install runtime dependencies (Node.js for addon.js, ca-certificates, curl, procps)
+# Install runtime dependencies (ca-certificates, curl, procps)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nodejs \
     ca-certificates \
     curl \
     procps \
@@ -34,7 +33,7 @@ RUN set -e; \
         tar -xzf "$TAR_PATH" -C /app; \
     else \
         echo "Release tarball not found at $TAR_PATH, copying workspace files directly..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/repo/addon.js /tmp/repo/warmup-ipc.php /app/ 2>/dev/null || true; \
+        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/repo/warmup-ipc.php /app/ 2>/dev/null || true; \
         if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /app/; fi; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /app/; fi; \
         mkdir -p /app/bin; \
@@ -48,8 +47,7 @@ RUN set -e; \
     fi; \
     rm -rf /tmp/repo; \
     mkdir -p /app/storage; \
-    chmod +x /app/bin/frankenphp /app/bin/php 2>/dev/null || true; \
-    if [ -f "/app/bin/addon" ]; then chmod +x /app/bin/addon 2>/dev/null || true; fi
+    chmod +x /app/bin/frankenphp /app/bin/php 2>/dev/null || true
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

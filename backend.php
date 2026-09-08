@@ -756,28 +756,7 @@ function fd_http_get_contents(string $url, array $options = []): string|false
         $headers[] = 'User-Agent: pencarimovie-server/' . FD_APP_VERSION;
     }
 
-    // Prefer curl — it has reliable SSL handling on Windows PHP 8.5
-    // 1. Try local Bun addon helper proxy first if target is WordPress or Cinemeta (bypasses all local DNS & cURL blocks)
-    if (str_contains($url, 'pencarimovie.com') || str_contains($url, 'v3-cinemeta.strem.io')) {
-        $addonPort = (int) ($_SERVER['ADDON_PORT'] ?? ($_ENV['ADDON_PORT'] ?? 8089));
-        $proxyUrl = 'http://127.0.0.1:' . $addonPort . '/proxy?url=' . urlencode($url);
-
-        $ctx = @stream_context_create([
-            'http' => [
-                'method' => $method,
-                'timeout' => min($timeout, 8),
-                'header' => implode("\r\n", $headers) . "\r\n",
-                'content' => $body !== '' ? $body : null,
-                'ignore_errors' => true,
-            ],
-        ]);
-        $bunRes = @file_get_contents($proxyUrl, false, $ctx);
-        if (is_string($bunRes) && $bunRes !== '') {
-            return $bunRes;
-        }
-    }
-
-    // 2. Direct cURL fallback
+    // Direct cURL fetch
     if (function_exists('curl_version')) {
         $ch = curl_init();
         // Build base curl options
@@ -815,6 +794,9 @@ function fd_http_get_contents(string $url, array $options = []): string|false
             $resolveEntries[] = 'pencarimovie.com:443:172.67.149.53';
             $resolveEntries[] = 'pencarimovie.com:80:104.21.47.164';
             $resolveEntries[] = 'pencarimovie.com:80:172.67.149.53';
+            // Default Cloudflare Anycast IPs for v3-cinemeta.strem.io
+            $resolveEntries[] = 'v3-cinemeta.strem.io:443:104.17.88.107';
+            $resolveEntries[] = 'v3-cinemeta.strem.io:443:104.17.89.107';
         }
         $curlOpts[CURLOPT_RESOLVE] = $resolveEntries;
 

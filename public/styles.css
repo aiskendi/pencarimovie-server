@@ -230,6 +230,225 @@
   text-align: left;
 }
 
+/* ─── Catalog Settings Card Styles ─── */
+.addon-catalog-card {
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  text-align: left;
+}
+
+.addon-catalog-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.addon-catalog-card__title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.addon-catalog-card__badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(0, 210, 106, 0.15);
+  color: #00d26a;
+}
+
+.addon-catalog-card__badge.disabled {
+  background: rgba(255, 107, 53, 0.18);
+  color: #ff8a5b;
+}
+
+.addon-catalog-card__modes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.addon-catalog-mode-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.addon-catalog-mode-opt:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.addon-catalog-mode-opt:has(input:checked) {
+  border-color: var(--accent, #ff6b35);
+  background: rgba(255, 107, 53, 0.12);
+}
+
+.addon-catalog-mode-opt input {
+  margin-top: 3px;
+  accent-color: var(--accent, #ff6b35);
+}
+
+.addon-catalog-mode-opt__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.addon-catalog-mode-opt__info strong {
+  font-size: 0.84rem;
+  color: #fff;
+}
+
+.addon-catalog-mode-opt__info span {
+  font-size: 0.74rem;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.addon-catalog-details {
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  padding-top: 10px;
+  margin-top: 8px;
+}
+
+.addon-catalog-details.hidden {
+  display: none !important;
+}
+
+.addon-catalog-section {
+  margin-bottom: 12px;
+}
+
+.addon-catalog-section__label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 6px;
+}
+
+.addon-catalog-quick-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.addon-catalog-link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.72rem;
+  color: #ff8a5b;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.addon-catalog-pill-group {
+  display: flex;
+  gap: 8px;
+}
+
+.addon-catalog-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  user-select: none;
+}
+
+.addon-catalog-pill:has(input:checked) {
+  border-color: #00d26a;
+  background: rgba(0, 210, 106, 0.12);
+  color: #fff;
+}
+
+.addon-catalog-pill input {
+  accent-color: #00d26a;
+}
+
+.addon-catalog-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+}
+
+.addon-catalog-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  font-size: 0.74rem;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.addon-catalog-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.addon-catalog-item:has(input:checked) {
+  border-color: rgba(255, 107, 53, 0.5);
+  background: rgba(255, 107, 53, 0.1);
+  color: #fff;
+}
+
+.addon-catalog-item input {
+  accent-color: var(--accent, #ff6b35);
+}
+
+.addon-catalog-save-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.addon-catalog-save-btn {
+  padding: 8px 16px;
+  font-size: 0.82rem;
+  width: auto;
+  margin-top: 0;
+}
+
+.addon-catalog-status-msg {
+  font-size: 0.78rem;
+  color: #00d26a;
+  font-weight: 600;
+}
+
+.addon-catalog-status-msg.error {
+  color: #ff4757;
+}
+
 .addon-stremio-sync {
   margin-top: 8px;
   padding: 14px 16px;
@@ -1170,6 +1389,10 @@
   aspect-ratio: 16 / 9;
   width: 100%;
   border-radius: 6px;
+}
+
+.category-page .stream-file-card {
+  width: 100%;
 }
 
 /* Responsive grid */

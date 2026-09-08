@@ -67,6 +67,9 @@ function fd_get_storage_dir(): string
         if (!is_dir($tmpStorage)) {
             @mkdir($tmpStorage, 0777, true);
         }
+        if (class_exists('\\danog\\MadelineProto\\Magic', false)) {
+            \danog\MadelineProto\Magic::$script_cwd = $tmpStorage;
+        }
         return $storageDir = $tmpStorage;
     }
 
@@ -1249,6 +1252,14 @@ function fd_ensure_autoload(): bool
     while (ob_get_level() > $level) {
         ob_end_clean();
     }
+
+    if ($result !== null && class_exists('\\danog\\MadelineProto\\Magic')) {
+        // Fix MadelineProto writing MadelineProto.log to read-only app directory on Vercel
+        $storageDir = fd_get_storage_dir();
+        \danog\MadelineProto\Magic::$script_cwd = $storageDir;
+        ini_set('error_log', $storageDir . DIRECTORY_SEPARATOR . 'MadelineProto.log');
+    }
+
     return $result !== null;
 }
 
@@ -1692,6 +1703,12 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
         ->setApiId($apiId)
         ->setApiHash($apiHash);
     $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::NOTICE);
+
+    // MadelineProto defaults to writing MadelineProto.log to Magic::$script_cwd (read-only /var/task/... on Vercel).
+    // Point it to the writable storage directory.
+    $madelineLogPath = fd_storage_path('storage/MadelineProto.log');
+    $settings->getLogger()->setType(\danog\MadelineProto\Logger::FILE_LOGGER);
+    $settings->getLogger()->setExtra($madelineLogPath);
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.

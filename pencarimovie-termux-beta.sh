@@ -91,33 +91,39 @@ fi
 if [ -f "$TAR_FILE" ]; then
   echo "Extracting into $APP_DIR..."
   mkdir -p "$APP_DIR"
-  tar -xzf "$TAR_FILE" -C "$APP_DIR" 2>/dev/null || tar -xf "$TAR_FILE" -C "$APP_DIR"
+  # Release tarballs package files under a top-level directory (pencarimovie-downloader-*)
+  # Use --strip-components=1 so backend.php and router.php are extracted directly into $APP_DIR
+  if ! tar -xzf "$TAR_FILE" --strip-components=1 -C "$APP_DIR" 2>/dev/null; then
+    tar -xzf "$TAR_FILE" -C "$APP_DIR" 2>/dev/null || tar -xf "$TAR_FILE" -C "$APP_DIR"
+    # Fallback: if files are nested in a subdirectory, move them up
+    SUBDIR="$(find "$APP_DIR" -maxdepth 2 -type f -name "router.php" -exec dirname {} \; 2>/dev/null | head -1 || true)"
+    if [ -n "$SUBDIR" ] && [ "$SUBDIR" != "$APP_DIR" ]; then
+      cp -rf "$SUBDIR"/* "$APP_DIR/" 2>/dev/null || true
+      rm -rf "$SUBDIR" 2>/dev/null || true
+    fi
+  fi
   rm -rf "$TMP_DIR"
 fi
 
-echo "[4/4] Starting PencariMovie Server (Beta Native Mode)..."
+echo "[4/4] Starting PencariMovie Server..."
 cd "$APP_DIR"
 
-# Ensure executable permissions
-chmod +x start.sh stop.sh router.php 2>/dev/null || true
+# Ensure executable permissions on all shell scripts and binaries
+chmod +x start.sh start-termux.sh stop.sh restart.sh restart-termux.sh router.php 2>/dev/null || true
+[ -f "bin/php" ] && chmod +x "bin/php" 2>/dev/null || true
+[ -f "bin/frankenphp" ] && chmod +x "bin/frankenphp" 2>/dev/null || true
 
-# Stop previous instances if running on port
-pkill -f "php.*router\.php" 2>/dev/null || true
+# Stop any previous instances
+./stop.sh 2>/dev/null || pkill -f "php.*router\.php" 2>/dev/null || true
 
-echo "Launching server on http://127.0.0.1:$PORT..."
-PORT="$PORT" HOST="$HOST" nohup php -S "$HOST:$PORT" router.php > "$APP_DIR/server-beta.log" 2>&1 &
-SERVER_PID=$!
-sleep 2
-
-if curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/manifest.json" | grep -q "200"; then
-  echo ""
-  echo "============================================================"
-  echo " PencariMovie Server (Beta) started successfully! [PID: $SERVER_PID]"
-  echo " Local URL:    http://127.0.0.1:$PORT"
-  echo " Manifest URL: http://127.0.0.1:$PORT/manifest.json"
-  echo " Log file:     $APP_DIR/server-beta.log"
-  echo " Stop server:  kill $SERVER_PID"
-  echo "============================================================"
+# Start via start-termux.sh if available, otherwise native php -S with router.php
+if [ -f "./start-termux.sh" ]; then
+  bash ./start-termux.sh
+elif [ -f "./start.sh" ]; then
+  bash ./start.sh
 else
-  echo "Notice: Server started with PID $SERVER_PID. Check $APP_DIR/server-beta.log for details."
+  PORT="$PORT" HOST="$HOST" nohup php -S "$HOST:$PORT" router.php > "$APP_DIR/server.log" 2>&1 &
+  SERVER_PID=$!
+  sleep 2
+  echo "Server started with PID: $SERVER_PID on http://127.0.0.1:$PORT"
 fi

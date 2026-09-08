@@ -34,7 +34,7 @@ fi
 PORT="${PORT:-8088}"
 HOST="${HOST:-0.0.0.0}"
 REPO="aiskendi/pencarimovie-server"
-FALLBACK_TAG="v1.0.0"
+FALLBACK_TAG="v1.8.0-beta.1"
 
 detect_target() {
   local arch os
@@ -182,28 +182,24 @@ download_file() {
   fi
 }
 
-# Query GitHub releases API (or redirect location) and return the tag (e.g. v1.6.0).
+# Query GitHub releases API (or redirect location) and return the tag (e.g. v1.6.0 or v1.8.0-beta.1).
 fetch_latest_tag() {
   local tag=""
-  # Method 1: GitHub REST API (most reliable across all curl/wget versions)
+
+  # Method 1: GitHub Releases API (picks newest release or pre-release)
   if command -v curl >/dev/null 2>&1; then
+    tag="$(curl -fsSL -H "User-Agent: pencarimovie-server" "https://api.github.com/repos/$REPO/releases" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  fi
+
+  # Method 2: GitHub Releases /latest endpoint
+  if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
     tag="$(curl -fsSL -H "User-Agent: pencarimovie-server" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
   fi
 
-  # Method 2: Redirect follow via curl %{url_effective}
+  # Method 3: Redirect follow via curl %{url_effective}
   if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
     local loc=""
     loc="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
-    loc="${loc%$'\r'}"
-    loc="${loc%/}"
-    tag="${loc##*/}"
-  fi
-
-  # Method 3: wget fallback
-  if [ -z "$tag" ] && command -v wget >/dev/null 2>&1; then
-    local loc=""
-    loc="$(wget -q --max-redirect=0 --server-response "https://github.com/$REPO/releases/latest" -O /dev/null 2>&1 \
-      | awk 'BEGIN{IGNORECASE=1} /^  Location:/{print $2; exit}' | tr -d '\r' || true)"
     loc="${loc%$'\r'}"
     loc="${loc%/}"
     tag="${loc##*/}"

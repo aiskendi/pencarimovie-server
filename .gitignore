@@ -104,7 +104,6 @@ frankenphp-*
 pencarimovie*
 !pencarimovie-linux.sh
 !pencarimovie-termux.sh
-!pencarimovie-termux-beta.sh
 !pencarimovie-windows.bat
 !pencarimovie-windows.ps1
 proot*

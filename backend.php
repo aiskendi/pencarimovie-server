@@ -25,6 +25,22 @@ if (is_dir($fdBinDir)) {
  * They are fetched from the WordPress REST API endpoint (/save-bot-token)
  * after successful bot token validation, encrypted with the token as key.
  */
+function fd_is_serverless(): bool
+{
+    static $isServerless = null;
+    if ($isServerless !== null) {
+        return $isServerless;
+    }
+    $sysTmp = sys_get_temp_dir();
+    return $isServerless = (
+        !empty($_ENV['VERCEL'])
+        || !empty($_SERVER['VERCEL'])
+        || !empty($_ENV['AWS_LAMBDA_FUNCTION_NAME'])
+        || str_starts_with(__DIR__, '/var/task')
+        || (is_dir($sysTmp) && !is_writable(__DIR__))
+    );
+}
+
 function fd_is_temp_app_dir(?string $dir): bool
 {
     if ($dir === null || $dir === '') {
@@ -55,15 +71,8 @@ function fd_get_storage_dir(): string
     }
 
     // If running in serverless / Vercel / Lambda environment where app root is read-only (/var/task/...)
-    $sysTmp = sys_get_temp_dir();
-    if (
-        !empty($_ENV['VERCEL'])
-        || !empty($_SERVER['VERCEL'])
-        || !empty($_ENV['AWS_LAMBDA_FUNCTION_NAME'])
-        || str_starts_with(__DIR__, '/var/task')
-        || (is_dir($sysTmp) && !is_writable(__DIR__))
-    ) {
-        $tmpStorage = rtrim($sysTmp, '/\\') . DIRECTORY_SEPARATOR . 'pencarimovie_storage';
+    if (fd_is_serverless()) {
+        $tmpStorage = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'pencarimovie_storage';
         if (!is_dir($tmpStorage)) {
             @mkdir($tmpStorage, 0777, true);
         }
@@ -1467,6 +1476,11 @@ function fd_ipc_worker_running(string $sessionDir): bool
  */
 function fd_ensure_ipc_worker(string $sessionDir): bool
 {
+    // On serverless / Vercel, background CLI workers cannot be spawned or detached.
+    if (fd_is_serverless()) {
+        return false;
+    }
+
     if (fd_ipc_worker_running($sessionDir)) {
         return true;
     }
@@ -1591,12 +1605,12 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $sessionPath = fd_get_bot_session_path($targetBotId);
     $sessionDir = dirname($sessionPath);
 
-    // During a fresh bot login (token provided, no session yet) force a full
-    // MadelineProto boot instead of trying to start an IPC server, which fails
-    // under FrankenPHP's short-lived requests. getSlow() (patched) checks this
-    // global. After login the session exists and IPC client connect is used.
-    $GLOBALS['FD_FORCE_FULL_BOOT'] = ($botToken !== null && $botToken !== '')
-        && !(is_dir($sessionPath) || is_file($sessionPath));
+    // Force full MadelineProto boot if fresh bot login OR if running in serverless/Vercel
+    // where background IPC workers cannot exist.
+    $GLOBALS['FD_FORCE_FULL_BOOT'] = fd_is_serverless() || (
+        ($botToken !== null && $botToken !== '')
+        && !(is_dir($sessionPath) || is_file($sessionPath))
+    );
 
     $bootObLevel = ob_get_level();
     $bootEntryObLevel = $bootObLevel;
@@ -6787,6 +6801,7 @@ if (str_starts_with($path, '/api/')) {
         '/api/version',
         '/api/proxy-stream',
         '/api/resolve-shortcode',
+        '/api/provision',
     ];
     if (fd_is_public_download_path($path) && !in_array($path, $alwaysPublicApi, true)) {
         $alwaysPublicApi[] = $path;
@@ -6915,7 +6930,7 @@ if (str_starts_with($path, '/api/')) {
     }
 
     // ── POST /api/provision — auto-provision a guest bot session on the fly ───
-    if ($path === '/api/provision' && $method === 'POST') {
+    if ($path === '/api/provision' && in_array($method, ['GET', 'POST'], true)) {
         $provisioned = fd_auto_provision_guest();
         if (!$provisioned) {
             fd_json([

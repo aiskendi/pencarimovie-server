@@ -50,18 +50,31 @@ function fd_storage_has_session(string $storageDir): bool
 function fd_get_storage_dir(): string
 {
     static $storageDir = null;
-    if ($storageDir !== null) {
+    if ($storageDir !== null && is_dir($storageDir) && is_writable($storageDir)) {
         return $storageDir;
+    }
+
+    // If running in serverless / Vercel / Lambda environment where app root is read-only (/var/task/...)
+    $sysTmp = sys_get_temp_dir();
+    if (
+        !empty($_ENV['VERCEL'])
+        || !empty($_SERVER['VERCEL'])
+        || !empty($_ENV['AWS_LAMBDA_FUNCTION_NAME'])
+        || str_starts_with(__DIR__, '/var/task')
+        || (is_dir($sysTmp) && !is_writable(__DIR__))
+    ) {
+        $tmpStorage = rtrim($sysTmp, '/\\') . DIRECTORY_SEPARATOR . 'pencarimovie_storage';
+        if (!is_dir($tmpStorage)) {
+            @mkdir($tmpStorage, 0777, true);
+        }
+        return $storageDir = $tmpStorage;
     }
 
     // Prefer the served project root, not __DIR__.
     // FrankenPHP can extract PHP into a temp folder, so __DIR__/storage
     // would lose the Madeline session on restart / next worker.
+
     $candidates = [];
-    // If running in serverless / Vercel environment where /tmp is the only writable directory
-    if (!empty($_ENV['VERCEL']) || !empty($_SERVER['VERCEL']) || (is_dir('/tmp') && !is_writable(__DIR__))) {
-        $candidates[] = '/tmp/storage';
-    }
     $docRoot = (string) ($_SERVER['DOCUMENT_ROOT'] ?? '');
     if ($docRoot !== '') {
         $candidates[] = rtrim($docRoot, '/\\') . DIRECTORY_SEPARATOR . 'storage';
@@ -117,21 +130,22 @@ function fd_storage_path(string $file): string
     $file = ltrim($file, '/\\');
     if (str_starts_with($file, 'storage/') || str_starts_with($file, 'storage\\')) {
         $subPath = substr($file, 7);
-        $subPath = ltrim($subPath, '/\\');
-        $storageDir = fd_get_storage_dir();
-
-        if (!is_dir($storageDir)) {
-            @mkdir($storageDir, 0777, true);
-        }
-
-        $fullPath = $storageDir . DIRECTORY_SEPARATOR . $subPath;
-        $parent = dirname($fullPath);
-        if (!is_dir($parent)) {
-            @mkdir($parent, 0777, true);
-        }
-        return $fullPath;
+    } else {
+        $subPath = $file;
     }
-    return __DIR__ . '/' . $file;
+    $subPath = ltrim($subPath, '/\\');
+    $storageDir = fd_get_storage_dir();
+
+    if (!is_dir($storageDir)) {
+        @mkdir($storageDir, 0777, true);
+    }
+
+    $fullPath = $storageDir . DIRECTORY_SEPARATOR . $subPath;
+    $parent = dirname($fullPath);
+    if (!is_dir($parent)) {
+        @mkdir($parent, 0777, true);
+    }
+    return $fullPath;
 }
 
 define('FD_SESSION_PATH', fd_storage_path('storage/session.madeline'));
@@ -180,7 +194,10 @@ function fd_log(string $message, array $context = []): void
     }
 
     $logLine = '[' . date('Y-m-d H:i:s') . '] [PencariMovie Downloader] ' . $message . $suffix . "\n";
-    @file_put_contents(fd_storage_path('storage/debug.log'), $logLine, FILE_APPEND | LOCK_EX);
+    $logPath = fd_storage_path('storage/debug.log');
+    if (is_writable(dirname($logPath))) {
+        @file_put_contents($logPath, $logLine, FILE_APPEND | LOCK_EX);
+    }
     error_log('[PencariMovie Downloader] ' . $message . $suffix);
 }
 

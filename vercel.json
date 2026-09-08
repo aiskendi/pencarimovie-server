@@ -4,33 +4,30 @@
   "buildCommand": "echo 'Preparing for Vercel deployment...'",
   "outputDirectory": "public",
   "functions": {
-    "api/**/*.php": {
-      "runtime": "vercel-php@0.7.3"
-    },
-    "index.php": {
+    "api/index.php": {
       "runtime": "vercel-php@0.7.3"
     }
   },
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "/index.php"
+      "dest": "/api/index.php"
     },
     {
       "src": "/manifest\\.json",
-      "dest": "/index.php"
+      "dest": "/api/index.php"
     },
     {
       "src": "/stream/(.*)",
-      "dest": "/index.php"
+      "dest": "/api/index.php"
     },
     {
       "src": "/catalog/(.*)",
-      "dest": "/index.php"
+      "dest": "/api/index.php"
     },
     {
       "src": "/meta/(.*)",
-      "dest": "/index.php"
+      "dest": "/api/index.php"
     },
     {
       "src": "/(.*)",

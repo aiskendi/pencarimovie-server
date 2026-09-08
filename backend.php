@@ -25,22 +25,6 @@ if (is_dir($fdBinDir)) {
  * They are fetched from the WordPress REST API endpoint (/save-bot-token)
  * after successful bot token validation, encrypted with the token as key.
  */
-function fd_is_serverless(): bool
-{
-    static $isServerless = null;
-    if ($isServerless !== null) {
-        return $isServerless;
-    }
-    $sysTmp = sys_get_temp_dir();
-    return $isServerless = (
-        !empty($_ENV['VERCEL'])
-        || !empty($_SERVER['VERCEL'])
-        || !empty($_ENV['AWS_LAMBDA_FUNCTION_NAME'])
-        || str_starts_with(__DIR__, '/var/task')
-        || (is_dir($sysTmp) && !is_writable(__DIR__))
-    );
-}
-
 function fd_is_temp_app_dir(?string $dir): bool
 {
     if ($dir === null || $dir === '') {
@@ -68,18 +52,6 @@ function fd_get_storage_dir(): string
     static $storageDir = null;
     if ($storageDir !== null && is_dir($storageDir) && is_writable($storageDir)) {
         return $storageDir;
-    }
-
-    // If running in serverless / Vercel / Lambda environment where app root is read-only (/var/task/...)
-    if (fd_is_serverless()) {
-        $tmpStorage = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'pencarimovie_storage';
-        if (!is_dir($tmpStorage)) {
-            @mkdir($tmpStorage, 0777, true);
-        }
-        if (class_exists('\\danog\\MadelineProto\\Magic', false)) {
-            \danog\MadelineProto\Magic::$script_cwd = $tmpStorage;
-        }
-        return $storageDir = $tmpStorage;
     }
 
     // Prefer the served project root, not __DIR__.
@@ -1262,13 +1234,6 @@ function fd_ensure_autoload(): bool
         ob_end_clean();
     }
 
-    if ($result !== null && class_exists('\\danog\\MadelineProto\\Magic')) {
-        // Fix MadelineProto writing MadelineProto.log to read-only app directory on Vercel
-        $storageDir = fd_get_storage_dir();
-        \danog\MadelineProto\Magic::$script_cwd = $storageDir;
-        ini_set('error_log', $storageDir . DIRECTORY_SEPARATOR . 'MadelineProto.log');
-    }
-
     return $result !== null;
 }
 
@@ -1476,11 +1441,6 @@ function fd_ipc_worker_running(string $sessionDir): bool
  */
 function fd_ensure_ipc_worker(string $sessionDir): bool
 {
-    // On serverless / Vercel, background CLI workers cannot be spawned or detached.
-    if (fd_is_serverless()) {
-        return false;
-    }
-
     if (fd_ipc_worker_running($sessionDir)) {
         return true;
     }
@@ -1605,12 +1565,12 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $sessionPath = fd_get_bot_session_path($targetBotId);
     $sessionDir = dirname($sessionPath);
 
-    // Force full MadelineProto boot if fresh bot login OR if running in serverless/Vercel
-    // where background IPC workers cannot exist.
-    $GLOBALS['FD_FORCE_FULL_BOOT'] = fd_is_serverless() || (
-        ($botToken !== null && $botToken !== '')
-        && !(is_dir($sessionPath) || is_file($sessionPath))
-    );
+    // During a fresh bot login (token provided, no session yet) force a full
+    // MadelineProto boot instead of trying to start an IPC server, which fails
+    // under FrankenPHP's short-lived requests. getSlow() (patched) checks this
+    // global. After login the session exists and IPC client connect is used.
+    $GLOBALS['FD_FORCE_FULL_BOOT'] = ($botToken !== null && $botToken !== '')
+        && !(is_dir($sessionPath) || is_file($sessionPath));
 
     $bootObLevel = ob_get_level();
     $bootEntryObLevel = $bootObLevel;
@@ -1717,12 +1677,6 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
         ->setApiId($apiId)
         ->setApiHash($apiHash);
     $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::NOTICE);
-
-    // MadelineProto defaults to writing MadelineProto.log to Magic::$script_cwd (read-only /var/task/... on Vercel).
-    // Point it to the writable storage directory.
-    $madelineLogPath = fd_storage_path('storage/MadelineProto.log');
-    $settings->getLogger()->setType(\danog\MadelineProto\Logger::FILE_LOGGER);
-    $settings->getLogger()->setExtra($madelineLogPath);
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.

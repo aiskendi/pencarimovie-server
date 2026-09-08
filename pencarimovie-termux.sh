@@ -499,10 +499,19 @@ do_start() {
         cp "$ROOT_DIR/bin/php.ini.unix" "$ROOT_DIR/bin/php.ini"
       fi
 
+      # Generate resolv.conf for proot DNS resolution on Android
+      cat <<'EOF' > "$TMP_DIR/resolv.conf"
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 1.0.0.1
+EOF
+      chmod 644 "$TMP_DIR/resolv.conf" 2>/dev/null || true
+
       proot --link2symlink -0 \
         -w "$ROOT_DIR" \
         -b "$ROOT_DIR:$ROOT_DIR" \
         -b "$TMP_DIR:/tmp" \
+        -b "$TMP_DIR/resolv.conf:/etc/resolv.conf" \
         /bin/sh -c 'export PATH="$1/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export LAN_IP="$6"; exec "$2" php-server --listen "$3:$4" --root "$5"' \
         sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" >>"$LOG_FILE" 2>&1 &
       PID="$!"

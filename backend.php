@@ -179,9 +179,11 @@ function fd_log(string $message, array $context = []): void
 
     $logLine = '[' . date('Y-m-d H:i:s') . '] [PencariMovie Downloader] ' . $message . $suffix . "\n";
     $logPath = fd_storage_path('storage/debug.log');
-    if (is_writable(dirname($logPath))) {
-        @file_put_contents($logPath, $logLine, FILE_APPEND | LOCK_EX);
+    $dir = dirname($logPath);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
     }
+    @file_put_contents($logPath, $logLine, FILE_APPEND | LOCK_EX);
     error_log('[PencariMovie Downloader] ' . $message . $suffix);
 }
 
@@ -802,10 +804,19 @@ function fd_http_get_contents(string $url, array $options = []): string|false
             },
         ];
 
-        // Optional custom DNS resolution via CURLOPT_RESOLVE
+        // Fallback DNS / direct Cloudflare IP resolution for pencarimovie.com & Cinemeta
+        // Essential in Android / Termux proot where /etc/resolv.conf is missing or blocked by mobile carrier DNS
+        $resolveEntries = [];
         if (defined('FD_CURL_RESOLVE') && FD_CURL_RESOLVE !== '') {
-            $curlOpts[CURLOPT_RESOLVE] = [FD_CURL_RESOLVE];
+            $resolveEntries[] = FD_CURL_RESOLVE;
+        } else {
+            // Default Cloudflare Anycast IPs for pencarimovie.com
+            $resolveEntries[] = 'pencarimovie.com:443:104.21.47.164';
+            $resolveEntries[] = 'pencarimovie.com:443:172.67.149.53';
+            $resolveEntries[] = 'pencarimovie.com:80:104.21.47.164';
+            $resolveEntries[] = 'pencarimovie.com:80:172.67.149.53';
         }
+        $curlOpts[CURLOPT_RESOLVE] = $resolveEntries;
 
         curl_setopt_array($ch, $curlOpts);
 
@@ -821,14 +832,28 @@ function fd_http_get_contents(string $url, array $options = []): string|false
             }
         }
 
+        $cStart = microtime(true);
         $response = curl_exec($ch);
+        $cDuration = round(microtime(true) - $cStart, 3);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
         if ($response === false) {
-            fd_log('curl_exec failed', [
+            fd_log('curl request failed', [
                 'url' => $url,
+                'http_code' => $httpCode,
+                'duration_seconds' => $cDuration,
                 'errno' => curl_errno($ch),
                 'error' => curl_error($ch),
             ]);
+        } else {
+            fd_log('curl request completed', [
+                'url' => $url,
+                'http_code' => $httpCode,
+                'duration_seconds' => $cDuration,
+                'bytes' => strlen($response),
+            ]);
         }
+
         // In PHP 8.5+ curl_close() is a no-op, just here for readability
         if (PHP_VERSION_ID < 80500) {
             curl_close($ch);
@@ -1001,22 +1026,26 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         'bots' => $candidateBots,
     ]);
 
-    $addonPort = (int) ($_SERVER['ADDON_PORT'] ?? ($_ENV['ADDON_PORT'] ?? 8089));
     foreach ($candidateBots as $bId) {
         $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
             'short_code' => $shortCode,
             'bot_id' => $bId,
         ]);
-        // Route through local Bun DoH proxy to avoid DNS delays/blocks
-        $proxyUrl = 'http://127.0.0.1:' . $addonPort . '/proxy?url=' . urlencode($targetUrl);
 
-        $ch = curl_init($proxyUrl);
-        curl_setopt_array($ch, [
+        $ch = curl_init($targetUrl);
+        $resOpts = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 12,
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_HTTPHEADER => $headers,
-        ]);
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_RESOLVE => [
+                'pencarimovie.com:443:104.21.47.164',
+                'pencarimovie.com:443:172.67.149.53',
+            ],
+        ];
+        curl_setopt_array($ch, $resOpts);
         curl_multi_add_handle($mh, $ch);
         $handles[$bId] = $ch;
     }
@@ -1073,6 +1102,12 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
     }
     curl_multi_close($mh);
 
+    fd_log('concurrent resolve multi-curl complete', [
+        'short_code' => $shortCode,
+        'winner_bot' => $winnerBotId,
+        'statuses' => $botStatuses,
+    ]);
+
     if ($winner !== null && $winnerBotId !== null) {
         $winner['bot_id'] = $winnerBotId;
         fd_save_resolve_cache($shortCode, $winnerBotId, $winner);
@@ -1092,20 +1127,24 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         // Re-race candidate bots
         $mhRetry = curl_multi_init();
         $retryHandles = [];
-        $addonPort = (int) ($_SERVER['ADDON_PORT'] ?? ($_ENV['ADDON_PORT'] ?? 8089));
         foreach ($candidateBots as $bId) {
             $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
                 'short_code' => $shortCode,
                 'bot_id' => $bId,
             ]);
-            $proxyUrl = 'http://127.0.0.1:' . $addonPort . '/proxy?url=' . urlencode($targetUrl);
 
-            $ch = curl_init($proxyUrl);
+            $ch = curl_init($targetUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_TIMEOUT => 6,
                 CURLOPT_CONNECTTIMEOUT => 3,
                 CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_RESOLVE => [
+                    'pencarimovie.com:443:104.21.47.164',
+                    'pencarimovie.com:443:172.67.149.53',
+                ],
             ]);
             curl_multi_add_handle($mhRetry, $ch);
             $retryHandles[$bId] = $ch;
@@ -2425,43 +2464,23 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
     }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
-    // 1. Try local Bun addon helper proxy on port 8089 (DoH + custom DNS)
-    $addonPort = (int) ($_SERVER['ADDON_PORT'] ?? ($_ENV['ADDON_PORT'] ?? 8089));
-    $bunProxyUrl = 'http://127.0.0.1:' . $addonPort . '/proxy?url=' . urlencode($fullWpUrl);
-    $ctx = @stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'timeout' => 6,
-            'header' => "X-Requested-With: XMLHttpRequest\r\n",
-            'ignore_errors' => true,
-        ],
-    ]);
-    $bunRes = @file_get_contents($bunProxyUrl, false, $ctx);
-    if (is_string($bunRes) && $bunRes !== '') {
-        $decoded = json_decode($bunRes, true);
-        if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
-            return (array) ($decoded['data'] ?? []);
-        }
-        if (is_array($decoded)) {
-            return $decoded;
-        }
-    }
-
-    // 2. Direct cURL fallback
+    // Direct cURL fetch
     try {
         $body = fd_http_get_contents($fullWpUrl, [
             'method' => 'GET',
             'headers' => ['X-Requested-With: XMLHttpRequest'],
-            'timeout' => 15,
+            'timeout' => 12,
         ]);
-        if ($body === false) {
-            return [];
+        if (is_string($body) && $body !== '') {
+            $decoded = json_decode($body, true);
+            if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
+                return (array) ($decoded['data'] ?? []);
+            }
+            if (is_array($decoded)) {
+                return $decoded;
+            }
         }
-        $decoded = json_decode($body, true);
-        if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
-            return (array) ($decoded['data'] ?? []);
-        }
-        return is_array($decoded) ? $decoded : [];
+        return [];
     } catch (\Throwable $e) {
         fd_log('stremio wp ajax fetch failed', ['action' => $streamAction, 'error' => $e->getMessage()]);
         return [];
@@ -3953,7 +3972,27 @@ function fd_tunnel_local_http_get(string $url, int $timeoutSec = 1): string
                 'User-Agent: pencarimovie-server/' . FD_APP_VERSION,
             ],
         ]);
+        $cStart = microtime(true);
         $body = curl_exec($ch);
+        $cDuration = round(microtime(true) - $cStart, 3);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($body !== false) {
+            fd_log('tunnel curl request completed', [
+                'url' => $url,
+                'http_code' => $httpCode,
+                'duration_seconds' => $cDuration,
+            ]);
+        } else {
+            fd_log('tunnel curl request failed', [
+                'url' => $url,
+                'http_code' => $httpCode,
+                'duration_seconds' => $cDuration,
+                'errno' => curl_errno($ch),
+                'error' => curl_error($ch),
+            ]);
+        }
+
         if (PHP_VERSION_ID < 80500) {
             curl_close($ch);
         }
@@ -4132,8 +4171,28 @@ function fd_http_download_file(string $url, string $dest, int $timeout = 120): b
                 $curlOpts[$k] = $v;
             }
             curl_setopt_array($ch, $curlOpts);
+            $cStart = microtime(true);
             $ok = curl_exec($ch) === true;
             $err = $ok ? '' : curl_error($ch);
+            $cDuration = round(microtime(true) - $cStart, 3);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+            if ($ok) {
+                fd_log('curl file download completed', [
+                    'url' => $url,
+                    'http_code' => $httpCode,
+                    'duration_seconds' => $cDuration,
+                ]);
+            } else {
+                fd_log('curl file download failed', [
+                    'url' => $url,
+                    'http_code' => $httpCode,
+                    'duration_seconds' => $cDuration,
+                    'errno' => curl_errno($ch),
+                    'error' => $err,
+                ]);
+            }
+
             if (PHP_VERSION_ID < 80500) {
                 curl_close($ch);
             }

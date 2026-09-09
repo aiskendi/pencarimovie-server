@@ -15,10 +15,10 @@ $url = "https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/penc
 Write-Host "PencariMovie Server: $installDir" -ForegroundColor Cyan
 (New-Object System.Net.WebClient).DownloadFile($url, $batFile)
 
-# Run installer inside the fixed user directory
+# Run installer via cmd.exe directly to prevent PowerShell stream collision
 Push-Location $installDir
 try {
-    & $batFile @args
+    cmd.exe /c ('"' + $batFile + '" ' + ($args -join ' '))
 }
 finally {
     Pop-Location

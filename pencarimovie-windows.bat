@@ -230,18 +230,22 @@ set "EXTRACT_SRC=%OTA_TMP%\extract"
 for /f "delims=" %%F in ('dir /b /s "%OTA_TMP%\extract\backend.php" 2^>nul') do (
     set "EXTRACT_SRC=%%~dpF"
 )
-set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
+if "!EXTRACT_SRC:~-1!"=="\" set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
 rem Use standard Windows robocopy to safely sync files into app folder without triggering AMSI / PowerShell script blocks
-robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD storage /XF storage /R:2 /W:1 /NP /NFL /NDL >nul
+robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD "!EXTRACT_SRC!\storage" "!APP_PATH!\storage" /R:2 /W:1 /NP /NFL /NDL >nul
 rem Robocopy exit codes 0-7 mean success (copied/matched files)
 if errorlevel 8 (
-    echo File copy failed.
-    rmdir /s /q "%OTA_TMP%" 2>nul
-    pause
-    exit /b 1
+    rem Fallback copy if robocopy failed due to path or environment restrictions
+    xcopy "!EXTRACT_SRC!" "!APP_PATH!" /E /I /Y /Q >nul 2>&1
+    if errorlevel 1 (
+        echo File copy failed.
+        rmdir /s /q "%OTA_TMP%" 2>nul
+        pause
+        exit /b 1
+    )
 )
 
 > "!APP_PATH!\.release-tag" echo !OTA_TAG!

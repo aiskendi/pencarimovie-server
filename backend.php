@@ -44,7 +44,8 @@ function fd_storage_has_session(string $storageDir): bool
     return is_dir($session)
         || is_file($session)
         || is_file($storageDir . DIRECTORY_SEPARATOR . 'bot_id.txt')
-        || is_file($storageDir . DIRECTORY_SEPARATOR . 'session_meta.json');
+        || is_file($storageDir . DIRECTORY_SEPARATOR . 'session_meta.json')
+        || is_dir($storageDir . DIRECTORY_SEPARATOR . 'sessions');
 }
 
 function fd_get_storage_dir(): string
@@ -135,7 +136,7 @@ function fd_storage_path(string $file): string
 define('FD_SESSION_PATH', fd_storage_path('storage/session.madeline'));
 define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v1');
 define('FD_WP_AJAX_URL', 'https://pencarimovie.com/wp-admin/admin-ajax.php');
-define('FD_APP_VERSION', '1.7.0');
+define('FD_APP_VERSION', '1.8.2');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
@@ -143,11 +144,73 @@ define('FD_DEVICE_ID_PATH', fd_storage_path('storage/device_id.txt'));
 define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));
 define('FD_BOT_POOL_PATH', fd_storage_path('storage/bot_pool.json'));
 define('FD_CATALOG_SETTINGS_PATH', fd_storage_path('storage/catalog_settings.json'));
+define('FD_DEBUG_LOG_PATH', fd_storage_path('storage/debug.log'));
+define('FD_DEBUG_TOGGLE_PATH', fd_storage_path('storage/debug_mode.txt'));
+define('FD_MAX_LOG_SIZE', 5 * 1024 * 1024); // 5 MB max per log file
 
 /**
  * Optional DNS resolution mapping for curl (e.g. "example.com:443:1.2.3.4").
  */
 define('FD_CURL_RESOLVE', '');
+
+function fd_is_debug_enabled(): bool
+{
+    $file = FD_DEBUG_TOGGLE_PATH;
+    if (!is_file($file)) {
+        return false;
+    }
+    $val = trim((string) @file_get_contents($file));
+    return $val === '1' || strtolower($val) === 'true' || strtolower($val) === 'on';
+}
+
+function fd_set_debug_enabled(bool $enabled): void
+{
+    $file = FD_DEBUG_TOGGLE_PATH;
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+    if ($enabled) {
+        @file_put_contents($file, '1', LOCK_EX);
+    } else {
+        @unlink($file);
+    }
+}
+
+function fd_limit_file_size(string $filePath, int $maxBytes = FD_MAX_LOG_SIZE): void
+{
+    if (!is_file($filePath)) {
+        return;
+    }
+    $size = @filesize($filePath);
+    if ($size === false || $size <= $maxBytes) {
+        return;
+    }
+
+    // Keep the most recent half of the file ($maxBytes / 2)
+    $keepBytes = (int) ($maxBytes / 2);
+    $fp = @fopen($filePath, 'r+');
+    if (!$fp) {
+        return;
+    }
+
+    if (@flock($fp, LOCK_EX)) {
+        @fseek($fp, -$keepBytes, SEEK_END);
+        // Advance to next newline to avoid truncated line
+        @fgets($fp);
+        $remaining = '';
+        while (!feof($fp)) {
+            $remaining .= fread($fp, 65536);
+        }
+        @ftruncate($fp, 0);
+        @rewind($fp);
+        @fwrite($fp, "[... truncated old log entries ...]\n" . $remaining);
+        @fflush($fp);
+        @flock($fp, LOCK_UN);
+    }
+    @fclose($fp);
+}
+
 function fd_json(array $data, int $status = 200): never
 {
     $body = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -172,19 +235,26 @@ function fd_json(array $data, int $status = 200): never
 
 function fd_log(string $message, array $context = []): void
 {
+    if (!fd_is_debug_enabled()) {
+        return;
+    }
+
     $suffix = '';
     if ($context !== []) {
         $suffix = ' ' . json_encode($context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 
     $logLine = '[' . date('Y-m-d H:i:s') . '] [PencariMovie Downloader] ' . $message . $suffix . "\n";
-    $logPath = fd_storage_path('storage/debug.log');
+    $logPath = FD_DEBUG_LOG_PATH;
     $dir = dirname($logPath);
     if (!is_dir($dir)) {
         @mkdir($dir, 0777, true);
     }
     @file_put_contents($logPath, $logLine, FILE_APPEND | LOCK_EX);
     error_log('[PencariMovie Downloader] ' . $message . $suffix);
+
+    // Limit debug.log size if it grows past 5MB
+    fd_limit_file_size($logPath, FD_MAX_LOG_SIZE);
 }
 
 /**
@@ -513,73 +583,87 @@ function fd_pick_pool_bot(): array
 function fd_auto_provision_guest(): ?array
 {
     fd_ensure_autoload();
-    $provisionUrl = FD_WP_API_BASE . '/provision-session?_nocache=' . time();
-    $resp = fd_http_json($provisionUrl, [], 'GET', 15);
+    // Try up to 3 times to get a provisioned bot that boots cleanly
+    for ($pAttempt = 0; $pAttempt < 3; $pAttempt++) {
+        $provisionUrl = FD_WP_API_BASE . '/provision-session?_nocache=' . time() . '_' . mt_rand(1000, 9999);
+        $resp = fd_http_json($provisionUrl, [], 'GET', 15);
 
-    if (empty($resp['ok']) || empty($resp['bot_token'])) {
-        fd_log('provision endpoint returned error or incomplete payload', ['resp' => $resp]);
-        return null;
+        if (empty($resp['ok']) || empty($resp['bot_token'])) {
+            fd_log('provision endpoint returned error or incomplete payload', ['resp' => $resp, 'attempt' => $pAttempt + 1]);
+            continue;
+        }
+
+        $botToken = trim((string) $resp['bot_token']);
+
+        if (!empty($resp['api_secret'])) {
+            fd_save_api_secret((string) $resp['api_secret']);
+        }
+
+        // Forward the encrypted API credentials so fd_boot_madeline decrypts them using $botToken
+        $overrides = [];
+        if (!empty($resp['encrypted_credentials']) && !empty($resp['credentials_iv'])) {
+            $overrides['encrypted_credentials'] = $resp['encrypted_credentials'];
+            $overrides['encryption_iv'] = $resp['credentials_iv'];
+        }
+
+        $targetBotId = !empty($resp['bot_id']) ? (string) $resp['bot_id'] : '';
+
+        // Clean any stale session for this bot before initial login
+        if ($targetBotId !== '') {
+            fd_clear_session($targetBotId);
+        } else {
+            // Generate a random temporary bot session bucket to prevent lock contention
+            $targetBotId = 'prov_' . substr(hash('sha256', $botToken), 0, 10);
+        }
+
+        // Capture stray output before boot
+        $diagObLevel = ob_get_level();
+        while (ob_get_level() > 0) {
+            ob_get_clean();
+        }
+        while (ob_get_level() < $diagObLevel) {
+            ob_start();
+        }
+
+        [$madeline, $error] = fd_boot_madeline($botToken, $overrides, $targetBotId);
+
+        if (!$madeline) {
+            fd_log('auto provision fd_boot_madeline failed', ['error' => $error, 'bot_id' => $targetBotId, 'attempt' => $pAttempt + 1]);
+            if ($targetBotId !== '') {
+                fd_clear_session($targetBotId);
+            }
+            continue;
+        }
+
+        try {
+            $self = $madeline->getSelf();
+            $botId = (string) ($self['id'] ?? $targetBotId);
+            $botUsername = (string) ($self['username'] ?? '');
+            $botName = (string) ($self['first_name'] ?? '');
+
+            fd_save_session_meta($botId, $botUsername, $botName);
+            fd_add_pool_bot([
+                'bot_id' => $botId,
+                'bot_username' => $botUsername,
+                'bot_name' => $botName,
+            ]);
+
+            return [
+                'bot_id' => $botId,
+                'bot_username' => $botUsername,
+                'bot_name' => $botName,
+                'madeline' => $madeline,
+            ];
+        } catch (Throwable $e) {
+            fd_log('auto provision getSelf failed', ['error' => $e->getMessage(), 'attempt' => $pAttempt + 1]);
+            if ($targetBotId !== '') {
+                fd_clear_session($targetBotId);
+            }
+            continue;
+        }
     }
 
-    $botToken = trim((string) $resp['bot_token']);
-
-    if (!empty($resp['api_secret'])) {
-        fd_save_api_secret((string) $resp['api_secret']);
-    }
-
-    // Forward the encrypted API credentials so fd_boot_madeline decrypts them using $botToken
-    $overrides = [];
-    if (!empty($resp['encrypted_credentials']) && !empty($resp['credentials_iv'])) {
-        $overrides['encrypted_credentials'] = $resp['encrypted_credentials'];
-        $overrides['encryption_iv'] = $resp['credentials_iv'];
-    }
-
-    $targetBotId = !empty($resp['bot_id']) ? (string) $resp['bot_id'] : '';
-
-    // Clean any stale session for this bot before initial login
-    if ($targetBotId !== '') {
-        fd_clear_session($targetBotId);
-    }
-
-    // Capture stray output before boot
-    $diagObLevel = ob_get_level();
-    while (ob_get_level() > 0) {
-        ob_get_clean();
-    }
-    while (ob_get_level() < $diagObLevel) {
-        ob_start();
-    }
-
-    [$madeline, $error] = fd_boot_madeline($botToken, $overrides, $targetBotId);
-
-    if (!$madeline) {
-        fd_log('auto provision fd_boot_madeline failed', ['error' => $error]);
-        return null;
-    }
-
-    try {
-        $self = $madeline->getSelf();
-        $botId = (string) ($self['id'] ?? $targetBotId);
-        $botUsername = (string) ($self['username'] ?? '');
-        $botName = (string) ($self['first_name'] ?? '');
-
-        fd_save_session_meta($botId, $botUsername, $botName);
-        fd_add_pool_bot([
-            'bot_id' => $botId,
-            'bot_username' => $botUsername,
-            'bot_name' => $botName,
-        ]);
-
-        return [
-            'bot_id' => $botId,
-            'bot_username' => $botUsername,
-            'bot_name' => $botName,
-            'madeline' => $madeline,
-        ];
-    } catch (Throwable $e) {
-        fd_log('auto provision getSelf failed', ['error' => $e->getMessage()]);
-        return null;
-    }
+    return null;
 }
 
 function fd_is_cloudflare_tunnel_request(): bool
@@ -731,12 +815,141 @@ function fd_http_json(string $url, array $payload = [], string $method = 'GET', 
  * }
  * @return string|false Response body on success, false on failure.
  */
+
+/**
+ * Singleton Amp HTTP client configured with an Anycast DNS Resolver.
+ */
+function fd_get_amphp_client(): ?\Amp\Http\Client\HttpClient
+{
+    static $client = null;
+    if ($client === null) {
+        if (!fd_ensure_autoload() || !interface_exists('Amp\\Dns\\DnsResolver') || !class_exists('Amp\\Http\\Client\\HttpClientBuilder')) {
+            return null;
+        }
+
+        if (!class_exists('FdAnycastDnsResolver', false)) {
+            class FdAnycastDnsResolver implements \Amp\Dns\DnsResolver
+            {
+                private array $staticHosts;
+                private ?\Amp\Dns\DnsResolver $fallback;
+
+                public function __construct(array $staticHosts = [], ?\Amp\Dns\DnsResolver $fallback = null)
+                {
+                    $this->staticHosts = $staticHosts;
+                    $this->fallback = $fallback;
+                }
+
+                public function resolve(string $name, ?int $typeRestriction = null, ?\Amp\Cancellation $cancellation = null): array
+                {
+                    $lower = strtolower($name);
+                    if (isset($this->staticHosts[$lower])) {
+                        $records = [];
+                        foreach ((array) $this->staticHosts[$lower] as $ip) {
+                            $type = str_contains($ip, ':') ? \Amp\Dns\DnsRecord::AAAA : \Amp\Dns\DnsRecord::A;
+                            if ($typeRestriction === null || $typeRestriction === $type) {
+                                $records[] = new \Amp\Dns\DnsRecord($ip, $type, 3600);
+                            }
+                        }
+                        if (!empty($records)) {
+                            return $records;
+                        }
+                    }
+                    $fallback = $this->fallback ?? \Amp\Dns\createDefaultResolver();
+                    return $fallback->resolve($name, $typeRestriction, $cancellation);
+                }
+
+                public function query(string $name, int $type, ?\Amp\Cancellation $cancellation = null): array
+                {
+                    return $this->resolve($name, $type, $cancellation);
+                }
+            }
+        }
+
+        $staticHosts = [
+            'pencarimovie.com' => ['104.21.47.164', '172.67.149.53'],
+            'v3-cinemeta.strem.io' => ['104.17.88.107', '104.17.89.107'],
+        ];
+        if (defined('FD_CURL_RESOLVE') && FD_CURL_RESOLVE !== '') {
+            $parts = explode(':', FD_CURL_RESOLVE);
+            if (count($parts) >= 3) {
+                $staticHosts[strtolower($parts[0])] = [$parts[2]];
+            }
+        }
+
+        $customResolver = new FdAnycastDnsResolver($staticHosts);
+        \Amp\Dns\dnsResolver($customResolver);
+        $client = \Amp\Http\Client\HttpClientBuilder::buildDefault();
+    }
+    return $client;
+}
+
+/**
+ * Execute an HTTP request via Amp\Http\Client with Anycast DNS resolution.
+ */
+function fd_amphp_http_request(string $url, string $method, array $headers, string $body, int $timeout): string|false
+{
+    $client = fd_get_amphp_client();
+    if ($client === null) {
+        return false;
+    }
+    $request = new \Amp\Http\Client\Request($url, $method);
+
+    foreach ($headers as $h) {
+        $parts = explode(':', $h, 2);
+        if (count($parts) === 2) {
+            $request->setHeader(trim($parts[0]), trim($parts[1]));
+        }
+    }
+    if ($body !== '') {
+        $request->setBody($body);
+    }
+
+    $tStart = microtime(true);
+    // Ensure a safe timeout of at least 10 seconds to accommodate TLS handshakes
+    $effectiveTimeout = max(10, $timeout);
+    $cancellation = new \Amp\TimeoutCancellation($effectiveTimeout);
+    $response = $client->request($request, $cancellation);
+    $status = $response->getStatus();
+
+    // Capture version headers if present
+    foreach ($response->getHeaders() as $name => $values) {
+        $lName = strtolower($name);
+        if (in_array($lName, ['x-min-version', 'x-update-url', 'x-update-required', 'x-sponsor-name', 'x-sponsor-desc', 'x-sponsor-url'], true)) {
+            $val = is_array($values) ? end($values) : (string) $values;
+            fd_update_version_state([$lName => $val]);
+        }
+    }
+
+    $resBody = $response->getBody()->buffer($cancellation);
+    $tDuration = round(microtime(true) - $tStart, 3);
+
+    if ($status < 200 || $status >= 400) {
+        fd_log('amphp request failed status', [
+            'url' => $url,
+            'http_code' => $status,
+            'duration_seconds' => $tDuration,
+        ]);
+        if ($resBody === '') {
+            return false;
+        }
+    } else {
+        fd_log('amphp request completed', [
+            'url' => $url,
+            'http_code' => $status,
+            'duration_seconds' => $tDuration,
+            'bytes' => strlen($resBody),
+        ]);
+    }
+
+    return $resBody;
+}
+
 function fd_http_get_contents(string $url, array $options = []): string|false
 {
     $method = strtoupper($options['method'] ?? 'GET');
     $headers = $options['headers'] ?? [];
     $body = $options['body'] ?? '';
-    $timeout = (int) ($options['timeout'] ?? 15);
+    $timeout = max(10, (int) ($options['timeout'] ?? 15));
 
     // Ensure X-App-Version and User-Agent headers are sent on all requests
     $hasVersionHeader = false;
@@ -756,7 +969,22 @@ function fd_http_get_contents(string $url, array $options = []): string|false
         $headers[] = 'User-Agent: pencarimovie-server/' . FD_APP_VERSION;
     }
 
-    // Direct cURL fetch
+    // 1. Preferred async/HTTP client: Amp\Http\Client with Custom Anycast DNS Resolver
+    if (fd_ensure_autoload() && class_exists('Amp\\Http\\Client\\HttpClientBuilder')) {
+        try {
+            $response = fd_amphp_http_request($url, $method, $headers, $body, $timeout);
+            if ($response !== false && $response !== '') {
+                return $response;
+            }
+        } catch (\Throwable $e) {
+            fd_log('amphp request exception, falling back to cURL', [
+                'url' => $url,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    // 2. Direct cURL fetch (fallback) with Anycast DNS resolution
     if (function_exists('curl_version')) {
         $ch = curl_init();
         // Build base curl options
@@ -917,7 +1145,8 @@ function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
     $diskCacheFile = fd_storage_path('storage/resolve_cache_' . md5($cacheKey) . '.json');
     if (is_file($diskCacheFile)) {
         $mtime = (int) filemtime($diskCacheFile);
-        if ((time() - $mtime) < 86400) {
+        // Expire file_id_mt after 2 hours because Telegram file_reference tokens expire
+        if ((time() - $mtime) < 7200) {
             $cachedRaw = @file_get_contents($diskCacheFile);
             if ($cachedRaw) {
                 $cachedJson = json_decode($cachedRaw, true);
@@ -1182,15 +1411,17 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
     return is_array($lastErrorResult) ? $lastErrorResult : ['ok' => 0, 'message' => 'Failed to resolve short code across all bots.'];
 }
 
-function fd_resolve_shortcode(string $shortCode, string $botId = ''): array
+function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypassCache = false): array
 {
     if ($botId === '') {
         return fd_resolve_shortcode_concurrent($shortCode);
     }
 
-    $cached = fd_resolve_shortcode_cached($shortCode, $botId);
-    if ($cached !== null) {
-        return $cached;
+    if (!$bypassCache) {
+        $cached = fd_resolve_shortcode_cached($shortCode, $botId);
+        if ($cached !== null) {
+            return $cached;
+        }
     }
 
     // Probabilistic cleanup (1 in 50 calls) to prune stale resolve cache files
@@ -1697,7 +1928,12 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $settings->getAppInfo()
         ->setApiId($apiId)
         ->setApiHash($apiHash);
-    $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::NOTICE);
+    if (fd_is_debug_enabled()) {
+        $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::NOTICE);
+    } else {
+        $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::FATAL_ERROR);
+    }
+    $settings->getLogger()->setMaxSize(FD_MAX_LOG_SIZE);
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.
@@ -1832,6 +2068,11 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
                 'error' => $lastError,
                 'attempt' => $bootAttempt + 1,
             ]);
+            // If session is busy or locked, clear the session lock files before retrying
+            if (str_contains(strtolower($lastError), 'busy') || str_contains(strtolower($lastError), 'lock') || str_contains(strtolower($lastError), 'could not connect')) {
+                fd_log('clearing session locks due to lock/busy error', ['target_bot_id' => $targetBotId]);
+                fd_clear_session($targetBotId);
+            }
             // Small delay before retrying
             if ($bootAttempt < 2) {
                 usleep(500000); // 500ms
@@ -1853,6 +2094,10 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
 function fd_clear_session_directory(string $sessionPath): void
 {
     if (is_dir($sessionPath)) {
+        // Terminate any background process locking this session path
+        if (PHP_OS_FAMILY !== 'Windows') {
+            @exec('pkill -9 -f ' . escapeshellarg($sessionPath) . ' 2>/dev/null');
+        }
         $deleted = false;
         for ($attempt = 0; $attempt < 3; $attempt++) {
             try {
@@ -1921,6 +2166,11 @@ function fd_clear_session(string $botId = ''): void
 {
     if ($botId !== '') {
         $path = fd_get_bot_session_path($botId);
+        // Delete the exact bot session directory as well as any parent folder under storage/sessions/
+        $botDir = fd_storage_path('storage/sessions/' . preg_replace('/[^a-zA-Z0-9_\-]/', '', $botId));
+        if (is_dir($botDir)) {
+            fd_clear_session_directory($botDir);
+        }
         fd_clear_session_directory(is_dir($path) ? $path : dirname($path));
         return;
     }
@@ -1950,12 +2200,18 @@ function fd_clear_session(string $botId = ''): void
     fd_clear_bot_id();
     fd_clear_session_meta();
 
-    // Clear resolve cache files
+    // Clear resolve cache files and stream cache files
     $storageDir = fd_get_storage_dir();
     $cacheFiles = glob($storageDir . '/resolve_cache_*.json');
     if ($cacheFiles) {
         foreach ($cacheFiles as $cf) {
             @unlink($cf);
+        }
+    }
+    $streamFiles = glob($storageDir . '/stream_cache_*.json');
+    if ($streamFiles) {
+        foreach ($streamFiles as $sf) {
+            @unlink($sf);
         }
     }
 }
@@ -2016,10 +2272,21 @@ function fd_check_version(): array
     global $fd_version_state;
 
     $current = FD_APP_VERSION;
+    $cacheFile = fd_storage_path('storage/version_cache.json');
 
-    // If we haven't received version headers yet from a previous request, fetch once
+    // 1. If in-memory state is empty, try loading disk cache first (persists across worker processes)
     if (empty($fd_version_state['min_version']) || !isset($fd_version_state['sponsor_url'])) {
-        $response = fd_http_json(FD_WP_VERSION_URL . '?t=' . time(), [], 'GET', 3);
+        if (is_file($cacheFile)) {
+            $cached = @json_decode((string) @file_get_contents($cacheFile), true);
+            if (is_array($cached) && !empty($cached['time']) && (time() - $cached['time'] < 3600)) {
+                $fd_version_state = $cached['data'] ?? [];
+            }
+        }
+    }
+
+    // 2. If still empty, fetch once with a quick timeout and write to disk cache
+    if (empty($fd_version_state['min_version']) || !isset($fd_version_state['sponsor_url'])) {
+        $response = fd_http_json(FD_WP_VERSION_URL . '?t=' . time(), [], 'GET', 4);
         if (!empty($response['ok'])) {
             $minVersion = (string) ($response['min_version'] ?? '');
             $updateUrl = (string) ($response['update_url'] ?? '');
@@ -2032,7 +2299,7 @@ function fd_check_version(): array
                 $fd_version_state['sponsor_desc'] = (string) ($response['sponsor']['description'] ?? '');
                 $fd_version_state['sponsor_url'] = (string) ($response['sponsor']['url'] ?? '');
             }
-            return [
+            $result = [
                 'ok' => true,
                 'update_needed' => $updateNeeded,
                 'current_version' => $current,
@@ -2045,6 +2312,12 @@ function fd_check_version(): array
                     'url' => (string) ($fd_version_state['sponsor_url'] ?? ''),
                 ],
             ];
+            @file_put_contents($cacheFile, json_encode([
+                'time' => time(),
+                'data' => $fd_version_state,
+                'result' => $result,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+            return $result;
         }
     }
 
@@ -2675,16 +2948,31 @@ function fd_episode_stream_filter(int $season, int $episode): callable
  * SxxExx MATCH misses E01-style names; search_files backfills those.
  * Never dump mixed/unfiltered post files onto an episode page.
  */
-function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 40): array
+function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 40, ?array $preloadedPost = null): array
 {
+    $tStart = microtime(true);
     if ($postId <= 0 || $season <= 0 || $episode <= 0) {
         return [];
+    }
+
+    if ($preloadedPost !== null && !empty($preloadedPost['title'])) {
+        $post = $preloadedPost;
+    } else {
+        $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+        $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+    }
+
+    $fullTitle = (string) ($post['title'] ?? '');
+    $keyword = fd_stream_keyword_from_post_title($fullTitle);
+    $postYear = null;
+    if (preg_match('/\b(19\d\d|20\d\d)\b/', $fullTitle, $ym)) {
+        $postYear = $ym[1];
     }
 
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, $postYear, $keyword, $fullTitle): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -2696,67 +2984,115 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             if (!$filter($file)) {
                 continue;
             }
+
+            $fTitle = (string) ($file['title'] ?? '');
+
+            // 1. Strict Year Guard: If file specifies a 4-digit year that contradicts post year, skip!
+            // E.g. Post is Glory 2025, but file has 2022 -> reject. Post is The Glory 2022, file has 2025 -> reject.
+            if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
+                if ($fym[1] !== $postYear) {
+                    continue;
+                }
+            }
+
+            // 2. Strict Franchise / Title Guard for short titles:
+            // Prevents "Glory" from matching unrelated titles like "You Are My Glory", "Gold Rush Our Race to Olympic Glory", etc.
+            $cleanKw = strtolower(trim($keyword));
+            if (strlen($cleanKw) >= 2) {
+                $normFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
+                $normFTitle = preg_replace('/\b(on9|stream|rilisanfilm|dailymaci|kdramashubs|wetv|pahe|galaxy|fanszz|dramaost|mkvdrama|dusklight|primefix|moviesmod|vegamovies|mkvcinemas|nodrakorid)\b/', ' ', $normFTitle);
+                $normFTitle = trim(preg_replace('/\s+/', ' ', $normFTitle));
+
+                if ($cleanKw === 'glory') {
+                    if (preg_match('/\b(?:my|olympic|special forces|cage of|song of|road to|power and the|greater|for the|tunes of|morning|race for|mad dog and)\s+glory\b/i', $normFTitle)) {
+                        continue;
+                    }
+                    // Differentiate Glory 2025 (Chinese series) from The Glory 2022 (Korean Netflix series)
+                    if ($postYear === '2025') {
+                        if (preg_match('/\b(2022|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fTitle) && !str_contains($fTitle, '2025')) {
+                            continue;
+                        }
+                    } elseif ($postYear === '2022') {
+                        if (preg_match('/\b(2025|wetv|dusklight|layarkeren)\b/i', $fTitle) && !str_contains($fTitle, '2022')) {
+                            continue;
+                        }
+                    }
+                }
+                if (!str_starts_with(strtolower($fullTitle), 'the ') && str_starts_with($normFTitle, 'the ') && $postYear !== null) {
+                    if (preg_match('/\b(2022|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fTitle) && !str_contains($fTitle, (string)$postYear)) {
+                        continue;
+                    }
+                }
+            }
+
             $seen[$code] = true;
             $all[] = $file;
         }
     };
 
-    // 1. First probe post files using exact season & episode parameters (fast MATCH)
-    $add(fd_fetch_post_files_paged($postId, [
+    // 1. Probe post files for exact SxxExx MATCH (1 page, 50 items)
+    $exactFiles = fd_fetch_post_files_paged($postId, [
         'page_size' => 50,
         'max_files' => $maxFiles,
         'season' => $season,
         'episode' => $episode,
         'filter' => $filter,
-        'max_pages' => 2,
-    ]));
+        'max_pages' => 1,
+    ]);
+    $add($exactFiles);
+    $exactCount = count($all);
 
-    // 2. Scan all files in the post up to 1000 items with the episode filter
-    // (covers posts where episodes lack Sxx or have custom tags like E01 / Ep.1 / nunadrama)
-    if (count($all) < $maxFiles) {
-        $add(fd_fetch_post_files_paged($postId, [
-            'page_size' => 100,
-            'max_files' => 1000,
-            'max_pages' => 10,
-            'filter' => $filter,
-        ]));
-    }
+    // 2. Fast keyword probe to discover external/Telegram channel releases (MalaySub, Fanszz, DramaOST, etc.)
+    if (count($all) < $maxFiles && $keyword !== '') {
+        $tokens = sprintf('(E%02d | S%02dE%02d | EP%02d', $episode, $season, $episode, $episode);
+        if ($episode < 10) {
+            $tokens .= sprintf(' | EP%d | E%d', $episode, $episode);
+        }
+        $tokens .= ')';
 
-    // 3. If still needed, probe search_files by title keywords
-    if (count($all) < $maxFiles) {
-        $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-        $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-        $keyword = fd_stream_keyword_from_post_title((string) ($post['title'] ?? ''));
+        $q = "{$keyword} {$tokens}";
+        $res = fd_fetch_stream_ajax('search_files', [
+            'search' => $q,
+            'limit' => 50,
+            'offset' => 0,
+        ]);
+        $add((array) ($res['files'] ?? []));
 
-        if ($keyword !== '') {
-            $kwVariants = fd_stream_keyword_variants($keyword);
-            $queries = [];
-            foreach ($kwVariants as $kwVar) {
-                $queries[] = sprintf('%s S%02dE%02d', $kwVar, $season, $episode);
-                $queries[] = sprintf('%s E%02d', $kwVar, $episode);
-                $queries[] = sprintf('%s EP%02d', $kwVar, $episode);
-                $queries[] = sprintf('E%02d %s', $episode, $kwVar);
-                $queries[] = sprintf('EP%02d %s', $episode, $kwVar);
-                $queries[] = sprintf('S%02dE%02d %s', $season, $episode, $kwVar);
-                if ($episode < 10) {
-                    $queries[] = sprintf('%s E%d', $kwVar, $episode);
-                    $queries[] = sprintf('E%d %s', $episode, $kwVar);
-                }
-            }
-
-            foreach (array_values(array_unique($queries)) as $query) {
-                if (count($all) >= $maxFiles) {
-                    break;
-                }
-                $res = fd_fetch_stream_ajax('search_files', [
-                    'search' => $query,
-                    'limit' => 50,
-                    'offset' => 0,
-                ]);
-                $add((array) ($res['files'] ?? []));
-            }
+        // If very few files and postYear is known, try with postYear
+        if (count($all) < 15 && $postYear !== null) {
+            $qYear = "{$keyword} {$postYear} {$tokens}";
+            $resYear = fd_fetch_stream_ajax('search_files', [
+                'search' => $qYear,
+                'limit' => 50,
+                'offset' => 0,
+            ]);
+            $add((array) ($resYear['files'] ?? []));
         }
     }
+
+    // 3. Fallback scan of post files only if we still have very few files
+    if (count($all) < 10) {
+        $pagedFiles = fd_fetch_post_files_paged($postId, [
+            'page_size' => 150,
+            'max_files' => 150,
+            'filter' => $filter,
+            'max_pages' => 1,
+        ]);
+        $add($pagedFiles);
+    }
+    $postCount = count($all);
+
+    $elapsed = round(microtime(true) - $tStart, 3);
+    fd_log('stremio episode streams resolved', [
+        'postId' => $postId,
+        'title' => $fullTitle,
+        'season' => $season,
+        'episode' => $episode,
+        'exactCount' => $exactCount,
+        'postCount' => $postCount,
+        'totalCount' => count($all),
+        'duration_seconds' => $elapsed,
+    ]);
 
     return $all;
 }
@@ -3609,6 +3945,36 @@ function fd_get_default_catalog_options(): array
     ];
 
     return $options;
+}
+
+/**
+ * Map of trending keyword catalog IDs to their search keyword strings.
+ * Shared by manifest building and catalog routing so both resolve the same
+ * top-keyword catalogs (limited to the top 5).
+ */
+function fd_get_trending_keywords_map(): array
+{
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $cached = [];
+    try {
+        $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
+        if (is_array($trending)) {
+            foreach ($trending as $item) {
+                $kw = trim((string) ($item['keyword'] ?? ''));
+                if (!fd_is_topkeyword_valid($kw)) continue;
+                $catId = 'pm_topkw_' . substr(md5(strtolower($kw)), 0, 10);
+                $cached[$catId] = $kw;
+                if (count($cached) >= 5) {
+                    break;
+                }
+            }
+        }
+    } catch (\Throwable $e) {
+    }
+    return $cached;
 }
 
 /**
@@ -5454,28 +5820,19 @@ if ($isNuvioRoute) {
         ];
 
         // Add top keyword catalogs to $manifestCatalogs if trending keywords are available
-        try {
-            $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
-            if (is_array($trending)) {
-                foreach ($trending as $item) {
-                    $kw = trim((string) ($item['keyword'] ?? ''));
-                    if (!fd_is_topkeyword_valid($kw)) continue;
-                    $catId = 'pm_topkw_' . substr(md5(strtolower($kw)), 0, 10);
-                    $manifestCatalogs[] = [
-                        'type' => 'other',
-                        'id' => $catId,
-                        'name' => ucwords($kw),
-                        'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
-                        'extra' => [
-                            ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
-                            ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                            ['name' => 'skip', 'isRequired' => false],
-                        ],
-                    ];
-                }
-            }
-        } catch (\Throwable $e) {
-            // Silently skip if trending fetch fails
+        $kwMap = fd_get_trending_keywords_map();
+        foreach ($kwMap as $catId => $kw) {
+            $manifestCatalogs[] = [
+                'type' => 'other',
+                'id' => $catId,
+                'name' => ucwords($kw),
+                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
+                'extra' => [
+                    ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
+                    ['name' => 'skip', 'isRequired' => false],
+                ],
+            ];
         }
 
         $identity = fd_stremio_manifest_identity();
@@ -5736,10 +6093,9 @@ if ($isNuvioRoute) {
             } else {
                 $keywordToSearch = '';
                 if (str_starts_with($catalogId, 'pm_topkw_')) {
-                    // Look up keyword from options
-                    $catOptions = fd_get_default_catalog_options();
-                    if (isset($catOptions[$catalogId]['keyword'])) {
-                        $keywordToSearch = $catOptions[$catalogId]['keyword'];
+                    $kwMap = fd_get_trending_keywords_map();
+                    if (isset($kwMap[$catalogId])) {
+                        $keywordToSearch = $kwMap[$catalogId];
                     }
                 }
 
@@ -6215,8 +6571,35 @@ if ($isNuvioRoute) {
 
     // ── Nuvio Stream: /stream/:type/:id.json ──
     if (preg_match('#^/stream/([^/]+)/([^/]+?)(?:\.json)?$#', $addonPath, $matches)) {
+        $streamStart = microtime(true);
         $itemType = urldecode($matches[1]);
         $itemId = urldecode(urldecode($matches[2])); // Handle double-encoded IDs from web clients
+
+        fd_log('stremio stream request received', [
+            'itemType' => $itemType,
+            'itemId' => $itemId,
+            'clientIp' => $_SERVER['REMOTE_ADDR'] ?? '',
+            'userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+        ]);
+
+        // Check 5-minute stream list cache (per itemId)
+        $streamCacheKey = md5($itemId . ':' . $itemType);
+        $streamCacheFile = fd_storage_path('storage/stream_cache_' . $streamCacheKey . '.json');
+        if (is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
+            $cachedJson = @file_get_contents($streamCacheFile);
+            if ($cachedJson) {
+                $cachedData = json_decode($cachedJson, true);
+                if (is_array($cachedData) && isset($cachedData['streams'])) {
+                    fd_log('stremio stream served from cache', [
+                        'itemId' => $itemId,
+                        'streamCount' => count($cachedData['streams']),
+                        'duration_seconds' => round(microtime(true) - $streamStart, 4),
+                    ]);
+                    fd_stremio_json($cachedData, 200, 'max-age=300, public');
+                }
+            }
+        }
+
         $streams = [];
 
         $botIdStr = fd_get_bot_id();
@@ -6413,12 +6796,32 @@ if ($isNuvioRoute) {
             $searchedYear = '';
 
             if ($imdbId !== '') {
-                $cinemetaType = ($targetSeason !== null || $itemType === 'series') ? 'series' : 'movie';
-                $cinemetaUrl = "https://v3-cinemeta.strem.io/meta/{$cinemetaType}/{$imdbId}.json";
-                $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 5);
-                if (!empty($cinemetaJson['meta']['name'])) {
-                    $searchedTitle = (string) $cinemetaJson['meta']['name'];
-                    $searchedYear = (string) ($cinemetaJson['meta']['year'] ?? '');
+                // Check 24-hour disk cache for Cinemeta metadata to eliminate repeated remote calls
+                $cCacheFile = fd_storage_path('storage/cinemeta_' . md5($imdbId) . '.json');
+                if (is_file($cCacheFile) && (time() - (int)filemtime($cCacheFile)) < 86400) {
+                    $cData = json_decode((string)@file_get_contents($cCacheFile), true);
+                    if (is_array($cData) && !empty($cData['name'])) {
+                        $searchedTitle = (string) ($cData['name'] ?? '');
+                        $searchedYear = (string) ($cData['year'] ?? '');
+                    }
+                }
+
+                if ($searchedTitle === '' || ($searchedYear === '' && ($targetSeason !== null || $itemType === 'series'))) {
+                    $cinemetaType = ($targetSeason !== null || $itemType === 'series') ? 'series' : 'movie';
+                    $cinemetaUrl = "https://v3-cinemeta.strem.io/meta/{$cinemetaType}/{$imdbId}.json";
+                    $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 5);
+                    if (!empty($cinemetaJson['meta']['name'])) {
+                        $searchedTitle = (string) $cinemetaJson['meta']['name'];
+                        $relInfo = (string) ($cinemetaJson['meta']['releaseInfo'] ?? ($cinemetaJson['meta']['year'] ?? ''));
+                        if (preg_match('/\b(19\d\d|20\d\d)\b/', $relInfo, $ym)) {
+                            $searchedYear = $ym[1];
+                        } elseif (!empty($cinemetaJson['meta']['videos'][0]['released']) && preg_match('/\b(19\d\d|20\d\d)\b/', (string)$cinemetaJson['meta']['videos'][0]['released'], $ym)) {
+                            $searchedYear = $ym[1];
+                        }
+                        if (!empty($cCacheFile)) {
+                            @file_put_contents($cCacheFile, json_encode(['name' => $searchedTitle, 'year' => $searchedYear]), LOCK_EX);
+                        }
+                    }
                 }
             }
 
@@ -6429,55 +6832,72 @@ if ($isNuvioRoute) {
                 if ($targetSeason !== null && $targetEpisode !== null) {
                     $imdbEpisodeFilter = fd_episode_stream_filter($targetSeason, $targetEpisode);
 
-                    // For Series Episode: search title with Season/Episode tokens
-                    $epQuery = sprintf('%s S%02dE%02d', $searchQuery, $targetSeason, $targetEpisode);
-                    $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
-                    if (is_array($sf) && !empty($sf['files'])) {
-                        foreach ($sf['files'] as $f) {
-                            if ($imdbEpisodeFilter($f)) {
-                                $filesToStream[] = $f;
+                    // 1. Exact Series Post Match: Try matching the title with year first (e.g. "Glory 2025")
+                    // This targets the exact post in 1 query instead of looping over 5 unrelated posts!
+                    $queriesToSearch = [];
+                    if ($searchedTitle !== '' && $searchedYear !== '') {
+                        $queriesToSearch[] = "{$searchedTitle} {$searchedYear}";
+                    }
+                    $queriesToSearch[] = $searchQuery;
+
+                    $matchedPostId = null;
+                    $matchedPostData = null;
+                    foreach ($queriesToSearch as $sq) {
+                        $sp = fd_fetch_stream_ajax('search', ['search' => $sq, 'limit' => 5]);
+                        if (!is_array($sp) || empty($sp)) {
+                            continue;
+                        }
+
+                        // Pass 1: exact year match
+                        if ($searchedYear !== '') {
+                            foreach ($sp as $p) {
+                                $pTitle = (string) ($p['title'] ?? '');
+                                $pId = $p['id'] ?? 0;
+                                if (!$pId) continue;
+                                if (preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] === $searchedYear) {
+                                    $matchedPostId = (int) $pId;
+                                    $matchedPostData = $p;
+                                    break 2;
+                                }
+                            }
+                        }
+
+                        // If no exact year match yet and we searched with year, try raw title query next
+                        if ($matchedPostId === null && $sq === "{$searchedTitle} {$searchedYear}") {
+                            continue;
+                        }
+
+                        // Pass 2: best candidate from search results
+                        if ($matchedPostId === null) {
+                            foreach ($sp as $p) {
+                                $pTitle = (string) ($p['title'] ?? '');
+                                $pId = $p['id'] ?? 0;
+                                if (!$pId) continue;
+                                // If searchedYear is known, avoid picking a post from a completely different year
+                                if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] !== $searchedYear) {
+                                    continue;
+                                }
+                                $matchedPostId = (int) $pId;
+                                $matchedPostData = $p;
+                                break 2;
                             }
                         }
                     }
 
-                    // Fallback to searching without SxxExx if few files found
+                    if ($matchedPostId !== null) {
+                        $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 40, $matchedPostData);
+                    }
+
+                    // Fallback: If no post matched or post returned 0 files, probe search_files directly
                     if (count($filesToStream) === 0) {
-                        $epQueryAlt = sprintf('%s E%02d', $searchQuery, $targetEpisode);
-                        $sfAlt = fd_fetch_stream_ajax('search_files', ['search' => $epQueryAlt, 'limit' => 30]);
-                        if (is_array($sfAlt) && !empty($sfAlt['files'])) {
-                            foreach ($sfAlt['files'] as $f) {
+                        $epQuery = sprintf('%s S%02dE%02d', $searchQuery, $targetSeason, $targetEpisode);
+                        $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
+                        if (is_array($sf) && !empty($sf['files'])) {
+                            foreach ($sf['files'] as $f) {
                                 if ($imdbEpisodeFilter($f)) {
                                     $filesToStream[] = $f;
                                 }
                             }
-                        }
-                    }
-
-                    // Also search post files, still locked to this S/E
-                    $sp = fd_fetch_stream_ajax('search', ['search' => $searchQuery, 'limit' => 5]);
-                    if (is_array($sp)) {
-                        foreach ($sp as $p) {
-                            $pId = $p['id'] ?? 0;
-                            if (!$pId) continue;
-                            $pFiles = fd_fetch_episode_stream_files((int) $pId, $targetSeason, $targetEpisode, 40);
-                            foreach ($pFiles as $pf) {
-                                $filesToStream[] = $pf;
-                            }
-                        }
-                    }
-
-                    // Fallback: If no files found yet, fetch direct search_files with broad search query and classify
-                    if (count($filesToStream) === 0) {
-                        for ($sfOffset = 0; $sfOffset < 500; $sfOffset += 100) {
-                            $sfBroad = fd_fetch_stream_ajax('search_files', ['search' => $searchQuery, 'limit' => 100, 'offset' => $sfOffset]);
-                            $broadFiles = (array) ($sfBroad['files'] ?? []);
-                            if (empty($broadFiles)) break;
-                            foreach ($broadFiles as $bf) {
-                                if ($imdbEpisodeFilter($bf)) {
-                                    $filesToStream[] = $bf;
-                                }
-                            }
-                            if (count($filesToStream) > 0 || count($broadFiles) < 100) break;
                         }
                     }
                 } else {
@@ -6767,6 +7187,11 @@ if ($isNuvioRoute) {
             }
         }
 
+        // Save to stream cache for 5 minutes
+        if (!empty($streamCacheFile)) {
+            @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
+
         fd_stremio_json(['streams' => $streams]);
     }
 
@@ -6809,6 +7234,8 @@ if (str_starts_with($path, '/api/')) {
         '/api/provision',
         '/api/catalog-settings',
         '/api/country',
+        '/api/logs',
+        '/api/debug-mode',
     ];
     if (!in_array($path, $alwaysPublicApi, true)) {
         $allowViaTunnel = fd_is_cloudflare_tunnel_request() && in_array($path, $tunnelReadableApi, true);
@@ -7140,10 +7567,7 @@ if (str_starts_with($path, '/api/')) {
     fd_ensure_autoload();
 
     // ── Version gate — block all other endpoints if update is required ──────
-    $v0 = microtime(true);
     $versionCheck = fd_check_version();
-    $v1 = microtime(true);
-    fd_log('version check timing', ['ms' => round(($v1 - $v0) * 1000), 'path' => $path]);
     if (!empty($versionCheck['update_needed'])) {
         $minVersion = $versionCheck['minimum_version'] ?? '';
         $currentVersion = $versionCheck['current_version'] ?? FD_APP_VERSION;
@@ -7165,6 +7589,95 @@ if (str_starts_with($path, '/api/')) {
         ], 426);
     }
 
+    // ── GET / POST /api/debug-mode — Toggle debug logging ────────────────────
+    // URL query toggle support: /api/debug-mode?enable=1 or ?enable=0
+    if ($path === '/api/debug-mode') {
+        if ($method === 'POST') {
+            $input = json_decode((string) file_get_contents('php://input'), true);
+            $enable = isset($input['enabled']) ? (bool) $input['enabled'] : false;
+            fd_set_debug_enabled($enable);
+            fd_json(['ok' => 1, 'enabled' => fd_is_debug_enabled()]);
+        }
+        if ($method === 'GET') {
+            if (isset($_GET['enable'])) {
+                $val = trim((string) $_GET['enable']);
+                $enable = ($val === '1' || strtolower($val) === 'true' || strtolower($val) === 'on');
+                fd_set_debug_enabled($enable);
+            }
+            fd_json(['ok' => 1, 'enabled' => fd_is_debug_enabled()]);
+        }
+    }
+
+    // ── GET /api/logs — View debug.log and MadelineProto.log from browser ────
+    // Supports query/path parameter: ?file=debug.log or ?file=MadelineProto.log
+    if ($path === '/api/logs' && $method === 'GET') {
+        if (!fd_is_debug_enabled()) {
+            fd_json(['ok' => 0, 'message' => 'Debug logging is currently disabled. Enable it via /api/debug-mode?enable=1'], 403);
+        }
+
+        $allowedFiles = [
+            'debug.log' => FD_DEBUG_LOG_PATH,
+            'madelineproto.log' => fd_storage_path('MadelineProto.log'),
+        ];
+
+        // Also check if MadelineProto.log is at repository root
+        $rootMadelineLog = fd_get_app_root() . DIRECTORY_SEPARATOR . 'MadelineProto.log';
+        if (is_file($rootMadelineLog)) {
+            $allowedFiles['madelineproto.log'] = $rootMadelineLog;
+        }
+
+        $reqFile = strtolower(trim((string) ($_GET['file'] ?? $_GET['path'] ?? 'debug.log')));
+        $reqFile = basename($reqFile);
+
+        if (!isset($allowedFiles[$reqFile])) {
+            fd_json([
+                'ok' => 0,
+                'message' => 'Invalid log file requested. Allowed: ' . implode(', ', array_keys($allowedFiles)),
+            ], 400);
+        }
+
+        $targetPath = $allowedFiles[$reqFile];
+        if (!is_file($targetPath)) {
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "(Log file {$reqFile} is empty or does not exist yet.)\n";
+            exit;
+        }
+
+        // Apply size limiter before serving
+        fd_limit_file_size($targetPath, FD_MAX_LOG_SIZE);
+
+        $linesLimit = isset($_GET['lines']) ? max(10, min(5000, (int) $_GET['lines'])) : 1000;
+        $download = !empty($_GET['download']);
+
+        if ($download) {
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="' . $reqFile . '"');
+            header('Content-Length: ' . filesize($targetPath));
+            readfile($targetPath);
+            exit;
+        }
+
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+
+        // Read last N lines if file is large
+        $fp = @fopen($targetPath, 'r');
+        if ($fp) {
+            $buffer = [];
+            while (($line = fgets($fp)) !== false) {
+                $buffer[] = $line;
+                if (count($buffer) > $linesLimit) {
+                    array_shift($buffer);
+                }
+            }
+            fclose($fp);
+            echo implode('', $buffer);
+        } else {
+            echo "(Could not open log file.)\n";
+        }
+        exit;
+    }
+
     // ── GET /api/resolve-shortcode — proxy short_code resolution through
     //     the local backend so the API secret (X-API-Secret header) is
     //     automatically sent to WordPress. The frontend should call this
@@ -7184,10 +7697,8 @@ if (str_starts_with($path, '/api/')) {
         }
 
         // Use concurrent multi-bot resolution across all pool bots for instantaneous resolution
-        $result = fd_resolve_shortcode_concurrent($shortCode, $botId !== '' ? [$botId] : []);
-        if (empty($result['ok']) && $botId !== '') {
-            $result = fd_resolve_shortcode_concurrent($shortCode);
-        }
+        // Pass empty candidate bots so it queries all pool bots + active bot simultaneously
+        $result = fd_resolve_shortcode_concurrent($shortCode);
         if (empty($result['ok'])) {
             fd_json($result, 200);
         }
@@ -7343,30 +7854,13 @@ if (str_starts_with($path, '/api/')) {
         foreach ($pool as $b) {
             $bId = (string) ($b['bot_id'] ?? '');
             if ($bId !== '') {
-                try {
-                    [$mBot, $eBot] = fd_boot_madeline(null, [], $bId);
-                    if ($mBot) {
-                        $mBot->logout();
-                    }
-                    unset($mBot);
-                } catch (Throwable $t) {
-                }
+                // Do not call $mBot->logout() for pooled / leased guest bots because calling logout()
+                // permanently terminates and revokes the Telegram bot auth session on Telegram's server,
+                // causing lock contention and "session is busy / AUTH_KEY_UNREGISTERED" for subsequent connections.
             }
         }
 
-        try {
-            [$madeline, $error] = fd_boot_madeline();
-            if ($madeline) {
-                $madeline->logout();
-                fd_log('madeline logout() completed');
-            }
-        } catch (Throwable $throwable) {
-            fd_log('madeline logout() threw', ['error' => $throwable->getMessage()]);
-        }
-
-        unset($madeline);
-
-        // Always clean up all local sessions and pool files
+        // Clean up all local sessions, locks, and pool files without invalidating keys on Telegram
         fd_clear_session();
         fd_json(['ok' => 1, 'message' => 'Session cleared.']);
     }
@@ -7467,7 +7961,8 @@ if (str_starts_with($path, '/api/')) {
             $autoProv = fd_auto_provision_guest();
             if ($autoProv && !empty($autoProv['bot_id'])) {
                 $activeBotId = (string) $autoProv['bot_id'];
-                if ($botId === '') {
+                // Always ensure activeBotId is used if incoming botId is empty or not in pool
+                if ($botId === '' || !fd_has_local_session($botId)) {
                     $botId = $activeBotId;
                 }
             } else {
@@ -7493,18 +7988,24 @@ if (str_starts_with($path, '/api/')) {
             }
         }
 
-        if ($botId !== '' && !in_array($botId, $candidateBots, true)) {
+        // Include active bot and local pool bots that have existing sessions
+        if ($activeBotId !== '' && !in_array($activeBotId, $candidateBots, true) && fd_has_local_session($activeBotId)) {
+            $candidateBots[] = $activeBotId;
+        }
+
+        if ($botId !== '' && !in_array($botId, $candidateBots, true) && fd_has_local_session($botId)) {
             $candidateBots[] = $botId;
         }
 
         $botPool = fd_get_bot_pool();
         foreach ($botPool as $pBot) {
             $pId = (string) ($pBot['bot_id'] ?? '');
-            if ($pId !== '' && !in_array($pId, $candidateBots, true)) {
+            if ($pId !== '' && !in_array($pId, $candidateBots, true) && fd_has_local_session($pId)) {
                 $candidateBots[] = $pId;
             }
         }
-        if ($activeBotId !== '' && !in_array($activeBotId, $candidateBots, true)) {
+
+        if (empty($candidateBots) && $activeBotId !== '') {
             $candidateBots[] = $activeBotId;
         }
 
@@ -7512,7 +8013,11 @@ if (str_starts_with($path, '/api/')) {
             $candidateBots[] = $activeBotId;
         }
 
-        $botId = (string) $candidateBots[0];
+        // Preserve the requested $botId if it was specified and has a local session,
+        // otherwise default to the first candidate bot
+        if ($botId === '' || !fd_has_local_session($botId)) {
+            $botId = (string) $candidateBots[0];
+        }
         $madeline = null;
         $error = null;
 
@@ -7527,8 +8032,18 @@ if (str_starts_with($path, '/api/')) {
             if ($candidateFileId !== '') {
                 // Try booting MadelineProto for this winning bot
                 [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], $cBotId);
-                if (!$bootedMadeline && $cBotId !== $activeBotId) {
-                    [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], '');
+                // If winning bot session boot failed or is missing, try with the caller's requested bot or active bot
+                if (!$bootedMadeline && $botId !== '' && $botId !== $cBotId) {
+                    [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], $botId);
+                    if ($bootedMadeline) {
+                        $cBotId = $botId;
+                    }
+                }
+                if (!$bootedMadeline && $cBotId !== $activeBotId && $activeBotId !== '') {
+                    [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], $activeBotId);
+                    if ($bootedMadeline) {
+                        $cBotId = $activeBotId;
+                    }
                 }
 
                 if ($bootedMadeline) {
@@ -7552,30 +8067,39 @@ if (str_starts_with($path, '/api/')) {
                 }
             }
 
-            // If resolve failed for current candidates, retry with a fresh auto-provisioned guest bot
+            // If resolve failed for current candidates, retry up to 3 times with fresh auto-provisioned guest bots
             if ($fileId === '' && empty($madeline)) {
-                $retryProv = fd_auto_provision_guest();
-                if ($retryProv && !empty($retryProv['bot_id'])) {
-                    $retryBotId = (string) $retryProv['bot_id'];
-                    $retryRes = fd_resolve_shortcode($shortCode, $retryBotId);
-                    $retryFileId = trim((string) ($retryRes['file_id_mt'] ?? $retryRes['file_id'] ?? ''));
-                    if ($retryFileId !== '') {
-                        [$retryBooted, $retryErr] = fd_boot_madeline(null, [], $retryBotId);
-                        if ($retryBooted) {
-                            $madeline = $retryBooted;
-                            $fileId = $retryFileId;
-                            $fileSize = (int) ($retryRes['file_size'] ?? $fileSize);
-                            $resolvedName = trim((string) ($retryRes['title'] ?? $retryRes['file_name'] ?? ''));
-                            if ($resolvedName !== '') {
-                                $fileName = $resolvedName;
+                for ($retryAttempt = 0; $retryAttempt < 3; $retryAttempt++) {
+                    $retryProv = fd_auto_provision_guest();
+                    if ($retryProv && !empty($retryProv['bot_id'])) {
+                        $retryBotId = (string) $retryProv['bot_id'];
+                        $retryRes = fd_resolve_shortcode($shortCode, $retryBotId);
+                        $retryFileId = trim((string) ($retryRes['file_id_mt'] ?? $retryRes['file_id'] ?? ''));
+                        if ($retryFileId !== '') {
+                            $retryMadeline = $retryProv['madeline'] ?? null;
+                            if (!$retryMadeline) {
+                                [$retryBooted, $retryErr] = fd_boot_madeline(null, [], $retryBotId);
+                                $retryMadeline = $retryBooted;
                             }
-                            $resolvedMime = trim((string) ($retryRes['mime'] ?? ''));
-                            $resolvedType = trim((string) ($retryRes['file_type'] ?? ''));
-                            $fileMime = fd_guess_video_mime(
-                                $fileName,
-                                $resolvedMime !== '' ? $resolvedMime : ($fileMime !== '' ? $fileMime : $resolvedType)
-                            );
-                            $botId = $retryBotId;
+                            if ($retryMadeline) {
+                                $madeline = $retryMadeline;
+                                $fileId = $retryFileId;
+                                $fileSize = (int) ($retryRes['file_size'] ?? $fileSize);
+                                $resolvedName = trim((string) ($retryRes['title'] ?? $retryRes['file_name'] ?? ''));
+                                if ($resolvedName !== '') {
+                                    $fileName = $resolvedName;
+                                }
+                                $resolvedMime = trim((string) ($retryRes['mime'] ?? ''));
+                                $resolvedType = trim((string) ($retryRes['file_type'] ?? ''));
+                                $fileMime = fd_guess_video_mime(
+                                    $fileName,
+                                    $resolvedMime !== '' ? $resolvedMime : ($fileMime !== '' ? $fileMime : $resolvedType)
+                                );
+                                $botId = $retryBotId;
+                                break;
+                            }
+                        } else {
+                            $resolved = $retryRes;
                         }
                     }
                 }
@@ -7625,16 +8149,37 @@ if (str_starts_with($path, '/api/')) {
 
         // If not already booted during short_code resolution loop, boot MadelineProto now
         if (!$madeline) {
-            [$madeline, $error] = fd_boot_madeline(null, [], $botId);
-            if (!$madeline && $botId !== $activeBotId) {
-                [$madeline, $error] = fd_boot_madeline(null, [], '');
+            // First try with the requested botId if a local session exists
+            if ($botId !== '' && fd_has_local_session($botId)) {
+                [$madeline, $error] = fd_boot_madeline(null, [], $botId);
             }
+            // If the specified bot has no session or failed, fallback to the primary active bot or any pool bot with a session
+            if (!$madeline && fd_has_local_session()) {
+                $picked = fd_pick_pool_bot();
+                $fallbackBotId = !empty($picked['bot_id']) ? (string) $picked['bot_id'] : $activeBotId;
+                if ($fallbackBotId !== '' && $fallbackBotId !== $botId) {
+                    [$madeline, $error] = fd_boot_madeline(null, [], $fallbackBotId);
+                    if ($madeline) {
+                        $botId = $fallbackBotId;
+                    }
+                }
+                if (!$madeline && $activeBotId !== '' && $activeBotId !== $botId) {
+                    [$madeline, $error] = fd_boot_madeline(null, [], $activeBotId);
+                    if ($madeline) {
+                        $botId = $activeBotId;
+                    }
+                }
+            }
+            // If still no session available, auto-provision a guest bot
             if (!$madeline) {
-                // Retry by provisioning a fresh guest session
-                $retryProv = fd_auto_provision_guest();
-                if ($retryProv && !empty($retryProv['bot_id'])) {
-                    $botId = (string) $retryProv['bot_id'];
-                    [$madeline, $error] = fd_boot_madeline(null, [], $botId);
+                fd_log('no local session for download, auto-provisioning guest bot');
+                $prov = fd_auto_provision_guest();
+                if ($prov && !empty($prov['bot_id'])) {
+                    $madeline = $prov['madeline'] ?? null;
+                    $botId = (string) $prov['bot_id'];
+                    if (!$madeline) {
+                        [$madeline, $error] = fd_boot_madeline(null, [], $botId);
+                    }
                 }
             }
         }
@@ -7660,30 +8205,78 @@ if (str_starts_with($path, '/api/')) {
             ], 501);
         }
 
-        try {
-            $fileName = fd_stremio_stream_filename($fileName, $fileMime);
-            $fileMime = fd_guess_video_mime($fileName, $fileMime);
-            if (!headers_sent()) {
-                header('Access-Control-Allow-Origin: *');
-                header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
-                header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
-                header('Accept-Ranges: bytes');
+        $fileName = fd_stremio_stream_filename($fileName, $fileMime);
+        $fileMime = fd_guess_video_mime($fileName, $fileMime);
+
+        $downloadAttempt = 0;
+        $maxDownloadAttempts = ($shortCode !== '') ? 2 : 1;
+
+        while ($downloadAttempt < $maxDownloadAttempts) {
+            $downloadAttempt++;
+            try {
+                if (!headers_sent()) {
+                    header('Access-Control-Allow-Origin: *');
+                    header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
+                    header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
+                    header('Accept-Ranges: bytes');
+                }
+                fd_log('starting downloadToBrowser', [
+                    'file_id' => $fileId,
+                    'file_size' => $fileSize,
+                    'file_name' => $fileName,
+                    'mime' => $fileMime,
+                    'attempt' => $downloadAttempt,
+                ]);
+                $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
+                return true;
+            } catch (Throwable $throwable) {
+                $errStr = $throwable->getMessage();
+                fd_log('downloadToBrowser failed', [
+                    'error' => $errStr,
+                    'attempt' => $downloadAttempt,
+                    'short_code' => $shortCode,
+                ]);
+
+                // If FILE_REFERENCE_EXPIRED or could not refresh file reference and we have a short_code,
+                // re-resolve the shortcode with cache bypassed to get a fresh file_id and retry
+                $isRefExpired = (stripos($errStr, 'FILE_REFERENCE_EXPIRED') !== false || stripos($errStr, 'refresh file reference') !== false);
+                if ($isRefExpired && $shortCode !== '' && $downloadAttempt < $maxDownloadAttempts) {
+                    fd_log('file reference expired, re-resolving short_code with nocache', ['short_code' => $shortCode]);
+                    // Re-resolve bypassing local cache
+                    $reResolved = fd_resolve_shortcode($shortCode, $botId, true);
+                    $newFileId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
+                    if ($newFileId !== '' && $newFileId !== $fileId) {
+                        $fileId = $newFileId;
+                        $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
+                        continue;
+                    }
+                    // If same bot returned same id, try with guest/alternate bot
+                    $retryProv = fd_auto_provision_guest();
+                    if ($retryProv && !empty($retryProv['bot_id'])) {
+                        $altBotId = (string) $retryProv['bot_id'];
+                        $reResolved = fd_resolve_shortcode($shortCode, $altBotId, true);
+                        $newFileId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
+                        if ($newFileId !== '') {
+                            $fileId = $newFileId;
+                            $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
+                            $botId = $altBotId;
+                            $altMadeline = $retryProv['madeline'] ?? null;
+                            if (!$altMadeline) {
+                                [$altMadeline, $altErr] = fd_boot_madeline(null, [], $altBotId);
+                            }
+                            if ($altMadeline) {
+                                $madeline = $altMadeline;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                fd_json([
+                    'ok' => 0,
+                    'message' => 'File download failed: ' . $errStr,
+                ], 500);
             }
-            fd_log('starting downloadToBrowser', [
-                'file_id' => $fileId,
-                'file_size' => $fileSize,
-                'file_name' => $fileName,
-                'mime' => $fileMime,
-            ]);
-            $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
-        } catch (Throwable $throwable) {
-            fd_log('downloadToBrowser failed', [
-                'error' => $throwable->getMessage(),
-            ]);
-            fd_json([
-                'ok' => 0,
-                'message' => 'File download failed.',
-            ], 500);
         }
 
         return true;
@@ -7693,6 +8286,11 @@ if (str_starts_with($path, '/api/')) {
 }
 
 // ─── Static file serving ────────────────────────────────────────────────────
+
+// If running in CLI / warmup-ipc mode, do not attempt to serve static files
+if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+    return true;
+}
 
 $publicDir = __DIR__ . '/public';
 $file = $path === '/' ? '/index.html' : $path;

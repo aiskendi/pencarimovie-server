@@ -48,7 +48,7 @@ class PencariMovieApp {
     this._cachePrefix = 'pencarimovie_cache:';
 
     // Session state
-    this.version = '1.8.0';
+    this.version = '1.8.2';
     this.botId = '';
     this.botUsername = '';
     this.botName = '';
@@ -1968,7 +1968,7 @@ class PencariMovieApp {
     return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 
-  buildDownloadUrl(fileId, fileSize, fileName, fileMime, botId = null) {
+  buildDownloadUrl(fileId, fileSize, fileName, fileMime, botId = null, shortCode = null) {
     const url = new URL(`${this.localApiBase}/api/download`);
     const payload = {
       file_id: fileId,
@@ -1978,6 +1978,9 @@ class PencariMovieApp {
     };
     if (botId) {
       payload.bot_id = botId;
+    }
+    if (shortCode) {
+      payload.short_code = shortCode;
     }
     url.searchParams.set('d', this.encodeDownloadPayload(payload));
     return url.toString();
@@ -2528,9 +2531,21 @@ class PencariMovieApp {
                   this.openFileDetail(postData.short_code || postData.id);
                 } else {
                   this.openModal(postData);
+                  if (!postData.content && !postData.excerpt) {
+                    this.fetchStream('get_post', { post_id: postId }).then((fullPost) => {
+                      if (fullPost && this.isModalOpen) {
+                        this.openModal(fullPost);
+                      }
+                    }).catch(() => {});
+                  }
                 }
               } else {
                 this.openModal({ id: postId, post_title: card.getAttribute('data-post-title') || 'Details' });
+                this.fetchStream('get_post', { post_id: postId }).then((fullPost) => {
+                  if (fullPost && this.isModalOpen) {
+                    this.openModal(fullPost);
+                  }
+                }).catch(() => {});
               }
             }
           });
@@ -3225,11 +3240,17 @@ class PencariMovieApp {
               if (postData) break;
             }
           }
-          if (postData) {
+          if (postData && (postData.content || postData.excerpt)) {
             this.openModal(postData);
           } else {
-            // Fallback: open modal with just the ID
-            this.openModal({ id: postId, post_title: postCard.getAttribute('data-post-title') || 'Details' });
+            // Fetch complete post details from WordPress API
+            const fallbackTitle = postCard.getAttribute('data-post-title') || 'Details';
+            this.openModal(postData || { id: postId, post_title: fallbackTitle });
+            this.fetchStream('get_post', { post_id: postId }).then((fullPost) => {
+              if (fullPost && this.isModalOpen) {
+                this.openModal(fullPost);
+              }
+            }).catch(() => {});
           }
         }
       }
@@ -3239,7 +3260,7 @@ class PencariMovieApp {
   _buildTrackHtml(trackId, title, items) {
     const cards = items.map((item) => {
       if (item && (item.is_file || item.short_code)) {
-        return this._renderFileCard(item);
+        return this._renderTrackFileCard(item);
       }
       return this._renderCard(item);
     }).join('');
@@ -3285,7 +3306,7 @@ class PencariMovieApp {
     `;
   }
 
-  _renderFileCard(file) {
+  _renderTrackFileCard(file) {
     if (file && file.short_code) {
       this._knownFiles.set(file.short_code, file);
     }
@@ -3317,6 +3338,59 @@ class PencariMovieApp {
         <div class="stream-card__overlay">
           <div class="stream-card__title">${this.escapeHtml(title)}</div>
           <div class="stream-card__meta">${this.escapeHtml(metaLine)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderFileCard(file) {
+    if (file && file.short_code) {
+      this._knownFiles.set(file.short_code, file);
+    }
+    const rawTitle = file.title || 'File';
+    const title = this.cleanMediaTitle(rawTitle);
+    const shortCode = file.short_code || '';
+    const fileType = file.file_type || file.extension || '';
+    const fileSize = file.file_size || 0;
+    const thumbnail = file.thumbnail_url || '';
+
+    let metaParts = [];
+    if (file.is_split_part) {
+      const pNum = String(file.part_num).padStart(2, '0');
+      const totalStr = file.total_parts ? `/${String(file.total_parts).padStart(2, '0')}` : '';
+      metaParts.push(`Part ${pNum}${totalStr}`);
+    }
+    if (fileType) {
+      metaParts.push(fileType.toUpperCase());
+    }
+    if (fileSize > 0) {
+      metaParts.push(this.formatSize(fileSize));
+    }
+
+    const thumbStyle = thumbnail ? `style="background-image: url('${thumbnail}')"` : '';
+    const playIcon = '<i class="fas fa-play"></i>';
+    const fileIcon = '<i class="fas fa-file-video"></i>';
+
+    return `
+      <div class="stream-file-card" data-short-code="${this.escapeHtml(shortCode)}"${file.is_combined_parts ? ' data-combined="1"' : ''} data-post-title="${this.escapeHtml(title)}" title="${this.escapeHtml(rawTitle)}">
+        <div class="stream-file-card__thumb" ${thumbStyle}>
+          ${!thumbnail ? fileIcon : ''}
+          <div class="stream-file-card__overlay">
+            <span class="stream-file-card__play">${playIcon}</span>
+          </div>
+        </div>
+        <div class="stream-file-card__info">
+          <div class="stream-file-card__title">${this.escapeHtml(title)}</div>
+          <div class="stream-file-card__meta">
+            ${fileType ? `<span class="stream-file-card__badge">${this.escapeHtml(fileType)}</span>` : ''}
+            ${fileSize > 0 ? `<span class="stream-file-card__size">${this.formatSize(fileSize)}</span>` : ''}
+            ${file.is_split_part ? `<span class="stream-file-card__badge">Part ${String(file.part_num).padStart(2, '0')}</span>` : ''}
+          </div>
+        </div>
+        <div class="stream-file-card__action">
+          <button class="stream-file-card__btn" aria-label="Play or download" title="Play or download">
+            <i class="fas fa-play"></i>
+          </button>
         </div>
       </div>
     `;
@@ -3557,7 +3631,7 @@ class PencariMovieApp {
       `;
 
       // Click → File Detail Page
-      filesSection.querySelectorAll('.stream-file-card').forEach((card) => {
+      filesSection.querySelectorAll('.stream-file-card, .stream-card[data-short-code]').forEach((card) => {
         card.addEventListener('click', () => {
           const shortCode = card.getAttribute('data-short-code');
           if (shortCode) {
@@ -3730,64 +3804,29 @@ class PencariMovieApp {
         };
       }
 
-      // 1. Try direct browser call to WordPress first if apiSecret is available in browser
-      if (this.apiSecret) {
+      // 1. Always use local backend proxy (/api/resolve-shortcode)
+      // The local backend runs concurrent multi-bot resolution across the active bot pool
+      const resolveUrl = new URL(`${this.localApiBase}/api/resolve-shortcode`);
+      resolveUrl.searchParams.set('short_code', shortCode);
+
+      const FETCH_TIMEOUT_MS = 15000;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const wpResolveUrl = new URL(`${this.wpApiBase}/resolve-file`);
-          wpResolveUrl.searchParams.set('short_code', shortCode);
-          if (this.botId) {
-            wpResolveUrl.searchParams.set('bot_id', this.botId);
-          }
-          const ctrl = new AbortController();
-          const tId = setTimeout(() => ctrl.abort(), 6000);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
           try {
-            const res = await fetch(wpResolveUrl.toString(), {
-              headers: {
-                'X-API-Secret': this.apiSecret,
-                'X-App-Version': this.version || '1.4.0'
-              },
-              signal: ctrl.signal
+            data = await this.requestJson(resolveUrl.toString(), {
+              signal: controller.signal,
             });
-            if (res.ok) {
-              const resData = await res.json();
-              if (resData && resData.ok) {
-                data = resData;
-              }
-            }
           } finally {
-            clearTimeout(tId);
+            clearTimeout(timeoutId);
           }
-        } catch (err) {
-          console.warn('Browser direct shortcode resolve skipped/failed, trying JS addon/backend proxy:', err);
+          if (data && data.ok) break;
+        } catch (e) {
+          if (attempt >= 3) throw e;
         }
-      }
-
-      // 2. Fallback to local backend proxy if browser-direct didn't resolve
-      if (!data || !data.ok) {
-        const resolveUrl = new URL(`${this.localApiBase}/api/resolve-shortcode`);
-        resolveUrl.searchParams.set('short_code', shortCode);
-
-        // 15-second timeout per attempt to prevent hanging on unresponsive API
-        const FETCH_TIMEOUT_MS = 15000;
-
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-            try {
-              data = await this.requestJson(resolveUrl.toString(), {
-                signal: controller.signal,
-              });
-            } finally {
-              clearTimeout(timeoutId);
-            }
-            if (data && data.ok) break;
-          } catch (e) {
-            if (attempt >= 3) throw e;
-          }
-          // Wait before retry (increasing delay)
-          await new Promise(r => setTimeout(r, attempt * 1000));
-        }
+        await new Promise(r => setTimeout(r, attempt * 1000));
       }
 
       // Resolving complete — hide spinner
@@ -3803,8 +3842,8 @@ class PencariMovieApp {
         return;
       }
 
-      // Cache the result (immutable mapping — no TTL expiry)
-      this._cacheSet(resolveCacheKey, data, 365 * 24 * 60 * 60 * 1000);
+      // Cache the result (TTL 2 hours because Telegram file_reference tokens expire)
+      this._cacheSet(resolveCacheKey, data, 2 * 60 * 60 * 1000);
 
       // Render
       this._renderResolvedFile(data, shortCode);
@@ -3868,7 +3907,7 @@ class PencariMovieApp {
 
     if (isEmbeddable && fileId && fileSize > 0) {
       // Build local download URL as video/audio source
-      const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id);
+      const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
 
       if (mediaType === 'video') {
         if (videoEl) {
@@ -3899,7 +3938,7 @@ class PencariMovieApp {
 
     // Download button: build local download URL
     if (fileId && fileSize > 0) {
-      const downloadUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id);
+      const downloadUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
       this.$('#fileDetailDownloadBtn').setAttribute('data-url', downloadUrl);
       this.$('#fileDetailDownloadBtn').disabled = false;
       this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> Download';

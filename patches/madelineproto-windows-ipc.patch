@@ -159,6 +159,19 @@ index d69cbf5..89b63ea 100644
          }
      }
      /**
+diff --git a/src/MTProtoTools/ReferenceDatabase.php b/src/MTProtoTools/ReferenceDatabase.php
+index e4271ec..5c49237 100644
+--- a/src/MTProtoTools/ReferenceDatabase.php
++++ b/src/MTProtoTools/ReferenceDatabase.php
+@@ -467,7 +467,7 @@ final class ReferenceDatabase implements TLCallback
+         $ok = false;
+         foreach ($queue as $locationString => $_) {
+             $data = $this->getDb($locationString);
+-            if (!\is_array($data) || !isset($data['reference'])) {
++            if (!\is_array($data) || !isset($data['reference']) || empty($data['origins'])) {
+                 continue;
+             }
+             $data['reference'] = (string) $data['reference'];
 diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
 index 0ba694d..27180d9 100644
 --- a/src/Settings/Ipc.php

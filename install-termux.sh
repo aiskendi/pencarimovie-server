@@ -7,8 +7,8 @@ cd "$ROOT_DIR"
 echo "Installing Termux helpers for PencariMovie Server..."
 
 if command -v pkg >/dev/null 2>&1; then
-  echo "Ensuring required Termux packages (proot, nodejs, openssl, ca-certificates)..."
-  pkg install -y proot nodejs openssl ca-certificates 2>/dev/null || true
+  echo "Ensuring required Termux packages (proot, openssl, ca-certificates)..."
+  pkg install -y proot openssl ca-certificates 2>/dev/null || true
 fi
 
 mkdir -p tmp

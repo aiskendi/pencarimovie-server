@@ -220,22 +220,12 @@ if not exist "%OTA_TMP%\pencarimovie.zip" (
     exit /b 1
 )
 
-rem Extract using tar.exe (built-in Windows 10/11 bsdtar)
-tar.exe -xf "%OTA_TMP%\pencarimovie.zip" -C "%OTA_TMP%\extract" >nul 2>&1
-if errorlevel 1 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path (Join-Path $env:OTA_TMP 'pencarimovie.zip') -DestinationPath (Join-Path $env:OTA_TMP 'extract') -Force"
-)
-
-set "EXTRACT_SRC="
-for /f "delims=" %%F in ('dir /b /s "%OTA_TMP%\extract\backend.php" 2^>nul') do (
-    set "EXTRACT_SRC=%%~dpF"
-)
-if not defined EXTRACT_SRC set "EXTRACT_SRC=!OTA_TMP!\extract\"
-if "!EXTRACT_SRC:~-1!"=="\" set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
-
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (Get-ChildItem -Path $env:OTA_TMP -Filter 'backend.php' -Recurse | Select-Object -First 1).DirectoryName; if (-not $s) { $s = Join-Path $env:OTA_TMP 'extract' }; $d = $env:APP_PATH; if (-not $d) { $d = Join-Path $env:USERPROFILE 'pencarimovie-server' }; Get-ChildItem -LiteralPath $s -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $d -Recurse -Force }"
+tar.exe -xf "%OTA_TMP%\pencarimovie.zip" --exclude=storage --exclude=storage/* -C "!APP_PATH!" >nul 2>&1
+if errorlevel 1 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path ('{0}\pencarimovie.zip' -f $env:OTA_TMP) -DestinationPath $env:APP_PATH -Force"
+)
 if errorlevel 1 (
     echo File copy failed.
     rmdir /s /q "%OTA_TMP%" 2>nul

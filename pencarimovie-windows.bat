@@ -215,7 +215,7 @@ if not exist "%OTA_TMP%\pencarimovie.zip" (
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-tar.exe -xf "%OTA_TMP%\pencarimovie.zip" --exclude=storage --exclude=storage/* -C "!APP_PATH!" >nul 2>&1
+tar.exe -xf "%OTA_TMP%\pencarimovie.zip" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
 if not exist "!APP_PATH!\backend.php" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = Join-Path $env:OTA_TMP 'pencarimovie.zip'; Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force"
 )

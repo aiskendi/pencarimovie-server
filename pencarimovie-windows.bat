@@ -226,23 +226,21 @@ if errorlevel 1 (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path (Join-Path $env:OTA_TMP 'pencarimovie.zip') -DestinationPath (Join-Path $env:OTA_TMP 'extract') -Force"
 )
 
-set "EXTRACT_SRC=%OTA_TMP%\extract"
+set "EXTRACT_SRC="
 for /f "delims=" %%F in ('dir /b /s "%OTA_TMP%\extract\backend.php" 2^>nul') do (
     set "EXTRACT_SRC=%%~dpF"
 )
+if not defined EXTRACT_SRC set "EXTRACT_SRC=!OTA_TMP!\extract\"
 if "!EXTRACT_SRC:~-1!"=="\" set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD storage /R:2 /W:1 /NP /NFL /NDL >nul
-if errorlevel 8 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "param($s,$d) Get-ChildItem -LiteralPath $s -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $d -Recurse -Force }" -s "!EXTRACT_SRC!" -d "!APP_PATH!"
-    if errorlevel 1 (
-        echo File copy failed.
-        rmdir /s /q "%OTA_TMP%" 2>nul
-        pause
-        exit /b 1
-    )
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = (Get-ChildItem -Path $env:OTA_TMP -Filter 'backend.php' -Recurse | Select-Object -First 1).DirectoryName; if (-not $s) { $s = Join-Path $env:OTA_TMP 'extract' }; $d = $env:APP_PATH; if (-not $d) { $d = Join-Path $env:USERPROFILE 'pencarimovie-server' }; Get-ChildItem -LiteralPath $s -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $d -Recurse -Force }"
+if errorlevel 1 (
+    echo File copy failed.
+    rmdir /s /q "%OTA_TMP%" 2>nul
+    pause
+    exit /b 1
 )
 
 > "!APP_PATH!\.release-tag" echo !OTA_TAG!

@@ -236,7 +236,7 @@ if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
 robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD storage /R:2 /W:1 /NP /NFL /NDL >nul
 if errorlevel 8 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:EXTRACT_SRC; $dst = $env:APP_PATH; Get-ChildItem -LiteralPath $src -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force }"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "param($s,$d) Get-ChildItem -LiteralPath $s -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $d -Recurse -Force }" -s "!EXTRACT_SRC!" -d "!APP_PATH!"
     if errorlevel 1 (
         echo File copy failed.
         rmdir /s /q "%OTA_TMP%" 2>nul

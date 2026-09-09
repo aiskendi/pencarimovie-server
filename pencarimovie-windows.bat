@@ -42,7 +42,7 @@ if exist "%USERPROFILE%\pencarimovie-downloader" (
     )
     rmdir /s /q "%USERPROFILE%\pencarimovie-downloader" 2>nul
 )
-if exist "%APP_DIR%" set "HAD_APP=1"
+if exist "%APP_DIR%\backend.php" set "HAD_APP=1"
 call :install_or_update
 call :register_cmd_path
 
@@ -234,12 +234,15 @@ if "!EXTRACT_SRC:~-1!"=="\" set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:EXTRACT_SRC; $dst = $env:APP_PATH; Get-ChildItem -Path $src -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -Path $_.FullName -Destination $dst -Recurse -Force }"
-if errorlevel 1 (
-    echo File copy failed.
-    rmdir /s /q "%OTA_TMP%" 2>nul
-    pause
-    exit /b 1
+robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD storage /R:2 /W:1 /NP /NFL /NDL >nul
+if errorlevel 8 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:EXTRACT_SRC; $dst = $env:APP_PATH; Get-ChildItem -LiteralPath $src -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force }"
+    if errorlevel 1 (
+        echo File copy failed.
+        rmdir /s /q "%OTA_TMP%" 2>nul
+        pause
+        exit /b 1
+    )
 )
 
 > "!APP_PATH!\.release-tag" echo !OTA_TAG!

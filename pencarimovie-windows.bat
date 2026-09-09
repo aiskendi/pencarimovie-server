@@ -234,16 +234,12 @@ if "!EXTRACT_SRC:~-1!"=="\" set "EXTRACT_SRC=!EXTRACT_SRC:~0,-1!"
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-:: Safe file sync into app folder
-robocopy "!EXTRACT_SRC!" "!APP_PATH!" /E /XD "!EXTRACT_SRC!\storage" "!APP_PATH!\storage" /R:2 /W:1 /NP /NFL /NDL >nul
-if errorlevel 8 (
-    xcopy "!EXTRACT_SRC!" "!APP_PATH!" /E /I /Y /Q >nul 2>&1
-    if errorlevel 1 (
-        echo File copy failed.
-        rmdir /s /q "%OTA_TMP%" 2>nul
-        pause
-        exit /b 1
-    )
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:EXTRACT_SRC; $dst = $env:APP_PATH; Get-ChildItem -Path $src -Force | Where-Object { $_.Name -ne 'storage' } | ForEach-Object { Copy-Item -Path $_.FullName -Destination $dst -Recurse -Force }"
+if errorlevel 1 (
+    echo File copy failed.
+    rmdir /s /q "%OTA_TMP%" 2>nul
+    pause
+    exit /b 1
 )
 
 > "!APP_PATH!\.release-tag" echo !OTA_TAG!

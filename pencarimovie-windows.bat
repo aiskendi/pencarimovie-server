@@ -35,13 +35,6 @@ if not "%1"=="" (
 )
 
 :start
-if exist "%USERPROFILE%\pencarimovie-downloader" (
-    if exist "%USERPROFILE%\pencarimovie-downloader\storage" if not exist "%APP_DIR%\storage" (
-        mkdir "%APP_DIR%" 2>nul
-        robocopy "%USERPROFILE%\pencarimovie-downloader\storage" "%APP_DIR%\storage" /e /np /nfl /ndl /njh /njs >nul 2>&1
-    )
-    rmdir /s /q "%USERPROFILE%\pencarimovie-downloader" 2>nul
-)
 if exist "%APP_DIR%\backend.php" set "HAD_APP=1"
 call :install_or_update
 call :register_cmd_path
@@ -223,10 +216,10 @@ if not exist "%OTA_TMP%\pencarimovie.zip" (
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
 tar.exe -xf "%OTA_TMP%\pencarimovie.zip" --exclude=storage --exclude=storage/* -C "!APP_PATH!" >nul 2>&1
-if errorlevel 1 (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path ('{0}\pencarimovie.zip' -f $env:OTA_TMP) -DestinationPath $env:APP_PATH -Force"
+if not exist "!APP_PATH!\backend.php" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = Join-Path $env:OTA_TMP 'pencarimovie.zip'; Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force"
 )
-if errorlevel 1 (
+if not exist "!APP_PATH!\backend.php" (
     echo File copy failed.
     rmdir /s /q "%OTA_TMP%" 2>nul
     pause

@@ -31,12 +31,12 @@
 Install and start the server with a single command:
 
 | Platform                | Command / Download                                                                                              |
-| :---------------------- | :-------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| :---------------------- | :-------------------------------------------------------------------------------------------------------------- |
 | **📱 Android (APK)**    | [**📥 Direct APK Download (telegra.my/apk)**](https://telegra.my/apk) _(Install, tap Start Server, and stream)_ |
-| **🪟 Windows (10/11)**  | `irm telegra.my/win                                                                                             | iex` _(Run in PowerShell)_      |
-| **🐧 Linux**            | `curl -fsSL telegra.my/linux                                                                                    | bash`                           |
-| **🍏 macOS**            | `curl -fsSL telegra.my/mac                                                                                      | bash` _(Apple Silicon & Intel)_ |
-| **🤖 Android (Termux)** | `curl -fsSL telegra.my/termux                                                                                   | bash`                           |
+| **🪟 Windows (10/11)**  | `irm telegra.my/win &#124; iex` _(Run in PowerShell)_                                                           |
+| **🐧 Linux**            | `curl -fsSL telegra.my/linux &#124; bash`                                                                       |
+| **🍏 macOS**            | `curl -fsSL telegra.my/mac &#124; bash` _(Apple Silicon & Intel)_                                               |
+| **🤖 Android (Termux)** | `curl -fsSL telegra.my/termux &#124; bash`                                                                      |
 
 Once started, open the web dashboard in your browser:
 👉 **`http://127.0.0.1:8088`** _(or your local LAN IP printed in terminal)_

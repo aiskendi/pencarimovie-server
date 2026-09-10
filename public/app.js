@@ -48,7 +48,7 @@ class PencariMovieApp {
     this._cachePrefix = 'pencarimovie_cache:';
 
     // Session state
-    this.version = '1.8.2';
+    this.version = '1.0.0';
     this.botId = '';
     this.botUsername = '';
     this.botName = '';
@@ -60,6 +60,7 @@ class PencariMovieApp {
     this.tunnelUrl = '';
     this.tunnelEnabled = false;
     this._tunnelBusy = false;
+    this.sponsor = null;
     this._updateAddonModalUrls = () => {};
     this._restoreCachedSession();
 
@@ -502,14 +503,61 @@ class PencariMovieApp {
 
           updateCatalogModeUI();
           renderCatalogOptions();
+
+          const isTunnelHost = !!res?.is_tunnel ||
+            window.location.hostname.endsWith('.trycloudflare.com') ||
+            window.location.hostname.includes('tunnel.pencarimovie.com');
+          if (isTunnelHost) {
+            const addonCatalogCard = this.$('#addonCatalogCard');
+            if (addonCatalogCard) {
+              addonCatalogCard.classList.add('addon-catalog-card--frozen');
+              if (!addonCatalogCard.querySelector('.addon-catalog-card__frozen-notice')) {
+                const notice = document.createElement('div');
+                notice.className = 'addon-catalog-card__frozen-notice';
+                notice.textContent = '🔒 Catalog configuration is frozen when accessed via Cloudflare Tunnel. Configure from your local network.';
+                const header = addonCatalogCard.querySelector('.addon-catalog-card__header');
+                if (header && header.nextSibling) {
+                  addonCatalogCard.insertBefore(notice, header.nextSibling);
+                } else {
+                  addonCatalogCard.prepend(notice);
+                }
+              }
+              addonCatalogCard.querySelectorAll('input').forEach((inp) => { inp.disabled = true; });
+              addonCatalogCard.querySelectorAll('button').forEach((btn) => {
+                if (btn.id !== 'addonModalClose') {
+                  btn.disabled = true;
+                  btn.style.pointerEvents = 'none';
+                  btn.style.opacity = '0.6';
+                }
+              });
+            }
+            if (addonCatalogStatusBadge) {
+              addonCatalogStatusBadge.textContent = '🔒 Frozen';
+              addonCatalogStatusBadge.title = 'Catalog configuration is disabled via Cloudflare tunnel. Configure locally.';
+            }
+            if (catSaveSettingsBtn) {
+              catSaveSettingsBtn.disabled = true;
+              catSaveSettingsBtn.textContent = '🔒 Configuration Frozen';
+              catSaveSettingsBtn.style.opacity = '0.6';
+              catSaveSettingsBtn.style.cursor = 'not-allowed';
+            }
+          }
         }
       } catch (err) {
         console.warn('Failed to load catalog settings:', err);
       }
     };
 
+    const isCatalogFrozen = () => {
+      const card = document.getElementById('addonCatalogCard');
+      return !!(card && card.classList.contains('addon-catalog-card--frozen')) ||
+        window.location.hostname.endsWith('.trycloudflare.com') ||
+        window.location.hostname.includes('tunnel.pencarimovie.com');
+    };
+
     if (catalogModeEnabled) {
       catalogModeEnabled.addEventListener('change', () => {
+        if (isCatalogFrozen() || catalogModeEnabled.disabled) return;
         catalogSettingsState.catalogs_enabled = true;
         updateCatalogModeUI();
       });
@@ -517,6 +565,7 @@ class PencariMovieApp {
 
     if (catalogModeDisabled) {
       catalogModeDisabled.addEventListener('change', () => {
+        if (isCatalogFrozen() || catalogModeDisabled.disabled) return;
         catalogSettingsState.catalogs_enabled = false;
         updateCatalogModeUI();
       });
@@ -526,8 +575,9 @@ class PencariMovieApp {
     const modeOpts = document.querySelectorAll('.addon-catalog-mode-opt');
     modeOpts.forEach((opt) => {
       opt.addEventListener('click', (e) => {
+        if (isCatalogFrozen()) return;
         const radio = opt.querySelector('input[type="radio"]');
-        if (radio && e.target !== radio) {
+        if (radio && e.target !== radio && !radio.disabled) {
           radio.checked = true;
           catalogSettingsState.catalogs_enabled = (radio.value === 'enabled');
           updateCatalogModeUI();
@@ -1823,7 +1873,7 @@ class PencariMovieApp {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-App-Version': this.version || '1.4.0'
+            'X-App-Version': this.version || '1.0.0'
           },
           body: JSON.stringify({ bot_token: primaryToken })
         });
@@ -2709,7 +2759,7 @@ class PencariMovieApp {
         const resp = await fetch(directUrl.toString(), {
           headers: {
             'X-Requested-With': 'XMLHttpRequest',
-            'X-App-Version': this.version || '1.4.0'
+            'X-App-Version': this.version || '1.0.0'
           },
           signal: ctrl.signal
         });
@@ -3610,28 +3660,45 @@ class PencariMovieApp {
       const files = this.groupSplitParts(rawFiles);
 
       if (files.length === 0) {
-        filesSection.innerHTML = `
-          <div class="stream-modal__files-title">
-            <i class="fas fa-download"></i> Files
-            <span class="stream-modal__files-count">0</span>
-          </div>
-          <p style="color:var(--text-muted);font-size:0.85rem;">No files found for this post.</p>
-        `;
+        const sponsorCardHtml = this._renderSponsorFileCard();
+        if (sponsorCardHtml) {
+          filesSection.innerHTML = `
+            <div class="stream-modal__files-title">
+              <i class="fas fa-download"></i> Files
+              <span class="stream-modal__files-count">1</span>
+            </div>
+            <div class="stream-modal__files-grid">
+              ${sponsorCardHtml}
+            </div>
+          `;
+        } else {
+          filesSection.innerHTML = `
+            <div class="stream-modal__files-title">
+              <i class="fas fa-download"></i> Files
+              <span class="stream-modal__files-count">0</span>
+            </div>
+            <p style="color:var(--text-muted);font-size:0.85rem;">No files found for this post.</p>
+          `;
+        }
         return;
       }
+
+      const sponsorCardHtml = this._renderSponsorFileCard();
+      const totalCount = files.length + (sponsorCardHtml ? 1 : 0);
 
       filesSection.innerHTML = `
         <div class="stream-modal__files-title">
           <i class="fas fa-download"></i> Files
-          <span class="stream-modal__files-count">${files.length}</span>
+          <span class="stream-modal__files-count">${totalCount}</span>
         </div>
         <div class="stream-modal__files-grid">
+          ${sponsorCardHtml}
           ${files.map((f) => this._renderFileCard(f)).join('')}
         </div>
       `;
 
-      // Click → File Detail Page
-      filesSection.querySelectorAll('.stream-file-card, .stream-card[data-short-code]').forEach((card) => {
+      // Click → File Detail Page (excluding sponsor cards which handle external link navigation)
+      filesSection.querySelectorAll('.stream-file-card:not(.stream-file-card--sponsor), .stream-card[data-short-code]').forEach((card) => {
         card.addEventListener('click', () => {
           const shortCode = card.getAttribute('data-short-code');
           if (shortCode) {
@@ -3946,6 +4013,73 @@ class PencariMovieApp {
       this.$('#fileDetailDownloadBtn').disabled = true;
       this.$('#fileDetailDownloadBtn').innerHTML = '<i class="fas fa-download"></i> No file ID';
     }
+
+    // Render sponsored button in File Detail page if configured
+    this._renderFileDetailSponsor();
+  }
+
+  /**
+   * Render sponsored card for post modal files list.
+   * Prepends a sponsored item to the files grid linking directly to sponsor url.
+   */
+  _renderSponsorFileCard() {
+    if (!this.sponsor || !this.sponsor.url) return '';
+    const sponsorName = this.sponsor.name || 'Sponsored';
+    const sponsorDesc = this.sponsor.description || 'Support / Sponsor';
+    const sponsorUrl = this.sponsor.url;
+
+    return `
+      <div class="stream-file-card stream-file-card--sponsor" data-sponsor-url="${this.escapeHtml(sponsorUrl)}" title="${this.escapeHtml(sponsorDesc)}" style="border: 1px solid rgba(255, 107, 53, 0.4); background: rgba(255, 107, 53, 0.05); cursor: pointer;" onclick="window.open('${this.escapeHtml(sponsorUrl)}', '_blank')">
+        <div class="stream-file-card__thumb" style="display: flex; align-items: center; justify-content: center; background: rgba(255, 107, 53, 0.15); color: var(--accent, #ff6b35); font-size: 1.5rem;">
+          <i class="fas fa-star"></i>
+          <div class="stream-file-card__overlay">
+            <span class="stream-file-card__play"><i class="fas fa-external-link-alt"></i></span>
+          </div>
+        </div>
+        <div class="stream-file-card__info">
+          <div class="stream-file-card__title" style="color: var(--accent, #ff6b35); font-weight: 600;">${this.escapeHtml(sponsorName)}</div>
+          <div class="stream-file-card__meta">
+            <span class="stream-file-card__size" style="color: rgba(255,255,255,0.7);">${this.escapeHtml(sponsorDesc)}</span>
+          </div>
+        </div>
+        <div class="stream-file-card__action">
+          <button class="stream-file-card__btn" style="background: var(--accent, #ff6b35); color: #fff;" aria-label="Open link" title="Open link">
+            <i class="fas fa-external-link-alt"></i>
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  /**
+   * Render or update sponsored button on the File Detail page.
+   */
+  _renderFileDetailSponsor() {
+    const actionsEl = this.$('#fileDetailActions');
+    if (!actionsEl) return;
+
+    let sponsorBtn = this.$('#fileDetailSponsorBtn');
+    if (!this.sponsor || !this.sponsor.url) {
+      if (sponsorBtn) sponsorBtn.remove();
+      return;
+    }
+
+    const sponsorName = this.sponsor.name || 'Sponsored';
+    const sponsorDesc = this.sponsor.description || '';
+    const sponsorUrl = this.sponsor.url;
+
+    if (!sponsorBtn) {
+      sponsorBtn = document.createElement('a');
+      sponsorBtn.id = 'fileDetailSponsorBtn';
+      sponsorBtn.className = 'file-detail__sponsor-btn';
+      sponsorBtn.target = '_blank';
+      sponsorBtn.rel = 'noopener noreferrer';
+      actionsEl.appendChild(sponsorBtn);
+    }
+
+    sponsorBtn.href = sponsorUrl;
+    sponsorBtn.title = sponsorDesc;
+    sponsorBtn.innerHTML = `${this.escapeHtml(sponsorName)}`;
   }
 
   closeFileDetail() {
@@ -4170,6 +4304,18 @@ class PencariMovieApp {
       if (data?.current_version) {
         this.version = String(data.current_version);
         this.renderSettingsVersion();
+      }
+      if (data?.sponsor && typeof data.sponsor === 'object') {
+        const url = String(data.sponsor.url || '').trim();
+        if (url) {
+          this.sponsor = {
+            name: String(data.sponsor.name || 'Sponsored').trim(),
+            description: String(data.sponsor.description || '').trim(),
+            url: url
+          };
+        } else {
+          this.sponsor = null;
+        }
       }
       if (data && data.update_needed) {
         return data;

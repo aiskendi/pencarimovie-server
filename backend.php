@@ -8,6 +8,7 @@ ini_set('display_errors', '0');
 ini_set('html_errors', '0');
 error_reporting(E_ALL);
 
+
 // Ensure bundled bin/ directory is added to PATH so MadelineProto ProcessRunner can locate PHP/FrankenPHP for IPC
 $fdBinDir = __DIR__ . DIRECTORY_SEPARATOR . 'bin';
 if (is_dir($fdBinDir)) {
@@ -136,7 +137,7 @@ function fd_storage_path(string $file): string
 define('FD_SESSION_PATH', fd_storage_path('storage/session.madeline'));
 define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v1');
 define('FD_WP_AJAX_URL', 'https://pencarimovie.com/wp-admin/admin-ajax.php');
-define('FD_APP_VERSION', '1.8.2');
+define('FD_APP_VERSION', '1.8.6');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
@@ -720,23 +721,6 @@ function fd_is_local_request(): bool
         return true;
     }
 
-    // Carrier-Grade NAT (CGNAT, RFC 6598: 100.64.0.0/10) used by mobile ISPs
-    $long = ip2long($remoteAddr);
-    if ($long !== false) {
-        $cgnatStart = ip2long('100.64.0.0');
-        $cgnatEnd = ip2long('100.127.255.255');
-        if ($long >= $cgnatStart && $long <= $cgnatEnd) {
-            return true;
-        }
-    }
-
-    // Host header is localhost or loopback
-    $httpHost = (string) ($_SERVER['HTTP_HOST'] ?? '');
-    $hostOnly = explode(':', $httpHost)[0];
-    if (in_array($hostOnly, ['localhost', '127.0.0.1', '::1'], true)) {
-        return true;
-    }
-
     return false;
 }
 
@@ -878,7 +862,17 @@ function fd_get_amphp_client(): ?\Amp\Http\Client\HttpClient
 
         $customResolver = new FdAnycastDnsResolver($staticHosts);
         \Amp\Dns\dnsResolver($customResolver);
-        $client = \Amp\Http\Client\HttpClientBuilder::buildDefault();
+
+        // Disable TLS certificate peer verification on Amp to prevent handshake errors
+        // on Android Termux / PRoot where system CA bundles are missing or unbundled
+        $tlsContext = (new \Amp\Socket\ClientTlsContext(''))->withoutPeerVerification();
+        $connectContext = (new \Amp\Socket\ConnectContext())->withTlsContext($tlsContext);
+        $factory = new \Amp\Http\Client\Connection\DefaultConnectionFactory(null, $connectContext);
+        $pool = new \Amp\Http\Client\Connection\UnlimitedConnectionPool($factory);
+
+        $client = (new \Amp\Http\Client\HttpClientBuilder())
+            ->usingPool($pool)
+            ->build();
     }
     return $client;
 }
@@ -2715,7 +2709,7 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
     // Cloudflare country header detection: pencarimovie.com automatically receives
     // $_SERVER['HTTP_CF_IPCOUNTRY'] from Cloudflare. If client passes ?country= or CF header exists, forward it.
     if (empty($queryParams['country']) && !empty($_SERVER['HTTP_CF_IPCOUNTRY'])) {
-        $queryParams['country'] = sanitize_text_field($_SERVER['HTTP_CF_IPCOUNTRY']);
+        $queryParams['country'] = preg_replace('/[^a-zA-Z0-9_-]/', '', trim((string) $_SERVER['HTTP_CF_IPCOUNTRY']));
     }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
@@ -3619,11 +3613,10 @@ function fd_get_stremio_base_url(): string
     $scheme = $isHttps ? 'https' : 'http';
     $origin = $scheme . '://' . $host;
 
-    // If request comes through tunnel or localhost with tunnel running, use custom subdomain
-    $tunnelOrigin = fd_get_live_tunnel_https_origin();
-    if ($tunnelOrigin !== '') {
-        $hostName = strtolower((string) (parse_url('http://' . $host, PHP_URL_HOST) ?: $host));
-        if ($isTunnel || in_array($hostName, ['127.0.0.1', 'localhost', '::1'], true)) {
+    // If request actually comes through tunnel, use custom subdomain or tunnel origin
+    if ($isTunnel) {
+        $tunnelOrigin = fd_get_live_tunnel_https_origin();
+        if ($tunnelOrigin !== '') {
             return $tunnelOrigin;
         }
     }
@@ -5191,6 +5184,10 @@ if ($isNuvioRoute) {
 
     // Handle Stremio's standard /configure route -> redirects directly to dashboard with #configure
     if ($path === '/configure' || $path === '/configure/' || $addonPath === '/configure' || $addonPath === '/configure/') {
+        if (fd_is_cloudflare_tunnel_request()) {
+            header('Location: /#addon', true, 302);
+            exit;
+        }
         header('Location: /#configure', true, 302);
         exit;
     }
@@ -5913,7 +5910,7 @@ if ($isNuvioRoute) {
             'idPrefixes' => ['pm_', 'pm:', 'tt'],
             'catalogs' => $filteredCatalogs,
             'behaviorHints' => [
-                'configurable' => true,
+                'configurable' => !(fd_is_cloudflare_tunnel_request() || ($identity['mode'] ?? '') === 'tunnel'),
                 'configurationRequired' => false,
                 'adult' => false,
                 'p2p' => false,
@@ -6582,8 +6579,8 @@ if ($isNuvioRoute) {
             'userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
         ]);
 
-        // Check 5-minute stream list cache (per itemId)
-        $streamCacheKey = md5($itemId . ':' . $itemType);
+        // Check 5-minute stream list cache (per itemId and baseUrl to differentiate tunnel vs local)
+        $streamCacheKey = md5($itemId . ':' . $itemType . ':' . $baseUrl);
         $streamCacheFile = fd_storage_path('storage/stream_cache_' . $streamCacheKey . '.json');
         if (is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
             $cachedJson = @file_get_contents($streamCacheFile);
@@ -7205,6 +7202,9 @@ if (str_starts_with($path, '/api/')) {
         header('Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret, Range');
         header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
+        header('X-Content-Type-Options: nosniff');
+        header('X-Frame-Options: SAMEORIGIN');
+        header('Referrer-Policy: strict-origin-when-cross-origin');
     }
 
     if ($method === 'OPTIONS') {
@@ -7221,11 +7221,12 @@ if (str_starts_with($path, '/api/')) {
         '/api/version',
         '/api/proxy-stream',
         '/api/resolve-shortcode',
-        '/api/provision',
     ];
     if (fd_is_public_download_path($path) && !in_array($path, $alwaysPublicApi, true)) {
         $alwaysPublicApi[] = $path;
     }
+    // Security note: /api/logs and /api/debug-mode must remain local-only
+    // to prevent sensitive session traces or Telegram auth tokens leaking over tunnels.
     $tunnelReadableApi = [
         '/api/session',
         '/api/lan-ip',
@@ -7234,8 +7235,6 @@ if (str_starts_with($path, '/api/')) {
         '/api/provision',
         '/api/catalog-settings',
         '/api/country',
-        '/api/logs',
-        '/api/debug-mode',
     ];
     if (!in_array($path, $alwaysPublicApi, true)) {
         $allowViaTunnel = fd_is_cloudflare_tunnel_request() && in_array($path, $tunnelReadableApi, true);
@@ -7280,10 +7279,18 @@ if (str_starts_with($path, '/api/')) {
             'ok' => 1,
             'settings' => $settings,
             'catalog_options' => $catalogOptions,
+            'is_tunnel' => fd_is_cloudflare_tunnel_request(),
         ]);
     }
 
     if ($path === '/api/catalog-settings' && $method === 'POST') {
+        if (fd_is_cloudflare_tunnel_request()) {
+            fd_json([
+                'ok' => 0,
+                'error' => 'Catalog configuration is disabled via Cloudflare tunnel. Please configure locally on your network.',
+            ], 403);
+        }
+
         $input = json_decode((string) file_get_contents('php://input'), true);
         if (!is_array($input)) {
             fd_json(['ok' => 0, 'error' => 'Invalid JSON input'], 400);
@@ -7361,13 +7368,14 @@ if (str_starts_with($path, '/api/')) {
             ], 500);
         }
 
+        $viaTunnel = fd_is_cloudflare_tunnel_request();
         fd_json([
             'ok' => 1,
             'message' => 'Guest bot session initialized successfully.',
             'bot_id' => $provisioned['bot_id'],
             'bot_username' => $provisioned['bot_username'],
             'bot_name' => $provisioned['bot_name'],
-            'api_secret' => fd_get_api_secret(),
+            'api_secret' => !$viaTunnel ? fd_get_api_secret() : '',
             'pool' => fd_get_bot_pool(),
         ]);
     }
@@ -7877,11 +7885,31 @@ if (str_starts_with($path, '/api/')) {
         // e.g., "trending" → "stream_trending", "search_files" → "stream_search_files"
         $streamAction = 'stream_' . $action;
 
-        // Build the WordPress admin-ajax.php URL, forwarding all GET params
-        // with the action replaced by the stream_* prefixed version
+        // Build the WordPress admin-ajax.php URL, strictly forwarding allowed parameters
         $wpUrl = defined('FD_WP_AJAX_URL') ? FD_WP_AJAX_URL : 'https://pencarimovie.com/wp-admin/admin-ajax.php';
-        $queryParams = $_GET;
-        $queryParams['action'] = $streamAction;
+
+        $allowedStreamParams = [
+            'category',
+            'slug',
+            'search',
+            'limit',
+            'offset',
+            'post_id',
+            'short_code',
+            'type',
+            'genre',
+            'year',
+            'sort',
+            'bot_id',
+            'country'
+        ];
+        $queryParams = ['action' => $streamAction];
+        foreach ($allowedStreamParams as $paramKey) {
+            if (isset($_GET[$paramKey]) && is_scalar($_GET[$paramKey])) {
+                $queryParams[$paramKey] = trim((string) $_GET[$paramKey]);
+            }
+        }
+
         if (empty($queryParams['bot_id'])) {
             $activeBotId = fd_get_bot_id();
             if ($activeBotId !== '') {

@@ -352,6 +352,14 @@ case "\${1:-}" in
   restart|--restart)
     bash "\$APP_DIR/restart.sh"
     ;;
+  tunnel|--tunnel)
+    if [ -f "\$APP_DIR/pencarimovie-termux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-termux.sh" tunnel
+    else
+      echo "Enabling Cloudflare Tunnel..."
+      curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
+    fi
+    ;;
   uninstall|--uninstall)
     bash "\$APP_DIR/stop.sh" 2>/dev/null || true
     rm -f "\$PREFIX/bin/pms" "\$PREFIX/bin/pm" "\$PREFIX/bin/pencarimovie" 2>/dev/null || true

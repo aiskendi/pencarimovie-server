@@ -320,6 +320,14 @@ case "\${1:-}" in
   restart|--restart)
     bash "\$APP_DIR/restart.sh"
     ;;
+  tunnel|--tunnel)
+    if [ -f "\$APP_DIR/pencarimovie-linux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-linux.sh" tunnel
+    else
+      echo "Enabling Cloudflare Tunnel..."
+      curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
+    fi
+    ;;
   uninstall|--uninstall)
     bash "\$APP_DIR/stop.sh" 2>/dev/null || true
     rm -f "\$HOME/.local/bin/pms" "\$HOME/.local/bin/pm" "\$HOME/.local/bin/pencarimovie" 2>/dev/null || true
@@ -360,7 +368,7 @@ EOF
       printf 'export PATH="$HOME/.local/bin:$PATH"\n' > "$rc" 2>/dev/null || true
     fi
   done
-  export PATH="${HOME:-/root}/.local/bin:$PATH"
+  export PATH="${HOME:-/root}/.local/bin:${HOME:-/root}/bin:$PATH"
 }
 
 do_start() {
@@ -379,6 +387,12 @@ do_start() {
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
       echo "Server is already running on port $PORT."
       print_urls
+      case ":$PATH:" in
+        *":${HOME:-/root}/.local/bin:"*|*":/usr/local/bin:"*|*":${HOME:-/root}/bin:"*) ;;
+        *)
+          echo "  Note: Run 'source ~/.bashrc' or 'export PATH=\"\$HOME/.local/bin:\$PATH\"' to use 'pms'."
+          ;;
+      esac
       return
     fi
     echo "Port $PORT is already in use; stopping leftover process..."
@@ -421,6 +435,12 @@ do_start() {
     if [ "$(uname -s)" = "Darwin" ]; then
       open "http://127.0.0.1:$PORT" 2>/dev/null || true
     fi
+    case ":$PATH:" in
+      *":${HOME:-/root}/.local/bin:"*|*":/usr/local/bin:"*|*":${HOME:-/root}/bin:"*) ;;
+      *)
+        echo "  Note: Run 'source ~/.bashrc' or 'export PATH=\"\$HOME/.local/bin:\$PATH\"' to use 'pms'."
+        ;;
+    esac
   fi
 }
 

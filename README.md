@@ -107,6 +107,7 @@ The installer registers a global `pms` command on your system:
 pms start       # Starts the server in the background (checks for updates)
 pms stop        # Stops the server and background helper services
 pms restart     # Restarts the server
+pms tunnel      # Enables Cloudflare Tunnel and prints public HTTPS URLs
 pms uninstall   # Completely uninstalls the server and cleans up files
 ```
 

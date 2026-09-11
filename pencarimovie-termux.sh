@@ -53,7 +53,7 @@ detect_target() {
 }
 
 usage() {
-  echo "Usage: $0 [start|stop|restart|uninstall]"
+  echo "Usage: $0 [start|stop|restart|tunnel|uninstall]"
   exit 1
 }
 
@@ -118,9 +118,10 @@ print_urls() {
   lan_ip="$(get_lan_ip)"
   echo "  Local:    http://127.0.0.1:$PORT"
   [ -n "$lan_ip" ] && echo "  Network:  http://$lan_ip:$PORT"
-  echo "  CLI:      pms [start|stop|restart|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
 }
 
 port_in_use() {
@@ -537,6 +538,35 @@ EOF
 
 do_restart() { do_stop; sleep 1; do_start; }
 
+do_tunnel() {
+  if ! port_in_use; then
+    echo "Server is not running. Starting server first..."
+    do_start
+    sleep 2
+  fi
+  echo "Enabling Cloudflare Tunnel..."
+  local resp=""
+  if command -v curl >/dev/null 2>&1; then
+    resp="$(curl -fsSL -X POST "http://127.0.0.1:$PORT/api/tunnel/enable" --max-time 120 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    resp="$(wget -qO- --post-data="" "http://127.0.0.1:$PORT/api/tunnel/enable" --timeout=120 2>/dev/null || true)"
+  fi
+
+  if [ -n "$resp" ] && echo "$resp" | grep -q '"ok": *1'; then
+    local pubUrl manUrl
+    pubUrl="$(echo "$resp" | grep -o '"public_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    manUrl="$(echo "$resp" | grep -o '"manifest_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    echo ""
+    echo "Cloudflare Tunnel is LIVE!"
+    [ -n "$pubUrl" ] && echo "  Public URL:   $pubUrl"
+    [ -n "$manUrl" ] && echo "  Manifest URL: $manUrl"
+    echo ""
+  else
+    echo "Failed to enable tunnel. Check server logs in $APP_DIR/storage/debug.log"
+    return 1
+  fi
+}
+
 do_uninstall() {
   echo "Stopping PencariMovie Server..."
   do_stop 2>/dev/null || true
@@ -560,6 +590,7 @@ case "${1:-}" in
   start|--start|"") do_start ;;
   stop|--stop) do_stop ;;
   restart|--restart) do_restart ;;
+  tunnel|--tunnel) do_tunnel ;;
   uninstall|--uninstall) do_uninstall ;;
   *) usage ;;
 esac

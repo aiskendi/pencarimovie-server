@@ -26,10 +26,12 @@ if "%1"=="--restart" goto restart
 if "%1"=="restart" goto restart
 if "%1"=="--start" goto start
 if "%1"=="start" goto start
+if "%1"=="--tunnel" goto tunnel
+if "%1"=="tunnel" goto tunnel
 if "%1"=="--uninstall" goto uninstall
 if "%1"=="uninstall" goto uninstall
 if not "%1"=="" (
-    echo Usage: %~nx0 [start^|stop^|restart^|uninstall]
+    echo Usage: %~nx0 [start^|stop^|restart^|tunnel^|uninstall]
     pause
     exit /b 1
 )
@@ -56,9 +58,10 @@ goto not_running
 echo Server is already running on port %PORT%.
 call :start_tray 1
 call :print_urls
-echo   CLI:      pms [start^|stop^|restart]
+echo   CLI:      pms [start^|stop^|restart^|tunnel]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
+echo   Tunnel:   pms tunnel
 echo   Tray:     right-click the PencariMovie icon in the system tray
 exit /b 0
 
@@ -92,11 +95,30 @@ if exist "%cd%\tray.ps1" (
 echo.
 echo PencariMovie Server is running in the background.
 call :print_urls
-echo   CLI:      pms [start^|stop^|restart]
+echo   CLI:      pms [start^|stop^|restart^|tunnel]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
+echo   Tunnel:   pms tunnel
 echo   Tray:     right-click the PencariMovie icon in the system tray
 exit /b 0
+
+:tunnel
+if not exist "%APP_DIR%" (
+    echo App directory was not installed.
+    pause
+    exit /b 1
+)
+cd /d "%APP_DIR%"
+echo Checking server status on port %PORT%...
+curl -s -o nul http://127.0.0.1:%PORT% >nul 2>&1
+if errorlevel 1 (
+    echo Starting server first...
+    call :not_running
+    ping 127.0.0.1 -n 3 >nul
+)
+echo Enabling Cloudflare Tunnel...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; try { $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; if ($res.tunnel_url -and ($res.tunnel_url -ne $res.public_url)) { Write-Host ('  Direct URL:   ' + $res.tunnel_url) }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+exit /b %ERRORLEVEL%
 
 :stop
 echo Stopping PencariMovie Server on 0.0.0.0:%PORT%...
@@ -245,15 +267,15 @@ goto :eof
 if not exist "%USERPROFILE%\pencarimovie-server" mkdir "%USERPROFILE%\pencarimovie-server" 2>nul
 (
     echo @echo off
-    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+    echo "%~f0" %%*
 ) > "%USERPROFILE%\pencarimovie-server\pm.cmd" 2>nul
 (
     echo @echo off
-    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+    echo "%~f0" %%*
 ) > "%USERPROFILE%\pencarimovie-server\pms.cmd" 2>nul
 (
     echo @echo off
-    echo "%USERPROFILE%\pencarimovie-server\pencarimovie-windows.bat" %%*
+    echo "%~f0" %%*
 ) > "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server'; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1

@@ -179,15 +179,15 @@ download_file() {
 # Query GitHub releases API (or redirect location) and return the tag (e.g. v1.6.0).
 fetch_latest_tag() {
   local tag=""
-  # Method 1: GitHub REST API (most reliable across all curl/wget versions)
+  # Method 1: GitHub REST API with 5s timeout
   if command -v curl >/dev/null 2>&1; then
-    tag="$(curl -fsSL -H "User-Agent: pencarimovie-server" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    tag="$(curl -fsSL --connect-timeout 4 --max-time 6 -H "User-Agent: pencarimovie-server" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
   fi
 
   # Method 2: Redirect follow via curl %{url_effective}
   if [ -z "$tag" ] && command -v curl >/dev/null 2>&1; then
     local loc=""
-    loc="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    loc="$(curl -fsSL --connect-timeout 4 --max-time 6 -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
     loc="${loc%$'\r'}"
     loc="${loc%/}"
     tag="${loc##*/}"
@@ -196,7 +196,7 @@ fetch_latest_tag() {
   # Method 3: wget fallback
   if [ -z "$tag" ] && command -v wget >/dev/null 2>&1; then
     local loc=""
-    loc="$(wget -q --max-redirect=0 --server-response "https://github.com/$REPO/releases/latest" -O /dev/null 2>&1 \
+    loc="$(wget -q -T 6 -t 1 --max-redirect=0 --server-response "https://github.com/$REPO/releases/latest" -O /dev/null 2>&1 \
       | awk 'BEGIN{IGNORECASE=1} /^  Location:/{print $2; exit}' | tr -d '\r' || true)"
     loc="${loc%$'\r'}"
     loc="${loc%/}"
@@ -368,9 +368,9 @@ case "\${1:-}" in
     ;;
   *)
     if [ -f "\$APP_DIR/pencarimovie-termux.sh" ]; then
-      bash "\$APP_DIR/pencarimovie-termux.sh" start
+      exec bash "\$APP_DIR/pencarimovie-termux.sh" "\$@"
     else
-      bash "\$APP_DIR/start-termux.sh"
+      exec bash "\$APP_DIR/start-termux.sh"
     fi
     ;;
 esac

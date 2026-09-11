@@ -171,6 +171,12 @@ if exist "!APP_PATH!" if not defined CURRENT (
     >"!APP_PATH!\.release-tag" echo %FALLBACK_TAG%
 )
 
+if not exist "!APP_PATH!" (
+    echo Checking for updates...
+) else (
+    echo Checking for updates [current: !CURRENT!]...
+)
+
 set "LATEST="
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='pencarimovie-server'}; if ($r.tag_name -match '^v[0-9]') { $r.tag_name; exit 0 } } catch {}; $req = [System.Net.HttpWebRequest]::Create('https://github.com/%REPO%/releases/latest'); $req.AllowAutoRedirect = $true; $req.Method = 'GET'; $req.UserAgent = 'pencarimovie-server'; try { $resp = $req.GetResponse(); $loc = [string]$resp.ResponseUri; $resp.Close(); $tag = ($loc.TrimEnd('/') -split '/')[-1]; if ($tag -match '^v[0-9]') { $tag; exit 0 } } catch {}; exit 1"`) do set "LATEST=%%i"
 
@@ -182,7 +188,10 @@ if not defined LATEST (
     set "LATEST=%FALLBACK_TAG%"
 )
 
-if exist "!APP_PATH!" if /I "!CURRENT!"=="!LATEST!" goto :eof
+if exist "!APP_PATH!" if /I "!CURRENT!"=="!LATEST!" (
+    echo Already up to date [!CURRENT!].
+    goto :eof
+)
 
 if not exist "!APP_PATH!" (
     echo Downloading PencariMovie Server !LATEST!...

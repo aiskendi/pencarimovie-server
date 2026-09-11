@@ -301,6 +301,12 @@ install_or_update() {
     printf '%s\n' "$current" > "$APP_DIR/.release-tag"
   fi
 
+  if [ -d "$APP_DIR" ]; then
+    echo "Checking for updates [current: ${current:-unknown}]..."
+  else
+    echo "Checking for updates..."
+  fi
+
   if [ -z "$latest" ]; then
     if [ -d "$APP_DIR" ]; then
       echo "Could not check GitHub for updates; using installed copy."
@@ -310,6 +316,7 @@ install_or_update() {
   fi
 
   if [ -d "$APP_DIR" ] && [ "$current" = "$latest" ]; then
+    echo "Already up to date [$current]."
     return 1
   fi
 

@@ -16,7 +16,7 @@
 
 ---
 
-## 💡 What is PencariMovie Server?
+## What is PencariMovie Server?
 
 **PencariMovie Server** runs a lightweight streaming engine on your local machine, home server, or Android device. It turns Telegram media into direct, high-speed HTTP streams with instant seeking for **Stremio**, **Nuvio**, or the built-in Netflix-style web player.
 
@@ -26,7 +26,7 @@
 
 ---
 
-## 🚀 Quick Install
+## Quick Install
 
 Install and start the server with a single command:
 
@@ -99,7 +99,7 @@ Once started, open the web dashboard in your browser:
 
 ---
 
-## 🛠️ CLI Commands (`pms`)
+## CLI Commands (`pms`)
 
 The installer registers a global `pms` command on your system:
 
@@ -122,7 +122,7 @@ By default, the server runs on port `8088`. Override it by setting the `PORT` va
 
 ---
 
-## ☁️ Remote Streaming (Cloudflare Tunnel)
+## Remote Streaming (Cloudflare Tunnel)
 
 Need to stream when away from your home Wi-Fi?
 
@@ -134,7 +134,7 @@ _No Cloudflare account, domain name, or router port forwarding required._
 
 ---
 
-## 🔒 Open Source & Security
+## Open Source & Security
 
 - **Open Source**: Licensed under GPL-3.0. Source code is fully verifiable on GitHub.
 - **Local Isolation**: Media requests and tokens are processed locally without third-party middleman servers.

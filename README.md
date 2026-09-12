@@ -6,12 +6,12 @@
 </p>
 
 <p align="center">
-  <a href="#-quick-install">Quick Install</a> •
-  <a href="#-features">Features</a> •
-  <a href="#-stremio--nuvio-setup">Stremio & Nuvio</a> •
-  <a href="#-cli-commands">CLI Usage</a> •
-  <a href="#-remote-streaming-cloudflare-tunnel">Remote Access</a> •
-  <a href="#-open-source--security">Security</a>
+  <a href="#quick-install">Quick Install</a> •
+  <a href="#features">Features</a> •
+  <a href="#stremio--nuvio-setup">Stremio & Nuvio</a> •
+  <a href="#cli-commands">CLI Usage</a> •
+  <a href="#remote-streaming-cloudflare-tunnel">Remote Access</a> •
+  <a href="#open-source--security">Security</a>
 </p>
 
 ---

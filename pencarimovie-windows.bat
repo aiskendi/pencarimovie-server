@@ -232,12 +232,16 @@ set "CURRENT="
 if exist "!APP_PATH!\.release-tag" (
     for /f "usebackq delims=" %%A in ("!APP_PATH!\.release-tag") do set "CURRENT=%%A"
 )
-if exist "!APP_PATH!" if not defined CURRENT (
+set "IS_INSTALLED=0"
+if exist "!APP_PATH!\backend.php" set "IS_INSTALLED=1"
+if exist "!APP_PATH!\bin\frankenphp.exe" set "IS_INSTALLED=1"
+
+if "!IS_INSTALLED!"=="1" if not defined CURRENT (
     set "CURRENT=%FALLBACK_TAG%"
     >"!APP_PATH!\.release-tag" echo %FALLBACK_TAG%
 )
 
-if not exist "!APP_PATH!" (
+if "!IS_INSTALLED!"=="0" (
     echo Checking for updates...
 ) else (
     echo Checking for updates [current: !CURRENT!]...
@@ -247,14 +251,14 @@ set "LATEST="
 for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/%REPO%/releases/latest' -Headers @{'User-Agent'='pencarimovie-server'} -TimeoutSec 6; if ($r.tag_name -match '^v[0-9]') { $r.tag_name; exit 0 } } catch {}; $req = [System.Net.HttpWebRequest]::Create('https://github.com/%REPO%/releases/latest'); $req.Timeout = 6000; $req.AllowAutoRedirect = $true; $req.Method = 'GET'; $req.UserAgent = 'pencarimovie-server'; try { $resp = $req.GetResponse(); $loc = [string]$resp.ResponseUri; $resp.Close(); $tag = ($loc.TrimEnd('/') -split '/')[-1]; if ($tag -match '^v[0-9]') { $tag; exit 0 } } catch {}; exit 1"`) do set "LATEST=%%i"
 
 if not defined LATEST (
-    if exist "!APP_PATH!" (
+    if "!IS_INSTALLED!"=="1" (
         echo Could not check GitHub for updates; using installed copy.
         goto :eof
     )
     set "LATEST=%FALLBACK_TAG%"
 )
 
-if exist "!APP_PATH!" if /I "!CURRENT!"=="!LATEST!" (
+if "!IS_INSTALLED!"=="1" if /I "!CURRENT!"=="!LATEST!" (
     echo Already up to date [!CURRENT!].
     goto :eof
 )
@@ -264,7 +268,7 @@ if exist "%OTA_TMP%" rmdir /s /q "%OTA_TMP%" 2>nul
 mkdir "%OTA_TMP%" 2>nul
 set "OTA_TAG=!LATEST!"
 
-if not exist "!APP_PATH!" (
+if "!IS_INSTALLED!"=="0" (
     echo Downloading PencariMovie Server !LATEST!...
     set "OTA_FILE=%OTA_TMP%\pencarimovie.zip"
     set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"

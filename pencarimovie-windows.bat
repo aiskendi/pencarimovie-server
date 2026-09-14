@@ -28,10 +28,12 @@ if "%1"=="--start" goto start
 if "%1"=="start" goto start
 if "%1"=="--tunnel" goto tunnel
 if "%1"=="tunnel" goto tunnel
+if "%1"=="--autostart" goto autostart
+if "%1"=="autostart" goto autostart
 if "%1"=="--uninstall" goto uninstall
 if "%1"=="uninstall" goto uninstall
 if not "%1"=="" (
-    echo Usage: %~nx0 [start^|stop^|restart^|tunnel^|uninstall]
+    echo Usage: %~nx0 [start^|stop^|restart^|tunnel^|autostart^|uninstall]
     pause
     exit /b 1
 )
@@ -40,6 +42,12 @@ if not "%1"=="" (
 if exist "%APP_DIR%\backend.php" set "HAD_APP=1"
 call :install_or_update
 call :register_cmd_path
+rem Enable autostart on boot by default on first run (like 9router)
+if not exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" (
+    if not exist "%APP_DIR%\storage\.no_autostart" (
+        call :autostart_silent on
+    )
+)
 
 curl -s -o nul http://127.0.0.1:%PORT% >nul 2>&1
 if not errorlevel 1 goto port_busy
@@ -58,10 +66,11 @@ goto not_running
 echo Server is already running on port %PORT%.
 call :start_tray 1
 call :print_urls
-echo   CLI:      pms [start^|stop^|restart^|tunnel]
+echo   CLI:      pms [start^|stop^|restart^|tunnel^|autostart]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
 echo   Tunnel:   pms tunnel
+echo   Autostart: pms autostart [on^|off]
 echo   Tray:     right-click the PencariMovie icon in the system tray
 exit /b 0
 
@@ -95,10 +104,11 @@ if exist "%cd%\tray.ps1" (
 echo.
 echo PencariMovie Server is running in the background.
 call :print_urls
-echo   CLI:      pms [start^|stop^|restart^|tunnel]
+echo   CLI:      pms [start^|stop^|restart^|tunnel^|autostart]
 echo   Stop:     pms stop
 echo   Restart:  pms restart
 echo   Tunnel:   pms tunnel
+echo   Autostart: pms autostart [on^|off]
 echo   Tray:     right-click the PencariMovie icon in the system tray
 exit /b 0
 
@@ -126,9 +136,43 @@ call :stop_quiet
 echo Server stopped.
 exit /b 0
 
+:autostart
+if "%2"=="off" goto disable_autostart
+if "%2"=="disable" goto disable_autostart
+if "%2"=="remove" goto disable_autostart
+call :autostart_silent on
+echo Auto-start on boot has been ENABLED.
+echo Startup file created at: %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs
+exit /b 0
+
+:disable_autostart
+call :autostart_silent off
+echo Auto-start on boot has been DISABLED.
+exit /b 0
+
+:autostart_silent
+set "STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+set "VBS_FILE=%STARTUP_DIR%\PencariMovie.vbs"
+if "%1"=="off" (
+    if exist "%VBS_FILE%" del /f /q "%VBS_FILE%" 2>nul
+    if not exist "%APP_DIR%\storage" mkdir "%APP_DIR%\storage" 2>nul
+    echo. > "%APP_DIR%\storage\.no_autostart" 2>nul
+    goto :eof
+)
+if exist "%APP_DIR%\storage\.no_autostart" del /f /q "%APP_DIR%\storage\.no_autostart" 2>nul
+if not exist "%STARTUP_DIR%" mkdir "%STARTUP_DIR%" 2>nul
+(
+    echo Set WshShell = CreateObject^("WScript.Shell"^)
+    echo WshShell.Run """%APP_DIR%\start.bat"" start", 0, False
+) > "%VBS_FILE%"
+goto :eof
+
 :uninstall
 echo Stopping PencariMovie Server...
 call :stop_quiet
+if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" (
+    del /f /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" 2>nul
+)
 rem Remove from User PATH if registered
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:APP_PATH; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
 echo Removing %APP_DIR% ...
@@ -215,29 +259,38 @@ if exist "!APP_PATH!" if /I "!CURRENT!"=="!LATEST!" (
     goto :eof
 )
 
-if not exist "!APP_PATH!" (
-    echo Downloading PencariMovie Server !LATEST!...
-) else (
-    echo Updating PencariMovie Server !CURRENT! -^> !LATEST!...
-    call :stop_quiet
-    ping 127.0.0.1 -n 2 >nul
-)
-
-set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
-set "OTA_TAG=!LATEST!"
-
 set "OTA_TMP=%TEMP%\pencarimovie-ota-%RANDOM%"
 if exist "%OTA_TMP%" rmdir /s /q "%OTA_TMP%" 2>nul
-mkdir "%OTA_TMP%\extract" 2>nul
+mkdir "%OTA_TMP%" 2>nul
+set "OTA_TAG=!LATEST!"
 
-echo Downloading %OTA_URL%
-rem Use curl.exe if available (standard on modern Windows), fallback to bitsadmin or powershell download
-curl.exe -fL -s -S -o "%OTA_TMP%\pencarimovie.zip" "%OTA_URL%" 2>nul
-if not exist "%OTA_TMP%\pencarimovie.zip" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile($env:OTA_URL, (Join-Path $env:OTA_TMP 'pencarimovie.zip'))"
+if not exist "!APP_PATH!" (
+    echo Downloading PencariMovie Server !LATEST!...
+    set "OTA_FILE=%OTA_TMP%\pencarimovie.zip"
+    set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
+    set "FALLBACK_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-server.tar.gz"
+) else (
+    echo Updating PencariMovie Server !CURRENT! -^> !LATEST! (fast updater: universal server package)...
+    call :stop_quiet
+    ping 127.0.0.1 -n 2 >nul
+    set "OTA_FILE=%OTA_TMP%\pencarimovie.tar.gz"
+    set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-server.tar.gz"
+    set "FALLBACK_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
 )
 
-if not exist "%OTA_TMP%\pencarimovie.zip" (
+echo Downloading %OTA_URL%
+rem Use curl.exe if available (standard on modern Windows), fallback to powershell download
+curl.exe -fL -s -S -o "%OTA_FILE%" "%OTA_URL%" 2>nul
+if not exist "%OTA_FILE%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { (New-Object System.Net.WebClient).DownloadFile($env:OTA_URL, $env:OTA_FILE) } catch { (New-Object System.Net.WebClient).DownloadFile($env:FALLBACK_URL, $env:OTA_FILE) }"
+)
+
+if not exist "%OTA_FILE%" (
+    echo Primary download failed, trying fallback: %FALLBACK_URL%
+    curl.exe -fL -s -S -o "%OTA_FILE%" "%FALLBACK_URL%" 2>nul
+)
+
+if not exist "%OTA_FILE%" (
     echo Update download failed.
     rmdir /s /q "%OTA_TMP%" 2>nul
     pause
@@ -246,9 +299,13 @@ if not exist "%OTA_TMP%\pencarimovie.zip" (
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-tar.exe -xf "%OTA_TMP%\pencarimovie.zip" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
+rem Extract with tar.exe (supports both .zip and .tar.gz on Windows 10/11)
+tar.exe -xf "%OTA_FILE%" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat --strip-components=1 -C "!APP_PATH!" >nul 2>&1
 if not exist "!APP_PATH!\backend.php" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = Join-Path $env:OTA_TMP 'pencarimovie.zip'; Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force"
+    tar.exe -xf "%OTA_FILE%" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
+)
+if not exist "!APP_PATH!\backend.php" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:OTA_FILE; if ($src.EndsWith('.zip')) { Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force } else { tar -xzf $src -C $env:APP_PATH }"
 )
 if not exist "!APP_PATH!\backend.php" (
     echo File copy failed.

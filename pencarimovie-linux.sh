@@ -45,8 +45,22 @@ detect_target() {
       case "$arch" in
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
-        armv7*|armv8l|armhf|arm|i686|i386) echo "server" ;;
-        *) echo "server" ;;
+        armv7*|armv8l|armhf|arm)
+          # Many Android TV boxes / Xiaomi Mi Box devices run a 32-bit userland (armv7l)
+          # on top of a 64-bit ARM CPU kernel, or report armv7l.
+          local abis=""
+          if command -v getprop >/dev/null 2>&1; then
+            abis="$(getprop ro.product.cpu.abilist64 2>/dev/null || true)"
+            [ -z "$abis" ] && abis="$(getprop ro.product.cpu.abilist 2>/dev/null || true)"
+          fi
+          if echo "$abis" | grep -qi "arm64"; then
+            echo "linux-aarch64"
+          else
+            echo "linux-aarch64"
+          fi
+          ;;
+        i686|i386) echo "linux-x86_64" ;;
+        *) echo "linux-aarch64" ;;
       esac
       ;;
     Darwin)

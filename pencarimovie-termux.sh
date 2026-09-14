@@ -285,15 +285,8 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url=""
-  local fallback_url=""
-  if [ "$target" = "server" ]; then
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-linux-aarch64.tar.gz"
-  else
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
-    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-  fi
+  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+  local fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -302,11 +295,9 @@ download_extract() {
 
   echo "Downloading $url"
   if ! download_file "$url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
-    if [ -n "$fallback_url" ]; then
-      echo "Primary download failed, trying fallback: $fallback_url"
-      download_file "$fallback_url" "$tmp/pencarimovie.tar.gz"
-    else
-      echo "Failed to download release archive: $url"
+    echo "Primary package ($target) download failed, trying universal fallback (pencarimovie-server.tar.gz)..."
+    if ! download_file "$fallback_url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
+      echo "Failed to download release archive."
       exit 1
     fi
   fi

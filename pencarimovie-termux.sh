@@ -285,8 +285,15 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
-  local fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  local url=""
+  local fallback_url=""
+
+  if [ "$target" = "server" ]; then
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  else
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -295,9 +302,14 @@ download_extract() {
 
   echo "Downloading $url"
   if ! download_file "$url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
-    echo "Primary package ($target) download failed, trying universal fallback (pencarimovie-server.tar.gz)..."
-    if ! download_file "$fallback_url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
-      echo "Failed to download release archive."
+    if [ -n "$fallback_url" ]; then
+      echo "Primary package ($target) download failed, trying fallback: $fallback_url"
+      if ! download_file "$fallback_url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
+        echo "Failed to download release archive."
+        exit 1
+      fi
+    else
+      echo "Failed to download release archive: $url"
       exit 1
     fi
   fi
@@ -323,31 +335,36 @@ install_or_update() {
   latest="$(fetch_latest_tag || true)"
   current="$(current_tag)"
 
-  if [ -d "$APP_DIR" ] && [ -z "$current" ]; then
+  local is_installed=0
+  if [ -d "$APP_DIR" ] && { [ -f "$APP_DIR/backend.php" ] || [ -f "$APP_DIR/bin/frankenphp" ]; }; then
+    is_installed=1
+  fi
+
+  if [ "$is_installed" -eq 1 ] && [ -z "$current" ]; then
     current="$FALLBACK_TAG"
     printf '%s\n' "$current" > "$APP_DIR/.release-tag"
   fi
 
-  if [ -d "$APP_DIR" ]; then
+  if [ "$is_installed" -eq 1 ]; then
     echo "Checking for updates [current: ${current:-unknown}]..."
   else
     echo "Checking for updates..."
   fi
 
   if [ -z "$latest" ]; then
-    if [ -d "$APP_DIR" ]; then
+    if [ "$is_installed" -eq 1 ]; then
       echo "Could not check GitHub for updates; using installed copy."
       return 1
     fi
     latest="$FALLBACK_TAG"
   fi
 
-  if [ -d "$APP_DIR" ] && [ "$current" = "$latest" ]; then
+  if [ "$is_installed" -eq 1 ] && [ "$current" = "$latest" ]; then
     echo "Already up to date [$current]."
     return 1
   fi
 
-  if [ ! -d "$APP_DIR" ]; then
+  if [ "$is_installed" -eq 0 ]; then
     echo "Downloading PencariMovie Server $latest ($target)..."
     download_extract "$target" "$latest"
   else

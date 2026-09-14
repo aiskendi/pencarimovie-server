@@ -236,6 +236,12 @@ copy_release_into_app() {
       mkdir -p "$APP_DIR/storage"
       continue
     fi
+    if [ "$name" = "bin" ]; then
+      mkdir -p "$APP_DIR/bin"
+      # Preserve existing binaries (like bin/frankenphp) when updating from pencarimovie-server.tar.gz
+      cp -R "$item"/* "$APP_DIR/bin/" 2>/dev/null || true
+      continue
+    fi
     rm -rf "$APP_DIR/$name"
     cp -R "$item" "$APP_DIR/$name"
   done

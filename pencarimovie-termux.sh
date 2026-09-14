@@ -349,15 +349,16 @@ install_or_update() {
 
   if [ ! -d "$APP_DIR" ]; then
     echo "Downloading PencariMovie Server $latest ($target)..."
+    download_extract "$target" "$latest"
   else
-    echo "Updating PencariMovie Server ${current:-unknown} -> $latest ($target)..."
+    echo "Updating PencariMovie Server ${current:-unknown} -> $latest (fast updater: universal server package)..."
     if port_in_use; then
       do_stop
       sleep 1
     fi
+    # Use lightweight pencarimovie-server.tar.gz for updates (keeps existing binaries, updates app/vendor code fast)
+    download_extract "server" "$latest"
   fi
-
-  download_extract "$target" "$latest"
   register_cli
   return 0
 }

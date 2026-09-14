@@ -45,7 +45,8 @@ detect_target() {
       case "$arch" in
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+        armv7*|armv8l|armhf|arm|i686|i386) echo "server" ;;
+        *) echo "server" ;;
       esac
       ;;
     *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, Android (Termux/APK), and Windows."; exit 1 ;;
@@ -148,6 +149,7 @@ do_stop() {
     fi
   done
 
+  pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
 
@@ -277,7 +279,15 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+  local url=""
+  local fallback_url=""
+  if [ "$target" = "server" ]; then
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-linux-aarch64.tar.gz"
+  else
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -285,7 +295,15 @@ download_extract() {
   mkdir -p "$tmp/extract"
 
   echo "Downloading $url"
-  download_file "$url" "$tmp/pencarimovie.tar.gz"
+  if ! download_file "$url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
+    if [ -n "$fallback_url" ]; then
+      echo "Primary download failed, trying fallback: $fallback_url"
+      download_file "$fallback_url" "$tmp/pencarimovie.tar.gz"
+    else
+      echo "Failed to download release archive: $url"
+      exit 1
+    fi
+  fi
   tar -xzf "$tmp/pencarimovie.tar.gz" -C "$tmp/extract"
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"

@@ -45,7 +45,8 @@ detect_target() {
       case "$arch" in
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+        armv7*|armv8l|armhf|arm|i686|i386) echo "server" ;;
+        *) echo "server" ;;
       esac
       ;;
     Darwin)
@@ -60,7 +61,7 @@ detect_target() {
 }
 
 usage() {
-  echo "Usage: $0 [start|stop|restart|tunnel|uninstall]"
+  echo "Usage: $0 [start|stop|restart|tunnel|autostart|uninstall]"
   exit 1
 }
 
@@ -83,10 +84,11 @@ print_urls() {
   lan_ip="$(get_lan_ip)"
   echo "  Local:    http://127.0.0.1:$PORT"
   [ -n "$lan_ip" ] && echo "  Network:  http://$lan_ip:$PORT"
-  echo "  CLI:      pms [start|stop|restart|tunnel|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
   echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
 }
 
 port_in_use() {
@@ -114,6 +116,7 @@ do_stop() {
     fi
   done
 
+  pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
 
@@ -234,7 +237,15 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+  local url=""
+  local fallback_url=""
+  if [ "$target" = "server" ]; then
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-linux-x86_64.tar.gz"
+  else
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -242,7 +253,15 @@ download_extract() {
   mkdir -p "$tmp/extract"
 
   echo "Downloading $url"
-  download_file "$url" "$tmp/pencarimovie.tar.gz"
+  if ! download_file "$url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
+    if [ -n "$fallback_url" ]; then
+      echo "Primary download failed, trying fallback: $fallback_url"
+      download_file "$fallback_url" "$tmp/pencarimovie.tar.gz"
+    else
+      echo "Failed to download release archive: $url"
+      exit 1
+    fi
+  fi
   tar -xzf "$tmp/pencarimovie.tar.gz" -C "$tmp/extract"
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"
@@ -328,6 +347,13 @@ case "\${1:-}" in
       curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
     fi
     ;;
+  autostart|--autostart)
+    if [ -f "\$APP_DIR/pencarimovie-linux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-linux.sh" autostart "\${2:-}"
+    else
+      echo "Autostart command not found in \$APP_DIR"
+    fi
+    ;;
   uninstall|--uninstall)
     bash "\$APP_DIR/stop.sh" 2>/dev/null || true
     rm -f "\$HOME/.local/bin/pms" "\$HOME/.local/bin/pm" "\$HOME/.local/bin/pencarimovie" 2>/dev/null || true
@@ -382,6 +408,16 @@ do_start() {
   fi
 
   register_cli
+
+  # Enable autostart by default on first run (like 9router)
+  if [ ! -f "$APP_DIR/storage/.no_autostart" ]; then
+    local _desk="${HOME:-/root}/.config/autostart/pencarimovie.desktop"
+    local _sysd="${HOME:-/root}/.config/systemd/user/pencarimovie.service"
+    local _plist="${HOME:-/root}/Library/LaunchAgents/com.pencarimovie.server.plist"
+    if [ ! -f "$_desk" ] && [ ! -f "$_sysd" ] && [ ! -f "$_plist" ]; then
+      do_autostart on >/dev/null 2>&1 || true
+    fi
+  fi
 
   if port_in_use; then
     if [ "$had_app" -eq 1 ] && [ "$updated" -eq 0 ]; then
@@ -471,9 +507,124 @@ do_tunnel() {
   fi
 }
 
+do_autostart() {
+  local action="${1:-}"
+  local autostart_dir="${HOME:-/root}/.config/autostart"
+  local desktop_file="$autostart_dir/pencarimovie.desktop"
+  local systemd_user_dir="${HOME:-/root}/.config/systemd/user"
+  local service_file="$systemd_user_dir/pencarimovie.service"
+
+  if [ "$action" = "off" ] || [ "$action" = "disable" ] || [ "$action" = "remove" ]; then
+    mkdir -p "$APP_DIR/storage" 2>/dev/null || true
+    touch "$APP_DIR/storage/.no_autostart" 2>/dev/null || true
+
+    # Disable XDG desktop autostart
+    rm -f "$desktop_file" 2>/dev/null || true
+
+    # Disable systemd user service if systemctl is available
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user disable --now pencarimovie.service 2>/dev/null || true
+      rm -f "$service_file" 2>/dev/null || true
+      systemctl --user daemon-reload 2>/dev/null || true
+    fi
+
+    # Disable launchd on macOS
+    if [ "$(uname -s)" = "Darwin" ]; then
+      local plist="${HOME:-/root}/Library/LaunchAgents/com.pencarimovie.server.plist"
+      launchctl unload "$plist" 2>/dev/null || true
+      rm -f "$plist" 2>/dev/null || true
+    fi
+
+    echo "Auto-start on boot has been DISABLED."
+    return 0
+  fi
+
+  rm -f "$APP_DIR/storage/.no_autostart" 2>/dev/null || true
+
+  # Enable autostart
+  echo "Enabling auto-start on boot..."
+  local start_script="$APP_DIR/pencarimovie-linux.sh"
+  [ ! -f "$start_script" ] && start_script="$APP_DIR/start.sh"
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    local agents_dir="${HOME:-/root}/Library/LaunchAgents"
+    local plist="$agents_dir/com.pencarimovie.server.plist"
+    mkdir -p "$agents_dir" 2>/dev/null || true
+    cat <<EOF > "$plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pencarimovie.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>$start_script</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+EOF
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load -w "$plist" 2>/dev/null || true
+    echo "Auto-start on boot ENABLED via macOS LaunchAgent: $plist"
+    return 0
+  fi
+
+  # 1. Desktop autostart (XDG Desktop Entry - standard across GNOME, KDE, XFCE, etc. Same as 9router)
+  mkdir -p "$autostart_dir" 2>/dev/null || true
+  cat <<EOF > "$desktop_file"
+[Desktop Entry]
+Type=Application
+Name=PencariMovie Server
+Comment=PencariMovie Local Streaming Downloader
+Exec=/usr/bin/env bash -c 'cd "$APP_DIR" && bash "$start_script" start'
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+EOF
+  chmod +x "$desktop_file" 2>/dev/null || true
+  echo "  - Desktop autostart created: $desktop_file"
+
+  # 2. Systemd User Service (for headless/CLI Linux servers & VPS without GUI)
+  if command -v systemctl >/dev/null 2>&1; then
+    mkdir -p "$systemd_user_dir" 2>/dev/null || true
+    cat <<EOF > "$service_file"
+[Unit]
+Description=PencariMovie Server
+After=network.target
+
+[Service]
+Type=forking
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/env bash $start_script start
+ExecStop=/usr/bin/env bash $APP_DIR/stop.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable pencarimovie.service 2>/dev/null || true
+    echo "  - Systemd user service enabled: $service_file"
+  fi
+
+  echo "Auto-start on boot has been ENABLED."
+}
+
 do_uninstall() {
   echo "Stopping PencariMovie Server..."
   do_stop 2>/dev/null || true
+
+  # Clean up autostart
+  do_autostart off 2>/dev/null || true
 
   # Remove CLI wrappers
   local bin_dir="${HOME:-/root}/.local/bin"
@@ -499,6 +650,7 @@ case "${1:-}" in
   stop|--stop) do_stop ;;
   restart|--restart) do_restart ;;
   tunnel|--tunnel) do_tunnel ;;
+  autostart|--autostart) do_autostart "${2:-}" ;;
   uninstall|--uninstall) do_uninstall ;;
   *) usage ;;
 esac

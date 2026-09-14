@@ -45,7 +45,8 @@ detect_target() {
       case "$arch" in
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+        armv7*|armv8l|armhf|arm|i686|i386) echo "server" ;;
+        *) echo "server" ;;
       esac
       ;;
     *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, Android (Termux/APK), and Windows."; exit 1 ;;
@@ -53,7 +54,7 @@ detect_target() {
 }
 
 usage() {
-  echo "Usage: $0 [start|stop|restart|tunnel|uninstall]"
+  echo "Usage: $0 [start|stop|restart|tunnel|autostart|uninstall]"
   exit 1
 }
 
@@ -118,10 +119,11 @@ print_urls() {
   lan_ip="$(get_lan_ip)"
   echo "  Local:    http://127.0.0.1:$PORT"
   [ -n "$lan_ip" ] && echo "  Network:  http://$lan_ip:$PORT"
-  echo "  CLI:      pms [start|stop|restart|tunnel|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
   echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
 }
 
 port_in_use() {
@@ -149,6 +151,7 @@ do_stop() {
     fi
   done
 
+  pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
 
@@ -266,7 +269,15 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+  local url=""
+  local fallback_url=""
+  if [ "$target" = "server" ]; then
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-linux-aarch64.tar.gz"
+  else
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
+  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -274,7 +285,15 @@ download_extract() {
   mkdir -p "$tmp/extract"
 
   echo "Downloading $url"
-  download_file "$url" "$tmp/pencarimovie.tar.gz"
+  if ! download_file "$url" "$tmp/pencarimovie.tar.gz" 2>/dev/null; then
+    if [ -n "$fallback_url" ]; then
+      echo "Primary download failed, trying fallback: $fallback_url"
+      download_file "$fallback_url" "$tmp/pencarimovie.tar.gz"
+    else
+      echo "Failed to download release archive: $url"
+      exit 1
+    fi
+  fi
   tar -xzf "$tmp/pencarimovie.tar.gz" -C "$tmp/extract"
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"
@@ -360,6 +379,13 @@ case "\${1:-}" in
       curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
     fi
     ;;
+  autostart|--autostart)
+    if [ -f "\$APP_DIR/pencarimovie-termux.sh" ]; then
+      bash "\$APP_DIR/pencarimovie-termux.sh" autostart "\${2:-}"
+    else
+      echo "Autostart command not found in \$APP_DIR"
+    fi
+    ;;
   uninstall|--uninstall)
     bash "\$APP_DIR/stop.sh" 2>/dev/null || true
     rm -f "\$PREFIX/bin/pms" "\$PREFIX/bin/pm" "\$PREFIX/bin/pencarimovie" 2>/dev/null || true
@@ -388,6 +414,15 @@ do_start() {
 
   if install_or_update; then
     updated=1
+  fi
+
+  # Enable autostart by default on first run (like 9router)
+  if [ ! -f "$APP_DIR/storage/.no_autostart" ]; then
+    local _boot="${HOME:-/data/data/com.termux/files/home}/.termux/boot/pencarimovie.sh"
+    local _rc="${HOME:-/data/data/com.termux/files/home}/.bashrc"
+    if [ ! -f "$_boot" ]; then
+      do_autostart on >/dev/null 2>&1 || true
+    fi
   fi
 
   if port_in_use; then
@@ -575,9 +610,58 @@ do_tunnel() {
   fi
 }
 
+do_autostart() {
+  local action="${1:-}"
+  local termux_boot_dir="${HOME:-/data/data/com.termux/files/home}/.termux/boot"
+  local boot_script="$termux_boot_dir/pencarimovie.sh"
+  local profile_script="${HOME:-/data/data/com.termux/files/home}/.bashrc"
+
+  if [ "$action" = "off" ] || [ "$action" = "disable" ] || [ "$action" = "remove" ]; then
+    mkdir -p "$APP_DIR/storage" 2>/dev/null || true
+    touch "$APP_DIR/storage/.no_autostart" 2>/dev/null || true
+    rm -f "$boot_script" 2>/dev/null || true
+    # Remove from .bashrc if added
+    if [ -f "$profile_script" ]; then
+      grep -v 'pms start' "$profile_script" > "$profile_script.tmp" 2>/dev/null && mv "$profile_script.tmp" "$profile_script" || true
+    fi
+    echo "Auto-start on boot has been DISABLED."
+    return 0
+  fi
+
+  rm -f "$APP_DIR/storage/.no_autostart" 2>/dev/null || true
+
+  echo "Enabling auto-start for Termux..."
+  local start_script="$APP_DIR/pencarimovie-termux.sh"
+  [ ! -f "$start_script" ] && start_script="$APP_DIR/start-termux.sh"
+
+  # 1. Termux:Boot support (Runs when device reboots if Termux:Boot app is installed)
+  mkdir -p "$termux_boot_dir" 2>/dev/null || true
+  cat <<EOF > "$boot_script"
+#!/data/data/com.termux/files/usr/bin/sh
+# PencariMovie Server Termux:Boot script
+termux-wake-lock 2>/dev/null || true
+bash "$start_script" start
+EOF
+  chmod +x "$boot_script" 2>/dev/null || true
+  echo "  - Termux:Boot script created: $boot_script"
+
+  # 2. Also ensure Termux shell launch starts the server if not already running
+  if [ -f "$profile_script" ]; then
+    if ! grep -q 'pms start' "$profile_script" 2>/dev/null; then
+      printf '\n# Auto-start PencariMovie Server on Termux shell launch\n(command -v pms >/dev/null 2>&1 && pms start >/dev/null 2>&1 &)\n' >> "$profile_script"
+      echo "  - Shell launch auto-start added to: $profile_script"
+    fi
+  fi
+
+  echo "Auto-start on boot has been ENABLED."
+}
+
 do_uninstall() {
   echo "Stopping PencariMovie Server..."
   do_stop 2>/dev/null || true
+
+  # Clean up autostart
+  do_autostart off 2>/dev/null || true
 
   # Remove CLI wrappers
   local bin_dir="${PREFIX:-/data/data/com.termux/files/usr}/bin"
@@ -599,6 +683,7 @@ case "${1:-}" in
   stop|--stop) do_stop ;;
   restart|--restart) do_restart ;;
   tunnel|--tunnel) do_tunnel ;;
+  autostart|--autostart) do_autostart "${2:-}" ;;
   uninstall|--uninstall) do_uninstall ;;
   *) usage ;;
 esac

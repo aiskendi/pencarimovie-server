@@ -537,7 +537,7 @@ nameserver 1.0.0.1
 EOF
       chmod 644 "$TMP_DIR/resolv.conf" 2>/dev/null || true
 
-      # Termux prefix must stay on PATH so `pkg`/`ffmpeg` (bionic-linked) resolve.
+      # Termux prefix must stay on PATH so `pkg` (bionic-linked) resolves.
       # $1 is the app dir, $7 is the Termux prefix.
       TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 

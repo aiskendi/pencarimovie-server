@@ -148,7 +148,7 @@ if [ -x "$FRANKENPHP_BIN" ]; then
       cp "$ROOT_DIR/bin/php.ini.unix" "$ROOT_DIR/bin/php.ini"
     fi
 
-    # Termux prefix must stay on PATH so `pkg`/`ffmpeg` (bionic-linked) resolve.
+    # Termux prefix must stay on PATH so `pkg` (bionic-linked) resolves.
     # $1 is the app dir, $7 is the Termux prefix.
     TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 

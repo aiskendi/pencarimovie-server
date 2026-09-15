@@ -7,11 +7,10 @@ cd "$ROOT_DIR"
 echo "Installing Termux helpers for PencariMovie Server..."
 
 if command -v pkg >/dev/null 2>&1; then
-  # ffmpeg is required for ALAC -> FLAC transcoding. The acoustid/ffmpeg-build
-  # binary is glibc-linked and cannot run under Termux's bionic libc, so the
-  # native Termux ffmpeg package is used instead.
-  echo "Ensuring required Termux packages (proot, openssl, ca-certificates, ffmpeg)..."
-  pkg install -y proot openssl ca-certificates ffmpeg 2>/dev/null || true
+  # No ffmpeg: audio is served as-is and decoded by the client. ALAC is not
+  # transcoded, so the ~800 MB Termux ffmpeg package is not needed.
+  echo "Ensuring required Termux packages (proot, openssl, ca-certificates)..."
+  pkg install -y proot openssl ca-certificates 2>/dev/null || true
 fi
 
 mkdir -p tmp

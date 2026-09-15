@@ -123,9 +123,11 @@ if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/d
   if [ -n "${LAN_IP:-}" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
   fi
-  echo "  CLI:      pms [start|stop|restart|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
   echo "  Uninstall: pms uninstall"
   exit 0
 fi
@@ -146,13 +148,17 @@ if [ -x "$FRANKENPHP_BIN" ]; then
       cp "$ROOT_DIR/bin/php.ini.unix" "$ROOT_DIR/bin/php.ini"
     fi
 
+    # Termux prefix must stay on PATH so `pkg`/`ffmpeg` (bionic-linked) resolve.
+    # $1 is the app dir, $7 is the Termux prefix.
+    TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+
     proot --link2symlink -0 \
       -w "$ROOT_DIR" \
       -b "$ROOT_DIR:$ROOT_DIR" \
       -b "$TMP_DIR:/tmp" \
       -b "$TMP_DIR/resolv.conf:/etc/resolv.conf" \
-      /bin/sh -c 'export PATH="$1/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export LAN_IP="$6"; exec "$2" php-server --listen "$3:$4" --root "$5"' \
-      sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" >>"$LOG_FILE" 2>&1 &
+      /bin/sh -c 'export PATH="$1/bin:$7/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export PREFIX="$7"; export LAN_IP="$6"; if [ -f "$5/Caddyfile" ]; then exec "$2" run --config "$5/Caddyfile"; else exec "$2" php-server --listen "$3:$4" --root "$5"; fi' \
+      sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" "$TERMUX_PREFIX" >>"$LOG_FILE" 2>&1 &
     PID="$!"
 
     echo "$PID" > "$PID_FILE" 2>/dev/null || true
@@ -208,8 +214,10 @@ echo "  Local:    http://127.0.0.1:$PORT"
 if [ -n "${LAN_IP}" ]; then
   echo "  Network:  http://$LAN_IP:$PORT"
 fi
-echo "  CLI:      pms [start|stop|restart|uninstall]"
+echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
 echo "  Stop:     pms stop"
 echo "  Restart:  pms restart"
+echo "  Tunnel:   pms tunnel"
+echo "  Autostart: pms autostart [on|off]"
 echo "  Uninstall: pms uninstall"
 echo "PID: $PID"

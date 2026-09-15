@@ -12246,6 +12246,62 @@ if (str_starts_with($path, '/api/')) {
         fd_json($result);
     }
 
+    // ── GET /api/ffmpeg-check — diagnostic: resolve the audio-encode FFmpeg
+    //     binary and actually EXECUTE it, reporting the version or the error.
+    //     Used to verify empirically whether the resolved binary can run on
+    //     this platform (e.g. glibc vs bionic on Android/Termux). ───────────
+    if ($path === '/api/ffmpeg-check' && $method === 'GET') {
+        $binName = fd_is_windows() ? 'ffmpeg.exe' : 'ffmpeg';
+        $candidates = [];
+        $appRootBin = fd_get_app_root() . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $binName;
+        $candidates['app_root_bin'] = $appRootBin;
+        $candidates['storage_bin'] = fd_storage_path('bin/' . $binName);
+        $candidates['tunnel_bin'] = fd_tunnel_bin_dir() . DIRECTORY_SEPARATOR . $binName;
+        $prefix = (string) ($_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? ''));
+        foreach (array_filter([$prefix, '/data/data/com.termux/files/usr', '/data/data/com.pencarimovie.downloader/files/usr']) as $i => $cand) {
+            $candidates['termux_prefix_' . $i] = rtrim($cand, '/\\') . '/bin/ffmpeg';
+        }
+
+        $report = [];
+        foreach ($candidates as $label => $path) {
+            $entry = ['path' => $path, 'exists' => is_file($path)];
+            if ($entry['exists']) {
+                $entry['size'] = (int) filesize($path);
+                // Actually execute it: `ffmpeg -version` prints the banner on stdout.
+                $out = [];
+                $code = -1;
+                @exec(escapeshellarg($path) . ' -version 2>&1', $out, $code);
+                $entry['exec_exit'] = $code;
+                $entry['exec_first_line'] = $out[0] ?? '';
+                $entry['runs'] = ($code === 0 && !empty($out));
+            }
+            $report[$label] = $entry;
+        }
+
+        [$resolved, $err] = fd_ensure_audio_ffmpeg();
+        $resolvedRuns = false;
+        $resolvedOut = '';
+        if ($resolved !== '' && is_file($resolved)) {
+            $out = [];
+            $code = -1;
+            @exec(escapeshellarg($resolved) . ' -version 2>&1', $out, $code);
+            $resolvedRuns = ($code === 0 && !empty($out));
+            $resolvedOut = $out[0] ?? '';
+        }
+
+        fd_json([
+            'ok' => 1,
+            'is_android' => fd_is_android_runtime(),
+            'is_windows' => fd_is_windows(),
+            'prefix' => $prefix,
+            'resolved' => $resolved,
+            'resolved_error' => $err,
+            'resolved_runs' => $resolvedRuns,
+            'resolved_version_line' => $resolvedOut,
+            'candidates' => $report,
+        ]);
+    }
+
     // ── POST /api/warmup-resolve — batch warm-up / repopulate the local
     //     resolve cache. Accepts either an explicit `short_codes` list or a
     //     `query` (which is searched via WordPress and every returned file is

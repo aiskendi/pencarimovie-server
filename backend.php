@@ -12923,6 +12923,17 @@ if (str_starts_with($path, '/api/')) {
                     // through to the normal download path below.
                 }
                 if ($lockHandle !== null) {
+                    // We just acquired the lock. A peer may have published the
+                    // FLAC between our cache check and the lock acquisition —
+                    // re-check before starting a redundant download.
+                    if (is_file($flacCacheFile) && filesize($flacCacheFile) > 1024) {
+                        fd_log('serving converted flac from cache (post-lock)', ['short_code' => $shortCode]);
+                        @flock($lockHandle, LOCK_UN);
+                        @fclose($lockHandle);
+                        fd_serve_local_file_with_range($flacCacheFile, 'audio/flac', $flacName);
+                        exit;
+                    }
+
                     // downloadToCallable with seekable=true uses parallel 1 MB
                     // chunks (~1.6 MB/s measured) whereas downloadToFile is
                     // sequential and far slower (~97 KB/s measured).

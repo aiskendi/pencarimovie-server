@@ -47,7 +47,6 @@ if (!is_dir($audioCacheDir)) {
     @mkdir($audioCacheDir, 0777, true);
 }
 $rawFile = $audioCacheDir . DIRECTORY_SEPARATOR . 'raw_' . $safeCode . '.m4a';
-$flacTmp = $audioCacheDir . DIRECTORY_SEPARATOR . 'grow_' . $safeCode . '.flac';
 
 function fd_prewarm_state(string $shortCode, array $patch): void
 {
@@ -156,73 +155,83 @@ try {
         exit(1);
     }
 
+    // The raw file is on disk. Delegate the encode to the single shared
+    // audio-encode-worker.php instead of running FFmpeg here.
+    //
+    // Running FFmpeg in BOTH this worker and the encode worker makes two
+    // processes write the same grow_<code>.flac, which clobbers the output and
+    // produces "ffmpeg produced no output". Exactly one FFmpeg process must run
+    // per short_code.
     fd_prewarm_state($shortCode, [
         'status' => 'encoding',
         'raw_size' => (int) filesize($rawFile),
     ]);
 
-    @unlink($flacTmp);
-
-    // NOTE: no `2>&1` — with bypass_shell=true the shell is not involved, so
-    // `2>&1` would be passed to FFmpeg as a literal output filename. stderr is
-    // captured via the descriptor spec below.
-    $ffCmd = escapeshellarg($ffmpegBin)
-        . ' -y -i ' . escapeshellarg($rawFile)
-        . ' -vn -c:a flac -f flac ' . escapeshellarg($flacTmp);
-
-    $logPath = $audioCacheDir . DIRECTORY_SEPARATOR . 'ffmpeg_' . $safeCode . '.log';
-    $ffDesc = [
-        0 => ['pipe', 'r'],
-        1 => ['file', $logPath, 'a'],
-        2 => ['file', $logPath, 'a'],
-    ];
-
-    $ffProc = @proc_open($ffCmd, $ffDesc, $ffPipes, null, null, ['bypass_shell' => true]);
-    if (!is_resource($ffProc)) {
-        fd_prewarm_state($shortCode, ['status' => 'failed', 'error' => 'ffmpeg spawn failed']);
+    $root = fd_get_app_root();
+    $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+    if (!is_file($phpBin)) {
+        $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $phpBin = PHP_BINARY;
+        }
+    }
+    $encodeWorker = $root . DIRECTORY_SEPARATOR . 'audio-encode-worker.php';
+    if (!is_file($encodeWorker)) {
+        fd_prewarm_state($shortCode, ['status' => 'failed', 'error' => 'audio-encode-worker.php missing']);
         exit(1);
     }
-    if (isset($ffPipes[0]) && is_resource($ffPipes[0])) {
-        fclose($ffPipes[0]);
+
+    $encCmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $encodeWorker . '"'
+        . ' ' . escapeshellarg($shortCode)
+        . ' ' . escapeshellarg($rawFile)
+        . ' ' . escapeshellarg($flacFile);
+
+    // Run the encode worker in the foreground so this worker's lock is held
+    // until the FLAC is published (the encode worker does not take the lock).
+    $encDesc = [
+        0 => ['pipe', 'r'],
+        1 => ['file', $audioCacheDir . DIRECTORY_SEPARATOR . 'encode_' . $safeCode . '.log', 'a'],
+        2 => ['file', $audioCacheDir . DIRECTORY_SEPARATOR . 'encode_' . $safeCode . '.log', 'a'],
+    ];
+    $encProc = @proc_open($encCmd, $encDesc, $encPipes, null, null, ['bypass_shell' => true]);
+    if (!is_resource($encProc)) {
+        fd_prewarm_state($shortCode, ['status' => 'failed', 'error' => 'encode worker spawn failed']);
+        exit(1);
+    }
+    if (isset($encPipes[0]) && is_resource($encPipes[0])) {
+        fclose($encPipes[0]);
     }
 
     $deadline = microtime(true) + 900; // 15 min hard cap
     while (microtime(true) < $deadline) {
-        $st = proc_get_status($ffProc);
+        $st = proc_get_status($encProc);
         if (!$st['running']) {
             break;
         }
         usleep(300000);
     }
-    $exitCode = proc_close($ffProc);
+    $exitCode = proc_close($encProc);
 
-    if (is_file($flacTmp) && filesize($flacTmp) > 1024) {
-        @rename($flacTmp, $flacFile);
-        @unlink($rawFile);
-        fd_prewarm_state($shortCode, [
-            'status' => 'done',
-            'flac_size' => (int) filesize($flacFile),
-            'ffmpeg_exit' => $exitCode,
-        ]);
-        exit(0);
-    }
-
-    // A competing worker may have already published the FLAC while we were
-    // encoding. Never overwrite a good result with a failure.
     if (is_file($flacFile) && filesize($flacFile) > 1024) {
-        fd_prewarm_state($shortCode, [
-            'status' => 'done',
-            'flac_size' => (int) filesize($flacFile),
-            'ffmpeg_exit' => $exitCode,
-        ]);
         exit(0);
     }
 
-    fd_prewarm_state($shortCode, [
-        'status' => 'failed',
-        'error' => 'ffmpeg produced no output',
-        'ffmpeg_exit' => $exitCode,
-    ]);
+    // The encode worker already wrote the failure state; do not overwrite it
+    // with a second failure (and never overwrite a good result).
+    if (!is_file($flacFile)) {
+        $state = fd_audio_convert_state($shortCode);
+        if (($state['status'] ?? '') !== 'failed') {
+            fd_prewarm_state($shortCode, [
+                'status' => 'failed',
+                'error' => 'encode worker produced no output',
+                'ffmpeg_exit' => $exitCode,
+            ]);
+        }
+    }
     exit(1);
 } finally {
     if ($lockHandle !== null) {

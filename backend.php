@@ -6841,6 +6841,90 @@ function fd_spawn_audio_encode_worker(string $shortCode, string $rawFile, string
 }
 
 /**
+ * Kick off an ALAC -> FLAC conversion in the background, without blocking the
+ * caller. Used by /eclipse/stream so the FLAC is usually ready by the time the
+ * client fetches the stream URL.
+ *
+ * Spawns a detached CLI worker that downloads the raw .m4a itself and runs
+ * FFmpeg. Unlike the /api/download path (which downloads in-request because it
+ * already holds a MadelineProto instance), this worker boots its own
+ * MadelineProto — acceptable here because it runs detached and the request
+ * that spawned it returns immediately.
+ *
+ * No-op when the FLAC is already cached or a conversion is already running.
+ */
+function fd_maybe_prewarm_flac(string $shortCode, string $botId, string $fileId, int $fileSize, string $fileName, string $mime): void
+{
+    $shortCode = trim($shortCode);
+    if ($shortCode === '' || $fileId === '') {
+        return;
+    }
+
+    $audioCacheDir = fd_storage_path('storage/cache/audio');
+    if (!is_dir($audioCacheDir)) {
+        @mkdir($audioCacheDir, 0777, true);
+    }
+    $flacCacheFile = $audioCacheDir . DIRECTORY_SEPARATOR . $shortCode . '.flac';
+    if (is_file($flacCacheFile) && filesize($flacCacheFile) > 1024) {
+        return; // already converted
+    }
+
+    // If a conversion is already running, do not spawn a second one.
+    $state = fd_audio_convert_state($shortCode);
+    $status = (string) ($state['status'] ?? '');
+    if ($status === 'encoding' || $status === 'downloading') {
+        return;
+    }
+
+    [$ffmpegBin] = fd_ensure_audio_ffmpeg();
+    if ($ffmpegBin === '' || !is_file($ffmpegBin)) {
+        return;
+    }
+
+    $root = fd_get_app_root();
+    $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+    if (!is_file($phpBin)) {
+        $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $phpBin = PHP_BINARY;
+        }
+    }
+
+    $worker = $root . DIRECTORY_SEPARATOR . 'audio-prewarm-worker.php';
+    if (!is_file($worker)) {
+        fd_log('audio prewarm worker script missing', ['path' => $worker]);
+        return;
+    }
+
+    $args = [$shortCode, $botId, $fileId, (string) $fileSize, $fileName, $mime, $flacCacheFile];
+    $argStr = '';
+    foreach ($args as $a) {
+        $argStr .= ' ' . escapeshellarg($a);
+    }
+
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $worker . '"' . $argStr;
+
+    fd_log('prewarming flac conversion', ['short_code' => $shortCode, 'file_size' => $fileSize]);
+
+    if (fd_is_windows()) {
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+    } else {
+        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    }
+
+    fd_audio_convert_state_write($shortCode, [
+        'short_code' => $shortCode,
+        'status' => 'downloading',
+        'started_at' => time(),
+        'pid' => 0,
+    ]);
+}
+
+/**
  * Wait until the growing raw .m4a has a complete `moov` box (or the download
  * finished / failed). Returns the moov end offset, or 0 on timeout.
  */
@@ -8391,6 +8475,16 @@ if ($isEclipseRoute) {
         // track (Android cannot decode ALAC).
         if ($format === 'flac' && !str_ends_with(strtolower($safeName), '.flac')) {
             $safeName = preg_replace('/\.(m4a|alac|aac|mp3)$/i', '', $safeName) . '.flac';
+        }
+
+        // Pre-warm the FLAC conversion in the background. The raw .m4a download
+        // takes ~30s; if we wait until /api/download is hit, the client's HTTP
+        // timeout fires first and it re-requests, which used to fall through to
+        // the raw ALAC .m4a (undecodable on Android) and get skipped.
+        // Kicking it off here means the FLAC is usually ready by the time the
+        // client fetches the stream URL.
+        if ($format === 'flac' && $shortCode !== '') {
+            fd_maybe_prewarm_flac($shortCode, $botId, $fileId, $fileSize, $fileName, $mime);
         }
 
         // Stream URL should preserve the base host Eclipse used to contact the server (e.g. LAN IP
@@ -12553,6 +12647,31 @@ if (str_starts_with($path, '/api/')) {
 
                 // Only one request may download+convert a given short_code.
                 $lockHandle = fd_audio_convert_lock_acquire($shortCode);
+                if ($lockHandle === null) {
+                    // Another request is already downloading/encoding this
+                    // short_code. Do NOT fall through to downloadToBrowser —
+                    // that would serve the raw ALAC .m4a, which Android cannot
+                    // decode, and the client skips the track. Instead wait for
+                    // the in-progress conversion to publish the FLAC.
+                    fd_log('audio conversion already in progress, waiting for flac', ['short_code' => $shortCode]);
+                    $waitDeadline = microtime(true) + 180;
+                    while (microtime(true) < $waitDeadline) {
+                        if (is_file($flacCacheFile) && filesize($flacCacheFile) > 1024) {
+                            fd_log('serving converted flac from cache (waited for peer)', ['short_code' => $shortCode]);
+                            fd_serve_local_file_with_range($flacCacheFile, 'audio/flac', $flacName);
+                            exit;
+                        }
+                        $state = fd_audio_convert_state($shortCode);
+                        $status = (string) ($state['status'] ?? '');
+                        if ($status === 'failed') {
+                            fd_log('peer audio conversion failed, falling back', ['short_code' => $shortCode, 'error' => $state['error'] ?? '']);
+                            break;
+                        }
+                        usleep(250000);
+                    }
+                    // If the peer finished but produced nothing usable, fall
+                    // through to the normal download path below.
+                }
                 if ($lockHandle !== null) {
                     // downloadToCallable with seekable=true uses parallel 1 MB
                     // chunks (~1.6 MB/s measured) whereas downloadToFile is

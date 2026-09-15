@@ -118,6 +118,17 @@ if (is_file($flacTmp) && filesize($flacTmp) > 1024) {
     exit(0);
 }
 
+// A competing worker may have already published the FLAC while we were
+// encoding. Never overwrite a good result with a failure.
+if (is_file($flacFile) && filesize($flacFile) > 1024) {
+    fd_encode_state($shortCode, [
+        'status' => 'done',
+        'flac_size' => (int) filesize($flacFile),
+        'ffmpeg_exit' => $exitCode,
+    ]);
+    exit(0);
+}
+
 fd_encode_state($shortCode, [
     'status' => 'failed',
     'error' => 'ffmpeg produced no output',

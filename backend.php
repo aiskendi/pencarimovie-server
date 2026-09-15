@@ -2408,6 +2408,173 @@ function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = ''): arr
 }
 
 /**
+ * Batch warm-up / repopulate the local resolve cache.
+ *
+ * Unlike fd_resolve_shortcodes_batch() (cache-only + fire-and-forget), this
+ * actually calls WordPress /resolve-files, waits for the response, and writes
+ * every resolved file_id_mt into the local resolve cache so subsequent
+ * playback is instant. Codes the batch endpoint misses are retried
+ * individually via fd_resolve_shortcode().
+ *
+ * @param array  $shortCodes List of short codes to warm up
+ * @param string $botId      Bot to resolve against (defaults to active pool bot)
+ * @param int    $chunkSize  Codes per batch request (WordPress caps at ~40)
+ * @return array{ok:int,bot_id:string,total:int,resolved:int,failed:int,results:array,failed_codes:array}
+ */
+function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chunkSize = 40): array
+{
+    $shortCodes = array_values(array_unique(array_filter(array_map('trim', $shortCodes))));
+    if (empty($shortCodes)) {
+        return ['ok' => 0, 'message' => 'No short_codes provided.', 'total' => 0, 'resolved' => 0, 'failed' => 0, 'results' => [], 'failed_codes' => []];
+    }
+
+    if ($botId === '') {
+        $picked = fd_pick_pool_bot();
+        $botId = !empty($picked['bot_id']) ? (string) $picked['bot_id'] : fd_get_bot_id();
+    }
+
+    $chunkSize = max(1, min(40, $chunkSize));
+    $results = [];
+    $failedCodes = [];
+
+    // 1. Serve anything already cached without a network round-trip.
+    $missingCodes = [];
+    foreach ($shortCodes as $sc) {
+        $cached = fd_resolve_shortcode_cached($sc, $botId);
+        if ($cached !== null) {
+            $results[$sc] = $cached;
+        } else {
+            $missingCodes[] = $sc;
+        }
+    }
+
+    // 2. Batch-resolve the misses against WordPress and persist the results.
+    if (!empty($missingCodes)) {
+        $chunks = array_chunk($missingCodes, $chunkSize);
+        foreach ($chunks as $chunk) {
+            $url = FD_WP_API_BASE . '/resolve-files';
+            $res = fd_http_json($url, [
+                'short_codes' => implode(',', $chunk),
+                'bot_id' => $botId,
+            ], 'POST', 30);
+
+            // WordPress may return {results:{code:{...}}} or {data:{results:{...}}}
+            $map = [];
+            if (is_array($res)) {
+                if (isset($res['results']) && is_array($res['results'])) {
+                    $map = $res['results'];
+                } elseif (isset($res['data']['results']) && is_array($res['data']['results'])) {
+                    $map = $res['data']['results'];
+                } elseif (isset($res['files']) && is_array($res['files'])) {
+                    foreach ($res['files'] as $row) {
+                        $code = (string) ($row['short_code'] ?? '');
+                        if ($code !== '') {
+                            $map[$code] = $row;
+                        }
+                    }
+                }
+            }
+
+            foreach ($chunk as $sc) {
+                $row = $map[$sc] ?? null;
+                if (is_array($row) && (!empty($row['file_id_mt']) || !empty($row['file_id']))) {
+                    if (empty($row['bot_id'])) {
+                        $row['bot_id'] = $botId;
+                    }
+                    fd_save_resolve_cache($sc, $botId, $row);
+                    $results[$sc] = $row;
+                } else {
+                    $failedCodes[] = $sc;
+                }
+            }
+        }
+    }
+
+    // 3. Retry the batch misses individually (the batch endpoint can skip codes
+    //    whose Telegram relay was not yet ready). Run these in parallel via
+    //    curl_multi so a large miss set does not serialize into minutes.
+    $stillFailed = [];
+    if (!empty($failedCodes)) {
+        $retryChunks = array_chunk($failedCodes, 12);
+        foreach ($retryChunks as $retryChunk) {
+            $multi = curl_multi_init();
+            $handles = [];
+            $secret = fd_get_api_secret();
+            $headers = [
+                'Accept: application/json',
+                'User-Agent: pencarimovie-server/' . FD_APP_VERSION,
+                'X-App-Version: ' . FD_APP_VERSION,
+            ];
+            if ($secret !== '') {
+                $headers[] = 'X-API-Secret: ' . $secret;
+            }
+            foreach ($retryChunk as $sc) {
+                $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
+                    'short_code' => $sc,
+                    'bot_id' => $botId,
+                    'force' => 1,
+                    'nocache' => 1,
+                ]);
+                $ch = curl_init($targetUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_TIMEOUT => 15,
+                    CURLOPT_CONNECTTIMEOUT => 5,
+                    CURLOPT_HTTPHEADER => $headers,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_SSL_VERIFYHOST => 2,
+                    CURLOPT_RESOLVE => fd_curl_resolve_entries(),
+                ]);
+                curl_multi_add_handle($multi, $ch);
+                $handles[$sc] = $ch;
+            }
+
+            $running = null;
+            do {
+                curl_multi_exec($multi, $running);
+                if ($running > 0) {
+                    curl_multi_select($multi, 0.5);
+                }
+            } while ($running > 0);
+
+            foreach ($handles as $sc => $ch) {
+                $body = (string) curl_multi_getcontent($ch);
+                curl_multi_remove_handle($multi, $ch);
+                curl_close($ch);
+                $row = json_decode($body, true);
+                if (is_array($row) && (!empty($row['file_id_mt']) || !empty($row['file_id']))) {
+                    if (empty($row['bot_id'])) {
+                        $row['bot_id'] = $botId;
+                    }
+                    fd_save_resolve_cache($sc, $botId, $row);
+                    $results[$sc] = $row;
+                } else {
+                    $stillFailed[] = $sc;
+                }
+            }
+            curl_multi_close($multi);
+        }
+    }
+
+    fd_log('warmup resolve batch completed', [
+        'bot_id' => $botId,
+        'total' => count($shortCodes),
+        'resolved' => count($results),
+        'failed' => count($stillFailed),
+    ]);
+
+    return [
+        'ok' => 1,
+        'bot_id' => $botId,
+        'total' => count($shortCodes),
+        'resolved' => count($results),
+        'failed' => count($stillFailed),
+        'results' => $results,
+        'failed_codes' => $stillFailed,
+    ];
+}
+
+/**
  * Prewarm / resolve all streams in the background (fire-and-forget) before playback/download.
  * Never blocks stream list delivery or user navigation.
  *
@@ -12067,6 +12234,74 @@ if (str_starts_with($path, '/api/')) {
         fd_json($result);
     }
 
+    // ── POST /api/warmup-resolve — batch warm-up / repopulate the local
+    //     resolve cache. Accepts either an explicit `short_codes` list or a
+    //     `query` (which is searched via WordPress and every returned file is
+    //     warmed). Unlike /api/resolve-shortcode this actually waits for and
+    //     persists the resolved file_id_mt values. ──────────────────────────
+    if ($path === '/api/warmup-resolve' && ($method === 'POST' || $method === 'GET')) {
+        $input = [];
+        if ($method === 'POST') {
+            $raw = (string) file_get_contents('php://input');
+            $decoded = json_decode($raw, true);
+            $input = is_array($decoded) ? $decoded : $_POST;
+        } else {
+            $input = $_GET;
+        }
+
+        $botId = trim((string) ($input['bot_id'] ?? ''));
+        if ($botId === '') {
+            $picked = fd_pick_pool_bot();
+            $botId = !empty($picked['bot_id']) ? (string) $picked['bot_id'] : fd_get_bot_id();
+        }
+
+        $codes = [];
+        $rawCodes = $input['short_codes'] ?? '';
+        if (is_array($rawCodes)) {
+            $codes = $rawCodes;
+        } elseif (is_string($rawCodes) && trim($rawCodes) !== '') {
+            $codes = preg_split('/[\s,]+/', trim($rawCodes));
+        }
+
+        // Optional: warm up every file matching a search query. Uses the
+        // WordPress `search_files` AJAX action (returns files[] with
+        // short_code) so a title like "Sunday.Morning" can be reindexed with
+        // its band/artist metadata.
+        $query = trim((string) ($input['query'] ?? ''));
+        if ($query !== '') {
+            $limit = max(1, min(200, (int) ($input['limit'] ?? 50)));
+            $searchRes = fd_fetch_stream_ajax('search_files', [
+                'search' => $query,
+                'limit' => $limit,
+                'offset' => 0,
+            ]);
+            $rows = [];
+            if (is_array($searchRes)) {
+                if (isset($searchRes['files']) && is_array($searchRes['files'])) {
+                    $rows = $searchRes['files'];
+                } elseif (isset($searchRes['data']['files']) && is_array($searchRes['data']['files'])) {
+                    $rows = $searchRes['data']['files'];
+                } elseif (isset($searchRes['results']) && is_array($searchRes['results'])) {
+                    $rows = $searchRes['results'];
+                }
+            }
+            foreach ($rows as $row) {
+                $sc = (string) ($row['short_code'] ?? '');
+                if ($sc !== '') {
+                    $codes[] = $sc;
+                }
+            }
+        }
+
+        $codes = array_values(array_unique(array_filter(array_map('trim', $codes))));
+        if (empty($codes)) {
+            fd_json(['ok' => 0, 'message' => 'Provide short_codes or query.'], 400);
+        }
+
+        $result = fd_warmup_resolve_batch($codes, $botId, (int) ($input['chunk_size'] ?? 40));
+        fd_json($result);
+    }
+
     // ── POST /api/botlogin — one-time bot token login ───────────────────────
     if ($path === '/api/botlogin' && $method === 'POST') {
         $input = json_decode((string) file_get_contents('php://input'), true);
@@ -12655,6 +12890,12 @@ if (str_starts_with($path, '/api/')) {
                     // the in-progress conversion to publish the FLAC.
                     fd_log('audio conversion already in progress, waiting for flac', ['short_code' => $shortCode]);
                     $waitDeadline = microtime(true) + 180;
+                    // A competing worker can transiently write status=failed
+                    // while another worker is still encoding (two workers race
+                    // on the same short_code). Only give up after the FLAC has
+                    // been absent for a sustained grace period, so a transient
+                    // failure state does not make us serve raw ALAC.
+                    $failedSince = 0.0;
                     while (microtime(true) < $waitDeadline) {
                         if (is_file($flacCacheFile) && filesize($flacCacheFile) > 1024) {
                             fd_log('serving converted flac from cache (waited for peer)', ['short_code' => $shortCode]);
@@ -12664,8 +12905,17 @@ if (str_starts_with($path, '/api/')) {
                         $state = fd_audio_convert_state($shortCode);
                         $status = (string) ($state['status'] ?? '');
                         if ($status === 'failed') {
-                            fd_log('peer audio conversion failed, falling back', ['short_code' => $shortCode, 'error' => $state['error'] ?? '']);
-                            break;
+                            if ($failedSince === 0.0) {
+                                $failedSince = microtime(true);
+                            }
+                            // Give a competing worker 20s to publish the FLAC
+                            // before we accept the failure and fall back.
+                            if ((microtime(true) - $failedSince) > 20) {
+                                fd_log('peer audio conversion failed, falling back', ['short_code' => $shortCode, 'error' => $state['error'] ?? '']);
+                                break;
+                            }
+                        } else {
+                            $failedSince = 0.0;
                         }
                         usleep(250000);
                     }

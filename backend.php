@@ -6642,6 +6642,27 @@ function fd_ensure_audio_ffmpeg(): array
 {
     $binName = fd_is_windows() ? 'ffmpeg.exe' : 'ffmpeg';
 
+    // 0. Termux / Android FIRST: the acoustid build bundled in bin/ is
+    //    glibc-linked and CANNOT run under Termux's bionic libc — it exits
+    //    immediately, so FFmpeg "produces no output" and every ALAC track
+    //    falls through to raw .m4a. The native Termux ffmpeg package is
+    //    bionic-linked and works without proot, so it MUST win on Android.
+    if (fd_is_android_runtime()) {
+        $prefix = (string) ($_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? ''));
+        $prefixCandidates = array_filter([
+            $prefix,
+            '/data/data/com.termux/files/usr',
+            '/data/data/com.pencarimovie.downloader/files/usr',
+        ]);
+        foreach ($prefixCandidates as $cand) {
+            $termuxBin = rtrim($cand, '/\\') . '/bin/ffmpeg';
+            if (is_file($termuxBin) && filesize($termuxBin) > 1024) {
+                @chmod($termuxBin, 0755);
+                return [$termuxBin, ''];
+            }
+        }
+    }
+
     // 1. Check the app-root bin/ (bundled with release packages).
     //    This is the primary path for shipped builds — no runtime download needed.
     $appRootBin = fd_get_app_root() . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . $binName;
@@ -6670,10 +6691,8 @@ function fd_ensure_audio_ffmpeg(): array
         return [$storageBin, ''];
     }
 
-    // 4. Termux / Android: the acoustid build is glibc-linked and CANNOT run
-    // natively under Termux's bionic libc. Prefer the native Termux ffmpeg
-    // package (bionic-linked, works without proot) BEFORE the generic PATH
-    // probe, because a proot PATH may expose a glibc binary that cannot exec.
+    // 4. Termux / Android fallback: install the native package if the prefix
+    //    probe above found nothing.
     if (fd_is_android_runtime()) {
         $prefix = (string) ($_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? ''));
         $prefixCandidates = array_filter([
@@ -6681,13 +6700,6 @@ function fd_ensure_audio_ffmpeg(): array
             '/data/data/com.termux/files/usr',
             '/data/data/com.pencarimovie.downloader/files/usr',
         ]);
-        foreach ($prefixCandidates as $cand) {
-            $termuxBin = rtrim($cand, '/\\') . '/bin/ffmpeg';
-            if (is_file($termuxBin) && filesize($termuxBin) > 1024) {
-                @chmod($termuxBin, 0755);
-                return [$termuxBin, ''];
-            }
-        }
         if (function_exists('exec')) {
             fd_log('installing native Termux ffmpeg package');
             @exec('pkg install -y ffmpeg 2>&1', $pkgOut, $pkgCode);

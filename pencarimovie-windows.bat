@@ -244,11 +244,7 @@ if "!IS_INSTALLED!"=="1" if not defined CURRENT (
 if "!IS_INSTALLED!"=="0" (
     echo Checking for updates...
 ) else (
-    if defined CURRENT (
-        echo Checking for updates [current: !CURRENT!]...
-    ) else (
-        echo Checking for updates...
-    )
+    echo Checking for updates...
 )
 
 set "LATEST="
@@ -263,7 +259,7 @@ if not defined LATEST (
 )
 
 if "!IS_INSTALLED!"=="1" if defined CURRENT if /I "!CURRENT!"=="!LATEST!" (
-    echo Already up to date [!CURRENT!].
+    echo Already up to date.
     goto :eof
 )
 
@@ -278,11 +274,7 @@ if "!IS_INSTALLED!"=="0" (
     set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
     set "FALLBACK_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-server.tar.gz"
 ) else (
-    if defined CURRENT (
-        echo Updating PencariMovie Server !CURRENT! -^> !LATEST! ^(fast updater: universal server package^)...
-    ) else (
-        echo Updating PencariMovie Server -^> !LATEST! ^(fast updater: universal server package^)...
-    )
+    echo Updating PencariMovie Server to !LATEST!...
     call :stop_quiet
     ping 127.0.0.1 -n 2 >nul
     set "OTA_FILE=%OTA_TMP%\pencarimovie.tar.gz"

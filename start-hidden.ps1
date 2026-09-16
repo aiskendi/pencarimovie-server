@@ -193,7 +193,33 @@ function ConvertTo-CommandLine([string[]]$items) {
         $items | ForEach-Object {
             $a = [string]$_
             if ($a -notmatch '[ \t"]') { $a }
-            else { '"' + ($a -replace '"', '\"') + '"' }
+            else {
+                # Windows quoting rule (CommandLineToArgvW): a run of N backslashes
+                # before a quote becomes 2N+1 backslashes, and the quote is escaped.
+                # Trailing backslashes before the closing quote must also be doubled.
+                # The old `-replace '"', '\"'` produced `\"` which Go/Caddy parsed as
+                # a literal backslash + string terminator, so an absolute path with a
+                # space (e.g. C:\Users\test test's\...\Caddyfile) was truncated at the
+                # space and frankenphp died with "reading config from file: open
+                # C:\Users\...\test: The system cannot find the file specified."
+                $sb = New-Object System.Text.StringBuilder
+                [void]$sb.Append('"')
+                $backslashes = 0
+                foreach ($ch in $a.ToCharArray()) {
+                    if ($ch -eq '\') { $backslashes++; continue }
+                    if ($ch -eq '"') {
+                        [void]$sb.Append('\', ($backslashes * 2) + 1)
+                        [void]$sb.Append('"')
+                        $backslashes = 0
+                        continue
+                    }
+                    if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes); $backslashes = 0 }
+                    [void]$sb.Append($ch)
+                }
+                if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes * 2) }
+                [void]$sb.Append('"')
+                $sb.ToString()
+            }
         }
     ) -join ' '
 }

@@ -92,17 +92,20 @@ echo Starting PencariMovie Server in the background...
 if exist "%cd%\tray.ps1" (
     call :start_tray 1
 ) else (
+    rem Pass bare script names + relative paths: PowerShell's -File parser and
+    rem frankenphp's flag parser both truncate an absolute path at the first
+    rem space (e.g. C:\Users\test test's\...). cwd is already APP_DIR.
     if exist "bin\frankenphp.exe" (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -ExecutionPolicy Bypass -File "%cd%\start-hidden.ps1" -FilePath "%cd%\bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ""%cd%"""
+            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath "bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ."
         ) else (
-            start "PencariMovie Server" /MIN "%cd%\bin\frankenphp.exe" php-server --listen 0.0.0.0:%PORT% --root "%cd%"
+            start "PencariMovie Server" /MIN /D "%cd%" "bin\frankenphp.exe" php-server --listen 0.0.0.0:%PORT% --root .
         )
     ) else (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -ExecutionPolicy Bypass -File "%cd%\start-hidden.ps1" -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
+            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
         ) else (
-            start "PencariMovie Server" /MIN php -S 0.0.0.0:%PORT% router.php
+            start "PencariMovie Server" /MIN /D "%cd%" php -S 0.0.0.0:%PORT% router.php
         )
     )
     call :start_tray
@@ -206,11 +209,16 @@ goto :eof
 
 :start_tray
 if not exist "%APP_DIR%\tray.ps1" goto :eof
+rem PowerShell's -File parser truncates at the first space, so an absolute script
+rem path under a profile like C:\Users\test test's\... fails with "Processing
+rem -File 'C:\Users\...\test' failed because the file does not have a '.ps1'
+rem extension." cd into APP_DIR and pass bare script names instead.
+cd /d "%APP_DIR%"
 if not exist "%APP_DIR%\start-hidden.ps1" (
-    start "PencariMovie Tray" /MIN powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%APP_DIR%\tray.ps1" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat "%APP_DIR%\stop.bat" -StartServer
+    start "PencariMovie Tray" /MIN /D "%APP_DIR%" powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer
     goto :eof
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%APP_DIR%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%APP_DIR%\stop.bat"" -StartServer"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer"
 goto :eof
 
 :stop_tray

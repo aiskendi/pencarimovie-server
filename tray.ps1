@@ -28,7 +28,33 @@ function ConvertTo-CommandLine([string[]]$items) {
         $items | ForEach-Object {
             $a = [string]$_
             if ($a -notmatch '[ \t"]') { $a }
-            else { '"' + ($a -replace '"', '\"') + '"' }
+            else {
+                # Windows quoting rule (CommandLineToArgvW): a run of N backslashes
+                # before a quote becomes 2N+1 backslashes, and the quote is escaped.
+                # Trailing backslashes before the closing quote must also be doubled.
+                # The old `-replace '"', '\"'` produced `\"` which Go/Caddy parsed as
+                # a literal backslash + string terminator, so an absolute path with a
+                # space (e.g. C:\Users\test test's\...\Caddyfile) was truncated at the
+                # space and frankenphp died with "reading config from file: open
+                # C:\Users\...\test: The system cannot find the file specified."
+                $sb = New-Object System.Text.StringBuilder
+                [void]$sb.Append('"')
+                $backslashes = 0
+                foreach ($ch in $a.ToCharArray()) {
+                    if ($ch -eq '\') { $backslashes++; continue }
+                    if ($ch -eq '"') {
+                        [void]$sb.Append('\', ($backslashes * 2) + 1)
+                        [void]$sb.Append('"')
+                        $backslashes = 0
+                        continue
+                    }
+                    if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes); $backslashes = 0 }
+                    [void]$sb.Append($ch)
+                }
+                if ($backslashes -gt 0) { [void]$sb.Append('\', $backslashes * 2) }
+                [void]$sb.Append('"')
+                $sb.ToString()
+            }
         }
     ) -join ' '
 }
@@ -226,20 +252,26 @@ function Start-HiddenProcess {
 }
 
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    # PowerShell's own -File parser truncates at the first space, so an absolute
+    # script path under a profile like C:\Users\test test's\... fails with
+    # "Processing -File 'C:\Users\...\test' failed because the file does not have
+    # a '.ps1' extension." Pass the bare script name and set the working directory
+    # to $root instead. Same for -StopBat / -IconPath / -PidFile: pass names
+    # relative to $root so no spaced absolute path reaches the child's argv.
     $argList = @(
         '-NoProfile',
         '-STA',
         '-WindowStyle', 'Hidden',
         '-ExecutionPolicy', 'Bypass',
-        '-File', $PSCommandPath,
+        '-File', (Split-Path -Leaf $PSCommandPath),
         '-Port', "$Port"
     )
     if ($OpenUrl) { $argList += @('-OpenUrl', $OpenUrl) }
-    if ($StopBat) { $argList += @('-StopBat', $StopBat) }
-    if ($IconPath) { $argList += @('-IconPath', $IconPath) }
-    if ($PidFile) { $argList += @('-PidFile', $PidFile) }
+    if ($StopBat) { $argList += @('-StopBat', (Split-Path -Leaf $StopBat)) }
+    if ($IconPath) { $argList += @('-IconPath', (Split-Path -Leaf $IconPath)) }
+    if ($PidFile) { $argList += @('-PidFile', (Split-Path -Leaf $PidFile)) }
     if ($StartServer) { $argList += '-StartServer' }
-    Start-HiddenProcess -FileName 'powershell.exe' -Arguments $argList | Out-Null
+    Start-HiddenProcess -FileName 'powershell.exe' -Arguments $argList -WorkingDirectory $root | Out-Null
     exit 0
 }
 
@@ -311,7 +343,13 @@ function Start-AppServer {
     $franken = Join-Path $root 'bin\frankenphp.exe'
     if (Test-Path -LiteralPath $franken) {
         Write-TrayLog "starting hidden frankenphp $franken"
-        $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root)
+        $caddyfile = Join-Path $root 'Caddyfile'
+        if (Test-Path -LiteralPath $caddyfile) {
+            $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('run', '--config', $caddyfile)
+        }
+        else {
+            $script:serverProc = Start-HiddenProcess -FileName $franken -Arguments @('php-server', '--listen', "0.0.0.0:$Port", '--root', $root)
+        }
         if ($script:serverProc) {
             Write-TrayLog "frankenphp pid=$($script:serverProc.Id)"
         }
@@ -352,6 +390,69 @@ function Stop-AppServer {
 
 function Open-App {
     Start-Process $OpenUrl | Out-Null
+}
+
+function Test-AutoStartEnabled {
+    try {
+        $startupDir = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+        $vbsPath = [System.IO.Path]::Combine($startupDir, 'PencariMovie.vbs')
+        return (Test-Path -LiteralPath $vbsPath)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Set-AutoStart {
+    param([bool]$Enable)
+    try {
+        $startupDir = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+        $vbsPath = [System.IO.Path]::Combine($startupDir, 'PencariMovie.vbs')
+        if ($Enable) {
+            if (-not (Test-Path -LiteralPath $startupDir)) {
+                New-Item -ItemType Directory -Path $startupDir -Force | Out-Null
+            }
+            $targetBat = Join-Path $root 'start.bat'
+            if (-not (Test-Path -LiteralPath $targetBat)) {
+                $targetBat = Join-Path $root 'pencarimovie-windows.bat'
+            }
+            # Create hidden VBS launcher in Startup (9router pattern)
+            $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`r`nWshShell.Run `"`"`"$targetBat`"`" start`", 0, False`r`n"
+            [System.IO.File]::WriteAllText($vbsPath, $vbsContent, [System.Text.Encoding]::ASCII)
+            $noAutostartFile = Join-Path $root 'storage\.no_autostart'
+            if (Test-Path -LiteralPath $noAutostartFile) {
+                Remove-Item -LiteralPath $noAutostartFile -Force -ErrorAction SilentlyContinue
+            }
+            Write-TrayLog "autostart enabled: $vbsPath"
+        }
+        else {
+            if (Test-Path -LiteralPath $vbsPath) {
+                Remove-Item -LiteralPath $vbsPath -Force -ErrorAction SilentlyContinue
+                Write-TrayLog "autostart disabled"
+            }
+            $noAutostartFile = Join-Path $root 'storage\.no_autostart'
+            Set-Content -LiteralPath $noAutostartFile -Value "" -ErrorAction SilentlyContinue
+        }
+        return $true
+    }
+    catch {
+        Write-TrayLog ("failed to set autostart: " + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Toggle-AutoStart {
+    $current = Test-AutoStartEnabled
+    $newVal = -not $current
+    Set-AutoStart -Enable $newVal | Out-Null
+    if ($script:autostartItem) {
+        $script:autostartItem.Checked = (Test-AutoStartEnabled)
+        $script:autostartItem.Text = if ($script:autostartItem.Checked) { "Auto-start on Boot" } else { "Auto-start on Boot" }
+    }
+    if ($notify) {
+        $msg = if ($newVal) { "Auto-start enabled" } else { "Auto-start disabled" }
+        $notify.ShowBalloonTip(2000, 'PencariMovie Server', $msg, [System.Windows.Forms.ToolTipIcon]::None)
+    }
 }
 
 function Stop-App {
@@ -410,9 +511,18 @@ try {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $openItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Open PencariMovie Server'
     $openItem.Add_Click({ Open-App })
+
+    $script:autostartItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto-start on Boot'
+    $script:autostartItem.CheckOnClick = $false
+    $script:autostartItem.Checked = (Test-AutoStartEnabled)
+    $script:autostartItem.Add_Click({ Toggle-AutoStart })
+
     $stopItem = New-Object System.Windows.Forms.ToolStripMenuItem 'Stop Server'
     $stopItem.Add_Click({ Stop-App })
+
     [void]$menu.Items.Add($openItem)
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    [void]$menu.Items.Add($script:autostartItem)
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$menu.Items.Add($stopItem)
     $notify.ContextMenuStrip = $menu

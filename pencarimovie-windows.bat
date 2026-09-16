@@ -17,7 +17,14 @@ if exist "%~dp0backend.php" if exist "%~dp0start.bat" if exist "%~dp0.git" set "
 if "%IN_PLACE%"=="1" (
     set "APP_DIR=%~dp0."
 ) else (
-    set "APP_DIR=%USERPROFILE%\pencarimovie-server"
+    rem Prefer the dir resolved by the PowerShell launcher. cmd.exe mangles paths
+    rem containing an apostrophe (e.g. C:\Users\test test's) when it re-derives
+    rem them from %USERPROFILE%, so never parse the profile path here.
+    if defined PENCARIMOVIE_APP_DIR (
+        set "APP_DIR=%PENCARIMOVIE_APP_DIR%"
+    ) else (
+        set "APP_DIR=%USERPROFILE%\pencarimovie-server"
+    )
 )
 
 if "%1"=="--stop" goto stop
@@ -174,7 +181,8 @@ if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.v
     del /f /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.vbs" 2>nul
 )
 rem Remove from User PATH if registered
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:APP_PATH; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
+set "PENCARIMOVIE_PATH_DIR=%APP_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
 echo Removing %APP_DIR% ...
 echo PencariMovie Server has been uninstalled.
 set "TARGET_DIR=%APP_DIR%"
@@ -303,10 +311,14 @@ if not exist "%OTA_FILE%" (
 
 if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
 
-rem Extract with tar.exe (supports both .zip and .tar.gz on Windows 10/11)
-tar.exe -xf "%OTA_FILE%" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat --strip-components=1 -C "!APP_PATH!" >nul 2>&1
+rem Extract with tar.exe (supports both .zip and .tar.gz on Windows 10/11).
+rem Archive entries are "./"-prefixed ("./pencarimovie-windows.bat"), so the
+rem exclude patterns must be "./"-prefixed too. Without the "./" the running
+rem batch file is overwritten mid-execution and cmd dies with
+rem "The batch file cannot be found." on every fresh install.
+tar.exe -xf "%OTA_FILE%" --exclude=./storage --exclude=./storage/* --exclude=./pencarimovie-windows.bat --exclude=pencarimovie-windows.bat --strip-components=1 -C "!APP_PATH!" >nul 2>&1
 if not exist "!APP_PATH!\backend.php" (
-    tar.exe -xf "%OTA_FILE%" --exclude=storage --exclude=storage/* --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
+    tar.exe -xf "%OTA_FILE%" --exclude=./storage --exclude=./storage/* --exclude=./pencarimovie-windows.bat --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
 )
 if not exist "!APP_PATH!\backend.php" (
     powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:OTA_FILE; if ($src.EndsWith('.zip')) { Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force } else { tar -xzf $src -C $env:APP_PATH }"
@@ -325,21 +337,24 @@ call :register_cmd_path
 goto :eof
 
 :register_cmd_path
-if not exist "%USERPROFILE%\pencarimovie-server" mkdir "%USERPROFILE%\pencarimovie-server" 2>nul
+rem Use APP_DIR (already resolved, apostrophe-safe) instead of re-deriving the
+rem path from %USERPROFILE%, which cmd.exe mangles for names like "test test's".
+if not exist "%APP_DIR%" mkdir "%APP_DIR%" 2>nul
 (
     echo @echo off
     echo "%~f0" %%*
-) > "%USERPROFILE%\pencarimovie-server\pm.cmd" 2>nul
+) > "%APP_DIR%\pm.cmd" 2>nul
 (
     echo @echo off
     echo "%~f0" %%*
-) > "%USERPROFILE%\pencarimovie-server\pms.cmd" 2>nul
+) > "%APP_DIR%\pms.cmd" 2>nul
 (
     echo @echo off
     echo "%~f0" %%*
-) > "%USERPROFILE%\pencarimovie-server\pencarimovie.cmd" 2>nul
+) > "%APP_DIR%\pencarimovie.cmd" 2>nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server'; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
+set "PENCARIMOVIE_PATH_DIR=%APP_DIR%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
 goto :eof
 
 :print_banner

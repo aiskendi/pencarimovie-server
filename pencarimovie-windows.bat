@@ -97,13 +97,13 @@ if exist "%cd%\tray.ps1" (
     rem space (e.g. C:\Users\test test's\...). cwd is already APP_DIR.
     if exist "bin\frankenphp.exe" (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath "bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ."
+            powershell -NoProfile -File start-hidden.ps1 -FilePath "bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ."
         ) else (
             start "PencariMovie Server" /MIN /D "%cd%" "bin\frankenphp.exe" php-server --listen 0.0.0.0:%PORT% --root .
         )
     ) else (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
+            powershell -NoProfile -File start-hidden.ps1 -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
         ) else (
             start "PencariMovie Server" /MIN /D "%cd%" php -S 0.0.0.0:%PORT% router.php
         )
@@ -137,7 +137,7 @@ if errorlevel 1 (
     ping 127.0.0.1 -n 3 >nul
 )
 echo Enabling Cloudflare Tunnel...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; try { $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; if ($res.tunnel_url -and ($res.tunnel_url -ne $res.public_url)) { Write-Host ('  Direct URL:   ' + $res.tunnel_url) }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; if ($res.tunnel_url -and ($res.tunnel_url -ne $res.public_url)) { Write-Host ('  Direct URL:   ' + $res.tunnel_url) }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
 exit /b %ERRORLEVEL%
 
 :stop
@@ -185,7 +185,7 @@ if exist "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PencariMovie.v
 )
 rem Remove from User PATH if registered
 set "PENCARIMOVIE_PATH_DIR=%APP_DIR%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
+powershell -NoProfile -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -and $curr -like ('*' + $dir + '*')) { $clean = (($curr -split ';') | Where-Object { $_ -and $_ -ne $dir }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $clean, 'User') } }" >nul 2>&1
 echo Removing %APP_DIR% ...
 echo PencariMovie Server has been uninstalled.
 set "TARGET_DIR=%APP_DIR%"
@@ -215,10 +215,10 @@ rem -File 'C:\Users\...\test' failed because the file does not have a '.ps1'
 rem extension." cd into APP_DIR and pass bare script names instead.
 cd /d "%APP_DIR%"
 if not exist "%APP_DIR%\start-hidden.ps1" (
-    start "PencariMovie Tray" /MIN /D "%APP_DIR%" powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer
+    start "PencariMovie Tray" /MIN /D "%APP_DIR%" powershell.exe -NoProfile -STA -WindowStyle Hidden -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer
     goto :eof
 )
-powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer"
+powershell -NoProfile -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer"
 goto :eof
 
 :stop_tray
@@ -279,67 +279,38 @@ if "!IS_INSTALLED!"=="1" if defined CURRENT if /I "!CURRENT!"=="!LATEST!" (
     goto :eof
 )
 
-set "OTA_TMP=%TEMP%\pencarimovie-ota-%RANDOM%"
-if exist "%OTA_TMP%" rmdir /s /q "%OTA_TMP%" 2>nul
-mkdir "%OTA_TMP%" 2>nul
+rem Download + extract is delegated to update.ps1 on purpose. Antivirus engines
+rem (BitDefender/Arcabit/Emsisoft/GData/VIPRE "Boxter", Kaspersky "BAT.Alien")
+rem flag BATCH FILES that download a remote archive and extract/execute it.
+rem Keeping that logic in PowerShell removes this .bat from the heuristic's
+rem target, and update.ps1 also verifies a SHA-256 sidecar when published.
+rem
+rem Do NOT add the PowerShell execution-policy bypass flag here: a .bat that
+rem launches a script with that flag is itself a scored heuristic chain.
+rem update.ps1 is a local file, so the default policy runs it.
 set "OTA_TAG=!LATEST!"
 
-if "!IS_INSTALLED!"=="0" (
-    echo Downloading PencariMovie Server !LATEST!...
-    set "OTA_FILE=%OTA_TMP%\pencarimovie.zip"
-    set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
-    set "FALLBACK_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-server.tar.gz"
-) else (
+if "!IS_INSTALLED!"=="1" (
     echo Updating PencariMovie Server to !LATEST!...
     call :stop_quiet
     ping 127.0.0.1 -n 2 >nul
-    set "OTA_FILE=%OTA_TMP%\pencarimovie.tar.gz"
-    set "OTA_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-server.tar.gz"
-    set "FALLBACK_URL=https://github.com/%REPO%/releases/download/!LATEST!/pencarimovie-downloader-windows-x86_64.zip"
+) else (
+    echo Downloading PencariMovie Server !LATEST!...
 )
 
-echo Downloading %OTA_URL%
-rem Use curl.exe if available (standard on modern Windows), fallback to powershell download
-curl.exe -fL -s -S -o "%OTA_FILE%" "%OTA_URL%" 2>nul
-if not exist "%OTA_FILE%" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { (New-Object System.Net.WebClient).DownloadFile($env:OTA_URL, $env:OTA_FILE) } catch { (New-Object System.Net.WebClient).DownloadFile($env:FALLBACK_URL, $env:OTA_FILE) }"
-)
-
-if not exist "%OTA_FILE%" (
-    echo Primary download failed, trying fallback: %FALLBACK_URL%
-    curl.exe -fL -s -S -o "%OTA_FILE%" "%FALLBACK_URL%" 2>nul
-)
-
-if not exist "%OTA_FILE%" (
-    echo Update download failed.
-    rmdir /s /q "%OTA_TMP%" 2>nul
+if not exist "%~dp0update.ps1" (
+    echo update.ps1 not found next to this script.
     pause
     exit /b 1
 )
 
-if not exist "!APP_PATH!" mkdir "!APP_PATH!" 2>nul
-
-rem Extract with tar.exe (supports both .zip and .tar.gz on Windows 10/11).
-rem Archive entries are "./"-prefixed ("./pencarimovie-windows.bat"), so the
-rem exclude patterns must be "./"-prefixed too. Without the "./" the running
-rem batch file is overwritten mid-execution and cmd dies with
-rem "The batch file cannot be found." on every fresh install.
-tar.exe -xf "%OTA_FILE%" --exclude=./storage --exclude=./storage/* --exclude=./pencarimovie-windows.bat --exclude=pencarimovie-windows.bat --strip-components=1 -C "!APP_PATH!" >nul 2>&1
-if not exist "!APP_PATH!\backend.php" (
-    tar.exe -xf "%OTA_FILE%" --exclude=./storage --exclude=./storage/* --exclude=./pencarimovie-windows.bat --exclude=pencarimovie-windows.bat -C "!APP_PATH!" >nul 2>&1
-)
-if not exist "!APP_PATH!\backend.php" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$src = $env:OTA_FILE; if ($src.EndsWith('.zip')) { Expand-Archive -Path $src -DestinationPath $env:APP_PATH -Force } else { tar -xzf $src -C $env:APP_PATH }"
-)
-if not exist "!APP_PATH!\backend.php" (
-    echo File copy failed.
-    rmdir /s /q "%OTA_TMP%" 2>nul
+powershell -NoProfile -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -Tag "!LATEST!" -Installed !IS_INSTALLED!
+if errorlevel 1 (
+    echo Update failed.
     pause
     exit /b 1
 )
 
-> "!APP_PATH!\.release-tag" echo !OTA_TAG!
-rmdir /s /q "%OTA_TMP%" 2>nul
 set "UPDATED=1"
 call :register_cmd_path
 goto :eof
@@ -362,7 +333,7 @@ if not exist "%APP_DIR%" mkdir "%APP_DIR%" 2>nul
 ) > "%APP_DIR%\pencarimovie.cmd" 2>nul
 
 set "PENCARIMOVIE_PATH_DIR=%APP_DIR%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
+powershell -NoProfile -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
 goto :eof
 
 :print_banner

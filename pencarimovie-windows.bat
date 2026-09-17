@@ -298,6 +298,14 @@ if "!IS_INSTALLED!"=="1" (
     echo Downloading PencariMovie Server !LATEST!...
 )
 
+rem On a fresh install only this .bat is downloaded, so update.ps1 may not be
+rem present yet. Fetch it from the repo (a plain file download, not an
+rem extract/execute) before delegating.
+if not exist "%~dp0update.ps1" (
+    echo Fetching update.ps1...
+    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60"
+)
+
 if not exist "%~dp0update.ps1" (
     echo update.ps1 not found next to this script.
     pause

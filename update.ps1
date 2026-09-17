@@ -73,7 +73,12 @@ if (-not $archive) {
 $shaUrl = "$($primary.Url).sha256"
 if ($archive -ne (Join-Path $otaTmp $primary.Name)) { $shaUrl = "$($fallback.Url).sha256" }
 try {
-    $expected = (Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 30).Content.Trim().Split()[0]
+    $resp = Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 30
+    # GitHub serves the .sha256 as application/octet-stream, so .Content can be
+    # a byte[] rather than a string. Normalize both shapes before parsing.
+    $raw = $resp.Content
+    if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::ASCII.GetString($raw) }
+    $expected = ([string]$raw).Trim().Split()[0]
     $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     if ($expected -and ($actual -ne $expected.ToUpper())) {
         Write-Host "SHA-256 mismatch: expected $expected, got $actual"

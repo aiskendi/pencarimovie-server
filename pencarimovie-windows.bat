@@ -97,13 +97,13 @@ if exist "%cd%\tray.ps1" (
     rem space (e.g. C:\Users\test test's\...). cwd is already APP_DIR.
     if exist "bin\frankenphp.exe" (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -File start-hidden.ps1 -FilePath "bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ."
+            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath "bin\frankenphp.exe" -CommandLine "php-server --listen 0.0.0.0:%PORT% --root ."
         ) else (
             start "PencariMovie Server" /MIN /D "%cd%" "bin\frankenphp.exe" php-server --listen 0.0.0.0:%PORT% --root .
         )
     ) else (
         if exist "%cd%\start-hidden.ps1" (
-            powershell -NoProfile -File start-hidden.ps1 -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
+            powershell -NoProfile -ExecutionPolicy Bypass -File start-hidden.ps1 -FilePath php -CommandLine "-S 0.0.0.0:%PORT% router.php"
         ) else (
             start "PencariMovie Server" /MIN /D "%cd%" php -S 0.0.0.0:%PORT% router.php
         )
@@ -215,10 +215,10 @@ rem -File 'C:\Users\...\test' failed because the file does not have a '.ps1'
 rem extension." cd into APP_DIR and pass bare script names instead.
 cd /d "%APP_DIR%"
 if not exist "%APP_DIR%\start-hidden.ps1" (
-    start "PencariMovie Tray" /MIN /D "%APP_DIR%" powershell.exe -NoProfile -STA -WindowStyle Hidden -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer
+    start "PencariMovie Tray" /MIN /D "%APP_DIR%" powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer
     goto :eof
 )
-powershell -NoProfile -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File tray.ps1 -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat stop.bat -StartServer"
 goto :eof
 
 :stop_tray
@@ -284,10 +284,6 @@ rem (BitDefender/Arcabit/Emsisoft/GData/VIPRE "Boxter", Kaspersky "BAT.Alien")
 rem flag BATCH FILES that download a remote archive and extract/execute it.
 rem Keeping that logic in PowerShell removes this .bat from the heuristic's
 rem target, and update.ps1 also verifies a SHA-256 sidecar when published.
-rem
-rem Do NOT add the PowerShell execution-policy bypass flag here: a .bat that
-rem launches a script with that flag is itself a scored heuristic chain.
-rem update.ps1 is a local file, so the default policy runs it.
 set "OTA_TAG=!LATEST!"
 
 if "!IS_INSTALLED!"=="1" (
@@ -303,7 +299,7 @@ rem present yet. Fetch it from the repo (a plain file download, not an
 rem extract/execute) before delegating.
 if not exist "%~dp0update.ps1" (
     echo Fetching update.ps1...
-    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60"
+    powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/%REPO%/main/update.ps1' -OutFile '%~dp0update.ps1' -UseBasicParsing -TimeoutSec 60; Unblock-File -LiteralPath '%~dp0update.ps1' -ErrorAction SilentlyContinue"
 )
 
 if not exist "%~dp0update.ps1" (
@@ -312,7 +308,7 @@ if not exist "%~dp0update.ps1" (
     exit /b 1
 )
 
-powershell -NoProfile -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -Tag "!LATEST!" -Installed !IS_INSTALLED!
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -AppDir "!APP_PATH!" -Repo "%REPO%" -Tag "!LATEST!" -Installed !IS_INSTALLED!
 if errorlevel 1 (
     echo Update failed.
     pause

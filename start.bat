@@ -58,13 +58,13 @@ if exist "%FRANKENPHP_EXE%" (
     set "SERVER_ARGS=php-server --listen %HOST%:%PORT% --root ""%ROOT%"""
   )
   if exist "%ROOT%\start-hidden.ps1" (
-    powershell -NoProfile -File "%ROOT%\start-hidden.ps1" -FilePath "%FRANKENPHP_EXE%" -CommandLine "!SERVER_ARGS!"
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath "%FRANKENPHP_EXE%" -CommandLine "!SERVER_ARGS!"
   ) else (
     start "PencariMovie Server" /MIN "%FRANKENPHP_EXE%" !SERVER_ARGS!
   )
 ) else (
   if exist "%ROOT%\start-hidden.ps1" (
-    powershell -NoProfile -File "%ROOT%\start-hidden.ps1" -FilePath php -CommandLine "-S %HOST%:%PORT% router.php"
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath php -CommandLine "-S %HOST%:%PORT% router.php"
   ) else (
     start "PencariMovie Server" /MIN php -S %HOST%:%PORT% router.php
   )
@@ -74,10 +74,10 @@ goto :eof
 :start_tray
 if not exist "%ROOT%\tray.ps1" goto :eof
 if not exist "%ROOT%\start-hidden.ps1" (
-  start "PencariMovie Tray" /MIN powershell.exe -NoProfile -STA -WindowStyle Hidden -File "%ROOT%\tray.ps1" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat "%ROOT%\stop.bat" -StartServer
+  start "PencariMovie Tray" /MIN powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%ROOT%\tray.ps1" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat "%ROOT%\stop.bat" -StartServer
   goto :eof
 )
-powershell -NoProfile -File "%ROOT%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -File ""%ROOT%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%ROOT%\stop.bat"" -StartServer"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%ROOT%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%ROOT%\stop.bat"" -StartServer"
 goto :eof
 
 :print_banner

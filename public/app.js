@@ -48,7 +48,7 @@ class PencariMovieApp {
     this._cachePrefix = 'pencarimovie_cache:';
 
     // Session state
-    this.version = '2.0.0';
+    this.version = '2.1.8';
     this.botId = '';
     this.botUsername = '';
     this.botName = '';

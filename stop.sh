@@ -4,6 +4,7 @@ set -euo pipefail
 HOST="0.0.0.0"
 PORT="8088"
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
 
 echo "Stopping PencariMovie Server on $HOST:$PORT..."
 
@@ -22,7 +23,6 @@ fi
 if command -v pkill >/dev/null 2>&1 && [ -n "$TUNNEL_CONFIG" ]; then
   pkill -f "$TUNNEL_CONFIG" 2>/dev/null || true
 fi
-rm -f "$ROOT_DIR/storage/tunnel/state.json" 2>/dev/null || true
 
 for PID_FILE in "$ROOT_DIR/.frankenphp.pid" "$ROOT_DIR/.php-server.pid"; do
   if [ -f "$PID_FILE" ]; then
@@ -30,10 +30,17 @@ for PID_FILE in "$ROOT_DIR/.frankenphp.pid" "$ROOT_DIR/.php-server.pid"; do
     if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
       echo "Killing process from $(basename "$PID_FILE") PID $PID"
       kill "$PID" 2>/dev/null || true
+      sleep 0.2
+      kill -9 "$PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE" 2>/dev/null || true
   fi
 done
+
+if command -v pkill >/dev/null 2>&1; then
+  pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
+  pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
+fi
 
 if command -v lsof >/dev/null 2>&1; then
   PIDS="$(lsof -ti tcp:"$PORT" -sTCP:LISTEN || true)"

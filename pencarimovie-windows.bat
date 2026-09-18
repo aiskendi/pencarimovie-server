@@ -37,10 +37,16 @@ if "%1"=="--tunnel" goto tunnel
 if "%1"=="tunnel" goto tunnel
 if "%1"=="--autostart" goto autostart
 if "%1"=="autostart" goto autostart
+if "%1"=="--password" goto password
+if "%1"=="password" goto password
+if "%1"=="--reset-password" goto reset_password
+if "%1"=="reset-password" goto reset_password
+if "%1"=="--token" goto token
+if "%1"=="token" goto token
 if "%1"=="--uninstall" goto uninstall
 if "%1"=="uninstall" goto uninstall
 if not "%1"=="" (
-    echo Usage: %~nx0 [start^|stop^|restart^|tunnel^|autostart^|uninstall]
+    echo Usage: %~nx0 [start^|stop^|restart^|tunnel^|autostart^|password^|reset-password^|token^|uninstall]
     pause
     exit /b 1
 )
@@ -136,8 +142,13 @@ if errorlevel 1 (
     call :not_running
     ping 127.0.0.1 -n 3 >nul
 )
-echo Enabling Cloudflare Tunnel...
-powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; if ($res.tunnel_url -and ($res.tunnel_url -ne $res.public_url)) { Write-Host ('  Direct URL:   ' + $res.tunnel_url) }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+if not "%~2"=="" (
+    echo Enabling Cloudflare Named Tunnel with token...
+    powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { $body = @{ tunnel_token = '%~2' } | ConvertTo-Json; $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.message) { Write-Host ('  Status:       ' + $res.message) -ForegroundColor Cyan }; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+) else (
+    echo Enabling Cloudflare Tunnel...
+    powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { $res = Invoke-RestMethod -Uri 'http://127.0.0.1:%PORT%/api/tunnel/enable' -Method POST -TimeoutSec 120; if ($res.ok -eq 1) { Write-Host ''; Write-Host 'Cloudflare Tunnel is LIVE' -ForegroundColor Green; if ($res.message) { Write-Host ('  Status:       ' + $res.message) -ForegroundColor Cyan }; if ($res.public_url) { Write-Host ('  Public URL:   ' + $res.public_url) -ForegroundColor Cyan }; if ($res.manifest_url) { Write-Host ('  Manifest URL: ' + $res.manifest_url) -ForegroundColor Yellow }; Write-Host ''; } else { Write-Host ('Failed to enable tunnel: ' + $res.message) -ForegroundColor Red; exit 1 } } catch { Write-Host ('Error enabling tunnel: ' + $_.Exception.Message) -ForegroundColor Red; exit 1 }"
+)
 exit /b %ERRORLEVEL%
 
 :stop
@@ -175,6 +186,39 @@ if not exist "%STARTUP_DIR%" mkdir "%STARTUP_DIR%" 2>nul
     echo Set WshShell = CreateObject^("WScript.Shell"^)
     echo WshShell.Run """%APP_DIR%\start.bat"" start", 0, False
 ) > "%VBS_FILE%"
+goto :eof
+
+:password
+if "%2"=="" (
+    echo Usage: pms password ^<new-password^>
+    exit /b 1
+)
+call :auth_write "%2"
+echo Password updated.
+exit /b 0
+
+:reset_password
+call :auth_write "123456"
+echo Password reset to the default (123456).
+exit /b 0
+
+:token
+if "%2"=="rotate" (
+    call :auth_write ""
+    echo Token rotated. Re-install the addon from #addon on every device.
+    exit /b 0
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $f = Join-Path $env:APP_DIR 'storage\auth.json'; if (-not (Test-Path $f)) { Write-Host 'No token yet. Start the server once.'; exit 0 }; $d = Get-Content $f -Raw | ConvertFrom-Json; Write-Host $d.token }"
+exit /b 0
+
+rem Write storage/auth.json via the bundled PHP so the hash matches
+rem password_verify() on the server. Empty %1 = rotate token only.
+:auth_write
+if not exist "%APP_DIR%\auth-write.ps1" (
+    echo auth-write.ps1 not found in %APP_DIR%
+    exit /b 1
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%\auth-write.ps1" -AppDir "%APP_DIR%" -Password "%~1"
 goto :eof
 
 :uninstall

@@ -137,7 +137,15 @@ function fd_storage_path(string $file): string
 define('FD_SESSION_PATH', fd_storage_path('storage/session.madeline'));
 define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v1');
 define('FD_WP_AJAX_URL', 'https://pencarimovie.com/wp-admin/admin-ajax.php');
-define('FD_APP_VERSION', '2.0.9');
+// Fallback host used when the primary domain is blocked by an in-path DPI
+// firewall (corporate / campus / hospital networks reset the TLS handshake on
+// the "pencarimovie.com" SNI). telegra.my is a Cloudflare Worker that reverse
+// proxies /wp-json/* and /wp-admin/admin-ajax.php back to pencarimovie.com over
+// Cloudflare's internal backbone, so the local SNI is a benign hostname.
+define('FD_WP_FALLBACK_HOST', 'telegra.my');
+define('FD_WP_API_BASE_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-json/pencarimovie-server/v1');
+define('FD_WP_AJAX_URL_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-admin/admin-ajax.php');
+define('FD_APP_VERSION', '2.1.8');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
@@ -145,6 +153,9 @@ define('FD_DEVICE_ID_PATH', fd_storage_path('storage/device_id.txt'));
 define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));
 define('FD_BOT_POOL_PATH', fd_storage_path('storage/bot_pool.json'));
 define('FD_CATALOG_SETTINGS_PATH', fd_storage_path('storage/catalog_settings.json'));
+define('FD_AUTH_PATH', fd_storage_path('storage/auth.json'));
+define('FD_AUTH_DEFAULT_PASSWORD', '123456');
+define('FD_AUTH_COOKIE', 'pm_auth');
 define('FD_DEBUG_LOG_PATH', fd_storage_path('storage/debug.log'));
 define('FD_DEBUG_TOGGLE_PATH', fd_storage_path('storage/debug_mode.txt'));
 define('FD_CACHE_DIR', fd_storage_path('storage/cache'));
@@ -221,8 +232,11 @@ function fd_prune_cache_files(bool $force = false): void
 
 /**
  * Optional DNS resolution mapping for curl (e.g. "example.com:443:1.2.3.4").
+ *
+ * Overridable via the FD_CURL_RESOLVE environment variable so a blocked
+ * primary host can be pinned to a black-hole IP for fallback testing.
  */
-define('FD_CURL_RESOLVE', '');
+define('FD_CURL_RESOLVE', (string) (getenv('FD_CURL_RESOLVE') ?: ''));
 
 function fd_is_debug_enabled(): bool
 {
@@ -688,6 +702,38 @@ function fd_is_guest_provision_in_progress(): bool
     if (!file_exists($lockFile)) {
         return false;
     }
+
+    // Staleness guard: a provision that crashed or was killed leaves the lock
+    // file behind with no holder. Without this check the frontend polls
+    // /api/session forever and shows "Provisioning guest bot..." in an endless
+    // loop (observed: a 4-day-old 0-byte lock kept is_provisioning=true).
+    //
+    // IMPORTANT: on Windows a file held open by another process makes
+    // filemtime() return false. Falling back to 0 would skip the guard and
+    // reproduce the loop, so we use a SEPARATE heartbeat file that is never
+    // flock()ed. The heartbeat is written when a provision starts and refreshed
+    // while it runs; if it is missing or older than 300s the lock is stale.
+    $heartbeatFile = fd_storage_path('storage/guest_provision.heartbeat');
+    $hb = @filemtime($heartbeatFile);
+    if ($hb === false) {
+        // No heartbeat at all. Fall back to the lock's own mtime, and if even
+        // that is unreadable treat the lock as stale (a live provision always
+        // writes a heartbeat first).
+        $lm = @filemtime($lockFile);
+        if ($lm === false) {
+            @unlink($lockFile);
+            fd_log('reclaimed guest_provision.lock (no heartbeat, unreadable mtime)');
+            return false;
+        }
+        $hb = $lm;
+    }
+    if ((time() - (int) $hb) > 300) {
+        @unlink($lockFile);
+        @unlink($heartbeatFile);
+        fd_log('reclaimed stale guest_provision.lock', ['age_seconds' => time() - (int) $hb]);
+        return false;
+    }
+
     $fp = @fopen($lockFile, 'c+');
     if (!$fp) {
         return false;
@@ -706,6 +752,26 @@ function fd_auto_provision_guest(): ?array
 {
     fd_ensure_autoload();
 
+    // ── Clock pre-check ───────────────────────────────────────────────────────
+    // A skewed clock makes the MTProto auth key exchange fail with
+    // ENCRYPTED_NOT_BOUND cancellation. Provisioning a new guest bot cannot fix
+    // that, so refuse up front and tell the user the exact offset. Without this
+    // guard every page load provisions yet another bot (observed: 8 bots in
+    // 12 minutes with a 48s skew).
+    $clockProbe = fd_measure_clock_offset();
+    if ($clockProbe['ok'] && abs((int) $clockProbe['offset']) > 30) {
+        $off = abs((int) $clockProbe['offset']);
+        $mins = intdiv($off, 60);
+        $secs = $off % 60;
+        $human = $mins > 0 ? "{$mins}m {$secs}s" : "{$secs}s";
+        $dir = (int) $clockProbe['offset'] > 0 ? 'ahead of' : 'behind';
+        fd_log('auto provision aborted: clock skew too large', [
+            'offset_seconds' => (int) $clockProbe['offset'],
+        ]);
+        return ['error' => "Device clock out of sync!\nYour clock is {$human} {$dir} Telegram's server time.\n\n"
+            . "Enable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server."];
+    }
+
     // Check if an existing valid guest session is already active or in the pool.
     // Avoid re-provisioning and duplicating guest bots if one is already functioning.
     $existingBotId = fd_get_bot_id();
@@ -719,6 +785,30 @@ function fd_auto_provision_guest(): ?array
                 'bot_name' => (string) ($meta['bot_name'] ?? ''),
                 'madeline' => $madeline,
             ];
+        }
+
+        // A session directory exists but the boot failed. If the failure is a
+        // clock-skew / auth-key problem, provisioning a NEW guest bot will not
+        // help — it will fail the same way and create an endless loop of new
+        // bots (observed: 8063426232 -> 8188066637 -> ...). Return the error so
+        // the user fixes their clock instead.
+        if ($error !== null && fd_is_clock_or_authkey_error((string) $error)) {
+            fd_log('auto provision aborted: existing session failed with clock/auth-key error', [
+                'bot_id' => $existingBotId,
+                'error' => $error,
+            ]);
+            return ['error' => fd_friendly_login_error((string) $error)];
+        }
+    }
+
+    // Also guard against a session directory that exists on disk but has no
+    // bot_id recorded (e.g. a previous provision died mid-handshake). Without
+    // this, every page load provisions yet another guest bot.
+    if ($existingBotId === '') {
+        $orphan = fd_find_orphan_session_bot_id();
+        if ($orphan !== '') {
+            fd_log('auto provision aborted: orphan session dir present without bot_id', ['orphan_bot_id' => $orphan]);
+            return ['error' => 'A previous login did not finish. Please restart the PencariMovie Server and try again.'];
         }
     }
 
@@ -737,6 +827,12 @@ function fd_auto_provision_guest(): ?array
         while (microtime(true) - $lockWaitStart < 30) {
             if (@flock($lockFp, LOCK_EX | LOCK_NB)) {
                 $locked = true;
+                // Heartbeat: write a SEPARATE file (never flock()ed) so the
+                // staleness guard in fd_is_guest_provision_in_progress() can
+                // read a fresh mtime even while this process holds the lock
+                // open. On Windows filemtime() on a locked file returns false,
+                // which would otherwise skip the guard and loop forever.
+                @file_put_contents(fd_storage_path('storage/guest_provision.heartbeat'), (string) time(), LOCK_EX);
                 break;
             }
             // During wait, check if session was successfully provisioned by another worker
@@ -943,8 +1039,7 @@ function fd_is_cloudflare_tunnel_request(): bool
 
 function fd_is_local_request(): bool
 {
-    // cloudflared proxies as 127.0.0.1. Treat TryCloudflare / CF headers as remote
-    // so enable/disable/bot-login stay on the real local dashboard.
+    // cloudflared proxies as 127.0.0.1. Treat TryCloudflare / CF headers as remote.
     if (fd_is_cloudflare_tunnel_request()) {
         return false;
     }
@@ -977,6 +1072,307 @@ function fd_require_local_request(): void
     if (!fd_is_local_request()) {
         fd_json(['ok' => 0, 'message' => 'This endpoint is restricted to local requests only.'], 403);
     }
+}
+
+// ─── Server password auth ───────────────────────────────────────────────────
+// A single password (default 123456) gates the admin surface and the streams
+// list. Localhost / private-LAN requests bypass it so local installs are
+// unaffected. Remote clients pass a token as a /t/<token>/ path segment.
+
+function fd_auth_load(): array
+{
+    $path = FD_AUTH_PATH;
+    $data = [];
+    if (is_file($path)) {
+        $decoded = json_decode((string) @file_get_contents($path), true);
+        if (is_array($decoded)) {
+            $data = $decoded;
+        }
+    }
+    if (empty($data['password_hash'])) {
+        $data['password_hash'] = password_hash(FD_AUTH_DEFAULT_PASSWORD, PASSWORD_DEFAULT);
+    }
+    if (empty($data['token'])) {
+        $data['token'] = bin2hex(random_bytes(16));
+    }
+    if (!isset($data['enabled'])) {
+        $data['enabled'] = true;
+    }
+    if (!is_file($path)) {
+        fd_auth_save($data);
+    }
+    return $data;
+}
+
+function fd_auth_save(array $data): void
+{
+    @file_put_contents(FD_AUTH_PATH, json_encode($data, JSON_UNESCAPED_SLASHES), LOCK_EX);
+}
+
+function fd_auth_enabled(): bool
+{
+    return !empty(fd_auth_load()['enabled']);
+}
+
+function fd_auth_token(): string
+{
+    return (string) (fd_auth_load()['token'] ?? '');
+}
+
+function fd_auth_rotate_token(): string
+{
+    $data = fd_auth_load();
+    $data['token'] = bin2hex(random_bytes(16));
+    fd_auth_save($data);
+    return $data['token'];
+}
+
+function fd_auth_verify_password(string $pw): bool
+{
+    $hash = (string) (fd_auth_load()['password_hash'] ?? '');
+    return $hash !== '' && password_verify($pw, $hash);
+}
+
+function fd_auth_set_password(string $pw): void
+{
+    $data = fd_auth_load();
+    $data['password_hash'] = password_hash($pw, PASSWORD_DEFAULT);
+    $data['token'] = bin2hex(random_bytes(16));
+    $data['enabled'] = true;
+    fd_auth_save($data);
+}
+
+function fd_auth_client_ip(): string
+{
+    if (fd_is_cloudflare_tunnel_request() && !empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        return (string) $_SERVER['HTTP_CF_CONNECTING_IP'];
+    }
+    return (string) ($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1');
+}
+
+/**
+ * Progressive lockout ladder (same as 9router):
+ * Tier 0: 30s, Tier 1: 120s (2m), Tier 2: 600s (10m), Tier 3+: 1800s (30m)
+ * Locked out after 5 consecutive failed attempts.
+ */
+function fd_auth_lockout_check(string $ip): ?int
+{
+    $lockFile = fd_storage_path('storage/cache/auth_lockout.json');
+    if (!is_file($lockFile)) {
+        return null;
+    }
+    $state = json_decode((string) @file_get_contents($lockFile), true) ?: [];
+    $entry = $state[$ip] ?? null;
+    if (!$entry || empty($entry['lockUntil'])) {
+        return null;
+    }
+    $now = time();
+    if ($entry['lockUntil'] > $now) {
+        return (int) ($entry['lockUntil'] - $now);
+    }
+    return null;
+}
+
+function fd_auth_record_failure(string $ip): array
+{
+    $lockFile = fd_storage_path('storage/cache/auth_lockout.json');
+    $dir = dirname($lockFile);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0755, true);
+    }
+    $state = is_file($lockFile) ? (json_decode((string) @file_get_contents($lockFile), true) ?: []) : [];
+    $now = time();
+
+    // Prune entries older than 1 hour
+    foreach ($state as $k => $v) {
+        if (!empty($v['lastFailAt']) && ($now - $v['lastFailAt'] > 3600) && empty($v['lockUntil'])) {
+            unset($state[$k]);
+        }
+    }
+
+    $tiers = [30, 120, 600, 1800];
+    $entry = $state[$ip] ?? ['fails' => 0, 'lockUntil' => 0, 'lockLevel' => 0, 'lastFailAt' => 0];
+    $entry['fails'] = ($entry['fails'] ?? 0) + 1;
+    $entry['lastFailAt'] = $now;
+
+    $retryAfter = 0;
+    if ($entry['fails'] >= 5) {
+        $level = min($entry['lockLevel'] ?? 0, count($tiers) - 1);
+        $duration = $tiers[$level];
+        $entry['lockUntil'] = $now + $duration;
+        $entry['lockLevel'] = $level + 1;
+        $entry['fails'] = 0;
+        $retryAfter = $duration;
+    }
+
+    $state[$ip] = $entry;
+    @file_put_contents($lockFile, json_encode($state, JSON_UNESCAPED_SLASHES), LOCK_EX);
+
+    return [
+        'locked' => $retryAfter > 0,
+        'retryAfter' => $retryAfter,
+        'remaining' => max(0, 5 - ($entry['fails'] ?? 0)),
+    ];
+}
+
+function fd_auth_record_success(string $ip): void
+{
+    $lockFile = fd_storage_path('storage/cache/auth_lockout.json');
+    if (!is_file($lockFile)) {
+        return;
+    }
+    $state = json_decode((string) @file_get_contents($lockFile), true) ?: [];
+    if (isset($state[$ip])) {
+        unset($state[$ip]);
+        @file_put_contents($lockFile, json_encode($state, JSON_UNESCAPED_SLASHES), LOCK_EX);
+    }
+}
+
+/**
+ * Extract the auth token from the request: /t/<token>/ path prefix, ?token=,
+ * X-Auth-Token header, or the pm_auth cookie.
+ */
+function fd_auth_token_from_request(): string
+{
+    $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
+    // Support clean /<token>/manifest.json or /<token>/stream/... (32-char hex token)
+    if (preg_match('#^/([0-9a-fA-F]{32})(?:/|$)#', $path, $m)) {
+        return strtolower($m[1]);
+    }
+    if (preg_match('#^/t/([A-Za-z0-9]+)(?:/|$)#', $path, $m)) {
+        return $m[1];
+    }
+    $q = trim((string) ($_GET['token'] ?? ''));
+    if ($q !== '') {
+        return $q;
+    }
+    $h = trim((string) ($_SERVER['HTTP_X_AUTH_TOKEN'] ?? ''));
+    if ($h !== '') {
+        return $h;
+    }
+    return trim((string) ($_COOKIE[FD_AUTH_COOKIE] ?? ''));
+}
+
+/**
+ * True when the request may access protected routes. Localhost and private
+ * LAN requests always pass so local installs never see a password prompt.
+ */
+function fd_is_authenticated(): bool
+{
+    if (!fd_auth_enabled()) {
+        return true;
+    }
+    if (fd_is_local_request()) {
+        return true;
+    }
+    $token = fd_auth_token_from_request();
+    return $token !== '' && hash_equals(fd_auth_token(), $token);
+}
+
+function fd_require_auth(): void
+{
+    if (!fd_is_authenticated()) {
+        fd_json(['ok' => 0, 'message' => 'Password required', 'auth_required' => true], 401);
+    }
+}
+
+/**
+ * Strip a leading /t/<token> segment so existing route matching still works.
+ */
+function fd_strip_token_prefix(string $path): string
+{
+    if (preg_match('#^/[0-9a-fA-F]{32}(/.*)?$#', $path, $m)) {
+        return (!empty($m[1])) ? $m[1] : '/';
+    }
+    if (preg_match('#^/t/[A-Za-z0-9]+(/.*)?$#', $path, $m)) {
+        return $m[1] ?? '/';
+    }
+    return $path;
+}
+
+/**
+ * Stremio-shaped locked stream: tells the user to re-install from #addon.
+ */
+function fd_stremio_locked_stream(string $baseUrl): never
+{
+    fd_stremio_json([
+        'streams' => [[
+            'name' => 'PencariMovie',
+            'description' => "Addon URL changed or password required.\nOpen PencariMovie and re-install the addon from #addon.",
+            'externalUrl' => rtrim($baseUrl, '/') . '/#addon',
+        ]],
+    ], 200, 'no-cache, no-store, must-revalidate');
+}
+
+/**
+ * Eclipse-shaped locked response (Eclipse expects {error}, not {streams}).
+ */
+function fd_eclipse_locked_response(string $baseUrl): never
+{
+    fd_stremio_json([
+        'error' => "Addon URL changed or password required. Open PencariMovie and re-install the addon from #addon.",
+        'externalUrl' => rtrim($baseUrl, '/') . '/#addon',
+    ], 200, 'no-cache, no-store, must-revalidate');
+}
+
+/**
+ * Minimal standalone password page. Deliberately does NOT load app.js or the
+ * dashboard CSS so no dashboard markup leaks to unauthenticated visitors.
+ */
+function fd_serve_auth_gate_html(): void
+{
+    if (!headers_sent()) {
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+    }
+    echo <<<'HTML'
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PencariMovie Server</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#141414;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.card{width:100%;max-width:360px;padding:28px;background:#1c1c1c;border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+h1{margin:0 0 6px;font-size:1.3rem}
+p{margin:0 0 18px;color:#9a9a9a;font-size:.86rem}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #333;background:#111;color:#fff;font-size:1rem}
+button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:8px;background:#ff6b35;color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+.err{margin-top:10px;color:#ff5c5c;font-size:.84rem;min-height:1.1em}
+</style></head><body>
+<div class="card">
+<h1>PencariMovie Server</h1>
+<p>Enter server password to continue. (Default: <code>123456</code>)</p>
+<form id="f">
+<input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+<button id="b" type="submit">Connect</button>
+<div class="err" id="e"></div>
+</form>
+</div>
+<script>
+document.getElementById('f').addEventListener('submit', async function(ev){
+  ev.preventDefault();
+  var b=document.getElementById('b'), e=document.getElementById('e');
+  b.disabled=true; e.textContent='';
+  try{
+    var r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
+    var d=await r.json();
+    if(d.ok){location.reload();return;}
+    if(r.status===429&&d.retryAfter){
+      var rem=d.retryAfter;
+      e.textContent='Too many attempts. Locked for '+rem+'s.';
+      var t=setInterval(function(){
+        rem--;
+        if(rem<=0){clearInterval(t);b.disabled=false;e.textContent='You can try again now.';}
+        else{e.textContent='Too many attempts. Locked for '+rem+'s.';}
+      },1000);
+      return;
+    }
+    e.textContent=d.message||'Wrong password';
+  }catch(err){e.textContent='Connection failed';}
+  b.disabled=false;
+});
+</script></body></html>
+HTML;
 }
 
 function fd_decode_download_payload(string $payload): array
@@ -1118,6 +1514,20 @@ function fd_get_upstream_manifest_hosts(): array
     if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < 86400) {
         $data = json_decode((string) @file_get_contents($cacheFile), true);
         if (is_array($data) && !empty($data)) {
+            // Self-heal: a cache written before the telegra.my fallback existed
+            // would omit the fallback host, breaking the DPI bypass on
+            // Android/Termux (no DNS). Merge it in without a full refresh.
+            if (
+                defined('FD_WP_FALLBACK_HOST') && FD_WP_FALLBACK_HOST !== ''
+                && empty($data[FD_WP_FALLBACK_HOST])
+            ) {
+                $fbIps = fd_resolve_host_ips(FD_WP_FALLBACK_HOST);
+                if (empty($fbIps)) {
+                    $fbIps = ['104.21.15.194', '172.67.163.205'];
+                }
+                $data[FD_WP_FALLBACK_HOST] = $fbIps;
+                @file_put_contents($cacheFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), LOCK_EX);
+            }
             return $cached = $data;
         }
     }
@@ -1125,6 +1535,9 @@ function fd_get_upstream_manifest_hosts(): array
     // Known-good Cloudflare anycast IPs used when live resolution fails.
     $fallbacks = [
         'pencarimovie.com' => ['104.21.47.164', '172.67.149.53'],
+        // telegra.my is the DPI-firewall fallback host (see fd_fallback_url()).
+        // Pinned so the fallback also works on Android/Termux with no DNS.
+        'telegra.my' => ['104.21.15.194', '172.67.163.205'],
         'v3-cinemeta.strem.io' => ['104.17.88.107', '104.17.89.107'],
         'opensubtitles-v3.strem.io' => ['104.17.88.107', '104.17.89.107'],
         'subs5.strem.io' => ['104.17.88.107', '104.17.89.107'],
@@ -1305,12 +1718,54 @@ function fd_amphp_http_request(string $url, string $method, array $headers, stri
     return $resBody;
 }
 
+/**
+ * Rewrite a pencarimovie.com URL to the telegra.my Cloudflare Worker fallback.
+ *
+ * Used when an in-path DPI firewall resets the TLS handshake on the
+ * "pencarimovie.com" SNI. Returns null when the URL is not a primary-domain URL
+ * (so callers can skip the retry).
+ */
+function fd_fallback_url(string $url): ?string
+{
+    if (!defined('FD_WP_FALLBACK_HOST') || FD_WP_FALLBACK_HOST === '') {
+        return null;
+    }
+    if (stripos($url, 'pencarimovie.com') === false) {
+        return null;
+    }
+    return str_ireplace('pencarimovie.com', FD_WP_FALLBACK_HOST, $url);
+}
+
+/**
+ * True when a failed request looks like an in-path firewall TLS reset rather
+ * than a genuine upstream error. cURL reports errno 35 (SSL connect error) /
+ * 56 (recv failure) / 7 (couldn't connect) with an empty HTTP code.
+ */
+function fd_is_connection_reset(?int $errno, int $httpCode, string $error): bool
+{
+    if ($httpCode > 0) {
+        return false;
+    }
+    if (in_array($errno, [7, 35, 52, 56], true)) {
+        return true;
+    }
+    $needle = strtolower($error);
+    foreach (['reset by peer', 'tls negotiation failed', 'ssl connect error', 'connection refused', 'timed out'] as $frag) {
+        if ($needle !== '' && str_contains($needle, $frag)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function fd_http_get_contents(string $url, array $options = []): string|false
 {
     $method = strtoupper($options['method'] ?? 'GET');
     $headers = $options['headers'] ?? [];
     $body = $options['body'] ?? '';
     $timeout = max(10, (int) ($options['timeout'] ?? 15));
+    // Set by the fallback retry so a failed telegra.my request cannot recurse.
+    $noFallback = !empty($options['_fd_no_fallback']);
 
     // Ensure X-App-Version and User-Agent headers are sent on all requests
     $hasVersionHeader = false;
@@ -1346,14 +1801,38 @@ function fd_http_get_contents(string $url, array $options = []): string|false
                 // Empty body with a 2xx is a valid (if unusual) response — stop.
                 break;
             } catch (\Throwable $e) {
-                $isCancelled = stripos($e->getMessage(), 'cancelled') !== false
-                    || stripos($e->getMessage(), 'timeout') !== false;
+                $msg = $e->getMessage();
+                $isCancelled = stripos($msg, 'cancelled') !== false
+                    || stripos($msg, 'timeout') !== false;
+                // In-path DPI firewall resets the TLS handshake on the
+                // "pencarimovie.com" SNI. Amp surfaces this as a socket/TLS
+                // error, not a timeout — retry once via the telegra.my Worker.
+                $isReset = !$isCancelled && (
+                    stripos($msg, 'reset') !== false
+                    || stripos($msg, 'tls') !== false
+                    || stripos($msg, 'handshake') !== false
+                    || stripos($msg, 'socket') !== false
+                    || stripos($msg, 'connection') !== false
+                );
                 fd_log('amphp request exception', [
                     'url' => $url,
-                    'error' => $e->getMessage(),
+                    'error' => $msg,
                     'attempt' => $ampTry,
                     'will_retry' => $isCancelled && $ampTry < $ampAttempts,
                 ]);
+                if ($isReset && !$noFallback) {
+                    $fallbackUrl = fd_fallback_url($url);
+                    if ($fallbackUrl !== null) {
+                        fd_log('amphp fallback to telegra.my', [
+                            'url' => $url,
+                            'fallback_url' => $fallbackUrl,
+                            'error' => $msg,
+                        ]);
+                        $fbOptions = $options;
+                        $fbOptions['_fd_no_fallback'] = true;
+                        return fd_http_get_contents($fallbackUrl, $fbOptions);
+                    }
+                }
                 if (!$isCancelled || $ampTry >= $ampAttempts) {
                     break;
                 }
@@ -1430,13 +1909,16 @@ function fd_http_get_contents(string $url, array $options = []): string|false
         $cDuration = round(microtime(true) - $cStart, 3);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
+        $cErrno = curl_errno($ch);
+        $cError = curl_error($ch);
+
         if ($response === false) {
             fd_log('curl request failed', [
                 'url' => $url,
                 'http_code' => $httpCode,
                 'duration_seconds' => $cDuration,
-                'errno' => curl_errno($ch),
-                'error' => curl_error($ch),
+                'errno' => $cErrno,
+                'error' => $cError,
             ]);
         } else {
             fd_log('curl request completed', [
@@ -1454,6 +1936,22 @@ function fd_http_get_contents(string $url, array $options = []): string|false
         unset($ch);
 
         if ($response === false || $response === '') {
+            // In-path DPI firewall (corporate / campus / hospital) resets the
+            // TLS handshake on the "pencarimovie.com" SNI. Retry once through
+            // the telegra.my Cloudflare Worker, which proxies back to the
+            // origin over Cloudflare's internal backbone.
+            $fallbackUrl = $noFallback ? null : fd_fallback_url($url);
+            if ($fallbackUrl !== null && fd_is_connection_reset($cErrno, $httpCode, $cError)) {
+                fd_log('curl fallback to telegra.my', [
+                    'url' => $url,
+                    'fallback_url' => $fallbackUrl,
+                    'errno' => $cErrno,
+                    'error' => $cError,
+                ]);
+                $fbOptions = $options;
+                $fbOptions['_fd_no_fallback'] = true;
+                return fd_http_get_contents($fallbackUrl, $fbOptions);
+            }
             return false;
         }
 
@@ -3252,6 +3750,37 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $settings->getAppInfo()
         ->setApiId($apiId)
         ->setApiHash($apiHash);
+    // Disable IPv6 and DoH on mobile/Android environments.
+    // DoH (DNS-over-HTTPS) tries to connect to mozilla.cloudflare-dns.com at startup,
+    // which hangs for 20+ seconds if DNS is cold or blocked on Android.
+    // Disabling DoH and IPv6 forces direct IPv4 connections to Telegram DCs (149.154.*.*)
+    // without any mozilla.cloudflare-dns.com lookups or flora/venus web subdomain hops.
+    //
+    // Obfuscated transport (MTProto Obfuscated2) is used as a FALLBACK, not by
+    // default. Some ISP DPI middleboxes (reported: TIME Fibre Home, Malaysia)
+    // fingerprint the plain MTProto handshake (first byte 0xef) and inject a
+    // TCP RST on port 443. The symptom is a successful TCP connect followed
+    // immediately by NothingInTheSocketException, then the auth key transition
+    // to ENCRYPTED_NOT_BOUND is cancelled ("The operation was cancelled").
+    //
+    // MadelineProto does NOT auto-retry with obfuscation: DataCenter::getCtxs()
+    // only inserts ObfuscatedStream when Connection::getObfuscated() is true,
+    // and the reconnect loop reuses the same stream stack. So we implement the
+    // fallback ourselves in the retry loop below: attempt 1 uses the plain
+    // transport (fast path, no AES-CTR overhead), and if it fails with a
+    // DPI-style error we flip $useObfuscated and retry.
+    //
+    // ObfuscatedStream is supported by every Telegram DC and is what official
+    // Telegram clients use, so the fallback is safe (no session change,
+    // negligible CPU cost via AES-NI). Verified: the stack becomes
+    // AbridgedStream => ObfuscatedStream => BufferedRawStream => DefaultStream
+    // and the full auth key transition completes.
+    $useObfuscated = false;
+    $settings->getConnection()
+        ->setIpv6(false)
+        ->setTimeout(15.0)
+        ->setObfuscated($useObfuscated)
+        ->setUseDoH(false);
     if (fd_is_debug_enabled()) {
         $settings->getLogger()->setLevel(\danog\MadelineProto\Logger::NOTICE);
     } else {
@@ -3260,11 +3789,15 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $settings->getLogger()->setMaxSize(FD_MAX_LOG_SIZE);
 
     // Increase RPC timeouts and parallel chunk tuning for Telegram file downloads
-    // Default rpcDropTimeout is 60s; on slower connections or heavy Telegram DC latency,
-    // upload.getFile can time out waiting for media chunks, causing Amp\TimeoutException.
-    // $settings->getRpc()->setRpcDropTimeout(180);
-    // $settings->getRpc()->setRpcResendTimeout(20);
-    // $settings->getFiles()->setDownloadParallelChunks(20);
+    // Default rpcDropTimeout is 60s; rpcResendTimeout defaults to 4s.
+    // On high-latency mobile networks or media DCs (DC -2 / DC -4), 4s is too aggressive
+    // and causes constant "Still missing upload.getFile ... sending state request" spam
+    // while the socket is busy receiving previous chunks. Raising resend timeout to 12s
+    // and drop timeout to 180s stops unnecessary state request stalls.
+    $settings->getRpc()->setRpcDropTimeout(180);
+    $settings->getRpc()->setRpcResendTimeout(12);
+    // Reduce parallel download chunks from 20 to 8 on mobile/Android to prevent socket saturation
+    $settings->getFiles()->setDownloadParallelChunks(8);
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.
@@ -3280,6 +3813,21 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     // from stale IPC sessions), but /lock is left alone.
     $lastError = null;
     for ($bootAttempt = 0; $bootAttempt < 3; $bootAttempt++) {
+        // ── Obfuscated-transport fallback ─────────────────────────────────────
+        // Attempt 1 uses the plain transport. If it fails with a DPI-style
+        // error (socket reset right after connect, or a cancelled auth key
+        // transition), flip to ObfuscatedStream and retry. This keeps the fast
+        // plain path for the ~99% of users whose ISP does not fingerprint
+        // MTProto, while still recovering automatically on TIME Fibre Home and
+        // similar DPI networks.
+        if ($bootAttempt > 0 && !$useObfuscated && fd_is_dpi_transport_error((string) $lastError)) {
+            $useObfuscated = true;
+            $settings->getConnection()->setObfuscated(true);
+            fd_log('retrying with obfuscated transport after DPI-style failure', [
+                'attempt' => $bootAttempt + 1,
+                'previous_error' => $lastError,
+            ]);
+        }
         try {
             // Clean stale state files (NOT /lock — that should persist to
             // prevent concurrent touch() races under FrankenPHP).
@@ -3301,6 +3849,23 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
             $madeline = new \danog\MadelineProto\API($sessionPath, $settings);
             $t1 = microtime(true);
             fd_log('madeline construction', ['ms' => round(($t1 - $t0) * 1000), 'attempt' => $bootAttempt + 1]);
+
+            // Reset the full-boot flag immediately after construction.
+            //
+            // Ipc::getSlow() consults FD_FORCE_FULL_BOOT during construction to
+            // decide between a full session deserialize and an IPC client
+            // connect. Leaving it set for the rest of the request means any
+            // later API construction in the same request also does a full boot,
+            // and a full-mode instance SAVES THE SESSION on shutdown
+            // (APIWrapper::serialize() returns early only for IPC clients).
+            //
+            // Each save takes an exclusive flock on safe.php.lock and
+            // lightState.php.lock. Under concurrency those locks serialize
+            // every request and can wedge the whole server. Clearing the flag
+            // here keeps it scoped to the single fresh-login boot it was
+            // intended for, so every other boot takes the IPC client path and
+            // performs no session save.
+            $GLOBALS['FD_FORCE_FULL_BOOT'] = false;
 
             // Try to resume existing session first.
             // The constructor already deserializes the session if present and logs
@@ -3429,6 +3994,212 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
 }
 
 /**
+ * Decide whether a MadelineProto boot error looks like ISP DPI interference on
+ * the plain MTProto transport, so the caller can retry with ObfuscatedStream.
+ *
+ * Reported signature (TIME Fibre Home, Malaysia): the TCP connect succeeds,
+ * then the socket is reset before the auth key transition completes.
+ *
+ *   ReadLoop: danog\MadelineProto\NothingInTheSocketException
+ *   Got exception in DC 2.0, reconnecting...
+ *   SecurityException ... An error occurred while handling state transition
+ *   to ENCRYPTED_NOT_BOUND in DC 2: The operation was cancelled
+ *
+ * Deliberately narrow: a generic "The operation was cancelled" alone is NOT
+ * enough (it also happens on slow cold Diffie-Hellman key generation), so we
+ * require a socket-level reset marker or the ENCRYPTED_NOT_BOUND transition.
+ */
+function fd_is_dpi_transport_error(string $error): bool
+{
+    if ($error === '') {
+        return false;
+    }
+    $lower = strtolower($error);
+
+    // A clock-skew error also surfaces as an ENCRYPTED_NOT_BOUND cancellation,
+    // but obfuscation cannot fix it. Exclude it so we do not waste a retry.
+    if (fd_is_clock_or_authkey_error($error)) {
+        return false;
+    }
+
+    // Socket reset / immediate EOF right after connect.
+    if (
+        str_contains($lower, 'nothinginthesocketexception')
+        || str_contains($lower, 'nothing in the socket')
+        || str_contains($lower, 'connection reset by peer')
+        || str_contains($lower, 'reset by peer')
+        || str_contains($lower, 'broken pipe')
+        || str_contains($lower, 'unexpected eof')
+    ) {
+        return true;
+    }
+
+    // Auth key transition cancelled while binding to the DC.
+    if (
+        str_contains($lower, 'encrypted_not_bound')
+        || str_contains($lower, 'encrypted_not_inited')
+    ) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Decide whether a boot error is caused by clock skew or a broken auth-key
+ * exchange. Provisioning a fresh guest bot cannot fix either, so the caller
+ * must stop instead of looping.
+ *
+ * Observed chain: clock ~49s ahead -> MsgIdHandler nudges time_delta -> Telegram
+ * replies bad_msg_notification "msg_id too high" -> ResponseHandler resets the
+ * MTProto session mid-handshake -> SecurityException "wrong new_nonce_hash1".
+ */
+function fd_is_clock_or_authkey_error(string $error): bool
+{
+    if ($error === '') {
+        return false;
+    }
+    $lower = strtolower($error);
+
+    return str_contains($lower, 'clock')
+        || str_contains($lower, 'sync your date')
+        || str_contains($lower, 'too new compared')
+        || str_contains($lower, 'too old compared')
+        || str_contains($lower, 'msg_id too high')
+        || str_contains($lower, 'message id')
+        || str_contains($lower, 'new_nonce_hash')
+        || str_contains($lower, 'time delta')
+        || str_contains($lower, 'time_delta');
+}
+
+/**
+ * Find a session directory that exists on disk but has no bot_id recorded in
+ * session_meta.json / bot_pool.json. This happens when a previous provision
+ * died mid-handshake, and it is what makes every page load provision yet
+ * another guest bot.
+ *
+ * @return string The orphan bot id, or '' when none is found.
+ */
+function fd_find_orphan_session_bot_id(): string
+{
+    $sessionsDir = fd_storage_path('storage/sessions');
+    if (!is_dir($sessionsDir)) {
+        return '';
+    }
+    $entries = @scandir($sessionsDir);
+    if (!$entries) {
+        return '';
+    }
+    foreach ($entries as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $dir = $sessionsDir . DIRECTORY_SEPARATOR . $entry;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        // A session dir counts as orphaned only if it has no usable session file.
+        $sess = $dir . DIRECTORY_SEPARATOR . 'session.madeline';
+        if (is_file($sess) || is_dir($sess)) {
+            return '';
+        }
+        return (string) $entry;
+    }
+    return '';
+}
+
+/**
+ * Measure the local clock offset against Telegram's server time.
+ *
+ * Telegram rejects MTProto handshakes when the client clock is off by more
+ * than ~300 seconds ("message ID too new/old compared to the max/min value").
+ * This probes a Telegram DC over plain HTTP (no auth, no session) and compares
+ * the `Date` response header to local time, so we can tell the user the exact
+ * number of seconds their clock is wrong instead of a generic message.
+ *
+ * @return array{ok: bool, offset: int, server_time: int, local_time: int, error: string}
+ */
+function fd_measure_clock_offset(): array
+{
+    $localTime = time();
+    $serverTime = 0;
+
+    // Telegram DCs answer plain HTTP on port 80 with a Date header.
+    $hosts = ['149.154.167.51', '149.154.175.50', '149.154.167.91'];
+    foreach ($hosts as $host) {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'HEAD',
+                'timeout' => 5,
+                'ignore_errors' => true,
+                'header' => "Host: telegram.org\r\nConnection: close\r\n",
+            ],
+            'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
+        ]);
+        $headers = @get_headers('http://' . $host . '/', true, $ctx);
+        if (is_array($headers)) {
+            // get_headers() returns a flat array for a single response.
+            $dateHeader = '';
+            foreach ($headers as $k => $v) {
+                if (is_string($k) && strtolower($k) === 'date' && is_string($v)) {
+                    $dateHeader = $v;
+                    break;
+                }
+            }
+            if ($dateHeader !== '') {
+                $parsed = strtotime($dateHeader);
+                if ($parsed !== false && $parsed > 0) {
+                    $serverTime = $parsed;
+                    break;
+                }
+            }
+        }
+    }
+
+    if ($serverTime === 0) {
+        return [
+            'ok' => false,
+            'offset' => 0,
+            'server_time' => 0,
+            'local_time' => $localTime,
+            'error' => 'Could not read Telegram server time.',
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'offset' => $localTime - $serverTime,
+        'server_time' => $serverTime,
+        'local_time' => $localTime,
+        'error' => '',
+    ];
+}
+
+/**
+ * Build a precise, actionable clock-skew message including the measured offset.
+ */
+function fd_clock_skew_message(): string
+{
+    $probe = fd_measure_clock_offset();
+    $base = "Device clock out of sync!\nTelegram requires accurate device time (within ~5 minutes).";
+
+    if (!$probe['ok']) {
+        return $base . "\n\nPlease enable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the server.";
+    }
+
+    $offset = (int) $probe['offset'];
+    $abs = abs($offset);
+    $direction = $offset > 0 ? 'ahead of' : 'behind';
+    $minutes = floor($abs / 60);
+    $seconds = $abs % 60;
+    $human = $minutes > 0 ? "{$minutes}m {$seconds}s" : "{$seconds}s";
+
+    return $base
+        . "\n\nYour clock is {$human} {$direction} Telegram's server time."
+        . "\n\nFix: enable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server.";
+}
+
+/**
  * Translate internal MadelineProto/system boot errors into clear, actionable advice for users.
  */
 function fd_friendly_login_error(string $rawError): string
@@ -3442,7 +4213,7 @@ function fd_friendly_login_error(string $rawError): string
         || str_contains($lower, 'too old compared to the min value')
         || str_contains($lower, 'message id')
     ) {
-        return "Device clock out of sync!\nTelegram requires accurate device time. Please enable 'Set time automatically' (Automatic date and time / NTP) in your Android/device Settings.";
+        return fd_clock_skew_message();
     }
 
     // 2. DNS / Network connectivity / IP resolution issues
@@ -3479,7 +4250,7 @@ function fd_friendly_login_error(string $rawError): string
         // Strip out the noisy stack callback boilerplate to show the core problem
         $core = trim($m[1]);
         if (str_contains($lower, 'sync your date') || str_contains($lower, 'too new compared')) {
-            return "Device clock out of sync!\nTelegram requires accurate device time. Please enable 'Set time automatically' (Automatic date & time / NTP) in your Android Settings.";
+            return fd_clock_skew_message();
         }
         return "Login failed: " . $core;
     }
@@ -4462,6 +5233,87 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
 }
 
 /**
+ * Cached genre list for /manifest.json.
+ *
+ * The manifest is fetched by every client on install/refresh, and the genre
+ * list is a blocking remote WordPress call (12s timeout). Caching it to disk
+ * means only the first request pays that latency; concurrent manifest requests
+ * read the cache instead of each opening their own WordPress connection.
+ *
+ * Single-flight: when the cache is cold, only ONE request performs the remote
+ * fetch. Every other concurrent request immediately gets the stale cache (or
+ * [] so the caller uses its hardcoded defaults) instead of piling onto
+ * WordPress. Without this, a burst of N cold requests each opened their own
+ * WordPress connection and timed out together (measured: 71/400 timeouts at
+ * C=100).
+ *
+ * Returns [] on failure so the caller falls back to its hardcoded defaults.
+ */
+function fd_manifest_categories_cached(): array
+{
+    $cacheFile = fd_cache_path('manifest_categories.json');
+    $ttl = 3600;
+
+    $readCache = static function () use ($cacheFile): array {
+        if (!is_file($cacheFile)) {
+            return [];
+        }
+        $data = json_decode((string) @file_get_contents($cacheFile), true);
+        return (is_array($data) && !empty($data)) ? $data : [];
+    };
+
+    // Fresh cache: serve it.
+    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+        $cached = $readCache();
+        if (!empty($cached)) {
+            return $cached;
+        }
+    }
+
+    // Cold/stale cache: only one request may refresh. Others serve stale now.
+    $lockFile = fd_cache_path('manifest_categories.lock');
+    $lockFp = @fopen($lockFile, 'c');
+    $isRefresher = false;
+    if ($lockFp) {
+        $isRefresher = @flock($lockFp, LOCK_EX | LOCK_NB);
+    }
+
+    if (!$isRefresher) {
+        // Someone else is refreshing: serve stale immediately, never block.
+        if ($lockFp) {
+            @fclose($lockFp);
+        }
+        return $readCache();
+    }
+
+    try {
+        // Re-check: the refresher ahead of us may have just published.
+        if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+            $cached = $readCache();
+            if (!empty($cached)) {
+                return $cached;
+            }
+        }
+
+        $categories = fd_fetch_stream_ajax('categories');
+        if (!empty($categories) && is_array($categories)) {
+            @file_put_contents(
+                $cacheFile,
+                json_encode($categories, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                LOCK_EX
+            );
+            return $categories;
+        }
+
+        // Remote fetch failed: serve stale rather than blocking on a dead upstream.
+        return $readCache();
+    } finally {
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+    }
+}
+
+/**
  * Page post_files through Manticore OPTION scroll instead of one 5000-row dump.
  * Each WP request is a small page; we stop at $maxFiles or when a page is short.
  *
@@ -4570,39 +5422,6 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
     }
 
     return $all;
-}
-
-/**
- * One representative file for an exact SxxExx hit.
- * Live WP MATCH only appends SxxExx when both season and episode are set.
- */
-function fd_fetch_one_episode_file(int $postId, int $season, int $episode): ?array
-{
-    if ($season <= 0 || $episode <= 0) {
-        return null;
-    }
-
-    $res = fd_fetch_stream_ajax('post_files', [
-        'post_id' => $postId,
-        'limit' => 8,
-        'offset' => 0,
-        'season' => $season,
-        'episode' => $episode,
-    ]);
-
-    foreach ((array) ($res['files'] ?? []) as $file) {
-        $parsed = fd_classify_season_episode(
-            (string) ($file['title'] ?? ''),
-            (int) ($file['season_num'] ?? 0),
-            (int) ($file['episode_num'] ?? 0),
-            (string) ($file['caption'] ?? '')
-        );
-        if ((int) $parsed['season'] === $season && (int) $parsed['episode'] === $episode) {
-            return $file;
-        }
-    }
-
-    return null;
 }
 
 function fd_stream_keyword_from_post_title(string $title): string
@@ -5331,6 +6150,14 @@ function fd_stremio_manifest_identity(): array
             'description' => 'Stream movies and series from Telegram on your Wi-Fi / LAN. Address: ' . $lanOrigin,
         ];
     }
+    if ($modeOverride === 'server') {
+        return [
+            'mode' => 'server',
+            'id' => 'org.pencarimovie.addon.server',
+            'name' => 'PencariMovie (Server)',
+            'description' => 'Stream movies and series from Telegram. Address: ' . $origin,
+        ];
+    }
 
     if ($isTunnel) {
         return [
@@ -5472,7 +6299,7 @@ function fd_stremio_stream_filename(string $fileName, string $mime = ''): string
     }
 
     // Preserve existing extension if it's already a raw split chunk (.001, .002) or archive
-    if (preg_match('/\.(?:0\d{2,3}|part\d+|\d{3}|zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i', $name)) {
+    if (preg_match('/\.(?:0\d{2,3}|\d{3}|zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i', $name)) {
         $name = preg_replace('/[^\w.\-]+/', '_', $name) ?: 'file';
         return trim($name, '._-');
     }
@@ -5505,7 +6332,12 @@ function fd_stremio_stream_filename(string $fileName, string $mime = ''): string
 function fd_build_stremio_stream_url(string $baseUrl, string $payloadB64, string $fileName, string $mime = ''): string
 {
     $safe = fd_stremio_stream_filename($fileName, $mime);
-    return rtrim($baseUrl, '/') . '/api/download/' . rawurlencode($payloadB64) . '/' . rawurlencode($safe);
+    // Carry the auth token as a query param so remote players can fetch the
+    // file. Localhost/LAN requests ignore it. The real filename + extension
+    // from fd_stremio_stream_filename() are preserved untouched.
+    $token = fd_auth_enabled() ? fd_auth_token() : '';
+    $query = $token !== '' ? '?token=' . rawurlencode($token) : '';
+    return rtrim($baseUrl, '/') . '/api/download/' . rawurlencode($payloadB64) . '/' . rawurlencode($safe) . $query;
 }
 
 function fd_is_public_download_path(string $path): bool
@@ -5573,6 +6405,28 @@ function fd_tunnel_dir(): string
         @mkdir($dir, 0777, true);
     }
     return $dir;
+}
+
+function fd_tunnel_token_path(): string
+{
+    return fd_tunnel_dir() . DIRECTORY_SEPARATOR . 'token.txt';
+}
+
+function fd_load_saved_tunnel_token(): string
+{
+    $path = fd_tunnel_token_path();
+    if (!is_file($path)) {
+        return '';
+    }
+    return trim((string) @file_get_contents($path));
+}
+
+function fd_save_tunnel_token(string $token): void
+{
+    $token = trim($token);
+    if ($token !== '') {
+        @file_put_contents(fd_tunnel_token_path(), $token, LOCK_EX);
+    }
 }
 
 function fd_tunnel_state_path(): string
@@ -6019,11 +6873,6 @@ function fd_tunnel_subdomain(): string
     return fd_get_device_id();
 }
 
-function fd_tunnel_bot_subdomain(): string
-{
-    return fd_tunnel_subdomain();
-}
-
 function fd_tunnel_register_worker(string $tunnelUrl): array
 {
     $shortId = fd_tunnel_device_id();
@@ -6046,19 +6895,30 @@ function fd_tunnel_register_worker(string $tunnelUrl): array
 function fd_load_tunnel_state(): array
 {
     $path = fd_tunnel_state_path();
-    if (!is_file($path)) {
-        return [];
+    $data = [];
+    if (is_file($path)) {
+        $raw = @file_get_contents($path);
+        if (is_string($raw) && $raw !== '') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $data = $decoded;
+            }
+        }
     }
-    $raw = @file_get_contents($path);
-    if (!is_string($raw) || $raw === '') {
-        return [];
+    if (empty($data['tunnel_token'])) {
+        $saved = fd_load_saved_tunnel_token();
+        if ($saved !== '') {
+            $data['tunnel_token'] = $saved;
+        }
     }
-    $data = json_decode($raw, true);
-    return is_array($data) ? $data : [];
+    return $data;
 }
 
 function fd_save_tunnel_state(array $state): void
 {
+    if (!empty($state['tunnel_token'])) {
+        fd_save_tunnel_token((string) $state['tunnel_token']);
+    }
     $path = fd_tunnel_state_path();
     $dir = dirname($path);
     if (!is_dir($dir)) {
@@ -6071,8 +6931,9 @@ function fd_save_tunnel_state(array $state): void
     );
 }
 
-function fd_clear_tunnel_state(): void
+function fd_clear_tunnel_state(bool $preserveToken = true): void
 {
+    $savedToken = $preserveToken ? fd_load_saved_tunnel_token() : '';
     $path = fd_tunnel_state_path();
     if (is_file($path)) {
         @unlink($path);
@@ -6080,6 +6941,11 @@ function fd_clear_tunnel_state(): void
     $pidPath = fd_tunnel_pid_path();
     if (is_file($pidPath)) {
         @unlink($pidPath);
+    }
+    if ($preserveToken && $savedToken !== '') {
+        fd_save_tunnel_token($savedToken);
+    } elseif (!$preserveToken) {
+        @unlink(fd_tunnel_token_path());
     }
 }
 
@@ -6210,6 +7076,41 @@ function fd_tunnel_read_logs(): string
         }
     }
     return implode("\n", $chunks);
+}
+
+function fd_tunnel_parse_ingress_domains(string $logs, int $port = 8088): array
+{
+    if ($logs === '' || !str_contains($logs, 'ingress')) {
+        return [];
+    }
+    $matched = [];
+    $allHosts = [];
+    foreach (explode("\n", $logs) as $line) {
+        $t = trim($line);
+        if ($t === '' || !str_contains($t, 'ingress')) {
+            continue;
+        }
+        $d = json_decode($t, true);
+        if (!is_array($d) || empty($d['config'])) {
+            continue;
+        }
+        $cfg = json_decode((string) $d['config'], true);
+        if (!is_array($cfg) || empty($cfg['ingress'])) {
+            continue;
+        }
+        foreach ($cfg['ingress'] as $ing) {
+            $host = strtolower(trim((string) ($ing['hostname'] ?? '')));
+            $svc = strtolower(trim((string) ($ing['service'] ?? '')));
+            if ($host === '' || str_starts_with($svc, 'http_status:')) {
+                continue;
+            }
+            $allHosts[$host] = true;
+            if (str_contains($svc, (string) $port)) {
+                $matched[$host] = true;
+            }
+        }
+    }
+    return array_values(array_keys(!empty($matched) ? $matched : $allHosts));
 }
 
 function fd_tunnel_pick_metrics_port(): int
@@ -6614,342 +7515,6 @@ function fd_ensure_cloudflared(): array
     return ['', 'Failed to download cloudflared from GitHub. Check internet access and try again.'];
 }
 
-/**
- * Parse the top-level MP4 box layout of a (possibly still-growing) file.
- *
- * Returns a list of ['type' => 'ftyp', 'offset' => 0, 'size' => 32, 'complete' => true].
- * Stops at the first box whose header is not yet fully written, so it is safe to
- * call repeatedly while a download is still in progress.
- */
-function fd_mp4_scan_boxes(string $filePath, int $maxBytes = 0): array
-{
-    if (!is_file($filePath)) {
-        return [];
-    }
-    $fp = @fopen($filePath, 'rb');
-    if ($fp === false) {
-        return [];
-    }
-    $fileSize = (int) filesize($filePath);
-    $limit = $maxBytes > 0 ? min($maxBytes, $fileSize) : $fileSize;
-    $boxes = [];
-    $offset = 0;
-    while ($offset + 8 <= $limit) {
-        if (fseek($fp, $offset) !== 0) {
-            break;
-        }
-        $hdr = fread($fp, 8);
-        if ($hdr === false || strlen($hdr) < 8) {
-            break;
-        }
-        $boxSize = (int) unpack('N', substr($hdr, 0, 4))[1];
-        $type = substr($hdr, 4, 4);
-        if ($boxSize === 1) {
-            // 64-bit extended size
-            $ext = fread($fp, 8);
-            if ($ext === false || strlen($ext) < 8) {
-                break;
-            }
-            $parts = unpack('N2', $ext);
-            $boxSize = ($parts[1] << 32) | $parts[2];
-        } elseif ($boxSize === 0) {
-            // Box extends to end of file
-            $boxSize = $fileSize - $offset;
-        }
-        if ($boxSize < 8) {
-            break;
-        }
-        $boxes[] = [
-            'type' => $type,
-            'offset' => $offset,
-            'size' => $boxSize,
-            'complete' => ($offset + $boxSize) <= $limit,
-        ];
-        $offset += $boxSize;
-    }
-    fclose($fp);
-    return $boxes;
-}
-
-/**
- * Return the byte offset just past the `moov` box, or 0 when `moov` is not yet
- * fully present. Used to decide when FFmpeg can safely open a growing .m4a.
- */
-function fd_mp4_moov_end(string $filePath): int
-{
-    foreach (fd_mp4_scan_boxes($filePath) as $box) {
-        if ($box['type'] === 'moov' && $box['complete']) {
-            return $box['offset'] + $box['size'];
-        }
-    }
-    return 0;
-}
-
-/**
- * True when the first top-level box is `ftyp` and `moov` appears before `mdat`
- * (i.e. the file is streamable without seeking to the end).
- */
-function fd_mp4_moov_at_start(string $filePath): bool
-{
-    $boxes = fd_mp4_scan_boxes($filePath);
-    if (empty($boxes) || $boxes[0]['type'] !== 'ftyp') {
-        return false;
-    }
-    $moovIdx = -1;
-    $mdatIdx = -1;
-    foreach ($boxes as $i => $box) {
-        if ($box['type'] === 'moov' && $moovIdx === -1) {
-            $moovIdx = $i;
-        }
-        if ($box['type'] === 'mdat' && $mdatIdx === -1) {
-            $mdatIdx = $i;
-        }
-    }
-    return $moovIdx !== -1 && ($mdatIdx === -1 || $moovIdx < $mdatIdx);
-}
-
-/**
- * Path of the on-the-fly conversion state file for a short_code.
- */
-function fd_audio_convert_state_path(string $shortCode): string
-{
-    return fd_storage_path('storage/cache/audio/convert_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.json');
-}
-
-/**
- * Read the on-the-fly conversion state for a short_code.
- */
-function fd_audio_convert_state(string $shortCode): array
-{
-    $path = fd_audio_convert_state_path($shortCode);
-    if (!is_file($path)) {
-        return [];
-    }
-    $json = json_decode((string) @file_get_contents($path), true);
-    return is_array($json) ? $json : [];
-}
-
-/**
- * Write the on-the-fly conversion state for a short_code.
- */
-function fd_audio_convert_state_write(string $shortCode, array $state): void
-{
-    $path = fd_audio_convert_state_path($shortCode);
-    $dir = dirname($path);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0777, true);
-    }
-    @file_put_contents($path, json_encode($state, JSON_UNESCAPED_SLASHES), LOCK_EX);
-}
-
-/**
- * Path of the exclusive lock file guarding a short_code conversion.
- */
-function fd_audio_convert_lock_path(string $shortCode): string
-{
-    return fd_storage_path('storage/cache/audio/convert_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.lock');
-}
-
-/**
- * Try to acquire the exclusive conversion lock for a short_code.
- *
- * Returns an open file handle on success (caller must keep it open for the
- * lifetime of the worker), or null when another worker already holds it.
- * This prevents the duplicate-spawn race where two workers download the same
- * file, one deletes the raw .m4a, and the other overwrites the good state
- * with a failure.
- */
-function fd_audio_convert_lock_acquire(string $shortCode)
-{
-    $lockPath = fd_audio_convert_lock_path($shortCode);
-    $dir = dirname($lockPath);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0777, true);
-    }
-    $fp = @fopen($lockPath, 'c');
-    if ($fp === false) {
-        return null;
-    }
-    if (!@flock($fp, LOCK_EX | LOCK_NB)) {
-        @fclose($fp);
-        return null;
-    }
-    return $fp;
-}
-
-
-/**
- * Wait until the growing raw .m4a has a complete `moov` box (or the download
- * finished / failed). Returns the moov end offset, or 0 on timeout.
- */
-function fd_audio_wait_for_moov(string $rawFile, int $timeoutSec = 25): int
-{
-    $deadline = microtime(true) + $timeoutSec;
-    while (microtime(true) < $deadline) {
-        $moovEnd = fd_mp4_moov_end($rawFile);
-        if ($moovEnd > 0) {
-            return $moovEnd;
-        }
-        usleep(150000); // 150ms
-    }
-    return 0;
-}
-
-/**
- * Serve a growing FLAC file to the browser while FFmpeg is still appending to
- * it. Sends a 200 with no Content-Length (chunked) and streams until the
- * conversion state reports completion, then stops.
- */
-function fd_serve_growing_flac(string $flacFile, string $shortCode, string $downloadName = ''): void
-{
-    if (!headers_sent()) {
-        http_response_code(200);
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
-        header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
-        header('Accept-Ranges: none');
-        header('Content-Type: audio/flac');
-        if ($downloadName !== '') {
-            header('Content-Disposition: inline; filename="' . str_replace('"', '', $downloadName) . '"');
-        }
-        header('Cache-Control: no-store, no-cache, must-revalidate');
-        header('X-Accel-Buffering: no');
-    }
-
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'HEAD') {
-        exit;
-    }
-
-    if (ob_get_level()) {
-        ob_end_flush();
-        ob_implicit_flush();
-    }
-
-    $fp = @fopen($flacFile, 'rb');
-    if ($fp === false) {
-        exit;
-    }
-
-    $pos = 0;
-    $idleTicks = 0;
-    $maxIdleTicks = 600; // ~60s of no new data before giving up
-    while (!connection_aborted()) {
-        clearstatcache(true, $flacFile);
-        $size = is_file($flacFile) ? (int) filesize($flacFile) : 0;
-        if ($size > $pos) {
-            fseek($fp, $pos);
-            while ($pos < $size && !connection_aborted()) {
-                $chunk = fread($fp, min(64 * 1024, $size - $pos));
-                if ($chunk === false || $chunk === '') {
-                    break;
-                }
-                echo $chunk;
-                flush();
-                $pos += strlen($chunk);
-            }
-            $idleTicks = 0;
-        } else {
-            $idleTicks++;
-        }
-
-        $state = fd_audio_convert_state($shortCode);
-        $status = (string) ($state['status'] ?? '');
-        if (in_array($status, ['done', 'failed'], true) && $size <= $pos) {
-            break;
-        }
-        if ($idleTicks >= $maxIdleTicks) {
-            break;
-        }
-        usleep(200000); // 200ms
-    }
-    fclose($fp);
-    exit;
-}
-
-function fd_serve_local_file_with_range(string $filePath, string $mimeType, string $downloadName = ''): void
-{
-    if (!is_file($filePath)) {
-        header('HTTP/1.1 404 Not Found');
-        exit;
-    }
-
-    $size = (int) filesize($filePath);
-    $start = 0;
-    $end = $size - 1;
-    $length = $size;
-    $status = 200;
-
-    $range = (string) ($_SERVER['HTTP_RANGE'] ?? '');
-    if ($range !== '' && preg_match('/bytes=(\d*)-(\d*)/i', $range, $matches)) {
-        if ($matches[1] === '' && $matches[2] !== '') {
-            $suffixLength = (int) $matches[2];
-            $start = max(0, $size - $suffixLength);
-        } else {
-            $start = (int) $matches[1];
-            if ($matches[2] !== '') {
-                $end = min($size - 1, (int) $matches[2]);
-            }
-        }
-        if ($start <= $end && $start < $size) {
-            $status = 206;
-            $length = $end - $start + 1;
-        } else {
-            header('HTTP/1.1 416 Range Not Satisfiable');
-            header("Content-Range: bytes */{$size}");
-            exit;
-        }
-    }
-
-    if (!headers_sent()) {
-        http_response_code($status);
-        header('Access-Control-Allow-Origin: *');
-        header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
-        header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
-        header('Accept-Ranges: bytes');
-        header('Content-Type: ' . $mimeType);
-        header('Content-Length: ' . $length);
-        if ($status === 206) {
-            header("Content-Range: bytes {$start}-{$end}/{$size}");
-        }
-        if ($downloadName !== '') {
-            header('Content-Disposition: inline; filename="' . str_replace('"', '', $downloadName) . '"');
-        }
-        header('Cache-Control: public, max-age=86400');
-    }
-
-    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'HEAD') {
-        exit;
-    }
-
-    $fp = fopen($filePath, 'rb');
-    if ($fp === false) {
-        exit;
-    }
-
-    if ($start > 0) {
-        fseek($fp, $start);
-    }
-
-    if (ob_get_level()) {
-        ob_end_flush();
-        ob_implicit_flush();
-    }
-
-    $buffer = 64 * 1024;
-    $remaining = $length;
-    while ($remaining > 0 && !feof($fp) && !connection_aborted()) {
-        $chunk = fread($fp, min($buffer, $remaining));
-        if ($chunk === false || $chunk === '') {
-            break;
-        }
-        echo $chunk;
-        flush();
-        $remaining -= strlen($chunk);
-    }
-    fclose($fp);
-    exit;
-}
-
 function fd_tunnel_write_dummy_config(string $localUrl = 'http://127.0.0.1:8088'): string
 {
     $path = fd_tunnel_config_path();
@@ -6959,7 +7524,7 @@ function fd_tunnel_write_dummy_config(string $localUrl = 'http://127.0.0.1:8088'
     return $path;
 }
 
-function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241): array
+function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241, string $tunnelToken = ''): array
 {
     $config = fd_tunnel_write_dummy_config($localUrl);
     $logFile = fd_tunnel_log_path();
@@ -6972,18 +7537,27 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
         }
     }
 
+    $isNamedTunnel = trim($tunnelToken) !== '';
+
     if (fd_is_windows()) {
         $binReal = realpath($bin) ?: $bin;
         $configReal = realpath($config) ?: $config;
         $logReal = realpath(dirname($logFile)) ? (realpath(dirname($logFile)) . DIRECTORY_SEPARATOR . basename($logFile)) : $logFile;
 
         // Use proc_open with bypass_shell = true so Windows executes the binary directly without cmd.exe or powershell dependency
-        $cmdLine = escapeshellarg($binReal)
-            . ' tunnel --url ' . escapeshellarg($localUrl)
-            . ' --config ' . escapeshellarg($configReal)
-            . ' --logfile ' . escapeshellarg($logReal)
-            . ' --metrics ' . escapeshellarg($metrics)
-            . ' --no-autoupdate --retries 99';
+        if ($isNamedTunnel) {
+            $cmdLine = escapeshellarg($binReal)
+                . ' tunnel --logfile ' . escapeshellarg($logReal)
+                . ' --metrics ' . escapeshellarg($metrics)
+                . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken));
+        } else {
+            $cmdLine = escapeshellarg($binReal)
+                . ' tunnel --url ' . escapeshellarg($localUrl)
+                . ' --config ' . escapeshellarg($configReal)
+                . ' --logfile ' . escapeshellarg($logReal)
+                . ' --metrics ' . escapeshellarg($metrics)
+                . ' --no-autoupdate --retries 99';
+        }
 
         $descriptors = [
             0 => ['pipe', 'r'],
@@ -7107,17 +7681,29 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
                 $sslEnv = 'SSL_CERT_FILE=' . escapeshellarg($caCertPath) . ' SSL_CERT_DIR=' . escapeshellarg(dirname($caCertPath)) . ' ';
             }
 
-            $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
-                . $prootBinds . ' '
-                . escapeshellarg($bin)
-                . ' tunnel --url ' . escapeshellarg($localUrl)
-                . ' --config ' . escapeshellarg($config)
-                . ' --logfile ' . escapeshellarg($logFile)
-                . ' --metrics ' . escapeshellarg($metrics)
-                . ' --edge-ip-version 4'
-                . ' --no-autoupdate --retries 99'
-                . ' >> ' . escapeshellarg($errLog)
-                . ' 2>&1 & echo $!';
+            if ($isNamedTunnel) {
+                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
+                    . $prootBinds . ' '
+                    . escapeshellarg($bin)
+                    . ' tunnel --logfile ' . escapeshellarg($logFile)
+                    . ' --metrics ' . escapeshellarg($metrics)
+                    . ' --edge-ip-version 4'
+                    . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken))
+                    . ' >> ' . escapeshellarg($errLog)
+                    . ' 2>&1 & echo $!';
+            } else {
+                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
+                    . $prootBinds . ' '
+                    . escapeshellarg($bin)
+                    . ' tunnel --url ' . escapeshellarg($localUrl)
+                    . ' --config ' . escapeshellarg($config)
+                    . ' --logfile ' . escapeshellarg($logFile)
+                    . ' --metrics ' . escapeshellarg($metrics)
+                    . ' --edge-ip-version 4'
+                    . ' --no-autoupdate --retries 99'
+                    . ' >> ' . escapeshellarg($errLog)
+                    . ' 2>&1 & echo $!';
+            }
             $pid = (int) trim((string) @shell_exec($cmd));
             if ($pid > 1) {
                 fd_tunnel_write_pid($pid);
@@ -7131,15 +7717,25 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
         $sslEnv = 'SSL_CERT_FILE=' . escapeshellarg($caCertPath) . ' SSL_CERT_DIR=' . escapeshellarg(dirname($caCertPath)) . ' ';
     }
 
-    $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
-        . ' tunnel --url ' . escapeshellarg($localUrl)
-        . ' --config ' . escapeshellarg($config)
-        . ' --logfile ' . escapeshellarg($logFile)
-        . ' --metrics ' . escapeshellarg($metrics)
-        . ' --edge-ip-version 4'
-        . ' --no-autoupdate --retries 99'
-        . ' >> ' . escapeshellarg($errLog)
-        . ' 2>&1 & echo $!';
+    if ($isNamedTunnel) {
+        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
+            . ' tunnel --logfile ' . escapeshellarg($logFile)
+            . ' --metrics ' . escapeshellarg($metrics)
+            . ' --edge-ip-version 4'
+            . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken))
+            . ' >> ' . escapeshellarg($errLog)
+            . ' 2>&1 & echo $!';
+    } else {
+        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
+            . ' tunnel --url ' . escapeshellarg($localUrl)
+            . ' --config ' . escapeshellarg($config)
+            . ' --logfile ' . escapeshellarg($logFile)
+            . ' --metrics ' . escapeshellarg($metrics)
+            . ' --edge-ip-version 4'
+            . ' --no-autoupdate --retries 99'
+            . ' >> ' . escapeshellarg($errLog)
+            . ' 2>&1 & echo $!';
+    }
     $pid = (int) trim((string) @shell_exec($cmd));
     if ($pid <= 1) {
         return [0, 'Failed to start cloudflared. proc/shell may be disabled on this runtime.'];
@@ -7211,15 +7807,29 @@ function fd_tunnel_auto_restart(): bool
         $metricsPort = fd_tunnel_pick_metrics_port();
     }
 
+    $tunnelToken = trim((string) ($state['tunnel_token'] ?? ''));
     $localUrl = 'http://127.0.0.1:' . $port;
     fd_tunnel_kill_leftovers();
 
-    [$newPid, $spawnError] = fd_tunnel_spawn($bin, $localUrl, $metricsPort);
+    [$newPid, $spawnError] = fd_tunnel_spawn($bin, $localUrl, $metricsPort, $tunnelToken);
     if ($newPid <= 1) {
         $state['restart_attempt_at'] = time();
         fd_save_tunnel_state($state);
         fd_log('tunnel auto-restart failed', ['error' => $spawnError]);
         return false;
+    }
+
+    if ($tunnelToken !== '') {
+        // Named tunnel with custom token
+        $state['enabled'] = true;
+        $state['pid'] = $newPid;
+        $state['metrics_port'] = $metricsPort;
+        $state['started_at'] = time();
+        $state['restart_attempt_at'] = time();
+        fd_save_tunnel_state($state);
+        fd_tunnel_write_pid($newPid);
+        fd_log('named tunnel auto-restarted', ['pid' => $newPid]);
+        return true;
     }
 
     $url = fd_tunnel_wait_for_url(60, $metricsPort, $newPid);
@@ -7252,6 +7862,19 @@ function fd_tunnel_auto_restart(): bool
     return true;
 }
 
+function fd_tunnel_extract_token(string $raw): string
+{
+    $raw = trim($raw);
+    if ($raw === '') {
+        return '';
+    }
+    // Handle full service install command or raw token
+    if (preg_match('/eyJh[A-Za-z0-9_=-]+/', $raw, $m)) {
+        return $m[0];
+    }
+    return $raw;
+}
+
 function fd_get_tunnel_status(): array
 {
     $state = fd_load_tunnel_state();
@@ -7266,8 +7889,47 @@ function fd_get_tunnel_status(): array
         $alive = $pid > 1 && fd_tunnel_pid_alive($pid);
     }
 
-    $url = trim((string) ($state['tunnel_url'] ?? ''));
+    $tunnelToken = trim((string) ($state['tunnel_token'] ?? ''));
+    $customDomain = trim((string) ($state['custom_domain'] ?? ''));
     $metricsPort = (int) ($state['metrics_port'] ?? 0);
+    $url = trim((string) ($state['tunnel_url'] ?? ''));
+
+    if ($alive && $tunnelToken !== '') {
+        $port = (int) ($state['local_port'] ?? fd_get_listen_port());
+        $logs = fd_tunnel_read_logs();
+        $ingressDomains = fd_tunnel_parse_ingress_domains($logs, $port);
+        if (!empty($ingressDomains)) {
+            $customDomain = $ingressDomains[0];
+            $state['custom_domain'] = $customDomain;
+            $state['custom_domains'] = $ingressDomains;
+            fd_save_tunnel_state($state);
+        }
+
+        $publicDomainUrl = $customDomain !== '' ? ('https://' . $customDomain) : '';
+        $activeUrl = $publicDomainUrl;
+        $manifestUrl = $activeUrl !== '' ? (rtrim($activeUrl, '/') . '/manifest.json') : '';
+
+        $domainMsg = !empty($ingressDomains)
+            ? ('Live on ' . implode(', ', array_map(fn($d) => 'https://' . $d, $ingressDomains)))
+            : ($publicDomainUrl !== '' ? ('Live on ' . $publicDomainUrl) : 'Named Cloudflare Tunnel connected.');
+
+        return [
+            'ok' => 1,
+            'enabled' => true,
+            'running' => true,
+            'pid' => $pid,
+            'tunnel_token' => $tunnelToken,
+            'tunnel_url' => $publicDomainUrl,
+            'public_url' => $publicDomainUrl,
+            'custom_domain' => $customDomain,
+            'custom_domains' => $ingressDomains,
+            'device_id' => fd_get_device_id(),
+            'manifest_url' => $manifestUrl,
+            'local_port' => $port,
+            'started_at' => (int) ($state['started_at'] ?? 0),
+            'message' => $domainMsg,
+        ];
+    }
 
     if ($alive) {
         $live = fd_tunnel_read_quicktunnel_url($pid, $metricsPort);
@@ -7306,8 +7968,10 @@ function fd_get_tunnel_status(): array
         'enabled' => $enabled,
         'running' => $alive,
         'pid' => $alive ? $pid : 0,
+        'tunnel_token' => $tunnelToken,
         'tunnel_url' => $enabled ? $url : '',
         'public_url' => $publicDomainUrl,
+        'custom_domain' => '',
         'device_id' => fd_get_device_id(),
         'manifest_url' => $manifestUrl,
         'local_port' => (int) ($state['local_port'] ?? fd_get_listen_port()),
@@ -7323,23 +7987,31 @@ function fd_disable_tunnel(): array
     // Invalidate registration on VPS Redis
     @fd_tunnel_register_worker('');
     fd_tunnel_kill_leftovers();
-    fd_clear_tunnel_state();
+    fd_clear_tunnel_state(true);
     return [
         'ok' => 1,
         'enabled' => false,
         'running' => false,
         'pid' => 0,
+        'tunnel_token' => fd_load_saved_tunnel_token(),
         'tunnel_url' => '',
         'manifest_url' => '',
         'message' => 'Cloudflare tunnel stopped.',
     ];
 }
 
-function fd_enable_tunnel(): array
+function fd_enable_tunnel(string $rawToken = ''): array
 {
     @set_time_limit(180);
     if (function_exists('ignore_user_abort')) {
         ignore_user_abort(true);
+    }
+
+    $tunnelToken = fd_tunnel_extract_token($rawToken);
+    if ($tunnelToken === '') {
+        $tunnelToken = fd_load_saved_tunnel_token();
+    } else {
+        fd_save_tunnel_token($tunnelToken);
     }
 
     // Always kill leftovers and clear previous state files before starting a new tunnel
@@ -7355,9 +8027,67 @@ function fd_enable_tunnel(): array
     $port = fd_get_listen_port();
     $localUrl = 'http://127.0.0.1:' . $port;
     $metricsPort = fd_tunnel_pick_metrics_port();
-    [$pid, $spawnError] = fd_tunnel_spawn($bin, $localUrl, $metricsPort);
+    [$pid, $spawnError] = fd_tunnel_spawn($bin, $localUrl, $metricsPort, $tunnelToken);
     if ($pid <= 1) {
         return ['ok' => 0, 'enabled' => false, 'message' => $spawnError ?: 'Failed to start cloudflared.'];
+    }
+
+    if ($tunnelToken !== '') {
+        // Wait up to 10s for the tunnel to register and retrieve connector ready status
+        $ready = false;
+        $customDomain = '';
+        $deadline = microtime(true) + 12;
+        while (microtime(true) < $deadline) {
+            $resp = @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1);
+            if ($resp !== '' && stripos($resp, '"status":200') !== false) {
+                $ready = true;
+                break;
+            }
+            usleep(250000);
+        }
+
+        $logs = fd_tunnel_read_logs();
+        $ingressDomains = fd_tunnel_parse_ingress_domains($logs, $port);
+        if (!empty($ingressDomains)) {
+            $customDomain = $ingressDomains[0];
+        }
+
+        $publicUrl = $customDomain !== '' ? ('https://' . $customDomain) : '';
+        $state = [
+            'enabled' => true,
+            'pid' => $pid,
+            'tunnel_token' => $tunnelToken,
+            'custom_domain' => $customDomain,
+            'custom_domains' => $ingressDomains,
+            'tunnel_url' => $publicUrl,
+            'public_url' => $publicUrl,
+            'local_port' => $port,
+            'metrics_port' => $metricsPort,
+            'started_at' => time(),
+            'bin' => $bin,
+        ];
+        fd_save_tunnel_state($state);
+        fd_tunnel_write_pid($pid);
+
+        $domainMsg = !empty($ingressDomains)
+            ? ('Connected to ' . implode(', ', array_map(fn($d) => 'https://' . $d, $ingressDomains)))
+            : ($publicUrl !== '' ? ('Connected to ' . $publicUrl) : 'Named Cloudflare Tunnel connected.');
+
+        return [
+            'ok' => 1,
+            'enabled' => true,
+            'running' => fd_tunnel_pid_alive($pid),
+            'pid' => $pid,
+            'tunnel_token' => $tunnelToken,
+            'custom_domain' => $customDomain,
+            'custom_domains' => $ingressDomains,
+            'tunnel_url' => $publicUrl,
+            'public_url' => $publicUrl,
+            'manifest_url' => $publicUrl !== '' ? (rtrim($publicUrl, '/') . '/manifest.json') : '',
+            'local_port' => $port,
+            'started_at' => $state['started_at'],
+            'message' => $domainMsg,
+        ];
     }
 
     $url = fd_tunnel_wait_for_url(90, $metricsPort, $pid);
@@ -7931,6 +8661,16 @@ function fd_eclipse_audio_quality_score(string $ext, int $sizeBytes): int
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
+// Strip a /t/<token> prefix so tokenized Stremio/Eclipse URLs match the same
+// routes as untokenized ones. The token itself is read by fd_auth_token_from_request().
+//
+// NOTE: this path form is a fallback only. Caddy's php_server rewrites the URI
+// to index.php before PHP runs, so REQUEST_URI is already /index.php by the
+// time this executes — the /t/<token> segment is gone. The dashboard therefore
+// emits the ?token= query form, which survives the rewrite. Keep this strip for
+// non-Caddy runtimes (php -S via router.php) where REQUEST_URI is preserved.
+$path = fd_strip_token_prefix($path);
+
 // Run non-blocking cache pruning (cleans expired files, throttled to once every 5 minutes)
 fd_prune_cache_files();
 
@@ -7966,8 +8706,8 @@ if ($isEclipseRoute) {
     if ($addonPath === '/' || $addonPath === '') {
         header('Content-Type: text/html; charset=utf-8');
         $parsedPort = parse_url($baseUrl, PHP_URL_PORT) ?? ($_SERVER['SERVER_PORT'] ?? '8088');
-        $portSuffix = ($parsedPort !== '' && $parsedPort !== '80' && $parsedPort !== '443') ? (':' . $parsedPort) : ':8088';
-        $localManifestUrl = "http://127.0.0.1{$portSuffix}/eclipse/manifest.json";
+        $portSuffix = ($parsedPort !== '' && $parsedPort !== '80' && $parsedPort !== '443') ? (':' . $parsedPort) : '';
+        $localManifestUrl = rtrim($baseUrl, '/') . '/eclipse/manifest.json';
         $lanIp = fd_get_lan_ip();
         $lanManifestUrl = ($lanIp !== '127.0.0.1') ? "http://{$lanIp}{$portSuffix}/eclipse/manifest.json" : $localManifestUrl;
 ?>
@@ -8275,6 +9015,9 @@ if ($isEclipseRoute) {
 
     // ── Stream Resolution: /eclipse/stream/{id} ──
     if (preg_match('#^/stream/([^/]+)$#', $addonPath, $m)) {
+        if (!fd_is_authenticated()) {
+            fd_eclipse_locked_response($baseUrl);
+        }
         $shortCode = urldecode($m[1]);
         fd_log('eclipse /stream requested', ['short_code' => $shortCode]);
         // Resolve with active bot
@@ -8522,11 +9265,7 @@ if ($isNuvioRoute) {
 
     // Handle Stremio's standard /configure route -> redirects directly to dashboard with #configure
     if ($path === '/configure' || $path === '/configure/' || $addonPath === '/configure' || $addonPath === '/configure/') {
-        if (fd_is_cloudflare_tunnel_request()) {
-            header('Location: /#addon', true, 302);
-            exit;
-        }
-        header('Location: /#configure', true, 302);
+        header('Location: /#addon', true, 302);
         exit;
     }
     if ($method === 'OPTIONS') {
@@ -8541,8 +9280,8 @@ if ($isNuvioRoute) {
     // ── Nuvio Addon Installation / Landing Page ──
     if ($addonPath === '/' && ($path === '/nuvio' || $path === '/nuvio/')) {
         header('Content-Type: text/html; charset=utf-8');
-        $randSuffix = '?r=' . random_int(100000, 999999);
-        $manifestUrl = $baseUrl . '/manifest.json' . $randSuffix;
+        // $randSuffix = '?r=' . random_int(100000, 999999);
+        $manifestUrl = $baseUrl . '/manifest.json';
         $lanIp = fd_get_lan_ip();
         $requestHost = (string) (parse_url($baseUrl, PHP_URL_HOST) ?? ($_SERVER['SERVER_ADDR'] ?? '127.0.0.1'));
         $openedViaLan = fd_is_usable_lan_ipv4($requestHost);
@@ -8787,8 +9526,12 @@ if ($isNuvioRoute) {
 
     // ── Nuvio / Stremio Manifest ──
     if ($addonPath === '/manifest.json') {
-        // Fetch genre list from WordPress (matching public/app.js)
-        $categories = fd_fetch_stream_ajax('categories');
+        // Fetch genre list from WordPress (matching public/app.js).
+        // Cached to disk: this is a blocking remote call (12s timeout) and
+        // /manifest.json is fetched by every client on every install/refresh.
+        // Without the cache, N concurrent manifest requests each open their own
+        // WordPress connection and TTFB stacks linearly (measured 1.5s -> 10.3s).
+        $categories = fd_manifest_categories_cached();
         $defaultCategories = [
             ['name' => 'Animation', 'slug' => 'animation'],
             ['name' => 'Action', 'slug' => 'action'],
@@ -9280,7 +10023,7 @@ if ($isNuvioRoute) {
             'idPrefixes' => ['pm_', 'pm:', 'tt', 'tmdb:', 'kitsu:', 'kitsu', 'mal:', 'anilist:', 'tvdb:'],
             'catalogs' => $filteredCatalogs,
             'behaviorHints' => [
-                'configurable' => !(fd_is_cloudflare_tunnel_request() || ($identity['mode'] ?? '') === 'tunnel'),
+                'configurable' => true,
                 'configurationRequired' => false,
                 'adult' => false,
                 'p2p' => false,
@@ -10026,6 +10769,9 @@ if ($isNuvioRoute) {
 
     // ── Nuvio Stream: /stream/:type/:id.json ──
     if (preg_match('#^/stream/([^/]+)/([^/]+?)(?:\.json)?$#', $addonPath, $matches)) {
+        if (!fd_is_authenticated()) {
+            fd_stremio_locked_stream($baseUrl);
+        }
         $streamStart = microtime(true);
         $itemType = urldecode($matches[1]);
         $itemId = urldecode(urldecode($matches[2])); // Handle double-encoded IDs from web clients
@@ -10037,8 +10783,10 @@ if ($isNuvioRoute) {
             'userAgent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
         ]);
 
-        // Check 5-minute stream list cache (per itemId and baseUrl to differentiate tunnel vs local)
-        $streamCacheKey = md5($itemId . ':' . $itemType . ':' . $baseUrl);
+        // Check 5-minute stream list cache (per itemId and baseUrl to differentiate tunnel vs local).
+        // The auth state is part of the key so an unauthenticated request can never
+        // be served a cached authenticated response (and vice versa).
+        $streamCacheKey = md5($itemId . ':' . $itemType . ':' . $baseUrl . ':' . (fd_is_authenticated() ? 'auth' : 'anon'));
         $streamCacheFile = fd_cache_path('stream_cache_' . $streamCacheKey . '.json');
         if (is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
             $cachedJson = @file_get_contents($streamCacheFile);
@@ -10095,6 +10843,19 @@ if ($isNuvioRoute) {
                 $hasSession = true;
                 $botIdStr = (string) $autoProv['bot_id'];
             } else {
+                // Surface the real reason instead of a generic "not connected".
+                // A clock-skew error is actionable and must be shown verbatim so
+                // the user knows to enable NTP; otherwise they only see a vague
+                // "Telegram bot not connected" and cannot fix anything.
+                $provErr = trim((string) ($autoProv['error'] ?? ''));
+                if ($provErr !== '') {
+                    $streams[] = [
+                        'name' => 'PencariMovie',
+                        'description' => $provErr,
+                        'externalUrl' => $baseUrl . '/#settings',
+                    ];
+                    fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
+                }
                 if (fd_is_guest_provision_in_progress()) {
                     $streams[] = [
                         'name' => 'PencariMovie',
@@ -10105,7 +10866,7 @@ if ($isNuvioRoute) {
                 } else {
                     $streams[] = [
                         'name' => 'PencariMovie',
-                        'description' => "Telegram bot not connected\nOpen the dashboard and paste a bot token",
+                        'description' => "Telegram bot not connected\nOpen Settings and paste a bot token",
                         'externalUrl' => $baseUrl . '/#settings'
                     ];
                     fd_stremio_json(['streams' => $streams]);
@@ -10576,10 +11337,11 @@ if ($isNuvioRoute) {
                 continue;
             }
 
-            // Check if file is an unplayable format (archive like .zip/.rar/.7z or raw split chunk like .001/.002)
-            $isRawSplit = (bool) preg_match('/\.(?:0\d{2,3}|\d{3})$/i', $fTitle);
+            // Check if file is an unplayable format. If it ends with a playable media extension (mp4, mkv, webm, etc.), it is playable!
+            $hasPlayableExt = (bool) preg_match('/\.(mp4|m4v|mkv|webm|avi|mov|ts|m2ts|flv|wmv|3gp|mpg|mpeg|mp3|m4a|flac|wav|ogg|opus|aac)$/i', $fTitle);
             $isArchive = (bool) preg_match('/\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i', $fTitle);
-            $isUnplayableItem = $isRawSplit || $isArchive;
+            $isRawSplit = !$hasPlayableExt && (bool) preg_match('/\.(?:0\d{2,3}|\d{3})$/i', $fTitle);
+            $isUnplayableItem = !$hasPlayableExt && ($isRawSplit || $isArchive);
             if ($excludeUnplayable && $isUnplayableItem) {
                 continue;
             }
@@ -10732,11 +11494,12 @@ if ($isNuvioRoute) {
             $cleanFTitle = fd_clean_media_title($fTitle);
             $fileName = $cleanFTitle !== '' ? $cleanFTitle : ($fTitle !== '' ? $fTitle : ($fCode . '.mp4'));
 
-            // Check if file is an unplayable format (archive like .zip/.rar/.7z or raw chunk like .001/.002/part01)
-            $isRawSplit = preg_match('/\.(?:0\d{2,3}|part\d+|\d{3})$/i', $fTitle)
-                || preg_match('/[._\s-]part[._\s-]*0*\d{1,4}/i', $fTitle);
-            $isArchive = preg_match('/\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i', $fTitle);
-            $isUnplayable = $isRawSplit || $isArchive;
+            // Check if file is an unplayable format (archive or raw split chunk).
+            // If the filename ends with any standard playable video/audio extension, it is playable!
+            $hasPlayableExt = (bool) preg_match('/\.(mp4|m4v|mkv|webm|avi|mov|ts|m2ts|flv|wmv|3gp|mpg|mpeg|mp3|m4a|flac|wav|ogg|opus|aac)$/i', $fTitle);
+            $isArchive = (bool) preg_match('/\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i', $fTitle);
+            $isRawSplit = !$hasPlayableExt && (bool) preg_match('/\.(?:0\d{2,3}|\d{3})$/i', $fTitle);
+            $isUnplayable = !$hasPlayableExt && ($isRawSplit || $isArchive);
 
             // Torrentio / AIOStreams Hybrid styling
             $resBadge = $qualityTag !== '' ? $qualityTag : 'Direct';
@@ -11075,36 +11838,24 @@ if (str_starts_with($path, '/api/')) {
         exit;
     }
 
-    // Public player/catalog routes. Everything else is local-only, except a
-    // small read-only set that the TryCloudflare web UI needs.
-    // Enable/disable and bot login stay behind fd_require_local_request();
-    // cloudflared connections are treated as remote via Host/CF headers.
+    // Public API routes: no auth, no local-only check. Auth endpoints must be
+    // reachable so a remote user can log in; /api/download is public at the
+    // route level but its handler calls fd_require_auth() itself.
     $alwaysPublicApi = [
         '/api/download',
         '/api/version',
-        '/api/proxy-stream',
-        '/api/resolve-shortcode',
-        '/api/sub-proxy',
+        '/api/clock-check',
+        '/api/auth/status',
+        '/api/auth/login',
     ];
     if (fd_is_public_download_path($path) && !in_array($path, $alwaysPublicApi, true)) {
         $alwaysPublicApi[] = $path;
     }
     // Security note: /api/logs and /api/debug-mode must remain local-only
     // to prevent sensitive session traces or Telegram auth tokens leaking over tunnels.
-    $tunnelReadableApi = [
-        '/api/session',
-        '/api/lan-ip',
-        '/api/bots',
-        '/api/tunnel/status',
-        '/api/provision',
-        '/api/catalog-settings',
-        '/api/country',
-    ];
+    // They require BOTH a valid token AND a local request.
     if (!in_array($path, $alwaysPublicApi, true)) {
-        $allowViaTunnel = fd_is_cloudflare_tunnel_request() && in_array($path, $tunnelReadableApi, true);
-        if (!$allowViaTunnel) {
-            fd_require_local_request();
-        }
+        fd_require_auth();
     }
 
     // ── GET /api/sub-proxy — proxy & convert subtitle (SRT -> WebVTT) for HTML5 video
@@ -11149,6 +11900,93 @@ if (str_starts_with($path, '/api/')) {
         exit;
     }
 
+    // ── Auth routes (public: must work before login and before the version gate) ──
+    if ($path === '/api/auth/status' && $method === 'GET') {
+        $authed = fd_is_authenticated();
+        fd_json([
+            'ok' => 1,
+            'enabled' => fd_auth_enabled(),
+            'authenticated' => $authed,
+            'token' => $authed ? fd_auth_token() : '',
+        ]);
+    }
+
+    if ($path === '/api/auth/login' && $method === 'POST') {
+        $clientIp = fd_auth_client_ip();
+        $retryAfter = fd_auth_lockout_check($clientIp);
+        if ($retryAfter !== null && $retryAfter > 0) {
+            header('Retry-After: ' . $retryAfter);
+            fd_json([
+                'ok' => 0,
+                'message' => "Too many failed attempts. Try again in {$retryAfter}s. (Or reset via: pms reset-password)",
+                'retryAfter' => $retryAfter,
+                'locked' => true,
+            ], 429);
+        }
+
+        $input = json_decode((string) file_get_contents('php://input'), true);
+        $pw = (string) (is_array($input) ? ($input['password'] ?? '') : '');
+        if (!fd_auth_verify_password($pw)) {
+            $fail = fd_auth_record_failure($clientIp);
+            if (!empty($fail['locked'])) {
+                $wait = $fail['retryAfter'];
+                header('Retry-After: ' . $wait);
+                fd_json([
+                    'ok' => 0,
+                    'message' => "Too many failed attempts. Try again in {$wait}s. (Or reset via: pms reset-password)",
+                    'retryAfter' => $wait,
+                    'locked' => true,
+                ], 429);
+            }
+            $left = $fail['remaining'];
+            fd_json([
+                'ok' => 0,
+                'message' => "Invalid password. {$left} attempt(s) left before lockout.",
+                'remainingBeforeLock' => $left,
+            ], 401);
+        }
+
+        fd_auth_record_success($clientIp);
+        $token = fd_auth_token();
+        setcookie(FD_AUTH_COOKIE, $token, [
+            'expires' => time() + 86400 * 365,
+            'path' => '/',
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+        fd_json(['ok' => 1, 'token' => $token]);
+    }
+
+    if ($path === '/api/auth/logout' && $method === 'POST') {
+        setcookie(FD_AUTH_COOKIE, '', ['expires' => time() - 3600, 'path' => '/']);
+        fd_json(['ok' => 1]);
+    }
+
+    if ($path === '/api/auth/password' && $method === 'POST') {
+        $input = json_decode((string) file_get_contents('php://input'), true);
+        $input = is_array($input) ? $input : [];
+        if (!fd_auth_verify_password((string) ($input['current'] ?? ''))) {
+            fd_json(['ok' => 0, 'message' => 'Current password is wrong'], 401);
+        }
+        $next = trim((string) ($input['next'] ?? ''));
+        if (strlen($next) < 4) {
+            fd_json(['ok' => 0, 'message' => 'Password must be at least 4 characters'], 400);
+        }
+        fd_auth_set_password($next);
+        fd_json(['ok' => 1, 'token' => fd_auth_token()]);
+    }
+
+    if ($path === '/api/auth/token/rotate' && $method === 'POST') {
+        fd_json(['ok' => 1, 'token' => fd_auth_rotate_token()]);
+    }
+
+    if ($path === '/api/auth/reset' && $method === 'POST') {
+        fd_require_local_request();
+        fd_auth_set_password(FD_AUTH_DEFAULT_PASSWORD);
+        @unlink(fd_storage_path('storage/cache/auth_lockout.json'));
+        fd_json(['ok' => 1, 'token' => fd_auth_token()]);
+    }
+
     // Lightweight routes must not load Composer/Madeline or hit the version
     // gate. Refreshing the page calls /api/session; autoload or a 426 there
     // is treated as logout by the frontend.
@@ -11169,7 +12007,9 @@ if (str_starts_with($path, '/api/')) {
     }
 
     if ($path === '/api/tunnel/enable' && $method === 'POST') {
-        $result = fd_enable_tunnel();
+        $input = json_decode((string) file_get_contents('php://input'), true);
+        $token = is_array($input) ? trim((string) ($input['tunnel_token'] ?? '')) : '';
+        $result = fd_enable_tunnel($token);
         fd_json($result, !empty($result['ok']) ? 200 : 500);
     }
 
@@ -11185,18 +12025,11 @@ if (str_starts_with($path, '/api/')) {
             'ok' => 1,
             'settings' => $settings,
             'catalog_options' => $catalogOptions,
-            'is_tunnel' => fd_is_cloudflare_tunnel_request(),
+            'is_tunnel' => false,
         ]);
     }
 
     if ($path === '/api/catalog-settings' && $method === 'POST') {
-        if (fd_is_cloudflare_tunnel_request()) {
-            fd_json([
-                'ok' => 0,
-                'error' => 'Catalog configuration is disabled via Cloudflare tunnel. Please configure locally on your network.',
-            ], 403);
-        }
-
         $input = json_decode((string) file_get_contents('php://input'), true);
         if (!is_array($input)) {
             fd_json(['ok' => 0, 'error' => 'Invalid JSON input'], 400);
@@ -11337,10 +12170,7 @@ if (str_starts_with($path, '/api/')) {
     // POST body: { post_id, media_ids: {prefix: value, ...}, title, year, imdb_id, media_type }
     // DELETE:    ?post_id=N  (removes all rows for that post)
     if ($path === '/api/media-ids' && in_array($method, ['POST', 'DELETE'], true)) {
-        if (fd_is_cloudflare_tunnel_request()) {
-            fd_json(['ok' => 0, 'error' => 'media-ids is local-only.'], 403);
-        }
-        fd_require_local_request();
+        fd_require_auth();
 
         if ($method === 'DELETE') {
             $postId = (int) ($_REQUEST['post_id'] ?? 0);
@@ -11449,9 +12279,6 @@ if (str_starts_with($path, '/api/')) {
     }
 
     if ($path === '/api/country' && $method === 'POST') {
-        if (fd_is_cloudflare_tunnel_request()) {
-            fd_json(['ok' => 0, 'error' => 'Country selection is disabled via Cloudflare tunnel.'], 403);
-        }
         $input = json_decode((string) file_get_contents('php://input'), true);
         if (!is_array($input)) {
             fd_json(['ok' => 0, 'error' => 'Invalid JSON input'], 400);
@@ -11476,7 +12303,6 @@ if (str_starts_with($path, '/api/')) {
         // as incomplete login so the frontend shows the token prompt.
         $hasSession = fd_has_local_session() && $botId !== '';
         $pool = fd_get_bot_pool();
-        $viaTunnel = fd_is_cloudflare_tunnel_request();
 
         // If meta username/name is empty, fill from bot pool
         $botUsername = (string) ($meta['bot_username'] ?? '');
@@ -11500,10 +12326,33 @@ if (str_starts_with($path, '/api/')) {
             'bot_id' => $hasSession ? $botId : '',
             'bot_username' => $hasSession ? $botUsername : '',
             'bot_name' => $hasSession ? $botName : '',
-            'api_secret' => ($hasSession && !$viaTunnel) ? fd_get_api_secret() : '',
+            'api_secret' => $hasSession ? fd_get_api_secret() : '',
             'device_id' => fd_get_device_id(),
             'bot_count' => count($pool),
             'bot_pool' => $pool,
+        ]);
+    }
+
+    // ── GET /api/clock-check — measure local clock offset vs Telegram ─────────
+    // Lets the frontend warn the user BEFORE attempting a bot login, since a
+    // skewed clock makes every MTProto handshake fail with a confusing
+    // "message ID too new/old" error.
+    if ($path === '/api/clock-check' && $method === 'GET') {
+        $probe = fd_measure_clock_offset();
+        $abs = abs((int) $probe['offset']);
+        fd_json([
+            'ok' => $probe['ok'] ? 1 : 0,
+            'offset_seconds' => (int) $probe['offset'],
+            'server_time' => (int) $probe['server_time'],
+            'local_time' => (int) $probe['local_time'],
+            // Telegram's MTProto handshake is far less tolerant than the
+            // documented ±300s: a measured 49s offset was enough to trigger
+            // bad_msg_notification "msg_id too high" and a mid-handshake
+            // session reset (SecurityException: wrong new_nonce_hash1).
+            // Treat anything beyond 30s as skewed and beyond 60s as critical.
+            'skewed' => $probe['ok'] && $abs > 30,
+            'critical' => $probe['ok'] && $abs > 60,
+            'message' => $probe['ok'] ? '' : $probe['error'],
         ]);
     }
 
@@ -11520,14 +12369,13 @@ if (str_starts_with($path, '/api/')) {
             ], 500);
         }
 
-        $viaTunnel = fd_is_cloudflare_tunnel_request();
         fd_json([
             'ok' => 1,
             'message' => 'Guest bot session initialized successfully.',
             'bot_id' => $provisioned['bot_id'],
             'bot_username' => $provisioned['bot_username'],
             'bot_name' => $provisioned['bot_name'],
-            'api_secret' => !$viaTunnel ? fd_get_api_secret() : '',
+            'api_secret' => fd_get_api_secret(),
             'pool' => fd_get_bot_pool(),
         ]);
     }
@@ -12219,9 +13067,13 @@ if (str_starts_with($path, '/api/')) {
     }
 
     // ── GET /api/download[/:payload/:filename] — stream Telegram file via MadelineProto ──
-    // Stremio Web requires the full URL to end with .mp4, so the payload is a path
-    // segment: /api/download/<base64url>/<filename>.mp4. Query ?d= remains supported.
+    // The payload is a path segment: /api/download/<base64url>/<filename>.<real-ext>.
+    // Query ?d= remains supported. Remote clients must carry the auth token as a
+    // /t/<token>/ prefix (stripped above) or a cookie/header.
     if (fd_is_public_download_path($path)) {
+        if (!fd_is_authenticated()) {
+            fd_json(['ok' => 0, 'message' => 'Password required', 'auth_required' => true], 401);
+        }
         $encoded = trim((string) ($_GET['d'] ?? $_POST['d'] ?? ''));
         if ($encoded === '') {
             $encoded = fd_extract_download_payload_from_path($path);
@@ -12269,10 +13121,10 @@ if (str_starts_with($path, '/api/')) {
                     'ok' => 0,
                     'message' => $isConnecting
                         ? 'Connecting guest bot in progress. Please refresh or try again in a few seconds.'
-                        : 'Telegram Bot is not connected. Please connect your bot token in dashboard settings to stream.',
+                        : 'Telegram Bot is not connected. Please connect your bot token in Settings to stream.',
                     'hint' => $isConnecting
                         ? 'Guest bot session is initializing. Please refresh playback shortly.'
-                        : 'Open dashboard settings and connect your bot token.',
+                        : 'Open Settings and connect your bot token.',
                     'short_code' => $shortCode,
                     'bot_id' => $botId,
                 ], $isConnecting ? 503 : 403);
@@ -12481,6 +13333,10 @@ if (str_starts_with($path, '/api/')) {
                     if (!$madeline) {
                         [$madeline, $error] = fd_boot_madeline(null, [], $botId);
                     }
+                } elseif ($prov && !empty($prov['error'])) {
+                    // Surface the real reason (e.g. clock skew) instead of the
+                    // generic "No valid MadelineProto session" fallback.
+                    $error = (string) $prov['error'];
                 }
             }
         }
@@ -12574,6 +13430,15 @@ if (str_starts_with($path, '/api/')) {
 
 // If running in CLI / warmup-ipc mode, do not attempt to serve static files
 if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+    return true;
+}
+
+// Auth gate: an unauthenticated visitor must never receive the dashboard HTML.
+// This runs BEFORE the provisioning gate so a remote visitor sees the password
+// page instead of the "Provisioning guest bot..." spinner (whose /api/session
+// poll would 401 and loop forever).
+if (($path === '/' || $path === '/index.html') && !fd_is_authenticated()) {
+    fd_serve_auth_gate_html();
     return true;
 }
 

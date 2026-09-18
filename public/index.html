@@ -24,26 +24,41 @@
       <p class="loading-screen__text">Connecting...</p>
     </div>
     <script>
-      // Immediately open configure / settings modal without waiting for scripts or network
+      // Immediately open configure / settings modal without waiting for scripts or network ONLY if session exists
       (function() {
-        var h = window.location.hash;
-        if (h === '#configure' || h === '#addon') {
-          var ls = document.getElementById('loadingScreen');
-          if (ls) ls.style.display = 'none';
-          var am = document.getElementById('addonModal');
-          if (am) {
-            am.classList.remove('hidden');
-            am.setAttribute('aria-hidden', 'false');
+        try {
+          var sessionRaw = localStorage.getItem('tgfd.session');
+          var legacyBotId = localStorage.getItem('tgfd.botId');
+          var hasSession = false;
+          if (sessionRaw) {
+            var parsed = JSON.parse(sessionRaw);
+            if (parsed && parsed.hasSession && parsed.botId) {
+              hasSession = true;
+            }
+          } else if (legacyBotId) {
+            hasSession = true;
           }
-        } else if (h === '#settings') {
-          var ls = document.getElementById('loadingScreen');
-          if (ls) ls.style.display = 'none';
-          var sg = document.getElementById('settingsGate');
-          if (sg) {
-            sg.classList.remove('hidden');
-            sg.setAttribute('aria-hidden', 'false');
+          if (!hasSession) return; // Keep loading screen visible during cold start provisioning
+
+          var h = window.location.hash;
+          if (h === '#configure' || h === '#addon') {
+            var ls = document.getElementById('loadingScreen');
+            if (ls) ls.style.display = 'none';
+            var am = document.getElementById('addonModal');
+            if (am) {
+              am.classList.remove('hidden');
+              am.setAttribute('aria-hidden', 'false');
+            }
+          } else if (h === '#settings') {
+            var ls = document.getElementById('loadingScreen');
+            if (ls) ls.style.display = 'none';
+            var sg = document.getElementById('settingsGate');
+            if (sg) {
+              sg.classList.remove('hidden');
+              sg.setAttribute('aria-hidden', 'false');
+            }
           }
-        }
+        } catch (e) {}
       })();
     </script>
 
@@ -77,6 +92,32 @@
         <a class="update-required__link" href="#" target="_blank" rel="noopener"
           >Download Update</a
         >
+      </div>
+    </div>
+
+    <!-- ─── Auth Gate (server password) ────────────────────────── -->
+    <div id="authGate" class="settings-gate hidden" aria-hidden="true">
+      <div class="settings-gate__card">
+        <h2 class="settings-gate__title">🔒 PencariMovie Server</h2>
+        <p class="settings-gate__desc">
+          Enter server password to continue. (Default: <code>123456</code>)
+        </p>
+        <div class="settings-gate__field">
+          <label class="settings-gate__label" for="authPasswordInput"
+            >Server Password</label
+          >
+          <input
+            type="password"
+            id="authPasswordInput"
+            class="settings-gate__input"
+            placeholder="Password"
+            autocomplete="current-password"
+          />
+        </div>
+        <button id="authConnectBtn" class="settings-gate__btn">
+          Connect
+        </button>
+        <div id="authStatus" class="settings-gate__status"></div>
       </div>
     </div>
 
@@ -281,16 +322,77 @@
             </button>
           </div>
 
+          <!-- Change Password Box -->
+          <div class="settings-gate__addon-box" style="margin-top: 14px">
+            <span>🔑 Change Password</span>
+            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 10px;">
+              <input
+                type="password"
+                id="changePwCurrent"
+                class="settings-gate__input"
+                placeholder="Current Password"
+                autocomplete="current-password"
+                style="padding: 8px 12px; font-size: 0.85rem;"
+              />
+              <input
+                type="password"
+                id="changePwNew"
+                class="settings-gate__input"
+                placeholder="New Password (min. 4 characters)"
+                autocomplete="new-password"
+                style="padding: 8px 12px; font-size: 0.85rem;"
+              />
+              <button
+                type="button"
+                id="changePwBtn"
+                class="settings-gate__btn"
+                style="padding: 8px 14px; font-size: 0.85rem;"
+              >
+                Update Password
+              </button>
+              <div id="changePwStatus" class="settings-gate__status" style="margin: 0;"></div>
+            </div>
+          </div>
+
           <div class="settings-gate__addon-box settings-gate__tunnel-box">
             <span>☁️ Cloudflare Tunnel</span>
             <p class="settings-gate__tunnel-desc" id="tunnelDescText">
-              Expose this local server at a public
-              <code id="tunnelSubdomainPlaceholder"
-                >https://{deviceId}-tunnel.pencarimovie.com</code
-              >
-              URL. No Cloudflare account needed. Anyone with the URL can browse
-              and stream.
+              Expose this server publicly. Leave blank for a free automatic URL, or enter your Custom Domain and Cloudflare Tunnel Token.
             </p>
+
+            <div style="margin: 10px 0 6px 0;">
+              <input
+                type="password"
+                id="tunnelTokenInput"
+                class="settings-gate__input"
+                placeholder="Cloudflare Tunnel Token (optional, leave blank for auto URL)"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+
+            <!-- Zero Trust Tunnel Guide -->
+            <details style="margin: 6px 0 10px 0; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px 12px; font-size: 0.74rem;">
+              <summary style="cursor: pointer; font-weight: 600; color: #ff6b35; outline: none; user-select: none;">
+                📖 How to create a Cloudflare Zero Trust Tunnel
+              </summary>
+              <div style="margin-top: 8px; color: #bbb; line-height: 1.5; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
+                <ol style="margin-left: 16px; display: flex; flex-direction: column; gap: 5px;">
+                  <li>Open Cloudflare Dashboard &rarr; <strong>Zero Trust</strong> &rarr; <strong>Networks</strong> &rarr; <strong>Tunnel & Mesh</strong>.</li>
+                  <li>Click <strong>Create a tunnel</strong> &rarr; Select tunnel type: <strong>Cloudflared</strong>.</li>
+                  <li><strong>Name your tunnel</strong>: e.g. <code>pms</code> &rarr; click <strong>Save tunnel</strong>.</li>
+                  <li><strong>Install and run a connector</strong>: Copy the command (e.g. <code>cloudflared.exe service install eyJh...</code>) and paste it into the box above.</li>
+                  <li><strong>Route tunnel</strong>: Add your public hostname:
+                    <div style="margin-top: 2px; color: #eee;">
+                      &bull; <strong>Subdomain / Domain</strong>: e.g. <code>addon</code>.<code>yourdomain.com</code><br/>
+                      &bull; <strong>Type</strong>: <code>HTTP</code><br/>
+                      &bull; <strong>URL (Service)</strong>: <code>localhost:8088</code>
+                    </div>
+                  </li>
+                </ol>
+              </div>
+            </details>
+
             <div class="settings-gate__tunnel-status" id="tunnelStatusText">
               Tunnel is off.
             </div>
@@ -330,12 +432,6 @@
               >
                 Disable
               </button>
-            </div>
-            <div
-              class="settings-gate__tunnel-remote-note hidden"
-              id="tunnelRemoteNote"
-            >
-              Enable and disable from this device's local dashboard only.
             </div>
           </div>
         </div>
@@ -468,19 +564,122 @@
         </div>
         <!-- Embedded video/audio player -->
         <div class="file-detail__player hidden" id="fileDetailPlayer">
-          <video
-            id="fileDetailVideo"
-            class="file-detail__video"
-            controls
-            preload="metadata"
-            playsinline
-          ></video>
-          <audio
-            id="fileDetailAudio"
-            class="file-detail__audio hidden"
-            controls
-            preload="metadata"
-          ></audio>
+          <div class="file-detail__player-media-wrap">
+            <video
+              id="fileDetailVideo"
+              class="file-detail__video sub-size-normal"
+              controls
+              crossorigin="anonymous"
+              preload="metadata"
+              playsinline
+            ></video>
+            <audio
+              id="fileDetailAudio"
+              class="file-detail__audio hidden"
+              controls
+              preload="metadata"
+            ></audio>
+          </div>
+
+          <!-- Stremio-style Player Options Toolbar -->
+          <div class="player-toolbar" id="playerToolbar">
+            <!-- Left Group: Playback & Scale -->
+            <div class="player-toolbar__group">
+              <!-- Playback Speed -->
+              <div class="player-toolbar__item">
+                <button type="button" class="player-toolbar__btn" id="playerSpeedBtn" title="Playback Speed">
+                  <i class="fas fa-tachometer-alt"></i> <span id="playerSpeedLabel">1.0x</span>
+                </button>
+                <div class="player-toolbar__dropdown hidden" id="playerSpeedMenu">
+                  <button type="button" class="player-toolbar__opt" data-speed="0.5">0.5x</button>
+                  <button type="button" class="player-toolbar__opt" data-speed="0.75">0.75x</button>
+                  <button type="button" class="player-toolbar__opt active" data-speed="1">Normal (1.0x)</button>
+                  <button type="button" class="player-toolbar__opt" data-speed="1.25">1.25x</button>
+                  <button type="button" class="player-toolbar__opt" data-speed="1.5">1.5x</button>
+                  <button type="button" class="player-toolbar__opt" data-speed="2">2.0x</button>
+                </div>
+              </div>
+
+              <!-- Aspect Ratio / Scale -->
+              <div class="player-toolbar__item">
+                <button type="button" class="player-toolbar__btn" id="playerScaleBtn" title="Video Aspect / Scale">
+                  <i class="fas fa-expand"></i> <span id="playerScaleLabel">Fit</span>
+                </button>
+                <div class="player-toolbar__dropdown hidden" id="playerScaleMenu">
+                  <button type="button" class="player-toolbar__opt active" data-scale="contain">Fit / Contain</button>
+                  <button type="button" class="player-toolbar__opt" data-scale="cover">Crop / Fill</button>
+                  <button type="button" class="player-toolbar__opt" data-scale="fill">Stretch Full</button>
+                </div>
+              </div>
+
+              <!-- PiP (Picture in Picture) -->
+              <button type="button" class="player-toolbar__btn" id="playerPipBtn" title="Picture in Picture">
+                <i class="fas fa-clone"></i> PiP
+              </button>
+            </div>
+
+            <!-- Middle Group: Subtitle Controls & Sync -->
+            <div class="player-toolbar__group">
+              <!-- Subtitles Menu -->
+              <div class="player-toolbar__item">
+                <button type="button" class="player-toolbar__btn" id="playerSubsBtn" title="Subtitles & Audio">
+                  <i class="fas fa-closed-captioning"></i> <span>Subtitles</span>
+                </button>
+                <div class="player-toolbar__dropdown player-toolbar__dropdown--wide hidden" id="playerSubsMenu">
+                  <div class="player-toolbar__dropdown-header">Subtitles Track</div>
+                  <div class="player-toolbar__subs-list" id="playerSubsList">
+                    <button type="button" class="player-toolbar__opt active" data-track="-1">Off</button>
+                  </div>
+                  <div class="player-toolbar__dropdown-divider"></div>
+                  <!-- Subtitle Timing Delay Sync -->
+                  <div class="player-toolbar__dropdown-header">Subtitle Delay (Sync)</div>
+                  <div class="player-toolbar__sub-sync">
+                    <button type="button" class="player-toolbar__sync-btn" id="playerSubDelayMinus" title="-250ms">-0.25s</button>
+                    <span id="playerSubDelayVal" class="player-toolbar__sync-val">0.0s</span>
+                    <button type="button" class="player-toolbar__sync-btn" id="playerSubDelayPlus" title="+250ms">+0.25s</button>
+                    <button type="button" class="player-toolbar__sync-btn" id="playerSubDelayReset" title="Reset delay">Reset</button>
+                  </div>
+                  <!-- Subtitle Sizing -->
+                  <div class="player-toolbar__dropdown-header" style="margin-top:8px;">Subtitle Size</div>
+                  <div class="player-toolbar__sub-size-group">
+                    <button type="button" class="player-toolbar__sync-btn" data-sub-size="small">Small</button>
+                    <button type="button" class="player-toolbar__sync-btn active" data-sub-size="normal">Normal</button>
+                    <button type="button" class="player-toolbar__sync-btn" data-sub-size="large">Large</button>
+                  </div>
+                  <div class="player-toolbar__dropdown-divider"></div>
+                  <!-- Load local subtitle file -->
+                  <label class="player-toolbar__custom-sub-btn">
+                    <i class="fas fa-upload"></i> Load local .srt / .vtt
+                    <input type="file" id="playerLocalSubFile" accept=".srt,.vtt" style="display:none;" />
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right Group: External Players & Copy Link -->
+            <div class="player-toolbar__group">
+              <div class="player-toolbar__item">
+                <button type="button" class="player-toolbar__btn player-toolbar__btn--accent" id="playerExtMenuBtn" title="Open in External Player">
+                  <i class="fas fa-external-link-alt"></i> <span>External Player</span> <i class="fas fa-chevron-down" style="font-size:0.7rem;margin-left:4px;"></i>
+                </button>
+                <div class="player-toolbar__dropdown player-toolbar__dropdown--right hidden" id="playerExtMenu">
+                  <a href="#" class="player-toolbar__opt" id="playerExtVlc" target="_blank" rel="noopener">
+                    <i class="fas fa-play-circle" style="color:#ff8800;margin-right:8px;"></i> Open in VLC Player
+                  </a>
+                  <a href="#" class="player-toolbar__opt" id="playerExtMpv" target="_blank" rel="noopener">
+                    <i class="fas fa-film" style="color:#a55eea;margin-right:8px;"></i> Open in MPV Player
+                  </a>
+                  <a href="#" class="player-toolbar__opt" id="playerExtStremioWeb" target="_blank" rel="noopener">
+                    <i class="fas fa-tv" style="color:#20bf6b;margin-right:8px;"></i> Open in Web Stremio
+                  </a>
+                  <div class="player-toolbar__dropdown-divider"></div>
+                  <button type="button" class="player-toolbar__opt" id="playerCopyStreamBtn">
+                    <i class="fas fa-copy" style="margin-right:8px;"></i> Copy Stream URL
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -559,9 +758,14 @@
         <!-- ─── Catalog Settings Card ───────────────────────────── -->
         <div class="addon-catalog-card" id="addonCatalogCard">
           <div class="addon-catalog-card__header">
-            <div style="display: flex; align-items: center; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
               <span class="addon-catalog-card__title">🗂️ Catalog Configuration</span>
-              <span id="addonServerCountryBadge" class="addon-catalog-card__badge" style="background: rgba(255,255,255,0.08); color: #ccc;" title="Detected Region (no user_id)">🌍 Detecting...</span>
+              <div class="addon-country-wrap">
+                <label for="addonCountrySelect" class="addon-country-label">🌍 Region:</label>
+                <select id="addonCountrySelect" class="addon-country-select">
+                  <option value="">Auto (Detecting...)</option>
+                </select>
+              </div>
             </div>
             <span class="addon-catalog-card__badge" id="addonCatalogStatusBadge">Enabled</span>
           </div>
@@ -571,15 +775,15 @@
             <label class="addon-catalog-mode-opt">
               <input type="radio" name="catalogModeRadio" id="catalogModeEnabled" value="enabled" checked />
               <div class="addon-catalog-mode-opt__info">
-                <strong>Enabled (Browse & Search)</strong>
-                <span>Home rows + Country/Genre catalogs + Streams</span>
+                <strong>PencariMovie Catalogs: Enabled</strong>
+                <span>Local home rows + Country/Genre catalogs (Movies, Series, Telegram Files)</span>
               </div>
             </label>
             <label class="addon-catalog-mode-opt">
               <input type="radio" name="catalogModeRadio" id="catalogModeDisabled" value="disabled" />
               <div class="addon-catalog-mode-opt__info">
-                <strong>Disable Catalogs (Streams Only)</strong>
-                <span>No home rows. Streams matched only via IMDb (tt) from Cinemeta</span>
+                <strong>PencariMovie Catalogs: Disabled</strong>
+                <span>Hide local home rows (Upstream bridged addons and Streams remain active)</span>
               </div>
             </label>
           </div>
@@ -636,16 +840,234 @@
             </div>
           </div>
 
+          <!-- Custom Upstream Manifests Section -->
+          <div class="addon-catalog-section" style="margin-top: 14px; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 12px;">
+            <div class="addon-catalog-section__label" style="display: flex; justify-content: space-between; align-items: center;">
+              <span>🔗 Upstream Stremio Addons (Bridge Catalogs, Streams & Subtitles):</span>
+            </div>
+            <p style="font-size: 0.74rem; color: #aaa; margin: 4px 0 8px 0; line-height: 1.35;">
+              Add external addon manifest URLs (AIOStreams, Torrentio, OpenSubtitles, etc.). Their catalogs, metadata, streams, and subtitles are automatically bridged into your single PencariMovie address.
+            </p>
+            <div id="upstreamAddonsList" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px;">
+              <!-- Dynamically populated list of upstream addons -->
+            </div>
+            <div style="display: flex; gap: 6px;">
+              <input
+                type="text"
+                id="upstreamAddonInput"
+                class="settings-gate__input"
+                style="font-size: 0.8rem; font-family: monospace; padding: 6px 10px;"
+                placeholder="https://.../manifest.json"
+              />
+              <button
+                type="button"
+                id="upstreamAddonAddBtn"
+                class="settings-gate__btn"
+                style="padding: 6px 14px; font-size: 0.8rem; white-space: nowrap;"
+              >
+                + Add & Validate
+              </button>
+            </div>
+            <div id="upstreamAddonStatus" style="font-size: 0.76rem; margin-top: 5px;" class="hidden"></div>
+          </div>
+
+          <!-- ─── Streams Configuration Section (AIOStreams style) ─── -->
+          <div class="addon-catalog-section" style="margin-top: 14px; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 12px;">
+            <div class="addon-catalog-section__label" style="display: flex; justify-content: space-between; align-items: center;">
+              <span>📺 Streams Configuration (AIOStreams Filter Engine):</span>
+            </div>
+            <p style="font-size: 0.74rem; color: #aaa; margin: 4px 0 8px 0; line-height: 1.35;">
+              Filter, rank, and limit video streams delivered to Nuvio/Stremio (Resolutions, Qualities, Codecs, HDR, File Sizes & Keywords).
+            </p>
+
+            <!-- Resolutions -->
+            <div style="margin-bottom: 8px;">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px;">Resolutions:</div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes4k" checked />
+                  <span>✨ 4K / UHD (2160p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes1080p" checked />
+                  <span>🧿 1080p (FHD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes720p" checked />
+                  <span>💿 720p (HD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResSd" checked />
+                  <span>📁 SD (480p / 360p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResUnknown" checked />
+                  <span>❓ Unknown</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Source Qualities -->
+            <div style="margin-bottom: 8px;">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px;">Source Qualities:</div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualRemux" checked />
+                  <span>🏆 BluRay REMUX</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualBluray" checked />
+                  <span>💿 BluRay</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebdl" checked />
+                  <span>🌐 WEB-DL</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebrip" checked />
+                  <span>⚡ WEBRip</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualHdtv" checked />
+                  <span>📺 HDTV</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualCam" checked />
+                  <span>🎥 CAM / Telesync</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeCam" />
+                  <span style="color: #ff5e57;">🚫 Block All CAM</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeUnplayable" checked />
+                  <span style="color: #ff5e57;">🚫 Exclude Unplayable</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Video Encodes & Visual Tags -->
+            <div style="margin-bottom: 8px;">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px;">Encodes & Formats:</div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncHevc" checked />
+                  <span>🎞️ HEVC (H.265)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAvc" checked />
+                  <span>🎞️ AVC (H.264)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAv1" checked />
+                  <span>🎞️ AV1</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisHdr" checked />
+                  <span>🌈 HDR / HDR10+</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisDv" checked />
+                  <span>👓 Dolby Vision</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Priority & Stream Limits -->
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 8px;">
+              <div style="display: flex; align-items: center; gap: 5px;">
+                <label for="streamPreferredRes" style="font-size: 0.76rem; color: #ccc;">Priority:</label>
+                <select id="streamPreferredRes" class="settings-gate__input" style="padding: 4px 6px; font-size: 0.76rem; width: auto; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;">
+                  <option value="auto">Auto (Highest First)</option>
+                  <option value="4k">4K (2160p)</option>
+                  <option value="1080p">1080p (FHD)</option>
+                  <option value="720p">720p (HD)</option>
+                  <option value="sd">SD (480p/360p)</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px;">
+                <label for="streamMaxPerRes" style="font-size: 0.76rem; color: #ccc;">Max / Resolution:</label>
+                <select id="streamMaxPerRes" class="settings-gate__input" style="padding: 4px 6px; font-size: 0.76rem; width: auto; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;">
+                  <option value="0">All Available</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px;">
+                <label for="streamMaxTotal" style="font-size: 0.76rem; color: #ccc;">Max Total:</label>
+                <select id="streamMaxTotal" class="settings-gate__input" style="padding: 4px 6px; font-size: 0.76rem; width: auto; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;">
+                  <option value="0">Default (100)</option>
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="30">30</option>
+                  <option value="50">50</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px;">
+                <label for="streamMinSizeMb" style="font-size: 0.76rem; color: #ccc;">Min Size:</label>
+                <input type="number" id="streamMinSizeMb" min="0" max="10000" placeholder="MB" class="settings-gate__input" style="padding: 4px 6px; font-size: 0.76rem; width: 68px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;" />
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px;">
+                <label for="streamMaxSizeGb" style="font-size: 0.76rem; color: #ccc;">Max Size:</label>
+                <input type="number" id="streamMaxSizeGb" min="0" max="100" placeholder="GB" class="settings-gate__input" style="padding: 4px 6px; font-size: 0.76rem; width: 68px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;" />
+              </div>
+            </div>
+
+            <!-- Keyword Filters -->
+            <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 6px;">
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <label for="streamExcludedKeywords" style="font-size: 0.74rem; color: #ff7675; min-width: 105px;">Exclude Keywords:</label>
+                <input type="text" id="streamExcludedKeywords" placeholder="e.g. cam, sample, trailer, dub" class="settings-gate__input" style="padding: 4px 8px; font-size: 0.74rem; flex: 1; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;" />
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <label for="streamRequiredKeywords" style="font-size: 0.74rem; color: #55efc4; min-width: 105px;">Require Keywords:</label>
+                <input type="text" id="streamRequiredKeywords" placeholder="e.g. malaysub, 10bit (optional)" class="settings-gate__input" style="padding: 4px 8px; font-size: 0.74rem; flex: 1; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.15); border-radius: 4px; color: #fff;" />
+              </div>
+            </div>
+          </div>
+
           <div class="addon-catalog-save-row">
             <button type="button" id="catSaveSettingsBtn" class="settings-gate__btn addon-catalog-save-btn">
-              💾 Save Catalog Settings
+              💾 Save Addon Configuration
             </button>
             <span id="catSaveStatus" class="addon-catalog-status-msg hidden">Saved!</span>
           </div>
         </div>
 
+        <!-- Access Token Card -->
+        <div class="addon-catalog-card" id="addonTokenCard">
+          <div class="addon-catalog-card__header">
+            <span class="addon-catalog-card__title">🔑 Access Token</span>
+            <span class="addon-catalog-card__badge" id="addonTokenBadge">Active</span>
+          </div>
+          <p style="font-size: 0.74rem; color: #aaa; margin: 4px 0 8px 0; line-height: 1.35;">
+            Remote devices (VPS, Cloudflare Tunnel) need this token in the manifest URL.
+            Localhost and Wi-Fi/LAN do not. Regenerating creates a new token and invalidates the old one.
+          </p>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input
+              type="text"
+              id="addonTokenInput"
+              class="settings-gate__input"
+              style="font-family: monospace; font-size: 0.82rem;"
+              readonly
+              value=""
+            />
+            <button type="button" id="addonTokenCopyBtn" class="settings-gate__btn" style="white-space: nowrap; padding: 10px 12px; font-size: 0.82rem;">📋</button>
+            <button type="button" id="addonTokenRotateBtn" class="settings-gate__btn" style="white-space: nowrap; padding: 10px 14px; font-size: 0.82rem;">🔄 Regenerate</button>
+          </div>
+          <div id="addonTokenStatus" class="addon-catalog-status-msg hidden"></div>
+        </div>
+
         <!-- Wi-Fi / LAN Manifest Field (Recommended for External Devices) -->
-        <div class="settings-gate__field" id="addonLanField">
+        <div class="settings-gate__field hidden" id="addonLanField" style="display: none !important;">
           <div
             style="
               display: flex;
@@ -708,12 +1130,14 @@
           >
             <label
               class="settings-gate__label"
+              id="addonLocalFieldLabel"
               for="addonManifestInput"
               style="margin-bottom: 0"
             >
               💻 Localhost Manifest (This Device Only)
             </label>
             <span
+              id="addonLocalFieldBadge"
               style="
                 font-size: 0.72rem;
                 background: rgba(255, 255, 255, 0.08);
@@ -824,6 +1248,61 @@
           </a>
         </div>
 
+        <div class="settings-gate__field" style="margin-top: 16px;">
+          <div
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestEclipseInput"
+              style="margin-bottom: 0"
+            >
+              🎵 Eclipse Music Addon URL
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: rgba(225, 29, 72, 0.15);
+                color: #fb7185;
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Music</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestEclipseInput"
+              class="settings-gate__input"
+              style="color: #fb7185; font-family: monospace; font-size: 0.88rem"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestEclipseBtn"
+              class="settings-gate__btn"
+              style="
+                white-space: nowrap;
+                padding: 10px 16px;
+                font-size: 0.88rem;
+                background: #e11d48;
+              "
+            >
+              📋 Copy
+            </button>
+          </div>
+          <p style="font-size: 0.76rem; color: #a1a1aa; margin-top: 6px;">
+            In Eclipse Music: <strong>Settings ➔ Connections ➔ Add Connection ➔ Addon</strong> and paste this URL.
+          </p>
+        </div>
+
         <div id="addonCopiedStatus" class="settings-gate__status ok hidden">
           ✓ Copied to clipboard!
         </div>
@@ -843,6 +1322,7 @@
             class="addon-mode-toggle"
             role="radiogroup"
             aria-label="Manifest address"
+            id="stremioSyncModeToggle"
           >
             <label class="addon-mode-toggle__option">
               <input
@@ -985,6 +1465,6 @@
       <div class="stream-mobile-nav__links" id="mobileNavLinks"></div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=2.0.1"></script>
   </body>
 </html>

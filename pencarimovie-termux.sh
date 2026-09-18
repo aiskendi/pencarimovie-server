@@ -70,7 +70,7 @@ detect_target() {
 }
 
 usage() {
-  echo "Usage: $0 [start|stop|restart|tunnel|autostart|uninstall]"
+  echo "Usage: $0 [start|stop|restart|tunnel|autostart|password|reset-password|token|uninstall]"
   exit 1
 }
 
@@ -404,10 +404,14 @@ case "\${1:-}" in
     ;;
   tunnel|--tunnel)
     if [ -f "\$APP_DIR/pencarimovie-termux.sh" ]; then
-      bash "\$APP_DIR/pencarimovie-termux.sh" tunnel
+      bash "\$APP_DIR/pencarimovie-termux.sh" tunnel "\${2:-}"
     else
       echo "Enabling Cloudflare Tunnel..."
-      curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
+      if [ -n "\${2:-}" ]; then
+        curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" -H "Content-Type: application/json" -d "{\"tunnel_token\":\"\${2:-}\"}" --max-time 120 2>/dev/null || wget -qO- --header="Content-Type: application/json" --post-data="{\"tunnel_token\":\"\${2:-}\"}" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
+      else
+        curl -fsSL -X POST "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --max-time 120 2>/dev/null || wget -qO- --post-data="" "http://127.0.0.1:\${PORT:-8088}/api/tunnel/enable" --timeout=120 2>/dev/null || true
+      fi
     fi
     ;;
   autostart|--autostart)
@@ -617,30 +621,51 @@ EOF
 do_restart() { do_stop; sleep 1; do_start; }
 
 do_tunnel() {
+  local token="${1:-}"
   if ! port_in_use; then
     echo "Server is not running. Starting server first..."
     do_start
     sleep 2
   fi
-  echo "Enabling Cloudflare Tunnel..."
+
   local resp=""
+  local payload=""
+  if [ -n "$token" ]; then
+    echo "Enabling Cloudflare Named Tunnel with token..."
+    payload="{\"tunnel_token\":\"$token\"}"
+  else
+    echo "Enabling Cloudflare Tunnel..."
+  fi
+
   if command -v curl >/dev/null 2>&1; then
-    resp="$(curl -fsSL -X POST "http://127.0.0.1:$PORT/api/tunnel/enable" --max-time 120 2>/dev/null || true)"
+    if [ -n "$payload" ]; then
+      resp="$(curl -fsSL -X POST "http://127.0.0.1:$PORT/api/tunnel/enable" -H "Content-Type: application/json" -d "$payload" --max-time 120 2>/dev/null || true)"
+    else
+      resp="$(curl -fsSL -X POST "http://127.0.0.1:$PORT/api/tunnel/enable" --max-time 120 2>/dev/null || true)"
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    resp="$(wget -qO- --post-data="" "http://127.0.0.1:$PORT/api/tunnel/enable" --timeout=120 2>/dev/null || true)"
+    if [ -n "$payload" ]; then
+      resp="$(wget -qO- --header="Content-Type: application/json" --post-data="$payload" "http://127.0.0.1:$PORT/api/tunnel/enable" --timeout=120 2>/dev/null || true)"
+    else
+      resp="$(wget -qO- --post-data="" "http://127.0.0.1:$PORT/api/tunnel/enable" --timeout=120 2>/dev/null || true)"
+    fi
   fi
 
   if [ -n "$resp" ] && echo "$resp" | grep -q '"ok": *1'; then
-    local pubUrl manUrl
+    local pubUrl manUrl msg
     pubUrl="$(echo "$resp" | grep -o '"public_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
     manUrl="$(echo "$resp" | grep -o '"manifest_url": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    msg="$(echo "$resp" | grep -o '"message": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
     echo ""
     echo "Cloudflare Tunnel is LIVE!"
+    [ -n "$msg" ] && echo "  Status:       $msg"
     [ -n "$pubUrl" ] && echo "  Public URL:   $pubUrl"
     [ -n "$manUrl" ] && echo "  Manifest URL: $manUrl"
     echo ""
   else
-    echo "Failed to enable tunnel. Check server logs in $APP_DIR/storage/debug.log"
+    local errMsg
+    errMsg="$(echo "$resp" | grep -o '"message": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+    echo "Failed to enable tunnel: ${errMsg:-Check server logs in $APP_DIR/storage/debug.log}"
     return 1
   fi
 }
@@ -691,6 +716,79 @@ EOF
   echo "Auto-start on boot has been ENABLED."
 }
 
+# Write storage/auth.json directly using the bundled PHP so the hash matches
+# password_verify() on the server side.
+do_password() {
+  local newpw="${1:-}"
+  local auth_file="$APP_DIR/storage/auth.json"
+  mkdir -p "$APP_DIR/storage" 2>/dev/null || true
+
+  if [ -z "$newpw" ]; then
+    echo "Usage: pms password <new-password>"
+    return 1
+  fi
+
+  local php_bin=""
+  for cand in "$APP_DIR/bin/php" "$(command -v php 2>/dev/null || true)"; do
+    [ -n "$cand" ] && [ -x "$cand" ] && php_bin="$cand" && break
+  done
+
+  if [ -n "$php_bin" ]; then
+    "$php_bin" -r '
+      $f = $_SERVER["argv"][1] ?? "";
+      $newpw = $_SERVER["argv"][2] ?? "";
+      if ($f === "" || $newpw === "") { exit(1); }
+      $d = is_file($f) ? (json_decode((string)@file_get_contents($f), true) ?: []) : [];
+      $d["password_hash"] = password_hash($newpw, PASSWORD_DEFAULT);
+      if (empty($d["token"])) { $d["token"] = bin2hex(random_bytes(16)); }
+      $d["enabled"] = true;
+      file_put_contents($f, json_encode($d, JSON_UNESCAPED_SLASHES), LOCK_EX);
+    ' "$auth_file" "$newpw"
+    echo "Password updated."
+  else
+    echo "PHP not found; cannot hash the password. Start the server once, then retry."
+    return 1
+  fi
+}
+
+do_reset_password() {
+  do_password "123456"
+  echo "Password reset to the default (123456)."
+}
+
+do_token() {
+  local action="${1:-show}"
+  local auth_file="$APP_DIR/storage/auth.json"
+  if [ "$action" = "rotate" ]; then
+    local php_bin=""
+    for cand in "$APP_DIR/bin/php" "$(command -v php 2>/dev/null || true)"; do
+      [ -n "$cand" ] && [ -x "$cand" ] && php_bin="$cand" && break
+    done
+    if [ -n "$php_bin" ]; then
+      "$php_bin" -r '
+        $f = $_SERVER["argv"][1] ?? "";
+        if ($f === "") { exit(1); }
+        $d = is_file($f) ? (json_decode((string)@file_get_contents($f), true) ?: []) : [];
+        if (empty($d["password_hash"])) { $d["password_hash"] = password_hash("123456", PASSWORD_DEFAULT); }
+        $d["token"] = bin2hex(random_bytes(16));
+        $d["enabled"] = true;
+        file_put_contents($f, json_encode($d, JSON_UNESCAPED_SLASHES), LOCK_EX);
+        echo $d["token"], "\n";
+      ' "$auth_file"
+      echo "Token rotated. Re-install the addon from #addon on every device."
+    else
+      echo "PHP not found; cannot rotate the token."
+      return 1
+    fi
+    return 0
+  fi
+  if [ -f "$auth_file" ]; then
+    grep -o '"token":"[^"]*"' "$auth_file" | head -1 | cut -d'"' -f4
+  else
+    echo "No token yet. Start the server once."
+  fi
+}
+
 do_uninstall() {
   echo "Stopping PencariMovie Server..."
   do_stop 2>/dev/null || true
@@ -717,8 +815,11 @@ case "${1:-}" in
   start|--start|"") do_start ;;
   stop|--stop) do_stop ;;
   restart|--restart) do_restart ;;
-  tunnel|--tunnel) do_tunnel ;;
+  tunnel|--tunnel) do_tunnel "${2:-}" ;;
   autostart|--autostart) do_autostart "${2:-}" ;;
+  password|--password) do_password "${2:-}" ;;
+  reset-password|--reset-password) do_reset_password ;;
+  token|--token) do_token "${2:-show}" ;;
   uninstall|--uninstall) do_uninstall ;;
   *) usage ;;
 esac

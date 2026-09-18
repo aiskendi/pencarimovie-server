@@ -41,5 +41,4 @@ if exist "%ROOT%\storage\tunnel\cloudflared.pid" (
   del /q "%ROOT%\storage\tunnel\cloudflared.pid" >nul 2>nul
 )
 powershell -NoProfile -Command "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'cloudflared' -and $_.CommandLine -and $_.CommandLine -match 'storage[\\/]tunnel' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
-if exist "%ROOT%\storage\tunnel\state.json" del /q "%ROOT%\storage\tunnel\state.json" >nul 2>nul
 goto :eof

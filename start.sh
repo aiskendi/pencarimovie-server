@@ -22,6 +22,7 @@ EOF
 print_banner
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
 FRANKENPHP_BIN="$ROOT_DIR/bin/frankenphp"
 HOST="0.0.0.0"
 PORT="8088"
@@ -68,9 +69,11 @@ print_urls() {
   if [ -n "$LAN_IP" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
   fi
-  echo "  CLI:      pms [start|stop|restart|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
   echo "  Uninstall: pms uninstall"
   echo ""
 }
@@ -82,9 +85,11 @@ if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/d
   if [ -n "$LAN_IP" ]; then
     echo "  Network:  http://$LAN_IP:$PORT"
   fi
-  echo "  CLI:      pms [start|stop|restart|uninstall]"
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
   echo "  Stop:     pms stop"
   echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
   echo "  Uninstall: pms uninstall"
   exit 0
 fi
@@ -102,7 +107,11 @@ if [ -x "$FRANKENPHP_BIN" ]; then
   export PATH="$ROOT_DIR/bin:$PATH"
   export PHP_BINDIR="$ROOT_DIR/bin"
   export PHPRC="$ROOT_DIR/bin"
-  nohup "$FRANKENPHP_BIN" php-server --listen "$HOST:$PORT" --root "$ROOT_DIR" >/dev/null 2>&1 &
+  if [ -f "$ROOT_DIR/Caddyfile" ]; then
+    nohup "$FRANKENPHP_BIN" run --config "$ROOT_DIR/Caddyfile" >/dev/null 2>&1 &
+  else
+    nohup "$FRANKENPHP_BIN" php-server --listen "$HOST:$PORT" --root "$ROOT_DIR" >/dev/null 2>&1 &
+  fi
   echo $! > "$ROOT_DIR/.frankenphp.pid"
   print_urls
   echo "FrankenPHP server started (PID $(cat "$ROOT_DIR/.frankenphp.pid"))."

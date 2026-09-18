@@ -1,0 +1,76 @@
+{
+    "catalogs_enabled": true,
+    "country": "MY",
+    "enabled_types": {
+        "movie": true,
+        "series": true,
+        "other": true
+    },
+    "enabled_catalogs": {
+        "top": true,
+        "year": true,
+        "pm_search_movie": true,
+        "pm_series_top": true,
+        "pm_series_year": true,
+        "pm_search_series": true,
+        "pm_files_year": true,
+        "pm_search_files": true,
+        "pm_trending_keywords": true,
+        "pm_movies_malay": true,
+        "pm_movies_indo": true,
+        "pm_movies_korean": true,
+        "pm_movies_japan": true,
+        "pm_movies_anime": true,
+        "pm_movies_chinese": true,
+        "pm_movies_thai": true,
+        "pm_movies_bollywood": true,
+        "pm_movies_philippines": true,
+        "pm_movies_english": true,
+        "pm_series_kdrama": true,
+        "pm_series_anime": true,
+        "pm_series_japan": true,
+        "pm_series_malay": true,
+        "pm_series_cdrama": true,
+        "pm_series_thai": true,
+        "pm_series_philippines": true,
+        "pm_series_english": true,
+        "pm_series_indo": true
+    },
+    "upstream_manifests": [],
+    "stream_config": {
+        "resolutions": {
+            "4k": true,
+            "1080p": true,
+            "720p": true,
+            "sd": true,
+            "unknown": true
+        },
+        "qualities": {
+            "remux": true,
+            "bluray": true,
+            "webdl": true,
+            "webrip": true,
+            "hdtv": true,
+            "cam": true,
+            "unknown": true
+        },
+        "encodes": {
+            "hevc": true,
+            "avc": true,
+            "av1": true
+        },
+        "visual_tags": {
+            "hdr": true,
+            "dv": true
+        },
+        "preferred_resolution": "auto",
+        "max_streams_per_resolution": 0,
+        "max_streams_total": 0,
+        "min_size_mb": 0,
+        "max_size_gb": 0,
+        "exclude_cam": false,
+        "exclude_unplayable": true,
+        "excluded_keywords": "",
+        "required_keywords": ""
+    }
+}

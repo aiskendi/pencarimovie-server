@@ -99,16 +99,30 @@ Once started, open the web dashboard in your browser:
 
 ---
 
+### 3. Eclipse Music Setup
+
+1. Open the **Eclipse Music** app (`https://eclipsemusic.app`) on your iOS, iPadOS, macOS, or Web device.
+2. Go to **Settings** ➔ **Connections** ➔ **Add Connection** ➔ **Addon**.
+3. Enter your Eclipse manifest URL: `http://<YOUR-LAN-IP>:8088/eclipse/manifest.json` (or visit `http://127.0.0.1:8088/eclipse` to copy it).
+4. Tap **Install**. You can now search over 500,000+ tracks directly in Eclipse or select it under **Default Playback**!
+
+---
+
 ## CLI Commands (`pms`)
 
 The installer registers a global `pms` command on your system:
 
 ```bash
-pms start       # Starts the server in the background (checks for updates)
-pms stop        # Stops the server and background helper services
-pms restart     # Restarts the server
-pms tunnel      # Enables Cloudflare Tunnel and prints public HTTPS URLs
-pms uninstall   # Completely uninstalls the server and cleans up files
+pms start           # Starts the server in the background (checks for updates)
+pms stop            # Stops the server and background helper services
+pms restart         # Restarts the server
+pms tunnel          # Enables Cloudflare Tunnel and prints public HTTPS URLs
+pms autostart       # Enables or disables auto-start on boot (pms autostart [on|off])
+pms password <new>  # Sets the server password
+pms reset-password  # Resets the server password to the default (123456)
+pms token           # Prints the current access token
+pms token rotate    # Generates a new access token (invalidates the old one)
+pms uninstall       # Completely uninstalls the server and cleans up files
 ```
 
 _(Works from any terminal on Windows, macOS, Linux, and Termux)._
@@ -119,6 +133,55 @@ By default, the server runs on port `8088`. Override it by setting the `PORT` va
 
 - **Linux/macOS/Termux**: `PORT=9090 pms start`
 - **Windows (PowerShell)**: `$env:PORT="9090"; pms start`
+
+---
+
+## 🔒 Server Password
+
+The server is protected by a password (default `123456`). It gates the admin
+surface (bot login, settings, tunnel, logs) **and** the streams list + `/api/download`.
+
+**Local installs are unaffected.** Localhost (`127.0.0.1`) and Wi-Fi/LAN requests
+bypass the password entirely, so a desktop, Raspberry Pi, or phone on the same
+network never sees a prompt and never needs to re-install the addon.
+
+The password only applies when the server is reached from a **public** address —
+a VPS public IP or a Cloudflare Tunnel.
+
+| Where you open `:8088`                                                     | Password prompt? |
+| -------------------------------------------------------------------------- | ---------------- |
+| `http://127.0.0.1:8088` (same machine)                                     | No               |
+| `http://192.168.x.x:8088` (Wi-Fi / LAN)                                    | No               |
+| VNC/RDP desktop on the VPS → `http://127.0.0.1:8088`                       | No               |
+| SSH tunnel `ssh -L 8088:127.0.0.1:8088 user@vps` → `http://localhost:8088` | No               |
+| `http://<vps-public-ip>:8088`                                              | **Yes**          |
+| `https://xxx.trycloudflare.com`                                            | **Yes**          |
+
+### Access token for remote addons
+
+Remote Stremio/Nuvio/Eclipse installs need an access token in the manifest URL:
+
+```text
+http://<host>:8088/t/<token>/manifest.json
+```
+
+The token is shown in the **🧩 Addon** modal under **🔑 Access Token**,
+where you can copy or regenerate it. Regenerating creates a new token and
+invalidates the old one — remote devices will need the new URL.
+
+If a remote player hits `/stream/*` without a valid token, it receives a stream card
+that says the addon URL changed and links back to `#addon` so you can re-install.
+
+### Recommended for VPS users
+
+Use an SSH tunnel instead of exposing port 8088:
+
+```bash
+ssh -L 8088:127.0.0.1:8088 user@your-vps
+```
+
+Then open `http://localhost:8088`. This bypasses the password (it terminates at
+localhost) and keeps port 8088 off the public internet entirely.
 
 ---
 

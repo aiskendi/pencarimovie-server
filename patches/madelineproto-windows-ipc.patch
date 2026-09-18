@@ -209,3 +209,36 @@ index 05e2406..a873ea5 100644
          if (class_exists(Installer::class)) {
              Installer::unlock();
          }
+diff --git a/src/MTProtoSession/MsgIdHandler.php b/src/MTProtoSession/MsgIdHandler.php
+index e4271ed..5c49238 100644
+--- a/src/MTProtoSession/MsgIdHandler.php
++++ b/src/MTProtoSession/MsgIdHandler.php
+@@ -70,2 +70,8 @@ final class MsgIdHandler
+         $maxMessageId = (time() + $this->session->time_delta + 30) << 32;
+         if ($newMessageId > $maxMessageId) {
++            // Clock skew auto-correction: dynamically adjust time_delta rather than throwing fatal exception
++            $skewSec = ($newMessageId >> 32) - time();
++            $this->session->time_delta = max(-300, min(300, $skewSec));
++            if (isset($this->session->API->logger)) {
++                $this->session->API->logger->logger('Auto-adjusting session time_delta to '.$this->session->time_delta.' due to clock skew.', Logger::WARNING);
++            }
++        }
+diff --git a/src/DoHWrapper.php b/src/DoHWrapper.php
+index d69cbf6..89b63eb 100644
+--- a/src/DoHWrapper.php
++++ b/src/DoHWrapper.php
+@@ -95,10 +95,10 @@ final class DoHWrapper
+                 try {
+                     return $loader->loadConfig();
+                 } catch (Throwable) {
+                     return new DnsConfig([
+-                        '1.1.1.1',
+-                        '1.0.0.1',
+-                        '[2606:4700:4700::1111]',
+-                        '[2606:4700:4700::1001]',
++                        '1.1.1.1:53',
++                        '1.0.0.1:53',
++                        '[2606:4700:4700::1111]:53',
++                        '[2606:4700:4700::1001]:53',
+                     ]);
+                 }

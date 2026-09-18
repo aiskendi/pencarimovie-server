@@ -85,6 +85,12 @@ nameserver 1.0.0.1
 EOF
 chmod 644 "$TMP_DIR/resolv.conf" 2>/dev/null || true
 
+# Also ensure $PREFIX/etc/resolv.conf exists for native Termux tools and PHP
+TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+mkdir -p "$TERMUX_PREFIX/etc" 2>/dev/null || true
+cp "$TMP_DIR/resolv.conf" "$TERMUX_PREFIX/etc/resolv.conf" 2>/dev/null || true
+chmod 644 "$TERMUX_PREFIX/etc/resolv.conf" 2>/dev/null || true
+
 # Ensure execute permissions (Windows-originated archives lose +x bits)
 for FILE in \
   "$FRANKENPHP_BIN" \

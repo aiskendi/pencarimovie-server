@@ -48,7 +48,7 @@ class PencariMovieApp {
     this._cachePrefix = 'pencarimovie_cache:';
 
     // Session state
-    this.version = '1.0.0';
+    this.version = '2.0.0';
     this.botId = '';
     this.botUsername = '';
     this.botName = '';
@@ -62,6 +62,7 @@ class PencariMovieApp {
     this._tunnelBusy = false;
     this.sponsor = null;
     this._updateAddonModalUrls = () => {};
+    this._authToken = localStorage.getItem('pm.auth') || '';
     this._restoreCachedSession();
 
     // ── DOM ref shortcuts ──
@@ -80,26 +81,39 @@ class PencariMovieApp {
     this.detectTelegram();
     this.bindGlobalEvents();
 
+    // ── Auth gate — must pass before anything else loads ──
+    if (!(await this.checkAuth())) {
+      return; // Auth gate is showing; stop init until the user logs in
+    }
+
     // ── Instant Modal Opening if requested by hash (zero waiting) ──
     const initHash = window.location.hash;
     if (initHash === '#configure' || initHash === '#addon') {
-      const loader = document.getElementById('loadingScreen');
-      if (loader) loader.style.display = 'none';
-      const addonM = document.getElementById('addonModal');
-      if (addonM) {
-        addonM.classList.remove('hidden');
-        addonM.setAttribute('aria-hidden', 'false');
+      if (this.hasSession) {
+        const addonM = document.getElementById('addonModal');
+        if (addonM) {
+          addonM.classList.remove('hidden');
+          addonM.setAttribute('aria-hidden', 'false');
+        }
+        this.openAddonModal?.();
+      } else {
+        // Ensure modal is hidden and loading screen is visible while auto-provision runs
+        const addonM = document.getElementById('addonModal');
+        if (addonM) addonM.classList.add('hidden');
       }
-      this.openAddonModal?.();
     } else if (initHash === '#settings') {
-      const loader = document.getElementById('loadingScreen');
-      if (loader) loader.style.display = 'none';
-      const sGate = document.getElementById('settingsGate');
-      if (sGate) {
-        sGate.classList.remove('hidden');
-        sGate.setAttribute('aria-hidden', 'false');
+      if (this.hasSession) {
+        const sGate = document.getElementById('settingsGate');
+        if (sGate) {
+          sGate.classList.remove('hidden');
+          sGate.setAttribute('aria-hidden', 'false');
+        }
+        this.showSettingsGate({ forceToken: false });
+      } else {
+        // Keep loading indicator visible while session check or background auto-provision runs
+        const sGate = document.getElementById('settingsGate');
+        if (sGate) sGate.classList.add('hidden');
       }
-      this.showSettingsGate({ forceToken: false });
     }
 
     // ── Version check — block everything if update is required ──
@@ -234,10 +248,11 @@ class PencariMovieApp {
       }
     } else {
       const gateMessage = tokenAddResult?.message || this.provisionError || null;
+      const isClockErr = gateMessage && (gateMessage.toLowerCase().includes('clock') || gateMessage.toLowerCase().includes('ntp') || gateMessage.toLowerCase().includes('time'));
       this.showSettingsGate({
         forceToken: true,
         message: gateMessage,
-        messageType: tokenAddResult?.success ? 'success' : (this.provisionError ? 'info' : 'error')
+        messageType: tokenAddResult?.success ? 'success' : (isClockErr ? 'error' : (this.provisionError ? 'info' : 'error'))
       });
       if (tokenAddResult && !tokenAddResult.success && tokenAddResult.token) {
         const input = this.$('#botTokenInput');
@@ -269,6 +284,18 @@ class PencariMovieApp {
   }
 
   bindGlobalEvents() {
+    // ── Auth gate ──
+    const authBtn = this.$('#authConnectBtn');
+    if (authBtn) {
+      authBtn.addEventListener('click', () => this.submitAuthPassword());
+    }
+    const authInput = this.$('#authPasswordInput');
+    if (authInput) {
+      authInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') this.submitAuthPassword();
+      });
+    }
+
     // ── Settings gate ──
     this.$('#connectBtn').addEventListener('click', () => {
       this.saveSettings().catch((err) => {
@@ -364,9 +391,11 @@ class PencariMovieApp {
     const copyAddonBtn = this.$('#copyAddonManifestBtn');
     const copyAddonLanBtn = this.$('#copyAddonManifestLanBtn');
     const copyAddonTunnelBtn = this.$('#copyAddonManifestTunnelBtn');
+    const copyAddonEclipseBtn = this.$('#copyAddonManifestEclipseBtn');
     const manifestInput = this.$('#addonManifestInput');
     const manifestLanInput = this.$('#addonManifestLanInput');
     const manifestTunnelInput = this.$('#addonManifestTunnelInput');
+    const manifestEclipseInput = this.$('#addonManifestEclipseInput');
     const addonLanField = this.$('#addonLanField');
     const addonLocalField = this.$('#addonLocalField');
     const addonTunnelField = this.$('#addonTunnelField');
@@ -375,10 +404,53 @@ class PencariMovieApp {
     const addonNuvioInstructions = this.$('#addonNuvioInstructions');
     const copiedStatus = this.$('#addonCopiedStatus');
     const stremioSyncUrlPreview = this.$('#stremioSyncUrlPreview');
+    const stremioSyncModeToggle = this.$('#stremioSyncModeToggle');
     const stremioSyncModeLan = this.$('#stremioSyncModeLan');
     const stremioSyncModeLocal = this.$('#stremioSyncModeLocal');
     const stremioSyncInstallBtn = this.$('#stremioSyncInstallBtn');
     const stremioSyncStatus = this.$('#stremioSyncStatus');
+
+    // ── Access token card ──
+    const addonTokenInput = this.$('#addonTokenInput');
+    const addonTokenCopyBtn = this.$('#addonTokenCopyBtn');
+    const addonTokenRotateBtn = this.$('#addonTokenRotateBtn');
+    const addonTokenStatus = this.$('#addonTokenStatus');
+
+    const showTokenStatus = (msg, ok = true) => {
+      if (!addonTokenStatus) return;
+      addonTokenStatus.textContent = msg;
+      addonTokenStatus.classList.remove('hidden');
+      addonTokenStatus.style.color = ok ? '#00d26a' : '#ff5c5c';
+      setTimeout(() => addonTokenStatus.classList.add('hidden'), 3000);
+    };
+
+    const refreshTokenField = () => {
+      if (addonTokenInput) addonTokenInput.value = this._authToken || '';
+    };
+
+    if (addonTokenCopyBtn && addonTokenInput) {
+      addonTokenCopyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(addonTokenInput.value);
+        showTokenStatus('✓ Token copied');
+      });
+    }
+    if (addonTokenRotateBtn) {
+      addonTokenRotateBtn.addEventListener('click', async () => {
+        if (!confirm('Regenerate the token? Every remote device using this addon will need the new URL.')) return;
+        try {
+          const res = await this.requestJson(`${this.localApiBase}/api/auth/token/rotate`, { method: 'POST' });
+          if (res?.ok && res.token) {
+            this._authToken = res.token;
+            localStorage.setItem('pm.auth', res.token);
+            refreshTokenField();
+            updateAddonModalUrls();
+            showTokenStatus('✓ Token regenerated');
+          }
+        } catch (err) {
+          showTokenStatus('Failed: ' + err.message, false);
+        }
+      });
+    }
 
     // ── Catalog settings elements ──
     const catalogModeEnabled = this.$('#catalogModeEnabled');
@@ -447,6 +519,110 @@ class PencariMovieApp {
       });
     };
 
+    const upstreamAddonsList = this.$('#upstreamAddonsList');
+    const upstreamAddonInput = this.$('#upstreamAddonInput');
+    const upstreamAddonAddBtn = this.$('#upstreamAddonAddBtn');
+    const upstreamAddonStatus = this.$('#upstreamAddonStatus');
+
+    const renderUpstreamAddons = () => {
+      if (!upstreamAddonsList) return;
+      upstreamAddonsList.innerHTML = '';
+      const list = catalogSettingsState.upstream_manifests || [];
+      if (list.length === 0) {
+        const emptyNotice = document.createElement('div');
+        emptyNotice.style.fontSize = '0.74rem';
+        emptyNotice.style.color = '#777';
+        emptyNotice.style.fontStyle = 'italic';
+        emptyNotice.textContent = 'No upstream addons configured yet.';
+        upstreamAddonsList.appendChild(emptyNotice);
+        return;
+      }
+
+      list.forEach((item, idx) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.05); padding: 5px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); gap: 8px;';
+
+        const info = document.createElement('div');
+        info.style.cssText = 'overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;';
+        info.innerHTML = `<strong style="font-size: 0.8rem; color: #fff;">${item.name || 'Addon'}</strong> <span style="font-size: 0.72rem; color: #888;">(${item.version || '1.0.0'})</span><br/><span style="font-size: 0.7rem; color: #aaa; font-family: monospace;">${item.url}</span>`;
+
+        const delBtn = document.createElement('button');
+        delBtn.type = 'button';
+        delBtn.style.cssText = 'background: none; border: none; color: #ff5e57; cursor: pointer; font-size: 0.82rem; padding: 4px;';
+        delBtn.innerHTML = '<i class="fas fa-trash"></i>';
+        delBtn.title = 'Remove addon';
+        delBtn.addEventListener('click', () => {
+          catalogSettingsState.upstream_manifests.splice(idx, 1);
+          renderUpstreamAddons();
+          updateCatalogModeUI();
+        });
+
+        row.appendChild(info);
+        row.appendChild(delBtn);
+        upstreamAddonsList.appendChild(row);
+      });
+    };
+
+    if (upstreamAddonAddBtn && upstreamAddonInput) {
+      upstreamAddonAddBtn.addEventListener('click', async () => {
+        const url = upstreamAddonInput.value.trim();
+        if (!url) return;
+        upstreamAddonAddBtn.disabled = true;
+        const origText = upstreamAddonAddBtn.textContent;
+        upstreamAddonAddBtn.textContent = 'Validating...';
+        if (upstreamAddonStatus) {
+          upstreamAddonStatus.classList.add('hidden');
+          upstreamAddonStatus.className = 'addon-catalog-status-msg';
+        }
+
+        try {
+          const res = await fetch(`${this.localApiBase}/api/validate-manifest`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+          });
+          const resData = await res.json().catch(() => null);
+          if (res.ok && resData?.ok && resData?.manifest) {
+            const m = resData.manifest;
+            if (!catalogSettingsState.upstream_manifests) {
+              catalogSettingsState.upstream_manifests = [];
+            }
+            // Check if already present
+            const exists = catalogSettingsState.upstream_manifests.some((existing) => existing.url === m.url);
+            if (!exists) {
+              catalogSettingsState.upstream_manifests.push({
+                id: m.id,
+                name: m.name,
+                version: m.version,
+                url: m.url
+              });
+              renderUpstreamAddons();
+              updateCatalogModeUI();
+              upstreamAddonInput.value = '';
+              if (upstreamAddonStatus) {
+                upstreamAddonStatus.textContent = `✓ Added "${m.name}" (${m.version || 'v1.0.0'}). Click "Save Catalog Settings" below to apply.`;
+                upstreamAddonStatus.classList.remove('hidden');
+                upstreamAddonStatus.style.color = '#00d26a';
+              }
+            } else {
+              throw new Error('This manifest URL is already added.');
+            }
+          } else {
+            throw new Error(resData?.error || 'Invalid manifest response.');
+          }
+        } catch (err) {
+          if (upstreamAddonStatus) {
+            upstreamAddonStatus.textContent = `✕ ${err.message || 'Validation failed.'}`;
+            upstreamAddonStatus.classList.remove('hidden');
+            upstreamAddonStatus.style.color = '#ff5e57';
+          }
+        } finally {
+          upstreamAddonAddBtn.disabled = false;
+          upstreamAddonAddBtn.textContent = origText;
+        }
+      });
+    }
+
     const updateCatalogModeUI = () => {
       const isEnabled = catalogSettingsState.catalogs_enabled;
       if (catalogModeEnabled) catalogModeEnabled.checked = isEnabled;
@@ -455,33 +631,71 @@ class PencariMovieApp {
       if (addonCatalogDetails) {
         addonCatalogDetails.classList.toggle('hidden', !isEnabled);
       }
+      const hasUpstreams = Array.isArray(catalogSettingsState.upstream_manifests) && catalogSettingsState.upstream_manifests.length > 0;
       if (addonCatalogStatusBadge) {
         if (isEnabled) {
           addonCatalogStatusBadge.textContent = 'Enabled';
           addonCatalogStatusBadge.classList.remove('disabled');
+        } else if (hasUpstreams) {
+          addonCatalogStatusBadge.textContent = 'Upstream Only';
+          addonCatalogStatusBadge.classList.remove('disabled');
         } else {
-          addonCatalogStatusBadge.textContent = 'Disabled (tt only)';
+          addonCatalogStatusBadge.textContent = 'Disabled';
           addonCatalogStatusBadge.classList.add('disabled');
         }
       }
     };
 
-    const addonServerCountryBadge = this.$('#addonServerCountryBadge');
+    const addonCountrySelect = this.$('#addonCountrySelect');
 
     const loadServerCountry = async () => {
       try {
         const res = await this.requestJson(`${this.localApiBase}/api/country`);
         if (res?.ok && res?.country) {
-          const c = res.country;
-          if (addonServerCountryBadge) {
-            addonServerCountryBadge.textContent = `🌍 ${c.country_name || c.country_code}`;
-            addonServerCountryBadge.title = `Detected region: ${c.country_name} (${c.country_code}) via ${c.source}`;
+          const currentCountry = res.configured_country || '';
+          this.country = res.country?.country_code || currentCountry;
+          if (addonCountrySelect && Array.isArray(res.available_countries)) {
+            addonCountrySelect.innerHTML = '';
+            res.available_countries.forEach((ac) => {
+              const opt = document.createElement('option');
+              opt.value = ac.code;
+              if (ac.code === '') {
+                opt.textContent = `Auto (${res.country.country_name || res.country.country_code})`;
+              } else {
+                opt.textContent = `${ac.name} (${ac.code})`;
+              }
+              addonCountrySelect.appendChild(opt);
+            });
+            addonCountrySelect.value = currentCountry;
           }
         }
       } catch (err) {
         console.warn('Failed to detect server country:', err);
       }
     };
+
+    if (addonCountrySelect) {
+      addonCountrySelect.addEventListener('change', async () => {
+        const newCountry = addonCountrySelect.value;
+        try {
+          const res = await fetch(`${this.localApiBase}/api/country`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ country: newCountry })
+          });
+          const resData = await res.json().catch(() => null);
+          if (res.ok && resData?.ok) {
+            catalogSettingsState.country = newCountry;
+            this.country = resData.country?.country_code || newCountry;
+            // Clear stream cache so fresh region queries are fetched immediately
+            this._cacheClear();
+            this.loadInitialData().catch((e) => console.warn('Failed to refresh data after country change:', e));
+          }
+        } catch (err) {
+          console.warn('Failed to update country:', err);
+        }
+      });
+    }
 
     const loadCatalogSettings = async () => {
       loadServerCountry();
@@ -501,59 +715,82 @@ class PencariMovieApp {
             catTypeOther.checked = catalogSettingsState.enabled_types?.other !== false;
           }
 
+          // Stream Configuration: resolutions, qualities, encodes, visual tags, sizes, keywords
+          const streamConfig = catalogSettingsState.stream_config || {};
+          const resConfig = streamConfig.resolutions || {};
+          const qualConfig = streamConfig.qualities || {};
+          const encConfig = streamConfig.encodes || {};
+          const visConfig = streamConfig.visual_tags || {};
+
+          const res4kEl = this.$('#streamRes4k');
+          const res1080pEl = this.$('#streamRes1080p');
+          const res720pEl = this.$('#streamRes720p');
+          const resSdEl = this.$('#streamResSd');
+          const resUnknownEl = this.$('#streamResUnknown');
+
+          if (res4kEl) res4kEl.checked = resConfig['4k'] !== false;
+          if (res1080pEl) res1080pEl.checked = resConfig['1080p'] !== false;
+          if (res720pEl) res720pEl.checked = resConfig['720p'] !== false;
+          if (resSdEl) resSdEl.checked = resConfig['sd'] !== false;
+          if (resUnknownEl) resUnknownEl.checked = resConfig['unknown'] !== false;
+
+          const qualRemuxEl = this.$('#streamQualRemux');
+          const qualBlurayEl = this.$('#streamQualBluray');
+          const qualWebdlEl = this.$('#streamQualWebdl');
+          const qualWebripEl = this.$('#streamQualWebrip');
+          const qualHdtvEl = this.$('#streamQualHdtv');
+          const qualCamEl = this.$('#streamQualCam');
+          const excludeCamEl = this.$('#streamExcludeCam');
+          const excludeUnplayableEl = this.$('#streamExcludeUnplayable');
+
+          if (qualRemuxEl) qualRemuxEl.checked = qualConfig['remux'] !== false;
+          if (qualBlurayEl) qualBlurayEl.checked = qualConfig['bluray'] !== false;
+          if (qualWebdlEl) qualWebdlEl.checked = qualConfig['webdl'] !== false;
+          if (qualWebripEl) qualWebripEl.checked = qualConfig['webrip'] !== false;
+          if (qualHdtvEl) qualHdtvEl.checked = qualConfig['hdtv'] !== false;
+          if (qualCamEl) qualCamEl.checked = qualConfig['cam'] !== false;
+          if (excludeCamEl) excludeCamEl.checked = !!streamConfig.exclude_cam;
+          if (excludeUnplayableEl) excludeUnplayableEl.checked = streamConfig.exclude_unplayable !== undefined ? !!streamConfig.exclude_unplayable : true;
+
+          const encHevcEl = this.$('#streamEncHevc');
+          const encAvcEl = this.$('#streamEncAvc');
+          const encAv1El = this.$('#streamEncAv1');
+          if (encHevcEl) encHevcEl.checked = encConfig['hevc'] !== false;
+          if (encAvcEl) encAvcEl.checked = encConfig['avc'] !== false;
+          if (encAv1El) encAv1El.checked = encConfig['av1'] !== false;
+
+          const visHdrEl = this.$('#streamVisHdr');
+          const visDvEl = this.$('#streamVisDv');
+          if (visHdrEl) visHdrEl.checked = visConfig['hdr'] !== false;
+          if (visDvEl) visDvEl.checked = visConfig['dv'] !== false;
+
+          const preferredResEl = this.$('#streamPreferredRes');
+          const maxPerResEl = this.$('#streamMaxPerRes');
+          const maxTotalEl = this.$('#streamMaxTotal');
+          const minSizeMbEl = this.$('#streamMinSizeMb');
+          const maxSizeGbEl = this.$('#streamMaxSizeGb');
+          const excludedKwEl = this.$('#streamExcludedKeywords');
+          const requiredKwEl = this.$('#streamRequiredKeywords');
+
+          if (preferredResEl) preferredResEl.value = streamConfig.preferred_resolution || 'auto';
+          if (maxPerResEl) maxPerResEl.value = String(streamConfig.max_streams_per_resolution || 0);
+          if (maxTotalEl) maxTotalEl.value = String(streamConfig.max_streams_total || 0);
+          if (minSizeMbEl) minSizeMbEl.value = streamConfig.min_size_mb ? String(streamConfig.min_size_mb) : '';
+          if (maxSizeGbEl) maxSizeGbEl.value = streamConfig.max_size_gb ? String(streamConfig.max_size_gb) : '';
+          if (excludedKwEl) excludedKwEl.value = streamConfig.excluded_keywords || '';
+          if (requiredKwEl) requiredKwEl.value = streamConfig.required_keywords || '';
+
           updateCatalogModeUI();
           renderCatalogOptions();
+          renderUpstreamAddons();
 
-          const isTunnelHost = !!res?.is_tunnel ||
-            window.location.hostname.endsWith('.trycloudflare.com') ||
-            window.location.hostname.includes('tunnel.pencarimovie.com');
-          if (isTunnelHost) {
-            const addonCatalogCard = this.$('#addonCatalogCard');
-            if (addonCatalogCard) {
-              addonCatalogCard.classList.add('addon-catalog-card--frozen');
-              if (!addonCatalogCard.querySelector('.addon-catalog-card__frozen-notice')) {
-                const notice = document.createElement('div');
-                notice.className = 'addon-catalog-card__frozen-notice';
-                notice.textContent = '🔒 Catalog configuration is frozen when accessed via Cloudflare Tunnel. Configure from your local network.';
-                const header = addonCatalogCard.querySelector('.addon-catalog-card__header');
-                if (header && header.nextSibling) {
-                  addonCatalogCard.insertBefore(notice, header.nextSibling);
-                } else {
-                  addonCatalogCard.prepend(notice);
-                }
-              }
-              addonCatalogCard.querySelectorAll('input').forEach((inp) => { inp.disabled = true; });
-              addonCatalogCard.querySelectorAll('button').forEach((btn) => {
-                if (btn.id !== 'addonModalClose') {
-                  btn.disabled = true;
-                  btn.style.pointerEvents = 'none';
-                  btn.style.opacity = '0.6';
-                }
-              });
-            }
-            if (addonCatalogStatusBadge) {
-              addonCatalogStatusBadge.textContent = '🔒 Frozen';
-              addonCatalogStatusBadge.title = 'Catalog configuration is disabled via Cloudflare tunnel. Configure locally.';
-            }
-            if (catSaveSettingsBtn) {
-              catSaveSettingsBtn.disabled = true;
-              catSaveSettingsBtn.textContent = '🔒 Configuration Frozen';
-              catSaveSettingsBtn.style.opacity = '0.6';
-              catSaveSettingsBtn.style.cursor = 'not-allowed';
-            }
-          }
         }
       } catch (err) {
         console.warn('Failed to load catalog settings:', err);
       }
     };
 
-    const isCatalogFrozen = () => {
-      const card = document.getElementById('addonCatalogCard');
-      return !!(card && card.classList.contains('addon-catalog-card--frozen')) ||
-        window.location.hostname.endsWith('.trycloudflare.com') ||
-        window.location.hostname.includes('tunnel.pencarimovie.com');
-    };
+    const isCatalogFrozen = () => false;
 
     if (catalogModeEnabled) {
       catalogModeEnabled.addEventListener('change', () => {
@@ -643,14 +880,60 @@ class PencariMovieApp {
           const isEnabled = catalogModeDisabled && catalogModeDisabled.checked ? false : !!(catalogModeEnabled && catalogModeEnabled.checked);
           catalogSettingsState.catalogs_enabled = isEnabled;
 
+          const res4kEl = this.$('#streamRes4k');
+          const res1080pEl = this.$('#streamRes1080p');
+          const res720pEl = this.$('#streamRes720p');
+          const resSdEl = this.$('#streamResSd');
+          const resUnknownEl = this.$('#streamResUnknown');
+          const preferredResEl = this.$('#streamPreferredRes');
+          const maxPerResEl = this.$('#streamMaxPerRes');
+
           const payload = {
             catalogs_enabled: isEnabled,
+            country: addonCountrySelect ? addonCountrySelect.value : (catalogSettingsState.country || ''),
             enabled_types: {
               movie: !!(catTypeMovies && catTypeMovies.checked),
               series: !!(catTypeSeries && catTypeSeries.checked),
               other: !!(catTypeOther && catTypeOther.checked)
             },
-            enabled_catalogs: catalogSettingsState.enabled_catalogs
+            enabled_catalogs: catalogSettingsState.enabled_catalogs,
+            upstream_manifests: catalogSettingsState.upstream_manifests || [],
+            stream_config: {
+              resolutions: {
+                '4k': res4kEl ? res4kEl.checked : true,
+                '1080p': res1080pEl ? res1080pEl.checked : true,
+                '720p': res720pEl ? res720pEl.checked : true,
+                'sd': resSdEl ? resSdEl.checked : true,
+                'unknown': resUnknownEl ? resUnknownEl.checked : true
+              },
+              qualities: {
+                'remux': this.$('#streamQualRemux') ? this.$('#streamQualRemux').checked : true,
+                'bluray': this.$('#streamQualBluray') ? this.$('#streamQualBluray').checked : true,
+                'webdl': this.$('#streamQualWebdl') ? this.$('#streamQualWebdl').checked : true,
+                'webrip': this.$('#streamQualWebrip') ? this.$('#streamQualWebrip').checked : true,
+                'hdtv': this.$('#streamQualHdtv') ? this.$('#streamQualHdtv').checked : true,
+                'cam': this.$('#streamQualCam') ? this.$('#streamQualCam').checked : true,
+                'unknown': true
+              },
+              encodes: {
+                'hevc': this.$('#streamEncHevc') ? this.$('#streamEncHevc').checked : true,
+                'avc': this.$('#streamEncAvc') ? this.$('#streamEncAvc').checked : true,
+                'av1': this.$('#streamEncAv1') ? this.$('#streamEncAv1').checked : true
+              },
+              visual_tags: {
+                'hdr': this.$('#streamVisHdr') ? this.$('#streamVisHdr').checked : true,
+                'dv': this.$('#streamVisDv') ? this.$('#streamVisDv').checked : true
+              },
+              exclude_cam: this.$('#streamExcludeCam') ? this.$('#streamExcludeCam').checked : false,
+              exclude_unplayable: this.$('#streamExcludeUnplayable') ? this.$('#streamExcludeUnplayable').checked : false,
+              preferred_resolution: preferredResEl ? preferredResEl.value : 'auto',
+              max_streams_per_resolution: maxPerResEl ? parseInt(maxPerResEl.value, 10) || 0 : 0,
+              max_streams_total: this.$('#streamMaxTotal') ? parseInt(this.$('#streamMaxTotal').value, 10) || 0 : 0,
+              min_size_mb: this.$('#streamMinSizeMb') ? parseInt(this.$('#streamMinSizeMb').value, 10) || 0 : 0,
+              max_size_gb: this.$('#streamMaxSizeGb') ? parseInt(this.$('#streamMaxSizeGb').value, 10) || 0 : 0,
+              excluded_keywords: this.$('#streamExcludedKeywords') ? this.$('#streamExcludedKeywords').value.trim() : '',
+              required_keywords: this.$('#streamRequiredKeywords') ? this.$('#streamRequiredKeywords').value.trim() : ''
+            }
           };
           const res = await fetch(`${this.localApiBase}/api/catalog-settings`, {
             method: 'POST',
@@ -665,7 +948,14 @@ class PencariMovieApp {
             this.loadInitialData().catch((e) => console.warn('Failed to refresh data after catalog save:', e));
 
             if (catSaveStatus) {
-              catSaveStatus.textContent = isEnabled ? '✓ Saved! Catalogs enabled.' : '✓ Saved! Streams only (tt).';
+              const hasUpstream = Array.isArray(catalogSettingsState.upstream_manifests) && catalogSettingsState.upstream_manifests.length > 0;
+              if (isEnabled) {
+                catSaveStatus.textContent = '✓ Saved! Local catalogs enabled.';
+              } else if (hasUpstream) {
+                catSaveStatus.textContent = '✓ Saved! Upstream catalogs only.';
+              } else {
+                catSaveStatus.textContent = '✓ Saved! Streams only.';
+              }
               catSaveStatus.classList.remove('hidden', 'error');
               setTimeout(() => catSaveStatus.classList.add('hidden'), 3000);
             }
@@ -713,27 +1003,71 @@ class PencariMovieApp {
       const pagePort = Number(window.location.port);
       const httpPort = (!onTunnel && pagePort > 0) ? pagePort : listenPort;
       const portSuffix = httpPort && httpPort !== 80 ? `:${httpPort}` : '';
-      const randParam = `?r=${Math.floor(Math.random() * 900000 + 100000)}`;
-      const localUrl = `http://127.0.0.1${portSuffix}/manifest.json${randParam}`;
+      // Clean path format: /<token>/manifest.json for remote players.
+      // Localhost/LAN can also use it or the unauthenticated /manifest.json.
+      const tokenPrefix = this._authToken ? `/${encodeURIComponent(this._authToken)}` : '';
       const pageHost = window.location.hostname;
+      const isLocal = pageHost === 'localhost' || pageHost === '127.0.0.1' || pageHost === '::1';
+
+      // 1. Localhost URL
+      const localUrl = `http://127.0.0.1${portSuffix}${tokenPrefix}/manifest.json`;
+
+      // 2. Server / Remote URL: for direct VPS / remote IP access
+      const serverUrl = (!isLocal && !onTunnel)
+        ? `${window.location.origin.replace(/\/+$/, '')}${tokenPrefix}/manifest.json`
+        : '';
+
       const lanHost = isUsableLanHost(this.lanIp)
         ? this.lanIp
         : (isUsableLanHost(pageHost) ? pageHost : '');
-      const lanUrl = lanHost ? `http://${lanHost}${portSuffix}/manifest.json${randParam}` : '';
-      let tunnelUrl = String(this.tunnelUrl || '').replace(/\/+$/, '');
-      if (onTunnel) {
+      const lanUrl = lanHost ? `http://${lanHost}${portSuffix}${tokenPrefix}/manifest.json` : '';
+
+      // 3. Tunnel URL: ONLY if Cloudflare tunnel is active/enabled or accessed via trycloudflare
+      let tunnelUrl = '';
+      if (this.tunnelEnabled || onTunnel) {
         if (this.tunnelPublicUrl) {
           tunnelUrl = this.tunnelPublicUrl;
-        } else if (!tunnelUrl) {
+        } else if (this.tunnelUrl) {
+          tunnelUrl = String(this.tunnelUrl).replace(/\/+$/, '');
+        } else if (onTunnel) {
           tunnelUrl = window.location.origin.replace(/\/+$/, '');
         }
       }
-      const tunnelManifest = tunnelUrl ? `${tunnelUrl}/manifest.json${randParam}` : '';
-      return { localUrl, lanUrl, tunnelManifest, lanHost };
+      const tunnelManifest = (tunnelUrl && (this.tunnelEnabled || onTunnel))
+        ? `${tunnelUrl}${tokenPrefix}/manifest.json`
+        : '';
+
+      // 4. Eclipse Music Addon URL:
+      // When on Cloudflare Tunnel: use tunnel URL
+      // When on remote server/VPS (public IP/domain): use current origin
+      // When on localhost: use localhost (or tunnel if running)
+      let eclipseBase = '';
+      if (onTunnel && tunnelUrl) {
+        eclipseBase = `${tunnelUrl}${tokenPrefix}`;
+      } else if (!isLocal) {
+        eclipseBase = `${window.location.origin.replace(/\/+$/, '')}${tokenPrefix}`;
+      } else if (tunnelUrl) {
+        eclipseBase = `${tunnelUrl}${tokenPrefix}`;
+      } else if (lanUrl) {
+        eclipseBase = lanUrl.replace(/\/manifest\.json.*$/i, '');
+      } else {
+        eclipseBase = localUrl.replace(/\/manifest\.json.*$/i, '');
+      }
+      const eclipseUrl = `${eclipseBase}/eclipse/manifest.json`;
+
+      return { localUrl, serverUrl, lanUrl, tunnelManifest, eclipseUrl, lanHost, isLocal, onTunnel };
     };
 
     const getSelectedStremioSyncUrl = () => {
       const urls = getAddonManifestUrls();
+      if (!urls.isLocal) {
+        if (urls.onTunnel && urls.tunnelManifest) {
+          return { url: urls.tunnelManifest, mode: 'tunnel', label: 'Cloudflare Tunnel' };
+        }
+        if (urls.serverUrl) {
+          return { url: urls.serverUrl, mode: 'server', label: 'Server' };
+        }
+      }
       const wantLan = !!(stremioSyncModeLan && stremioSyncModeLan.checked);
       if (wantLan && urls.lanUrl) {
         return { url: urls.lanUrl, mode: 'lan', label: 'Wi-Fi / LAN' };
@@ -742,14 +1076,21 @@ class PencariMovieApp {
     };
 
     const updateStremioSyncPreview = () => {
+      const urls = getAddonManifestUrls();
       const selected = getSelectedStremioSyncUrl();
+
+      if (stremioSyncModeToggle) {
+        // On VPS, remote server, or Cloudflare Tunnel: hide Wi-Fi/LAN/Localhost toggle
+        stremioSyncModeToggle.style.display = (!urls.isLocal || urls.onTunnel) ? 'none' : 'flex';
+      }
+
       if (stremioSyncUrlPreview) {
         stremioSyncUrlPreview.textContent = selected.url
           ? `${selected.label}: ${selected.url}`
           : '';
       }
-      if (stremioSyncModeLan) {
-        const urls = getAddonManifestUrls();
+
+      if (stremioSyncModeLan && urls.isLocal && !urls.onTunnel) {
         const lanMissing = !urls.lanUrl;
         stremioSyncModeLan.disabled = lanMissing;
         if (lanMissing && stremioSyncModeLocal) {
@@ -759,12 +1100,31 @@ class PencariMovieApp {
     };
 
     const updateAddonModalUrls = () => {
-      const { localUrl, lanUrl, tunnelManifest } = getAddonManifestUrls();
-      const pageHost = window.location.hostname;
-      const isTunnelPage = this._isCloudflareTunnelPage();
+      const { localUrl, serverUrl, lanUrl, tunnelManifest, eclipseUrl, isLocal, onTunnel } = getAddonManifestUrls();
+
+      const addonLocalFieldLabel = this.$('#addonLocalFieldLabel');
+      const addonLocalFieldBadge = this.$('#addonLocalFieldBadge');
 
       if (manifestInput) {
-        manifestInput.value = localUrl;
+        if (!isLocal && serverUrl) {
+          manifestInput.value = serverUrl;
+          manifestInput.style.color = '#ff8a5b';
+          if (addonLocalFieldLabel) addonLocalFieldLabel.textContent = '🌐 Server Manifest';
+          if (addonLocalFieldBadge) {
+            addonLocalFieldBadge.textContent = 'Public';
+            addonLocalFieldBadge.style.color = '#ff8a5b';
+            addonLocalFieldBadge.style.background = 'rgba(255, 107, 53, 0.18)';
+          }
+        } else {
+          manifestInput.value = localUrl;
+          manifestInput.style.color = '#bbb';
+          if (addonLocalFieldLabel) addonLocalFieldLabel.textContent = '💻 Localhost Manifest (This Device Only)';
+          if (addonLocalFieldBadge) {
+            addonLocalFieldBadge.textContent = 'Local';
+            addonLocalFieldBadge.style.color = '#aaa';
+            addonLocalFieldBadge.style.background = 'rgba(255, 255, 255, 0.08)';
+          }
+        }
       }
 
       if (manifestLanInput) {
@@ -775,9 +1135,14 @@ class PencariMovieApp {
         manifestTunnelInput.value = tunnelManifest;
       }
 
+      if (manifestEclipseInput) {
+        manifestEclipseInput.value = eclipseUrl;
+      }
+
       if (addonStremioDirectBtn) {
-        if (tunnelManifest) {
-          const stremioDeepLink = tunnelManifest.replace(/^https?:\/\//i, 'stremio://');
+        const directUrl = tunnelManifest || serverUrl || (isLocal ? localUrl : '');
+        if (directUrl) {
+          const stremioDeepLink = directUrl.replace(/^https?:\/\//i, 'stremio://');
           addonStremioDirectBtn.href = stremioDeepLink;
           addonStremioDirectBtn.classList.remove('hidden');
         } else {
@@ -786,33 +1151,25 @@ class PencariMovieApp {
         }
       }
 
-      if (isTunnelPage) {
-        if (addonModalTitle) addonModalTitle.textContent = '🧩 Stremio Addon';
-        if (addonModalDesc) addonModalDesc.textContent = 'Add this addon directly to Stremio or copy the manifest URL.';
-        if (addonLanField) addonLanField.classList.add('hidden');
-        if (addonLocalField) addonLocalField.classList.add('hidden');
-        if (addonStremioSync) addonStremioSync.classList.add('hidden');
-        if (addonNuvioInstructions) addonNuvioInstructions.classList.add('hidden');
-        if (addonTunnelField) addonTunnelField.classList.remove('hidden');
-      } else {
-        if (addonModalTitle) addonModalTitle.textContent = '🧩 Nuvio / Stremio Addon';
-        if (addonModalDesc) addonModalDesc.textContent = 'Copy a manifest URL for Nuvio, or install an HTTP address into Stremio via API sync.';
-        if (addonLanField) {
-          addonLanField.classList.toggle('hidden', !lanUrl);
-        }
-        if (addonLocalField) {
-          const openedViaLan = isUsableLanHost(pageHost);
-          addonLocalField.classList.toggle('hidden', openedViaLan);
-        }
-        if (addonTunnelField) {
-          addonTunnelField.classList.toggle('hidden', !tunnelManifest);
-        }
-        if (addonStremioSync) {
-          addonStremioSync.classList.remove('hidden');
-        }
-        if (addonNuvioInstructions) {
-          addonNuvioInstructions.classList.remove('hidden');
-        }
+      if (addonModalTitle) addonModalTitle.textContent = '🧩 Nuvio / Stremio Addon';
+      if (addonModalDesc) addonModalDesc.textContent = 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
+      if (addonLanField) {
+        // User requested: hide Wi-Fi / LAN Manifest completely
+        addonLanField.classList.add('hidden');
+      }
+      if (addonLocalField) {
+        // Show server/local field unless specifically browsing on an active tunnel domain
+        addonLocalField.classList.toggle('hidden', onTunnel);
+      }
+      if (addonTunnelField) {
+        // Only show Cloudflare Tunnel field if a real tunnel is active with a valid manifest
+        addonTunnelField.classList.toggle('hidden', !tunnelManifest);
+      }
+      if (addonStremioSync) {
+        addonStremioSync.classList.remove('hidden');
+      }
+      if (addonNuvioInstructions) {
+        addonNuvioInstructions.classList.remove('hidden');
       }
 
       updateStremioSyncPreview();
@@ -820,11 +1177,13 @@ class PencariMovieApp {
 
     this._updateAddonModalUrls = updateAddonModalUrls;
     updateAddonModalUrls();
+    refreshTokenField();
 
     const openAddonModal = () => {
       if (addonModal) {
         // 1. Instant reveal modal and cached/default inputs immediately
         updateAddonModalUrls();
+        refreshTokenField();
         addonModal.classList.remove('hidden');
         addonModal.setAttribute('aria-hidden', 'false');
         if (copiedStatus) copiedStatus.classList.add('hidden');
@@ -897,6 +1256,14 @@ class PencariMovieApp {
         manifestTunnelInput.select();
         navigator.clipboard.writeText(manifestTunnelInput.value);
         showCopiedFeedback('✓ Copied Cloudflare tunnel URL to clipboard!');
+      });
+    }
+
+    if (copyAddonEclipseBtn && manifestEclipseInput) {
+      copyAddonEclipseBtn.addEventListener('click', () => {
+        manifestEclipseInput.select();
+        navigator.clipboard.writeText(manifestEclipseInput.value);
+        showCopiedFeedback('✓ Copied Eclipse Music Addon URL to clipboard!');
       });
     }
 
@@ -1149,6 +1516,9 @@ class PencariMovieApp {
       aEl.addEventListener('error', () => handleMediaPlaybackError(aEl));
     }
 
+    // ── Stremio-Style Web Player Controls Binding ──
+    this._bindPlayerToolbar();
+
     // ── Category Page ──
     this.$('#categoryPageBack').addEventListener('click', () => this.closeCategoryPage());
 
@@ -1167,9 +1537,12 @@ class PencariMovieApp {
       }
     });
 
-    // ── Keyboard ──
+    // ── Keyboard Shortcuts (Stremio-style) ──
     document.addEventListener('keydown', (e) => {
+      // Allow Esc to close overlays
       if (e.key === 'Escape') {
+        // First close open player dropdowns if any
+        if (this._closePlayerDropdowns && this._closePlayerDropdowns()) return;
         if (this.isModalOpen) this.closeModal();
         else if (this.isSearchOpen) this.closeSearch();
         else if (this.isFileDetailOpen()) this.closeFileDetail();
@@ -1180,6 +1553,50 @@ class PencariMovieApp {
           this.hasSession
         ) {
           this.closeSettingsGate();
+        }
+        return;
+      }
+
+      // If typing in input/textarea, do not intercept player hotkeys
+      const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+      if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
+
+      // Only handle player shortcuts when file detail page with video is open
+      const videoEl = this.$('#fileDetailVideo');
+      if (this.isFileDetailOpen() && videoEl && !videoEl.classList.contains('hidden') && videoEl.src) {
+        if (e.key === ' ' || e.key.toLowerCase() === 'k') {
+          e.preventDefault();
+          if (videoEl.paused) videoEl.play();
+          else videoEl.pause();
+        } else if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'l') {
+          e.preventDefault();
+          videoEl.currentTime = Math.min(videoEl.duration || Infinity, videoEl.currentTime + 10);
+        } else if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'j') {
+          e.preventDefault();
+          videoEl.currentTime = Math.max(0, videoEl.currentTime - 10);
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          videoEl.volume = Math.min(1, videoEl.volume + 0.05);
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          videoEl.volume = Math.max(0, videoEl.volume - 0.05);
+        } else if (e.key.toLowerCase() === 'f') {
+          e.preventDefault();
+          if (!document.fullscreenElement) {
+            if (videoEl.requestFullscreen) videoEl.requestFullscreen();
+            else if (videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
+          } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+          }
+        } else if (e.key.toLowerCase() === 'm') {
+          e.preventDefault();
+          videoEl.muted = !videoEl.muted;
+        } else if (e.key.toLowerCase() === 'g') {
+          e.preventDefault();
+          this._adjustSubtitleDelay(-0.25);
+        } else if (e.key.toLowerCase() === 'h') {
+          e.preventDefault();
+          this._adjustSubtitleDelay(0.25);
         }
       }
     });
@@ -1206,9 +1623,40 @@ class PencariMovieApp {
     }
   }
 
+  _isIpHost(host) {
+    const h = String(host || '').trim();
+    return /^(\d{1,3}\.){3}\d{1,3}$/.test(h) || h.includes(':') || h === 'localhost';
+  }
+
   _isCloudflareTunnelPage() {
     const host = String(window.location.hostname || '').toLowerCase();
-    return host.endsWith('.trycloudflare.com') || host === 'trycloudflare.com' || host.endsWith('.tunnel.pencarimovie.com') || host.endsWith('-tunnel.pencarimovie.com') || host === 'tunnel.pencarimovie.com';
+    if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1' || this._isLanHost(host) || this._isIpHost(host)) {
+      return false;
+    }
+    if (host.endsWith('.trycloudflare.com')) {
+      return true;
+    }
+    // Only treat custom domains as Cloudflare Tunnel if the tunnel is actually enabled/running
+    if (this.tunnelEnabled && (this.tunnelRunning || this.tunnelUrl)) {
+      if (this.tunnelCustomDomain && host === String(this.tunnelCustomDomain).toLowerCase()) {
+        return true;
+      }
+      if (Array.isArray(this.tunnelCustomDomains) && this.tunnelCustomDomains.some(d => String(d).toLowerCase() === host)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _isLanHost(host) {
+    const h = String(host || '').trim();
+    if (/^10\./.test(h) || /^192\.168\./.test(h)) return true;
+    const m = h.match(/^172\.(\d+)\./);
+    if (m) {
+      const o = parseInt(m[1], 10);
+      if (o >= 16 && o <= 31) return true;
+    }
+    return false;
   }
 
   bindTunnelControls() {
@@ -1256,6 +1704,50 @@ class PencariMovieApp {
       });
     }
 
+    // Change dashboard password handler
+    const changePwBtn = this.$('#changePwBtn');
+    const changePwCurrent = this.$('#changePwCurrent');
+    const changePwNew = this.$('#changePwNew');
+    const changePwStatus = this.$('#changePwStatus');
+
+    if (changePwBtn) {
+      changePwBtn.addEventListener('click', async () => {
+        const current = changePwCurrent ? changePwCurrent.value : '';
+        const next = changePwNew ? changePwNew.value : '';
+        if (!current) {
+          if (changePwStatus) { changePwStatus.className = 'settings-gate__status error'; changePwStatus.textContent = 'Please enter current password.'; }
+          return;
+        }
+        if (!next || next.length < 4) {
+          if (changePwStatus) { changePwStatus.className = 'settings-gate__status error'; changePwStatus.textContent = 'New password must be at least 4 characters.'; }
+          return;
+        }
+        changePwBtn.disabled = true;
+        if (changePwStatus) { changePwStatus.className = 'settings-gate__status'; changePwStatus.textContent = 'Updating...'; }
+
+        try {
+          const res = await this.requestJson(`${this.localApiBase}/api/auth/password`, {
+            method: 'POST',
+            body: JSON.stringify({ current, next })
+          });
+          if (res?.ok) {
+            if (res.token) {
+              this._authToken = res.token;
+              localStorage.setItem('pm.auth', res.token);
+            }
+            if (changePwStatus) { changePwStatus.className = 'settings-gate__status ok'; changePwStatus.textContent = '✓ Password updated successfully!'; }
+            if (changePwCurrent) changePwCurrent.value = '';
+            if (changePwNew) changePwNew.value = '';
+          } else {
+            if (changePwStatus) { changePwStatus.className = 'settings-gate__status error'; changePwStatus.textContent = res?.message || 'Failed to update password.'; }
+          }
+        } catch (err) {
+          if (changePwStatus) { changePwStatus.className = 'settings-gate__status error'; changePwStatus.textContent = err.message || 'Request failed.'; }
+        }
+        changePwBtn.disabled = false;
+      });
+    }
+
     this.renderTunnelStatus({
       enabled: this.tunnelEnabled,
       tunnel_url: this.tunnelUrl,
@@ -1274,7 +1766,7 @@ class PencariMovieApp {
     const addBotsBtn = this.$('#toggleAddBotsBtn');
     const addBotsSection = this.$('#addBotsSection');
     const disconnectBtn = this.$('#settingsDisconnectBtn');
-    const viaTunnel = this._isCloudflareTunnelPage();
+    const tokenInput = this.$('#tunnelTokenInput');
     const enabled = Boolean(data.enabled);
     const publicUrl = String(data.public_url || '').replace(/\/+$/, '');
     const quickUrl = String(data.tunnel_url || '').replace(/\/+$/, '');
@@ -1285,6 +1777,9 @@ class PencariMovieApp {
     this.tunnelEnabled = enabled;
     this.tunnelUrl = displayUrl;
     this.tunnelPublicUrl = publicUrl;
+    if (tokenInput && data.tunnel_token && !tokenInput.value) {
+      tokenInput.value = data.tunnel_token;
+    }
     this._updateAddonModalUrls();
 
     if (statusEl) {
@@ -1311,19 +1806,18 @@ class PencariMovieApp {
 
     if (input) input.value = displayUrl;
     if (urlRow) urlRow.classList.toggle('hidden', !displayUrl);
-    if (localActions) localActions.classList.toggle('hidden', viaTunnel);
-    if (remoteNote) remoteNote.classList.toggle('hidden', !viaTunnel);
-    if (addBotsBtn) addBotsBtn.classList.toggle('hidden', viaTunnel);
-    if (viaTunnel && addBotsSection) addBotsSection.classList.add('hidden');
-    if (disconnectBtn) disconnectBtn.classList.toggle('hidden', viaTunnel);
+    if (remoteNote) remoteNote.classList.add('hidden');
+    if (localActions) localActions.classList.remove('hidden');
+    if (addBotsBtn) addBotsBtn.classList.remove('hidden');
+    if (disconnectBtn) disconnectBtn.classList.remove('hidden');
 
     if (enableBtn) {
-      enableBtn.disabled = busy || enabled || viaTunnel;
+      enableBtn.disabled = busy || enabled;
       enableBtn.textContent = busy && !enabled ? 'Starting...' : 'Enable Tunnel';
       enableBtn.classList.toggle('hidden', enabled);
     }
     if (disableBtn) {
-      disableBtn.disabled = busy || !enabled || viaTunnel;
+      disableBtn.disabled = busy || !enabled;
       disableBtn.textContent = busy && enabled ? 'Stopping...' : 'Disable';
       disableBtn.classList.toggle('hidden', !enabled);
     }
@@ -1364,7 +1858,7 @@ class PencariMovieApp {
   }
 
   async enableTunnel() {
-    if (this._tunnelBusy || this._isCloudflareTunnelPage()) return;
+    if (this._tunnelBusy) return;
     this._tunnelBusy = true;
     this.renderTunnelStatus({
       enabled: false,
@@ -1392,10 +1886,13 @@ class PencariMovieApp {
 
     startPolling();
 
+    const tokenInput = this.$('#tunnelTokenInput');
+    const tunnelToken = tokenInput ? tokenInput.value.trim() : '';
+
     try {
       const data = await this.requestJson(`${this.localApiBase}/api/tunnel/enable`, {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({ tunnel_token: tunnelToken }),
       });
       pollFinished = true;
       if (pollTimer) clearInterval(pollTimer);
@@ -1428,7 +1925,7 @@ class PencariMovieApp {
   }
 
   async disableTunnel() {
-    if (this._tunnelBusy || this._isCloudflareTunnelPage()) return;
+    if (this._tunnelBusy) return;
     this._tunnelBusy = true;
     this.renderTunnelStatus({
       enabled: this.tunnelEnabled,
@@ -1536,19 +2033,16 @@ class PencariMovieApp {
         return;
       }
 
-      const viaTunnel = this._isCloudflareTunnelPage();
       listEl.innerHTML = resp.bots.map(b => {
         const isAct = b.is_active;
         const bId = this.escapeHtml(String(b.bot_id || ''));
         const bUser = this.escapeHtml(String(b.bot_username || ''));
         const bName = this.escapeHtml(String(b.bot_name || bId));
         let actions = isAct ? '<span class="bot-pool-item__badge">Primary</span>' : '';
-        if (!viaTunnel) {
-          if (!isAct) {
-            actions += `<button type="button" class="set-active-bot-btn bot-pool-item__set-btn" data-bot-id="${bId}">Set Primary</button>`;
-          }
-          actions += `<button type="button" class="remove-bot-btn bot-pool-item__remove-btn" data-bot-id="${bId}" title="Remove bot"><i class="fas fa-trash-alt"></i></button>`;
+        if (!isAct) {
+          actions += `<button type="button" class="set-active-bot-btn bot-pool-item__set-btn" data-bot-id="${bId}">Set Primary</button>`;
         }
+        actions += `<button type="button" class="remove-bot-btn bot-pool-item__remove-btn" data-bot-id="${bId}" title="Remove bot"><i class="fas fa-trash-alt"></i></button>`;
 
         return `
           <div class="bot-pool-item">
@@ -1616,14 +2110,13 @@ class PencariMovieApp {
         this.deviceId = String(data.device_id).trim();
       }
       const hasSession = Boolean(data?.has_session);
+      const isProvisioning = Boolean(data?.is_provisioning);
 
       if (hasSession) {
         this.botId = String(data.bot_id || this.botId || '').trim();
         this.botUsername = String(data.bot_username || this.botUsername || '');
         this.botName = String(data.bot_name || this.botName || '');
         this.apiSecret = String(data.api_secret || this.apiSecret || '');
-        // Leftover Madeline session files can keep browsing unlocked while
-        // WordPress resolve-file fails with "bot_id not found".
         if (!this.botId) {
           this._clearCachedSession();
         } else {
@@ -1631,12 +2124,67 @@ class PencariMovieApp {
           this._persistCachedSession();
           this.loadBotPool();
         }
+      } else if (isProvisioning) {
+        // Server is actively provisioning a guest bot session in the background.
+        // Poll a bounded number of times so a stuck provision cannot loop the
+        // UI forever (observed: an endless "Provisioning guest bot..." spinner).
+        this._provisionPollCount = (this._provisionPollCount || 0) + 1;
+        this.provisionError = 'Provisioning guest bot...';
+        const loadText = document.querySelector('.loading-screen__text');
+        if (loadText) loadText.textContent = 'Provisioning guest bot...';
+
+        if (this._provisionPollCount > 20) {
+          // ~50s of polling with no session — stop and surface the gate.
+          this._provisionPollCount = 0;
+          this.provisionError = 'Provisioning is taking longer than expected. Please restart the PencariMovie Server, or enter your Telegram bot token below.';
+          this._clearCachedSession();
+          this.showSettingsGate({ forceToken: true, message: this.provisionError, messageType: 'error' });
+          return;
+        }
+
+        // Schedule an automatic poll in 2.5s to check if the session is ready
+        setTimeout(async () => {
+          await this.loadSessionStatus();
+          if (this.hasSession) {
+            this._provisionPollCount = 0;
+            window.location.reload();
+          }
+        }, 2500);
       } else if (data && data.ok === 1) {
-        // No session found — attempt 1-click automatic guest bot provisioning on the fly
+        // No session found and not currently provisioning — attempt 1-click automatic guest bot provisioning on the fly
+        const loadText = document.querySelector('.loading-screen__text');
+        if (loadText) loadText.textContent = 'Provisioning guest bot...';
+
+        // Pre-flight clock check: a skewed clock makes every MTProto handshake
+        // fail with a confusing "message ID too new/old" error. Detect it now
+        // and show the exact offset so the user can fix it before we waste a
+        // provisioning attempt.
+        try {
+          const clock = await this.requestJson(`${this.localApiBase}/api/clock-check`);
+          // Use `skewed` (>30s), not `critical` (>60s): a measured 48s offset
+          // was already enough to break the MTProto auth key exchange.
+          if (clock && clock.ok && clock.skewed) {
+            const off = Math.abs(Number(clock.offset_seconds) || 0);
+            const mins = Math.floor(off / 60);
+            const secs = off % 60;
+            const human = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+            const dir = Number(clock.offset_seconds) > 0 ? 'ahead of' : 'behind';
+            this.provisionError =
+              `Device clock out of sync!\nYour clock is ${human} ${dir} Telegram's server time.\n\n` +
+              `Enable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server.`;
+            this._clearCachedSession();
+            return;
+          }
+        } catch (clockErr) {
+          // Non-fatal: if the probe fails, continue with provisioning.
+          console.warn('Clock pre-check failed, continuing:', clockErr);
+        }
+
         try {
           const provResp = await this.requestJson(`${this.localApiBase}/api/provision`, {
             method: 'POST'
           });
+
           if (provResp?.ok && provResp?.bot_id) {
             this.botId = String(provResp.bot_id).trim();
             this.botUsername = String(provResp.bot_username || '');
@@ -1647,11 +2195,12 @@ class PencariMovieApp {
             this.loadBotPool();
             return;
           } else {
-            this.provisionError = provResp?.message || 'Auto-provisioning unavailable.';
+            this.provisionError = provResp?.message || 'Auto-connect unavailable. Please enter your Telegram bot token.';
           }
         } catch (provErr) {
           console.warn('Auto-provision failed, falling back to manual gate:', provErr);
-          this.provisionError = 'Auto-connect unavailable. Please enter your Telegram bot token.';
+          const errMsg = provErr?.message || '';
+          this.provisionError = errMsg || 'Auto-connect unavailable. Please enter your Telegram bot token.';
         }
         this._clearCachedSession();
       }
@@ -1676,11 +2225,6 @@ class PencariMovieApp {
   }
 
   promptBotRelogin(message) {
-    // Login/logout stay local-dashboard-only. A tunneled visitor cannot
-    // enter a bot token, and prompting would look like a broken file page.
-    if (this._isCloudflareTunnelPage()) {
-      return;
-    }
     const msg = String(message || '').trim()
       || 'Bot ID not found. Please enter your bot token again.';
     this.clearSession().then(() => {
@@ -1873,7 +2417,7 @@ class PencariMovieApp {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'X-App-Version': this.version || '1.0.0'
+            'X-App-Version': this.version || '2.0.0'
           },
           body: JSON.stringify({ bot_token: primaryToken })
         });
@@ -1900,7 +2444,10 @@ class PencariMovieApp {
       });
 
       if (loginResp?.ok !== 1) {
-        if (statusEl) statusEl.textContent = 'Login failed: ' + (loginResp?.message || 'unknown error');
+        if (statusEl) {
+          statusEl.textContent = loginResp?.message || 'Login failed: unknown error';
+          statusEl.style.whiteSpace = 'pre-line';
+        }
         return;
       }
 
@@ -1946,7 +2493,19 @@ class PencariMovieApp {
         console.warn('Version check after login failed:', e);
       }
     } catch (error) {
-      if (statusEl) statusEl.textContent = 'Login failed: ' + error.message;
+      if (statusEl) {
+        const rawMsg = error.message || '';
+        if (
+          rawMsg.includes('Failed to fetch') ||
+          rawMsg.includes('NetworkError') ||
+          rawMsg.includes('Load failed')
+        ) {
+          statusEl.textContent = 'Connection error: Could not connect to local server (Failed to fetch).\nPlease ensure the server is running on Termux / Android and not blocked by battery optimizer.';
+        } else {
+          statusEl.textContent = 'Login failed: ' + rawMsg;
+        }
+        statusEl.style.whiteSpace = 'pre-line';
+      }
     }
   }
 
@@ -1967,8 +2526,34 @@ class PencariMovieApp {
   //  HELPERS
   // ══════════════════════════════════════════════════════════════
 
+  decodeHtmlEntities(value) {
+    if (!value) return '';
+    let str = String(value);
+    // 1. First standard unescape for named and numeric entities
+    try {
+      const doc = new DOMParser().parseFromString(str, 'text/html');
+      str = doc.documentElement.textContent || str;
+    } catch (e) {
+      str = str.replace(/&/g, '&').replace(/"/g, '"').replace(/&#039;/g, "'").replace(/</g, '<').replace(/>/g, '>');
+    }
+    // 2. Fix unclosed or malformed entity remnants (e.g. &amp, &quot, &;, &amp;)
+    str = str.replace(/&amp(?:;|\b(?=[^\w;]|$))/gi, '&');
+    str = str.replace(/&quot(?:;|\b(?=[^\w;]|$))/gi, '"');
+    str = str.replace(/&apos(?:;|\b(?=[^\w;]|$))/gi, "'");
+    str = str.replace(/&lt(?:;|\b(?=[^\w;]|$))/gi, '<');
+    str = str.replace(/&gt(?:;|\b(?=[^\w;]|$))/gi, '>');
+    str = str.replace(/&\s*;\s*/g, '& ');
+    try {
+      const doc2 = new DOMParser().parseFromString(str, 'text/html');
+      return (doc2.documentElement.textContent || str).trim();
+    } catch (e) {
+      return str.trim();
+    }
+  }
+
   escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>'"]/g, (char) => ({
+    const decoded = this.decodeHtmlEntities(value);
+    return String(decoded ?? '').replace(/[&<>'"]/g, (char) => ({
       '&': '&',
       '<': '<',
       '>': '>',
@@ -1999,6 +2584,84 @@ class PencariMovieApp {
     return t.replace(/^[\s._\-=\t\n\r]+|[\s._\-=\t\n\r]+$/g, '');
   }
 
+  extractMediaTags(title = '', caption = '') {
+    const text = `${title} ${caption}`;
+
+    // Resolution
+    let res = '';
+    if (/\b(2160p|4k|uhd)\b/i.test(text)) res = '4K';
+    else if (/\b(1080p|fhd)\b/i.test(text)) res = '1080p';
+    else if (/\b(720p|hd)\b/i.test(text)) res = '720p';
+    else if (/\b(540p)\b/i.test(text)) res = '540p';
+    else if (/\b(480p|sd)\b/i.test(text)) res = '480p';
+    else if (/\b(360p)\b/i.test(text)) res = '360p';
+
+    // Source
+    let source = '';
+    if (/\b(remux)\b/i.test(text)) source = 'REMUX';
+    else if (/\b(bluray|blu-ray|bdrip|brrip)\b/i.test(text)) source = 'BluRay';
+    else if (/\b(web-?dl|webrip|web)\b/i.test(text)) source = 'WEB-DL';
+    else if (/\b(hdrip)\b/i.test(text)) source = 'HDRip';
+    else if (/\b(hdtv|tvrip|pdtv)\b/i.test(text)) source = 'HDTV';
+    else if (/\b(dvdrip|dvd)\b/i.test(text)) source = 'DVDRip';
+    else if (/\b(hdcam|camrip|cam|telesync|ts|tc)\b/i.test(text)) source = 'CAM';
+
+    // Platform
+    let platform = '';
+    if (/\b(nf|netflix)\b/i.test(text)) platform = 'NF';
+    else if (/\b(amzn|primevideo|prime)\b/i.test(text)) platform = 'AMZN';
+    else if (/\b(dsnp|disney\+?|disney)\b/i.test(text)) platform = 'DSNP';
+    else if (/\b(atvp|apple\s*tv\+?)\b/i.test(text)) platform = 'ATVP';
+    else if (/\b(hmax|hbo\s*max)\b/i.test(text)) platform = 'HMAX';
+    else if (/\b(zee5)\b/i.test(text)) platform = 'ZEE5';
+    else if (/\b(hotstar)\b/i.test(text)) platform = 'Hotstar';
+    else if (/\b(viki)\b/i.test(text)) platform = 'Viki';
+    else if (/\b(wetv)\b/i.test(text)) platform = 'WeTV';
+    else if (/\b(iqiyi)\b/i.test(text)) platform = 'iQIYI';
+    else if (/\b(starzplay)\b/i.test(text)) platform = 'StarzPlay';
+
+    // Codec
+    let codec = '';
+    if (/\b(hevc|x265|h\.?265)\b/i.test(text)) codec = 'HEVC';
+    else if (/\b(avc|x264|h\.?264)\b/i.test(text)) codec = 'H.264';
+    else if (/\b(av1)\b/i.test(text)) codec = 'AV1';
+    else if (/\b(xvid|divx)\b/i.test(text)) codec = 'XviD';
+
+    // Audio
+    let audio = '';
+    if (/\b(atmos)\b/i.test(text)) audio = 'Atmos';
+    else if (/\b(ddp\s*5\.1|dd\+\s*5\.1|eac3\s*5\.1)\b/i.test(text)) audio = 'DDP5.1';
+    else if (/\b(ddp\s*2\.0|dd\+\s*2\.0|eac3\s*2\.0)\b/i.test(text)) audio = 'DDP2.0';
+    else if (/\b(ddp|dd\+|eac3)\b/i.test(text)) audio = 'DDP';
+    else if (/\b(dd\s*5\.1|ac3\s*5\.1)\b/i.test(text)) audio = 'DD5.1';
+    else if (/\b(ac3|dd)\b/i.test(text)) audio = 'AC3';
+    else if (/\b(dts-hd\s*ma)\b/i.test(text)) audio = 'DTS-HD MA';
+    else if (/\b(dts-hd)\b/i.test(text)) audio = 'DTS-HD';
+    else if (/\b(dts)\b/i.test(text)) audio = 'DTS';
+    else if (/\b(truehd)\b/i.test(text)) audio = 'TrueHD';
+    else if (/\b(aac\s*5\.1|5\.1\s*aac)\b/i.test(text)) audio = 'AAC5.1';
+    else if (/\b(aac\s*2\.0|2\.0\s*aac|aac2)\b/i.test(text)) audio = 'AAC2.0';
+    else if (/\b(aac)\b/i.test(text)) audio = 'AAC';
+    else if (/\b(flac)\b/i.test(text)) audio = 'FLAC';
+    else if (/\b(opus)\b/i.test(text)) audio = 'Opus';
+
+    // Visual
+    const visual = [];
+    if (/\b(hdr10\+|hdr10|hdr)\b/i.test(text)) visual.push('HDR');
+    if (/\b(dolby\s*vision|dovi|dv)\b/i.test(text)) visual.push('DV');
+    if (/\b(10bit|10-bit|hi10p?)\b/i.test(text)) visual.push('10bit');
+    if (/\b(imax)\b/i.test(text)) visual.push('IMAX');
+
+    // Edition
+    let edition = '';
+    if (/\b(remastered)\b/i.test(text)) edition = 'Remastered';
+    else if (/\b(extended)\b/i.test(text)) edition = 'Extended';
+    else if (/\b(uncut)\b/i.test(text)) edition = 'Uncut';
+    else if (/\b(repack|proper)\b/i.test(text)) edition = 'Proper';
+
+    return { resolution: res, source, platform, codec, audio, visual, edition };
+  }
+
   formatSize(bytes) {
     const size = Number(bytes || 0);
     if (!size) return 'Unknown size';
@@ -2018,12 +2681,64 @@ class PencariMovieApp {
     return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   }
 
+  formatStreamFilename(fileName, mime = '') {
+    let name = String(fileName || '').trim();
+    if (!name) name = 'file';
+
+    // Preserve existing extension if it's already a raw split chunk (.001, .002) or archive
+    if (/\.(?:0\d{2,3}|part\d+|\d{3}|zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$/i.test(name)) {
+      name = name.replace(/[^\w.\-]+/g, '_') || 'file';
+      return name.replace(/^[._\-]+|[._\-]+$/g, '') || 'file';
+    }
+
+    const extFromMime = (m) => {
+      const lower = String(m || '').toLowerCase().trim();
+      if (!lower) return 'mp4';
+      if (lower.includes('matroska')) return 'mkv';
+      if (lower.includes('webm')) return 'webm';
+      if (lower.includes('quicktime')) return 'mov';
+      if (lower.includes('x-msvideo') || lower.includes('avi')) return 'avi';
+      if (lower.includes('mp2t') || lower.includes('m2ts')) return 'ts';
+      if (lower.includes('flv')) return 'flv';
+      if (lower.includes('wmv')) return 'wmv';
+      if (lower.includes('3gp')) return '3gp';
+      if (lower.includes('mp4') || lower.includes('m4v')) return 'mp4';
+      if (lower.includes('mpeg') || lower.includes('mpg')) return 'mpg';
+      if (lower.includes('audio/mpeg') || lower.includes('mp3')) return 'mp3';
+      if (lower.includes('audio/mp4') || lower.includes('m4a')) return 'm4a';
+      if (lower.includes('audio/flac') || lower.includes('flac')) return 'flac';
+      if (lower.includes('audio/wav') || lower.includes('wave')) return 'wav';
+      if (lower.includes('audio/ogg') || lower.includes('opus')) return 'ogg';
+      if (lower.includes('zip')) return 'zip';
+      if (lower.includes('x-rar') || lower.includes('rar')) return 'rar';
+      if (lower.includes('7z')) return '7z';
+      if (lower.includes('tar')) return 'tar';
+      if (lower.includes('gzip')) return 'gz';
+      return 'mp4';
+    };
+
+    const targetExt = extFromMime(mime);
+    if (!name) name = `video.${targetExt}`;
+
+    // Strip any existing media extensions so we don't end up with duplicate extensions like .mp4.mkv
+    const mediaExtsPattern = /\.(mp4|m4v|mkv|webm|avi|mov|ts|m2ts|flv|wmv|3gp|mpg|mpeg|mp3|m4a|flac|wav|ogg|opus)$/i;
+    while (mediaExtsPattern.test(name)) {
+      name = name.replace(mediaExtsPattern, '');
+    }
+
+    name = name.replace(/[^\w.\-]+/g, '_') || 'video';
+    name = name.replace(/^[._\-]+|[._\-]+$/g, '') || 'video';
+
+    name = `${name}.${targetExt}`;
+    return name;
+  }
+
   buildDownloadUrl(fileId, fileSize, fileName, fileMime, botId = null, shortCode = null) {
-    const url = new URL(`${this.localApiBase}/api/download`);
+    const safeName = this.formatStreamFilename(fileName, fileMime);
     const payload = {
       file_id: fileId,
       file_size: fileSize,
-      file_name: fileName,
+      file_name: safeName,
       mime: fileMime
     };
     if (botId) {
@@ -2032,8 +2747,9 @@ class PencariMovieApp {
     if (shortCode) {
       payload.short_code = shortCode;
     }
-    url.searchParams.set('d', this.encodeDownloadPayload(payload));
-    return url.toString();
+    const d = this.encodeDownloadPayload(payload);
+    const base = String(this.localApiBase || '').replace(/\/+$/, '');
+    return `${base}/api/download/${encodeURIComponent(d)}/${encodeURIComponent(safeName)}`;
   }
 
 
@@ -2111,20 +2827,27 @@ class PencariMovieApp {
     const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mpg', 'mpeg'];
     const audioExts = ['mp3', 'flac', 'm4a', 'wav', 'ogg', 'aac', 'wma', 'opus'];
 
-    // Check title extension
-    const dotIdx = (title || '').lastIndexOf('.');
+    const t = String(title || '').toLowerCase().trim();
+
+    // Check for unplayable split parts (.001, .002, .003, etc.) or archive formats
+    if (/\.(0\d{2,3}|part\d+|\d{3})$/i.test(t)) {
+      return null;
+    }
+    const archiveExts = ['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'bin', 'exe', 'apk', 'pdf', 'epub', 'txt'];
+    const dotIdx = t.lastIndexOf('.');
     if (dotIdx > 0) {
-      const ext = title.substring(dotIdx + 1).toLowerCase();
+      const ext = t.substring(dotIdx + 1);
+      if (archiveExts.includes(ext)) return null;
       if (videoExts.includes(ext)) return 'video';
       if (audioExts.includes(ext)) return 'audio';
     }
 
     // Check file_type
-    const ft = (fileType || '').toLowerCase();
+    const ft = String(fileType || '').toLowerCase().trim();
     if (ft.startsWith('video')) return 'video';
     if (ft.startsWith('audio')) return 'audio';
 
-    return null; // unknown / not playable inline
+    return null; // unknown / unplayable inline
   }
 
   // ══════════════════════════════════════════════════════════════
@@ -2388,10 +3111,307 @@ class PencariMovieApp {
   }
 
   _resetFileDetailPlayer() {
-    this._resetMediaElement(this.$('#fileDetailVideo'));
+    const videoEl = this.$('#fileDetailVideo');
+    if (videoEl) {
+      const tracks = videoEl.querySelectorAll('track');
+      tracks.forEach((t) => t.remove());
+      videoEl.className = 'file-detail__video sub-size-normal';
+      videoEl.style.objectFit = 'contain';
+      videoEl.playbackRate = 1.0;
+    }
+    this._resetMediaElement(videoEl);
     this._resetMediaElement(this.$('#fileDetailAudio'));
     const playerEl = this.$('#fileDetailPlayer');
     if (playerEl) playerEl.classList.add('hidden');
+    this._closePlayerDropdowns();
+    this.currentSubDelay = 0;
+    const delayValEl = this.$('#playerSubDelayVal');
+    if (delayValEl) delayValEl.textContent = '0.0s';
+  }
+
+  /** Close all open dropdown menus on player toolbar */
+  _closePlayerDropdowns() {
+    let closedAny = false;
+    ['#playerSpeedMenu', '#playerScaleMenu', '#playerSubsMenu', '#playerExtMenu'].forEach((sel) => {
+      const el = this.$(sel);
+      if (el && !el.classList.contains('hidden')) {
+        el.classList.add('hidden');
+        closedAny = true;
+      }
+    });
+    return closedAny;
+  }
+
+  /** Stremio-style Player Toolbar Event Binding */
+  _bindPlayerToolbar() {
+    const videoEl = this.$('#fileDetailVideo');
+    this.currentSubDelay = 0;
+
+    // Toggle dropdown helper
+    const toggleDropdown = (dropdownId) => {
+      const target = this.$(dropdownId);
+      if (!target) return;
+      const wasHidden = target.classList.contains('hidden');
+      this._closePlayerDropdowns();
+      if (wasHidden) target.classList.remove('hidden');
+    };
+
+    // Close on clicking outside
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('#playerToolbar')) {
+        this._closePlayerDropdowns();
+      }
+    });
+
+    // Speed button & options
+    const speedBtn = this.$('#playerSpeedBtn');
+    if (speedBtn) {
+      speedBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleDropdown('#playerSpeedMenu');
+      });
+    }
+    this.$$('.player-toolbar__opt[data-speed]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const speed = parseFloat(btn.getAttribute('data-speed')) || 1;
+        if (videoEl) videoEl.playbackRate = speed;
+        const lbl = this.$('#playerSpeedLabel');
+        if (lbl) lbl.textContent = `${speed}x`;
+        this.$$('.player-toolbar__opt[data-speed]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        this._closePlayerDropdowns();
+      });
+    });
+
+    // Aspect Ratio / Scale button & options
+    const scaleBtn = this.$('#playerScaleBtn');
+    if (scaleBtn) {
+      scaleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleDropdown('#playerScaleMenu');
+      });
+    }
+    this.$$('.player-toolbar__opt[data-scale]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const scale = btn.getAttribute('data-scale') || 'contain';
+        if (videoEl) videoEl.style.objectFit = scale;
+        const lbl = this.$('#playerScaleLabel');
+        if (lbl) {
+          lbl.textContent = scale === 'contain' ? 'Fit' : scale === 'cover' ? 'Fill' : 'Stretch';
+        }
+        this.$$('.player-toolbar__opt[data-scale]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        this._closePlayerDropdowns();
+      });
+    });
+
+    // Picture-in-Picture (PiP)
+    const pipBtn = this.$('#playerPipBtn');
+    if (pipBtn) {
+      pipBtn.addEventListener('click', async () => {
+        if (!videoEl) return;
+        try {
+          if (document.pictureInPictureElement) {
+            await document.exitPictureInPicture();
+          } else if (videoEl.requestPictureInPicture) {
+            await videoEl.requestPictureInPicture();
+          }
+        } catch (err) {
+          console.warn('[Player] PiP failed:', err);
+        }
+      });
+    }
+
+    // Subtitles dropdown toggle & track management
+    const subsBtn = this.$('#playerSubsBtn');
+    if (subsBtn) {
+      subsBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._populateSubtitlesList();
+        toggleDropdown('#playerSubsMenu');
+      });
+    }
+
+    // Subtitle delay adjustments
+    this.$('#playerSubDelayMinus')?.addEventListener('click', () => this._adjustSubtitleDelay(-0.25));
+    this.$('#playerSubDelayPlus')?.addEventListener('click', () => this._adjustSubtitleDelay(0.25));
+    this.$('#playerSubDelayReset')?.addEventListener('click', () => this._setSubtitleDelay(0));
+
+    // Subtitle sizing
+    this.$$('.player-toolbar__sync-btn[data-sub-size]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const sz = btn.getAttribute('data-sub-size');
+        if (videoEl) {
+          videoEl.classList.remove('sub-size-small', 'sub-size-normal', 'sub-size-large');
+          videoEl.classList.add(`sub-size-${sz}`);
+        }
+        this.$$('.player-toolbar__sync-btn[data-sub-size]').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+
+    // Local Subtitle File Upload
+    const subFileInput = this.$('#playerLocalSubFile');
+    if (subFileInput) {
+      subFileInput.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file || !videoEl) return;
+        const text = await file.text();
+        let vtt = text;
+        if (!text.trim().startsWith('WEBVTT')) {
+          vtt = 'WEBVTT\n\n' + text.replace(/\r\n|\r/g, '\n').replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+        }
+        const blob = new Blob([vtt], { type: 'text/vtt' });
+        const objectUrl = URL.createObjectURL(blob);
+        const track = document.createElement('track');
+        track.kind = 'subtitles';
+        track.label = `Local: ${file.name}`;
+        track.srclang = 'custom';
+        track.src = objectUrl;
+        track.default = true;
+        videoEl.appendChild(track);
+        setTimeout(() => {
+          if (videoEl.textTracks && videoEl.textTracks.length > 0) {
+            for (let i = 0; i < videoEl.textTracks.length; i++) {
+              videoEl.textTracks[i].mode = (i === videoEl.textTracks.length - 1) ? 'showing' : 'disabled';
+            }
+          }
+          this._populateSubtitlesList();
+        }, 100);
+        this._closePlayerDropdowns();
+      });
+    }
+
+    // External Player Menu toggle
+    const extMenuBtn = this.$('#playerExtMenuBtn');
+    if (extMenuBtn) {
+      extMenuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._updateExternalPlayerUrls();
+        toggleDropdown('#playerExtMenu');
+      });
+    }
+
+    // Copy stream URL button
+    const copyStreamBtn = this.$('#playerCopyStreamBtn');
+    if (copyStreamBtn) {
+      copyStreamBtn.addEventListener('click', async () => {
+        const currentUrl = videoEl?.src || this.currentStreamUrl || '';
+        if (currentUrl) {
+          try {
+            await navigator.clipboard.writeText(currentUrl);
+            const orig = copyStreamBtn.innerHTML;
+            copyStreamBtn.innerHTML = '<i class="fas fa-check" style="color:#20bf6b;margin-right:8px;"></i> Copied!';
+            setTimeout(() => { copyStreamBtn.innerHTML = orig; }, 2000);
+          } catch (e) {
+            window.prompt('Copy Stream URL:', currentUrl);
+          }
+        }
+        this._closePlayerDropdowns();
+      });
+    }
+  }
+
+  /** Populate the subtitles list inside the dropdown from available textTracks */
+  _populateSubtitlesList() {
+    const listEl = this.$('#playerSubsList');
+    const videoEl = this.$('#fileDetailVideo');
+    if (!listEl || !videoEl) return;
+
+    listEl.innerHTML = '';
+    const tracks = videoEl.textTracks || [];
+    let hasActive = false;
+
+    // Track buttons
+    for (let i = 0; i < tracks.length; i++) {
+      const t = tracks[i];
+      const isShowing = t.mode === 'showing';
+      if (isShowing) hasActive = true;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `player-toolbar__opt ${isShowing ? 'active' : ''}`;
+      btn.textContent = t.label || t.language || `Track ${i + 1}`;
+      btn.addEventListener('click', () => {
+        for (let j = 0; j < tracks.length; j++) {
+          tracks[j].mode = (j === i) ? 'showing' : 'disabled';
+        }
+        this._populateSubtitlesList();
+        this._closePlayerDropdowns();
+      });
+      listEl.appendChild(btn);
+    }
+
+    // Off button
+    const offBtn = document.createElement('button');
+    offBtn.type = 'button';
+    offBtn.className = `player-toolbar__opt ${!hasActive ? 'active' : ''}`;
+    offBtn.textContent = 'Off';
+    offBtn.addEventListener('click', () => {
+      for (let j = 0; j < tracks.length; j++) {
+        tracks[j].mode = 'disabled';
+      }
+      this._populateSubtitlesList();
+      this._closePlayerDropdowns();
+    });
+    listEl.insertBefore(offBtn, listEl.firstChild);
+  }
+
+  /** Adjust subtitle delay by offset in seconds */
+  _adjustSubtitleDelay(delta) {
+    this._setSubtitleDelay((this.currentSubDelay || 0) + delta);
+  }
+
+  /** Set absolute subtitle delay in seconds */
+  _setSubtitleDelay(delay) {
+    this.currentSubDelay = Math.round(delay * 100) / 100;
+    const delayValEl = this.$('#playerSubDelayVal');
+    if (delayValEl) {
+      delayValEl.textContent = `${this.currentSubDelay > 0 ? '+' : ''}${this.currentSubDelay.toFixed(2)}s`;
+    }
+
+    const videoEl = this.$('#fileDetailVideo');
+    if (!videoEl || !videoEl.textTracks) return;
+
+    // Apply offset shift to cues of all tracks
+    for (let i = 0; i < videoEl.textTracks.length; i++) {
+      const track = videoEl.textTracks[i];
+      if (track.cues) {
+        for (let j = 0; j < track.cues.length; j++) {
+          const cue = track.cues[j];
+          if (cue._origStart === undefined) cue._origStart = cue.startTime;
+          if (cue._origEnd === undefined) cue._origEnd = cue.endTime;
+          cue.startTime = Math.max(0, cue._origStart + this.currentSubDelay);
+          cue.endTime = Math.max(0, cue._origEnd + this.currentSubDelay);
+        }
+      }
+    }
+  }
+
+  /** Update External Player deep links (VLC, MPV, Web Stremio) */
+  _updateExternalPlayerUrls() {
+    const videoEl = this.$('#fileDetailVideo');
+    const streamUrl = videoEl?.src || this.currentStreamUrl || '';
+    if (!streamUrl) return;
+
+    // VLC protocol: vlc://http...
+    const vlcLink = this.$('#playerExtVlc');
+    if (vlcLink) {
+      vlcLink.href = `vlc://${streamUrl}`;
+    }
+
+    // MPV protocol: mpv://http...
+    const mpvLink = this.$('#playerExtMpv');
+    if (mpvLink) {
+      mpvLink.href = `mpv://${streamUrl}`;
+    }
+
+    // Web Stremio player link: https://web.stremio.com/#/player/...
+    const stremioWebLink = this.$('#playerExtStremioWeb');
+    if (stremioWebLink) {
+      const encodedStream = encodeURIComponent(JSON.stringify({ url: streamUrl }));
+      stremioWebLink.href = `https://web.stremio.com/#/player/${encodedStream}`;
+    }
   }
 
   /** Hide resolving spinner and optionally show action buttons */
@@ -2675,11 +3695,89 @@ class PencariMovieApp {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════
+  //  AUTH GATE (dashboard password)
+  // ══════════════════════════════════════════════════════════════
+
+  /**
+   * Returns true when the dashboard may load. Shows the auth gate and returns
+   * false when a password is required. Localhost/LAN always pass server-side.
+   */
+  async checkAuth() {
+    try {
+      const res = await fetch(`${this.localApiBase}/api/auth/status`, {
+        cache: 'no-store',
+        headers: this._authToken ? { 'X-Auth-Token': this._authToken } : {}
+      });
+      const data = await res.json();
+      if (data?.authenticated) {
+        if (data.token) {
+          this._authToken = data.token;
+          localStorage.setItem('pm.auth', data.token);
+        }
+        this.hideAuthGate();
+        return true;
+      }
+      this.showAuthGate();
+      return false;
+    } catch (_) {
+      // Network error — let the normal flow surface it rather than blocking.
+      return true;
+    }
+  }
+
+  showAuthGate() {
+    const gate = this.$('#authGate');
+    if (!gate) return;
+    gate.classList.remove('hidden');
+    gate.setAttribute('aria-hidden', 'false');
+    this._hideLoadingScreen?.();
+    const input = this.$('#authPasswordInput');
+    if (input) input.focus();
+  }
+
+  hideAuthGate() {
+    const gate = this.$('#authGate');
+    if (!gate) return;
+    gate.classList.add('hidden');
+    gate.setAttribute('aria-hidden', 'true');
+  }
+
+  async submitAuthPassword() {
+    const input = this.$('#authPasswordInput');
+    const btn = this.$('#authConnectBtn');
+    const status = this.$('#authStatus');
+    const pw = input ? input.value : '';
+    if (!pw) return;
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = '';
+    try {
+      const res = await fetch(`${this.localApiBase}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw })
+      });
+      const data = await res.json();
+      if (data?.ok && data.token) {
+        this._authToken = data.token;
+        localStorage.setItem('pm.auth', data.token);
+        window.location.reload();
+        return;
+      }
+      if (status) status.textContent = data?.message || 'Wrong password';
+    } catch (_) {
+      if (status) status.textContent = 'Connection failed';
+    }
+    if (btn) btn.disabled = false;
+  }
+
   async requestJson(url, options = {}) {
+    const authToken = this._authToken || '';
     const response = await fetch(url, {
       cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
+        ...(authToken ? { 'X-Auth-Token': authToken } : {}),
         ...(options.headers || {})
       },
       ...options
@@ -2706,6 +3804,9 @@ class PencariMovieApp {
       if (response.status === 426 && data?.update_needed) {
         this.showUpdateRequired(data);
       }
+      if (response.status === 401 && data?.auth_required) {
+        this.showAuthGate();
+      }
       throw new Error(data?.message || data?.code || `HTTP ${response.status}`);
     }
 
@@ -2717,8 +3818,9 @@ class PencariMovieApp {
   // ══════════════════════════════════════════════════════════════
 
   async fetchStream(action, params = {}) {
-    // ── Cache check ──
-    const cacheKey = this._cacheKey('stream', { action, ...params });
+    // Include effective country in cache key so region changes avoid stale cache hits
+    const effectiveCountry = params.country || this.country || '';
+    const cacheKey = this._cacheKey('stream', { action, ...params, _region: effectiveCountry });
     const ttl = this._getStreamTTL(action);
     const cached = this._cacheGet(cacheKey);
 
@@ -2743,11 +3845,17 @@ class PencariMovieApp {
    * Extracted so both fetchStream() and background refresh can share the same logic.
    */
   async _rawFetchStream(action, params) {
+    // Inject configured region if set
+    const effectiveParams = { ...params };
+    if (!effectiveParams.country && this.country) {
+      effectiveParams.country = this.country;
+    }
+
     // 1. Direct browser call to WordPress admin-ajax (no local device DNS/cURL dependency)
     try {
       const directUrl = new URL(this.wpAjaxUrl || 'https://pencarimovie.com/wp-admin/admin-ajax.php');
       directUrl.searchParams.set('action', `stream_${action}`);
-      Object.entries(params).forEach(([key, value]) => {
+      Object.entries(effectiveParams).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== '') {
           directUrl.searchParams.set(key, value);
         }
@@ -2759,7 +3867,7 @@ class PencariMovieApp {
         const resp = await fetch(directUrl.toString(), {
           headers: {
             'X-Requested-With': 'XMLHttpRequest',
-            'X-App-Version': this.version || '1.0.0'
+            'X-App-Version': this.version || '2.0.0'
           },
           signal: ctrl.signal
         });
@@ -2779,7 +3887,7 @@ class PencariMovieApp {
     // 2. Fallback to local backend proxy route (/api/proxy-stream)
     const url = new URL(`${this.localApiBase}/api/proxy-stream`);
     url.searchParams.set('action', action);
-    Object.entries(params).forEach(([key, value]) => {
+    Object.entries(effectiveParams).forEach(([key, value]) => {
       if (value !== undefined && value !== null && value !== '') {
         url.searchParams.set(key, value);
       }
@@ -2802,10 +3910,9 @@ class PencariMovieApp {
     try {
       // Fetch /manifest.json in parallel with WordPress streaming metadata
       // so categories, rows, and home feeds react directly to manifest changes
-      const [trendingData, categoriesData, latestData, manifestData] = await Promise.all([
+      const [trendingData, categoriesData, manifestData] = await Promise.all([
         this.fetchStream('trending', { limit: 10 }).catch(() => []),
         this.fetchStream('categories').catch(() => []),
-        this.fetchStream('posts', { limit: 12 }).catch(() => []),
         this.requestJson(`${this.localApiBase}/manifest.json`).catch(() => null)
       ]);
 
@@ -2901,16 +4008,52 @@ class PencariMovieApp {
         this.categories = defaultCategories;
       }
 
-      // Store posts by category for lazy loading
-      if (Array.isArray(latestData)) {
-        this.posts['latest'] = latestData;
+      // Fetch hero items from a randomly chosen enabled catalog
+      let heroPosts = [];
+      const enabledCats = this.categories.length > 0 ? this.categories : defaultCategories;
+      if (enabledCats.length > 0) {
+        // Pick a random enabled catalog
+        const randomCat = enabledCats[Math.floor(Math.random() * enabledCats.length)];
+        try {
+          if (randomCat.is_topkw) {
+            const q = randomCat.search_query || '';
+            const sfRes = await this.fetchStream('search_files', { search: q, limit: 12 }).catch(() => null);
+            if (sfRes?.files && Array.isArray(sfRes.files) && sfRes.files.length > 0) {
+              heroPosts = sfRes.files.map((f) => ({
+                id: f.short_code,
+                short_code: f.short_code,
+                title: f.title || 'Telegram File',
+                thumbnail_url: f.thumbnail_url || '',
+                thumbnail: f.thumbnail_url || '',
+                is_file: true,
+                file_size: f.file_size,
+                size: f.file_size
+              }));
+            }
+          } else {
+            const params = { category: randomCat.slug, limit: 12 };
+            if (randomCat.media_type) {
+              params.media_type = randomCat.media_type;
+            }
+            const fetched = await this.fetchStream('posts', params).catch(() => []);
+            if (Array.isArray(fetched) && fetched.length > 0) {
+              heroPosts = fetched;
+            }
+          }
+        } catch (catErr) {
+          console.warn('Failed to load random catalog for hero:', catErr);
+        }
       }
 
-      // Check if hero/latest should be shown based on manifest
-      const manifestsHasLatest = !this.manifest || (Array.isArray(this.manifest.catalogs) && this.manifest.catalogs.some(c => c.id === 'top' || c.id === 'pm_series_top' || c.id === 'year' || c.id === 'pm_series_year' || c.id === 'pm_movies_latest' || c.id === 'pm_series_latest'));
+      // Fallback to trending or any available posts if random catalog was empty
+      if (heroPosts.length === 0 && this.trending.length > 0) {
+        heroPosts = this.trending;
+      }
+
+      // Check if hero should be shown based on enabled catalogs
       const heroSection = this.$('#streamHero');
       if (heroSection) {
-        if (!manifestsHasLatest && this.categories.length === 0) {
+        if (this.categories.length === 0 && (!this.manifest || !Array.isArray(this.manifest.catalogs) || this.manifest.catalogs.length === 0)) {
           heroSection.classList.add('hidden');
         } else {
           heroSection.classList.remove('hidden');
@@ -2919,7 +4062,7 @@ class PencariMovieApp {
 
       // Render
       this.renderNavLinks();
-      this.renderHero(latestData);
+      this.renderHero(heroPosts);
       this.renderTrending();
       this.renderSearchChips();
 
@@ -3045,8 +4188,8 @@ class PencariMovieApp {
     const title = post.title || post.post_title || '';
     const excerpt = post.excerpt || post.post_excerpt || '';
 
-    if (heroTitle) heroTitle.textContent = title;
-    if (heroExcerpt) heroExcerpt.textContent = excerpt.replace(/<[^>]*>/g, '').trim();
+    if (heroTitle) heroTitle.textContent = this.decodeHtmlEntities(title);
+    if (heroExcerpt) heroExcerpt.textContent = this.decodeHtmlEntities(excerpt.replace(/<[^>]*>/g, '')).trim();
 
     // Bind CTA button
     if (heroCta) {
@@ -3055,7 +4198,11 @@ class PencariMovieApp {
       heroCta.parentNode.replaceChild(newCta, heroCta);
       newCta.addEventListener('click', (e) => {
         e.preventDefault();
-        this.openModal(post);
+        if (post.is_file || post.short_code) {
+          this.openFileDetail(post.short_code || post.id);
+        } else {
+          this.openModal(post);
+        }
       });
       this._heroCtaPost = post;
     }
@@ -3193,7 +4340,7 @@ class PencariMovieApp {
           <div style="font-size: 2rem; margin-bottom: 12px;">⚡</div>
           <h3 style="color: #fff; margin-bottom: 8px;">Catalogs are currently disabled</h3>
           <p style="max-width: 480px; margin: 0 auto; font-size: 0.88rem; line-height: 1.5;">
-            Addon is configured for streams only via IMDb (tt) IDs from Cinemeta. You can search files or enable catalogs in Addon Settings.
+            Addon is configured for streams only via Streams matched by ID (IMDb, TMDB, Kitsu, and more). You can search files or enable catalogs in Addon Settings.
           </p>
         </div>
       `;
@@ -3417,9 +4564,10 @@ class PencariMovieApp {
       metaParts.push(this.formatSize(fileSize));
     }
 
+    const isUnplayable = this._guessMediaType(rawTitle, fileType) === null;
     const thumbStyle = thumbnail ? `style="background-image: url('${thumbnail}')"` : '';
-    const playIcon = '<i class="fas fa-play"></i>';
-    const fileIcon = '<i class="fas fa-file-video"></i>';
+    const playIcon = isUnplayable ? '<i class="fas fa-external-link-alt"></i>' : '<i class="fas fa-play"></i>';
+    const fileIcon = isUnplayable ? '<i class="fas fa-file-archive"></i>' : '<i class="fas fa-file-video"></i>';
 
     return `
       <div class="stream-file-card" data-short-code="${this.escapeHtml(shortCode)}"${file.is_combined_parts ? ' data-combined="1"' : ''} data-post-title="${this.escapeHtml(title)}" title="${this.escapeHtml(rawTitle)}">
@@ -3432,14 +4580,26 @@ class PencariMovieApp {
         <div class="stream-file-card__info">
           <div class="stream-file-card__title">${this.escapeHtml(title)}</div>
           <div class="stream-file-card__meta">
-            ${fileType ? `<span class="stream-file-card__badge">${this.escapeHtml(fileType)}</span>` : ''}
+            ${(() => {
+              const tags = this.extractMediaTags(rawTitle, file.caption || '');
+              const badges = [];
+              if (tags.resolution) badges.push(`<span class="stream-file-card__badge stream-file-card__badge--res">${this.escapeHtml(tags.resolution)}</span>`);
+              if (tags.platform) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.platform)}</span>`);
+              if (tags.source) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.source)}</span>`);
+              tags.visual.forEach(v => badges.push(`<span class="stream-file-card__badge stream-file-card__badge--hdr">${this.escapeHtml(v)}</span>`));
+              if (tags.codec) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.codec)}</span>`);
+              if (tags.audio) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.audio)}</span>`);
+              if (tags.edition) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.edition)}</span>`);
+              if (file.is_split_part) badges.push(`<span class="stream-file-card__badge">Part ${String(file.part_num).padStart(2, '0')}</span>`);
+              if (fileType && !tags.source && !tags.codec) badges.push(`<span class="stream-file-card__badge">${this.escapeHtml(fileType)}</span>`);
+              return badges.join('');
+            })()}
             ${fileSize > 0 ? `<span class="stream-file-card__size">${this.formatSize(fileSize)}</span>` : ''}
-            ${file.is_split_part ? `<span class="stream-file-card__badge">Part ${String(file.part_num).padStart(2, '0')}</span>` : ''}
           </div>
         </div>
         <div class="stream-file-card__action">
-          <button class="stream-file-card__btn" aria-label="Play or download" title="Play or download">
-            <i class="fas fa-play"></i>
+          <button class="stream-file-card__btn" aria-label="${isUnplayable ? 'Download external' : 'Play or download'}" title="${isUnplayable ? 'Download external' : 'Play or download'}">
+            ${isUnplayable ? '<i class="fas fa-external-link-alt"></i>' : '<i class="fas fa-play"></i>'}
           </button>
         </div>
       </div>
@@ -3655,8 +4815,47 @@ class PencariMovieApp {
     }
 
     try {
-      const result = await this.fetchStream('post_files', { post_id: postId, limit: 100 });
-      const rawFiles = result?.files || [];
+      let result = await this.fetchStream('post_files', { post_id: postId, limit: 100 });
+      let rawFiles = result?.files || [];
+
+      // Fallback: If post_files returned 0 files (common when post title has HTML entities or slight wording variants),
+      // search files using clean query variants derived from the post title
+      if (rawFiles.length === 0) {
+        const rawTitle = post.title || post.post_title || '';
+        if (rawTitle) {
+          const cleanTitle = this.decodeHtmlEntities(rawTitle).replace(/\s*[•··]\s*.+$/u, '').trim();
+          let postYear = '';
+          const ym = cleanTitle.match(/\b(19\d\d|20\d\d)\b/);
+          if (ym) postYear = ym[1];
+
+          let baseTitle = cleanTitle;
+          if (postYear) {
+            baseTitle = baseTitle.replace(new RegExp('\\b' + postYear + '\\b'), '').trim();
+          }
+          baseTitle = baseTitle.replace(/\s+/g, ' ');
+
+          const searchQueries = [];
+          if (baseTitle.includes('&')) {
+            searchQueries.push(baseTitle.replace(/&/g, ' dan ').replace(/\s+/g, ' ').trim());
+            searchQueries.push(baseTitle.replace(/&/g, ' and ').replace(/\s+/g, ' ').trim());
+            searchQueries.push(baseTitle.replace(/&/g, ' ').replace(/\s+/g, ' ').trim());
+          } else if (/\b(?:dan|and)\b/i.test(baseTitle)) {
+            searchQueries.push(baseTitle.replace(/\b(?:dan|and)\b/gi, '&').replace(/\s+/g, ' ').trim());
+            searchQueries.push(baseTitle.replace(/\b(?:dan|and)\b/gi, ' ').replace(/\s+/g, ' ').trim());
+          }
+          searchQueries.unshift(baseTitle);
+
+          for (const sq of searchQueries) {
+            const queryWithYear = postYear ? `${sq} ${postYear}` : sq;
+            const sfRes = await this.fetchStream('search_files', { search: queryWithYear, limit: 50 }).catch(() => null);
+            if (sfRes?.files && Array.isArray(sfRes.files) && sfRes.files.length > 0) {
+              rawFiles = sfRes.files;
+              break;
+            }
+          }
+        }
+      }
+
       const files = this.groupSplitParts(rawFiles);
 
       if (files.length === 0) {
@@ -3672,12 +4871,18 @@ class PencariMovieApp {
             </div>
           `;
         } else {
+          const sponsorUrl = (this.sponsor && this.sponsor.url) ? this.sponsor.url : 'https://pencarimovie.com';
+          const sponsorDesc = (this.sponsor && this.sponsor.description) ? this.sponsor.description : 'Support / Request Files';
           filesSection.innerHTML = `
             <div class="stream-modal__files-title">
               <i class="fas fa-download"></i> Files
               <span class="stream-modal__files-count">0</span>
             </div>
-            <p style="color:var(--text-muted);font-size:0.85rem;">No files found for this post.</p>
+            <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:8px;">No files found for this post.</p>
+            <a href="${this.escapeHtml(sponsorUrl)}" target="_blank" rel="noopener noreferrer" class="stream-file-card stream-file-card--sponsor" style="display:flex;align-items:center;padding:10px 14px;gap:12px;border:1px dashed rgba(255,107,53,0.4);border-radius:8px;text-decoration:none;color:#fff;background:rgba(255,107,53,0.06);">
+              <i class="fas fa-external-link-alt" style="color:var(--accent,#ff6b35);font-size:1.1rem;"></i>
+              <div style="font-size:0.82rem;"><strong style="color:var(--accent,#ff6b35);">No Streams Found</strong> — <span>${this.escapeHtml(sponsorDesc)}</span></div>
+            </a>
           `;
         }
         return;
@@ -3696,6 +4901,39 @@ class PencariMovieApp {
           ${files.map((f) => this._renderFileCard(f)).join('')}
         </div>
       `;
+
+      // Pre-resolve all streams before play or download (cache warmed files)
+      const codesToWarm = [];
+      files.forEach((f) => {
+        if (f.short_code) {
+          codesToWarm.push(f.short_code);
+          if (f.file_id_mt || f.file_id) {
+            const cacheKey = this._cacheKey('resolve', { shortCode: f.short_code, botId: this.botId || f.bot_id || '' });
+            this._cacheSet(cacheKey, {
+              ok: 1,
+              short_code: f.short_code,
+              file_id_mt: f.file_id_mt || f.file_id,
+              file_size: f.file_size || 0,
+              file_type: f.file_type || '',
+              title: f.title || f.short_code,
+              bot_id: f.bot_id || this.botId,
+            }, 2 * 60 * 60 * 1000);
+          }
+        }
+      });
+
+      // Background batch pre-resolve missing codes via /api/resolve-shortcode
+      if (codesToWarm.length > 0) {
+        const missingCodes = codesToWarm.filter((sc) => {
+          const cached = this._cacheGet(this._cacheKey('resolve', { shortCode: sc, botId: this.botId || '' }));
+          return !cached || cached.expired;
+        });
+        if (missingCodes.length > 0) {
+          const batchUrl = new URL(`${this.localApiBase}/api/resolve-shortcode`);
+          batchUrl.searchParams.set('short_codes', missingCodes.slice(0, 30).join(','));
+          fetch(batchUrl.toString()).catch(() => {});
+        }
+      }
 
       // Click → File Detail Page (excluding sponsor cards which handle external link navigation)
       filesSection.querySelectorAll('.stream-file-card:not(.stream-file-card--sponsor), .stream-card[data-short-code]').forEach((card) => {
@@ -3962,11 +5200,20 @@ class PencariMovieApp {
     }
 
     // Tags
-    let tagsHtml = '';
-    if (fileType) {
-      tagsHtml += `<span class="stream-file-card__badge">${this.escapeHtml(fileType)}</span>`;
+    const tags = this.extractMediaTags(title, data.caption || '');
+    const isUnplayable = this._guessMediaType(title, fileType) === null;
+    const detailBadges = [];
+    if (tags.resolution) detailBadges.push(`<span class="stream-file-card__badge stream-file-card__badge--res">${this.escapeHtml(tags.resolution)}</span>`);
+    if (tags.platform) detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.platform)}</span>`);
+    if (tags.source) detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.source)}</span>`);
+    tags.visual.forEach(v => detailBadges.push(`<span class="stream-file-card__badge stream-file-card__badge--hdr">${this.escapeHtml(v)}</span>`));
+    if (tags.codec) detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.codec)}</span>`);
+    if (tags.audio) detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.audio)}</span>`);
+    if (tags.edition) detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(tags.edition)}</span>`);
+    if (fileType && !tags.source && !tags.codec) {
+      detailBadges.push(`<span class="stream-file-card__badge">${this.escapeHtml(fileType)}</span>`);
     }
-    this.$('#fileDetailTags').innerHTML = tagsHtml;
+    this.$('#fileDetailTags').innerHTML = detailBadges.join('');
 
     // Detect media type and embed player if video/audio
     const mediaType = this._guessMediaType(title, fileType);
@@ -3975,20 +5222,54 @@ class PencariMovieApp {
     if (isEmbeddable && fileId && fileSize > 0) {
       // Build local download URL as video/audio source
       const streamUrl = this.buildDownloadUrl(fileId, fileSize, title, data.mime || fileType, data.bot_id, shortCode);
+      this.currentStreamUrl = streamUrl;
 
       if (mediaType === 'video') {
         if (videoEl) {
           videoEl.src = streamUrl;
           if (thumbnail) videoEl.poster = thumbnail;
           videoEl.classList.remove('hidden');
+
+          // Fetch and attach subtitles (OpenSubtitles) using IMDb ID or media title fallback
+          const imdbId = data.imdb_id || (this._previousPostData && this._previousPostData.imdb_id) || '';
+          const subQueryId = imdbId || (data.title ? encodeURIComponent(data.title) : '');
+          if (subQueryId) {
+            const mediaTypeForSub = (data.type === 'series' || (this._previousPostData && this._previousPostData.type === 'series')) ? 'series' : 'movie';
+            fetch(`${this.localApiBase}/subtitles/${mediaTypeForSub}/${subQueryId}.json`)
+              .then((r) => (r.ok ? r.json() : null))
+              .then((subData) => {
+                if (subData && Array.isArray(subData.subtitles) && subData.subtitles.length > 0) {
+                  subData.subtitles.slice(0, 40).forEach((sub, idx) => {
+                    if (sub && sub.url) {
+                      const track = document.createElement('track');
+                      track.kind = 'subtitles';
+                      const langLabel = (sub.lang || sub.lang_code || 'und').toUpperCase();
+                      const subName = sub.subtitleFileName || sub.title || sub.movieReleaseName || `Track ${idx + 1}`;
+                      track.label = `[${langLabel}] ${subName}`;
+                      track.srclang = sub.lang || sub.lang_code || 'en';
+                      // Route via local subtitle proxy to guarantee valid WebVTT and bypass CORS
+                      track.src = `${this.localApiBase}/api/sub-proxy?url=${encodeURIComponent(sub.url)}`;
+                      videoEl.appendChild(track);
+                    }
+                  });
+                  // Update toolbar subtitle dropdown immediately
+                  this._populateSubtitlesList();
+                }
+              })
+              .catch((err) => {
+                console.warn('[Subtitles] Failed to load OpenSubtitles:', err);
+              });
+          }
         }
         if (audioEl) audioEl.classList.add('hidden');
+        this.$('#playerToolbar')?.classList.remove('hidden');
       } else {
         if (audioEl) {
           audioEl.src = streamUrl;
           audioEl.classList.remove('hidden');
         }
         if (videoEl) videoEl.classList.add('hidden');
+        this.$('#playerToolbar')?.classList.add('hidden');
       }
 
       if (playerEl) playerEl.classList.remove('hidden');
@@ -3996,11 +5277,10 @@ class PencariMovieApp {
       // Hide the Stream button (embedded player replaces it)
       this.$('#fileDetailStreamBtn').classList.add('hidden');
     } else {
-      // Not embeddable: keep Stream button using play_url
-      const playUrl = data.play_url || '';
-      this.$('#fileDetailStreamBtn').setAttribute('data-url', playUrl);
-      this.$('#fileDetailStreamBtn').disabled = !playUrl;
-      this.$('#fileDetailStreamBtn').classList.remove('hidden');
+      // Not embeddable inline (archive, .001 split chunk, etc.):
+      // Hide inline player and Stream button; user can download the file via Download button
+      this.$('#fileDetailStreamBtn').classList.add('hidden');
+      if (playerEl) playerEl.classList.add('hidden');
     }
 
     // Download button: build local download URL

@@ -2,39 +2,55 @@
 
 All notable changes to the PencariMovie Server / Downloader project will be documented in this file.
 
-## [Unreleased]
+## [2.1.7] - 2026-09-18
 
 ### Added
 
-- **Stremio HTTP API sync**: addon modal can install `http://127.0.0.1:<port>/manifest.json` or `http://<LAN-IP>:<port>/manifest.json` into a Stremio account from the browser (`api.strem.io` login → addonCollectionGet → addonCollectionSet). Credentials never leave the browser. Choose Wi-Fi / LAN vs Localhost; `/manifest.json` names the addon `PencariMovie (Localhost)`, `PencariMovie (Wi-Fi / LAN)`, or `PencariMovie (Cloudflare)` so the address type is visible in Stremio.
-
-- **Optional Cloudflare TryCloudflare tunnel**:
-  - Settings can enable/disable an official `cloudflared` quick tunnel (`*.trycloudflare.com`) without a Cloudflare account.
-  - Backend routes: `GET /api/tunnel/status`, `POST /api/tunnel/enable`, `POST /api/tunnel/disable`.
-  - Windows spawn helper [`tunnel-spawn.ps1`](tunnel-spawn.ps1:1); binary cached in `storage/bin/`.
-  - Nuvio addon modal shows a public Cloudflare tunnel manifest URL when the tunnel is running.
-  - `stop.bat` / `stop.sh` kill leftover `cloudflared` processes.
-
-### Changed
-
-- Stremio/Nuvio stream objects now follow the official [addon-sdk stream spec](https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/api/responses/stream.md), [addon-helloworld](https://github.com/Stremio/addon-helloworld), and [AIOStreams](https://github.com/Viren070/AIOStreams) HTTP MP4 shape:
-  - Stream `url` is `https://…/api/download/<payload>/<filename>.mp4` so the **full URL** ends with `.mp4`. Stremio Web's HTML5 check is `url.endsWith('.mp4')`; a query-string `?d=` after `.mp4` made it hide streams ("No streams were found") even when the JSON list was populated. Nuvio was already fine.
-  - When `/stream` is requested over localhost HTTP and a TryCloudflare tunnel is live, stream URLs use the public HTTPS origin so Stremio Web can play them.
-  - Playable streams emit only `name` + `description` + `url` + `behaviorHints` (no extra `title`). Dummy `externalUrl`-only "Updates" rows are no longer mixed into the playable list.
-  - `behaviorHints.notWebReady` is omitted for HTTPS `.mp4` (helloworld / AIOStreams); local HTTP / AVI still sets `notWebReady: true`.
-  - Manifest `resources` now declare `idPrefixes: ["pm:", "tt"]` on `meta` and `stream` so Stremio 5 / AIOStreams actually query `pm:file:` catalog IDs.
-  - Invalid `behaviorHints.headers` removed (SDK uses `proxyHeaders` only with `notWebReady`).
-  - `/api/download` no longer overwrites MIME with Telegram `file_type=document`; it serves `video/mp4` (or guessed video MIME) so HTML5 players accept the stream. Query `?d=` remains supported for the dashboard download button.
-  - `/api/download` also sends CORS `Access-Control-Allow-Origin: *` plus `Access-Control-Expose-Headers` for Range so Stremio Web can probe the MP4.
-- File detail (`#file/SHORT_CODE`) resolves through local `GET /api/resolve-shortcode` instead of calling WordPress `/resolve-file` with a client `api_secret`. Tunneled sessions hide that secret, so public TryCloudflare file pages can now build `/api/download?d=...`.
-- Tunnel status prefers the live `cloudflared` `/quicktunnel` hostname over a stale log scrape or `state.json` URL, so Settings does not advertise a hostname that returns Cloudflare Error 1033.
-- `cloudflared` is downloaded into `storage/bin/` first; a `PATH` binary is only a fallback.
-- Windows spawn writes `--logfile` and `--metrics` so the public URL can be read after handshake.
+- **Server Password Authentication & Token Model**:
+  - Remote and public requests (VPS public IP, Cloudflare Tunnel) are guarded by password authentication (default `123456`) and persistent 32-character tokens.
+  - Manifest and stream paths support clean token URL routing (`/<token>/manifest.json`, `/<token>/stream/...`).
+  - Localhost and private LAN (RFC-1918) requests remain password-free with instant access.
+  - CLI management commands: `pms password <new>`, `pms reset-password`, `pms token`, and `pms token rotate` (implemented in [`pencarimovie-linux.sh`](pencarimovie-linux.sh:1), [`pencarimovie-termux.sh`](pencarimovie-termux.sh:1), [`pencarimovie-windows.bat`](pencarimovie-windows.bat:1), and [`auth-write.ps1`](auth-write.ps1:1)).
+- **Cloudflare Zero Trust Named Tunnel & Token Persistence**:
+  - Support for custom Named Tunnel tokens via Settings UI and `POST /api/tunnel/enable`.
+  - Added CLI command `pms tunnel <TOKEN>` across Linux, Windows, and Termux launchers.
+  - Dedicated token persistence in `storage/tunnel/token.txt` preserved across server restarts and `pms stop`.
+  - Automatic tunnel warm-up in [`warmup-ipc.php`](warmup-ipc.php:1) on `pms start` or `pms restart` when previously enabled.
+  - Dynamic discovery of mapped public hostnames matching local listening port from connector logs.
+- **VPS & Remote Server Manifest Mode**:
+  - Direct IP detection in frontend (`_isIpHost`) preventing public VPS addresses from showing TryCloudflare tunnel badges when tunnels are disabled.
+  - Added `mode=server` to [`backend.php`](backend.php:6102) yielding `PencariMovie (Server)` / `org.pencarimovie.addon.server`.
+  - Addon modal displays "🌐 Server Manifest" on VPS IPs and automatically selects the Server manifest in Stremio Sync.
+  - Dynamically hides the Wi-Fi/LAN vs Localhost toggle when accessing from a public VPS IP or Cloudflare Tunnel.
+- **Eclipse Music Addon Integration**:
+  - Native discovery and streaming for 500,000+ audio tracks under `/eclipse` routes (`/eclipse/manifest.json`, `/eclipse/search`, `/eclipse/stream/{id}`, `/eclipse/catalog/{id}`, `/eclipse/resolve`).
+  - Advanced caption and title parsing in [`backend.php`](backend.php:8165) separating artist, title, and featured collaborations with multi-word connector handling.
+- **Stremio HTTP API Sync**:
+  - Browser-side Stremio HTTP API sync (`api.strem.io` login → `addonCollectionGet` → `addonCollectionSet`) without transmitting user credentials to the PHP backend.
 
 ### Security
 
-- Cloudflare-proxied requests are treated as remote (Host `.trycloudflare.com` / `CF-*` headers), so tunnel enable/disable and bot login stay local-only.
-- Tunneled `/api/session` hides `api_secret`. Catalog, stream, and `/api/download` remain reachable through the public URL by design.
+- **Caddy Sensitive File Shield**:
+  - Added `@blocked` route matcher in [`Caddyfile`](Caddyfile:1) returning HTTP 404 for sensitive files and directories (`storage/*`, `vendor/*`, `bin/*`, `patches/*`, `Caddyfile*`, `*.sh`, `*.bat`, `*.key`, `*.log`, `*.lock`, `*.md`, `*.yml`, `*.yaml`, `composer.json`, `package.json`).
+- **Progressive Brute-Force Rate Limiting**:
+  - Exponential lockout ladder (30s, 2m, 10m, 30m) for failed password submissions tracked in `storage/cache/auth_lockout.json` returning HTTP 429 with `Retry-After`.
+- **Locked Stream Responses**:
+  - Unauthenticated remote stream requests receive an informative Stremio stream banner directing users to authenticate via `#addon`, rather than failing silently with 401.
+- **Native PHP Static Boundary**:
+  - Direct built-in PHP server execution (`php -S ... router.php`) strictly isolates file serving to `public/` via `realpath()` and `str_starts_with()` checks.
+
+### Changed
+
+- **Stream Object Specification**:
+  - Playable `/stream` objects comply with AIOStreams specification (`name`, `description`, `url`, `behaviorHints`).
+  - Stream URLs end with clean file extensions (`.mp4`, `.flac`, `.mkv`) to guarantee playback compatibility across Stremio Web, Android, and desktop players.
+- **Release Packaging**:
+  - Updated [`scripts/build-release.bat`](scripts/build-release.bat:1) and [`scripts/package-unix.sh`](scripts/package-unix.sh:1) to include [`pencarimovie-linux.sh`](pencarimovie-linux.sh:1), [`pencarimovie-termux.sh`](pencarimovie-termux.sh:1), [`README.md`](README.md:1), and [`patches/`](patches/) across all release archives.
+  - Added automated line ending normalization (CRLF → LF) for all shell scripts and `bin/php` when building Unix packages on Windows.
+  - Exported [`update.ps1`](update.ps1:1) to `dist/` alongside [`pencarimovie-windows.bat`](pencarimovie-windows.bat:1).
+- **Process Management**:
+  - Preserved tunnel token state during `stop.sh` and `stop.bat` process teardown.
+  - Improved working directory resolution in Unix start scripts ensuring Caddy directives resolve from the repository root.
 
 ## [1.0.1] - 2026-08-29
 

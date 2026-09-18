@@ -11,6 +11,41 @@
  */
 require_once __DIR__ . '/backend.php';
 
+function fd_warmup_tunnel(): void
+{
+    $state = fd_load_tunnel_state();
+    if (empty($state['enabled'])) {
+        return;
+    }
+
+    $pid = fd_tunnel_read_pid();
+    if ($pid > 1 && fd_tunnel_pid_alive($pid)) {
+        echo "Cloudflare tunnel already running (PID $pid).\n";
+        return;
+    }
+
+    echo "Cloudflare tunnel is enabled. Auto-starting tunnel...\n";
+    if (fd_tunnel_auto_restart()) {
+        $newPid = fd_tunnel_read_pid();
+        echo "Cloudflare tunnel auto-started (PID $newPid).\n";
+        return;
+    }
+
+    $token = fd_load_saved_tunnel_token();
+    if ($token !== '') {
+        $res = fd_enable_tunnel($token);
+        if (!empty($res['ok'])) {
+            echo "Cloudflare tunnel started with token (PID " . ($res['pid'] ?? '?') . ").\n";
+        } else {
+            echo "Cloudflare tunnel start failed: " . ($res['message'] ?? 'unknown error') . "\n";
+        }
+    }
+}
+
+// 1. Auto-start Cloudflare tunnel if previously enabled
+fd_warmup_tunnel();
+
+// 2. Warm up persistent IPC workers for bots
 $pool = fd_get_bot_pool();
 if (empty($pool)) {
     echo "No bots in pool, nothing to warm up.\n";

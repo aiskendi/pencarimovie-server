@@ -400,6 +400,7 @@ class PencariMovieApp {
     const addonLocalField = this.$('#addonLocalField');
     const addonTunnelField = this.$('#addonTunnelField');
     const addonStremioDirectBtn = this.$('#addonStremioDirectBtn');
+    const addonStremioLocalDirectBtn = this.$('#addonStremioLocalDirectBtn');
     const addonStremioSync = this.$('#addonStremioSync');
     const addonNuvioInstructions = this.$('#addonNuvioInstructions');
     const copiedStatus = this.$('#addonCopiedStatus');
@@ -1151,8 +1152,26 @@ class PencariMovieApp {
         }
       }
 
+      const isHttps = window.location.protocol === 'https:' || onTunnel;
+
+      if (addonStremioLocalDirectBtn) {
+        const directUrl = serverUrl || localUrl;
+        if (directUrl && isHttps) {
+          const stremioDeepLink = directUrl.replace(/^https?:\/\//i, 'stremio://');
+          addonStremioLocalDirectBtn.href = stremioDeepLink;
+          addonStremioLocalDirectBtn.classList.remove('hidden');
+        } else {
+          addonStremioLocalDirectBtn.href = '#';
+          addonStremioLocalDirectBtn.classList.add('hidden');
+        }
+      }
+
       if (addonModalTitle) addonModalTitle.textContent = '🧩 Nuvio / Stremio Addon';
-      if (addonModalDesc) addonModalDesc.textContent = 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
+      if (addonModalDesc) {
+        addonModalDesc.textContent = isHttps
+          ? 'Copy a manifest URL for Nuvio, or click Add to Stremio.'
+          : 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
+      }
       if (addonLanField) {
         // User requested: hide Wi-Fi / LAN Manifest completely
         addonLanField.classList.add('hidden');
@@ -1166,13 +1185,16 @@ class PencariMovieApp {
         addonTunnelField.classList.toggle('hidden', !tunnelManifest);
       }
       if (addonStremioSync) {
-        addonStremioSync.classList.remove('hidden');
+        // If already HTTPS, no need to show HTTP API Sync
+        addonStremioSync.classList.toggle('hidden', isHttps);
       }
       if (addonNuvioInstructions) {
         addonNuvioInstructions.classList.remove('hidden');
       }
 
-      updateStremioSyncPreview();
+      if (!isHttps) {
+        updateStremioSyncPreview();
+      }
     };
 
     this._updateAddonModalUrls = updateAddonModalUrls;

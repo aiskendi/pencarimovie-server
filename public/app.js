@@ -57,8 +57,16 @@ class PencariMovieApp {
     this.lanIp = '';
     this.listenPort = 8088;
     this.deviceId = '';
-    this.tunnelUrl = '';
-    this.tunnelEnabled = false;
+    this.tunnelUrl = localStorage.getItem('pm.tunnel_url') || '';
+    this.tunnelPublicUrl = localStorage.getItem('pm.tunnel_public_url') || '';
+    this.tunnelCustomDomain = localStorage.getItem('pm.tunnel_custom_domain') || '';
+    this.tunnelCustomDomains = [];
+    try {
+      const cd = localStorage.getItem('pm.tunnel_custom_domains');
+      if (cd) this.tunnelCustomDomains = JSON.parse(cd);
+    } catch (e) {}
+    this.tunnelEnabled = localStorage.getItem('pm.tunnel_enabled') === '1';
+    this.tunnelRunning = false;
     this._tunnelBusy = false;
     this.sponsor = null;
     this._updateAddonModalUrls = () => {};
@@ -1014,7 +1022,7 @@ class PencariMovieApp {
       const localUrl = `http://127.0.0.1${portSuffix}${tokenPrefix}/manifest.json`;
 
       // 2. Server / Remote URL: for direct VPS / remote IP access
-      const serverUrl = (!isLocal && !onTunnel)
+      let serverUrl = (!isLocal && !onTunnel)
         ? `${window.location.origin.replace(/\/+$/, '')}${tokenPrefix}/manifest.json`
         : '';
 
@@ -1037,6 +1045,15 @@ class PencariMovieApp {
       const tunnelManifest = (tunnelUrl && (this.tunnelEnabled || onTunnel))
         ? `${tunnelUrl}${tokenPrefix}/manifest.json`
         : '';
+
+      // If serverUrl matches tunnelManifest or current host matches tunnel host, suppress serverUrl
+      let tunnelHost = '';
+      if (tunnelUrl) {
+        try { tunnelHost = new URL(tunnelUrl).hostname.toLowerCase(); } catch (e) {}
+      }
+      if (serverUrl && (onTunnel || (tunnelManifest && (serverUrl === tunnelManifest || pageHost.toLowerCase() === tunnelHost)))) {
+        serverUrl = '';
+      }
 
       // 4. Eclipse Music Addon URL:
       // When on Cloudflare Tunnel: use tunnel URL
@@ -1177,8 +1194,9 @@ class PencariMovieApp {
         addonLanField.classList.add('hidden');
       }
       if (addonLocalField) {
-        // Show server/local field unless specifically browsing on an active tunnel domain
-        addonLocalField.classList.toggle('hidden', onTunnel);
+        // Show server/local field unless specifically browsing on an active tunnel domain or when duplicate
+        const hideLocal = onTunnel || (!isLocal && (!serverUrl || serverUrl === tunnelManifest));
+        addonLocalField.classList.toggle('hidden', hideLocal);
       }
       if (addonTunnelField) {
         // Only show Cloudflare Tunnel field if a real tunnel is active with a valid manifest
@@ -1658,14 +1676,20 @@ class PencariMovieApp {
     if (host.endsWith('.trycloudflare.com')) {
       return true;
     }
-    // Only treat custom domains as Cloudflare Tunnel if the tunnel is actually enabled/running
-    if (this.tunnelEnabled && (this.tunnelRunning || this.tunnelUrl)) {
-      if (this.tunnelCustomDomain && host === String(this.tunnelCustomDomain).toLowerCase()) {
-        return true;
+    // Check against tunnel URL / public URL hostname
+    for (const u of [this.tunnelPublicUrl, this.tunnelUrl]) {
+      if (u) {
+        try {
+          if (new URL(u).hostname.toLowerCase() === host) return true;
+        } catch (e) {}
       }
-      if (Array.isArray(this.tunnelCustomDomains) && this.tunnelCustomDomains.some(d => String(d).toLowerCase() === host)) {
-        return true;
-      }
+    }
+    // Check custom domain or custom domains
+    if (this.tunnelCustomDomain && host === String(this.tunnelCustomDomain).toLowerCase()) {
+      return true;
+    }
+    if (Array.isArray(this.tunnelCustomDomains) && this.tunnelCustomDomains.some(d => String(d).toLowerCase() === host)) {
+      return true;
     }
     return false;
   }
@@ -1799,6 +1823,18 @@ class PencariMovieApp {
     this.tunnelEnabled = enabled;
     this.tunnelUrl = displayUrl;
     this.tunnelPublicUrl = publicUrl;
+    this.tunnelRunning = Boolean(data.running);
+    this.tunnelCustomDomain = data.custom_domain || '';
+    this.tunnelCustomDomains = Array.isArray(data.custom_domains) ? data.custom_domains : [];
+    try {
+      localStorage.setItem('pm.tunnel_enabled', enabled ? '1' : '0');
+      if (displayUrl) localStorage.setItem('pm.tunnel_url', displayUrl);
+      if (publicUrl) localStorage.setItem('pm.tunnel_public_url', publicUrl);
+      if (data.custom_domain) localStorage.setItem('pm.tunnel_custom_domain', data.custom_domain);
+      if (Array.isArray(data.custom_domains) && data.custom_domains.length > 0) {
+        localStorage.setItem('pm.tunnel_custom_domains', JSON.stringify(data.custom_domains));
+      }
+    } catch (e) {}
     if (tokenInput && data.tunnel_token && !tokenInput.value) {
       tokenInput.value = data.tunnel_token;
     }

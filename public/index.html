@@ -357,7 +357,7 @@
           <div class="settings-gate__addon-box settings-gate__tunnel-box">
             <span>☁️ Cloudflare Tunnel</span>
             <p class="settings-gate__tunnel-desc" id="tunnelDescText">
-              Expose this server publicly. Leave blank for a free automatic URL, or enter your Custom Domain and Cloudflare Tunnel Token.
+              Expose this server publicly for remote streaming. Leave blank for a free automatic Quick Tunnel (<code>*.trycloudflare.com</code>), or paste your Cloudflare Zero Trust Tunnel Token to use your own custom domain.
             </p>
 
             <div style="margin: 10px 0 6px 0;">
@@ -365,7 +365,7 @@
                 type="password"
                 id="tunnelTokenInput"
                 class="settings-gate__input"
-                placeholder="Cloudflare Tunnel Token (optional, leave blank for auto URL)"
+                placeholder="Cloudflare Tunnel Token (optional, leave blank for auto Quick Tunnel)"
                 autocomplete="off"
                 spellcheck="false"
               />
@@ -378,10 +378,10 @@
               </summary>
               <div style="margin-top: 8px; color: #bbb; line-height: 1.5; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
                 <ol style="margin-left: 16px; display: flex; flex-direction: column; gap: 5px;">
-                  <li>Open Cloudflare Dashboard &rarr; <strong>Zero Trust</strong> &rarr; <strong>Networks</strong> &rarr; <strong>Tunnel & Mesh</strong>.</li>
+                  <li>Open Cloudflare Dashboard &rarr; <strong>Zero Trust</strong> &rarr; <strong>Networks</strong> &rarr; <strong>Tunnels</strong> (or <strong>Tunnel & Mesh</strong>).</li>
                   <li>Click <strong>Create a tunnel</strong> &rarr; Select tunnel type: <strong>Cloudflared</strong>.</li>
                   <li><strong>Name your tunnel</strong>: e.g. <code>pms</code> &rarr; click <strong>Save tunnel</strong>.</li>
-                  <li><strong>Install and run a connector</strong>: Copy the command (e.g. <code>cloudflared.exe service install eyJh...</code>) and paste it into the box above.</li>
+                  <li><strong>Install and run a connector</strong>: Copy the token or connector command (e.g. <code>cloudflared.exe service install eyJh...</code>) and paste it into the box above.</li>
                   <li><strong>Route tunnel</strong>: Add your public hostname:
                     <div style="margin-top: 2px; color: #eee;">
                       &bull; <strong>Subdomain / Domain</strong>: e.g. <code>addon</code>.<code>yourdomain.com</code><br/>

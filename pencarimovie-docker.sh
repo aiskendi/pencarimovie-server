@@ -110,19 +110,18 @@ do_start() {
   cd "$APP_DIR"
 
   echo "Starting PencariMovie Server in Docker..."
-  compose_cmd pull 2>/dev/null || true
-  if compose_cmd up -d; then
+  if compose_cmd up -d --build; then
     :
   else
     echo "Falling back to standalone docker run..."
-    docker pull ghcr.io/aiskendi/pencarimovie-server:latest 2>/dev/null || true
+    docker build -t pencarimovie-server:latest .
     docker rm -f pencarimovie-server 2>/dev/null || true
     docker run -d \
       --name pencarimovie-server \
       --restart unless-stopped \
       -p "${PORT}:8088" \
       -v "$APP_DIR/storage:/app/storage" \
-      ghcr.io/aiskendi/pencarimovie-server:latest
+      pencarimovie-server:latest
   fi
 
   local lan_ip
@@ -181,7 +180,7 @@ do_update() {
   echo "Updating PencariMovie Server Docker..."
   curl -fsSL "$GITHUB_RAW/pencarimovie-docker.sh" -o "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
   chmod +x "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
-  compose_cmd pull
+  compose_cmd build --no-cache
   compose_cmd up -d --force-recreate
   docker image prune -f 2>/dev/null || true
   echo "Updated to latest version."

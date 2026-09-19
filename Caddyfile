@@ -6,19 +6,19 @@
 		#   - At ~30-50MB per thread, 16 threads caps memory usage under 600MB RAM.
 		#   - Idle threads above num_threads are automatically reclaimed after 10s.
 		#   - High-end multi-core servers can override via FRANKENPHP_NUM_THREADS=16 FRANKENPHP_MAX_THREADS=64.
-		num_threads {$FRANKENPHP_NUM_THREADS:4}
-		max_threads {$FRANKENPHP_MAX_THREADS:6}
-		max_idle_time 5s
+		num_threads {$FRANKENPHP_NUM_THREADS:8}
+		max_threads {$FRANKENPHP_MAX_THREADS:16}
+		max_idle_time 10s
 
 		# Limit per-request memory usage to prevent runaway heap allocations.
-		php_ini memory_limit {$PHP_MEMORY_LIMIT:128M}
+		php_ini memory_limit {$PHP_MEMORY_LIMIT:512M}
 
 		# Disable PHP execution timeout so long-running media streams (movies, music)
 		# and large file downloads are never abruptly terminated mid-playback.
 		php_ini max_execution_time 0
 
 		# Cap how long a queued request waits for a thread during extreme spikes before failing fast.
-		max_wait_time {$FRANKENPHP_MAX_WAIT_TIME:10s}
+		max_wait_time {$FRANKENPHP_MAX_WAIT_TIME:30s}
 	}
 	order php_server before file_server
 	servers {

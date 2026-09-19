@@ -54,7 +54,7 @@ class PencariMovieApp {
     this.botName = '';
     this.apiSecret = '';
     this.hasSession = false;
-    this.lanIp = '';
+    this.lanIp = localStorage.getItem('pm.lan_ip') || '';
     this.listenPort = 8088;
     this.deviceId = '';
     this.tunnelUrl = localStorage.getItem('pm.tunnel_url') || '';
@@ -88,6 +88,7 @@ class PencariMovieApp {
   async init() {
     this.detectTelegram();
     this.bindGlobalEvents();
+    this.loadLanIp();
 
     // ── Auth gate — must pass before anything else loads ──
     if (!(await this.checkAuth())) {
@@ -438,8 +439,13 @@ class PencariMovieApp {
     };
 
     if (addonTokenCopyBtn && addonTokenInput) {
-      addonTokenCopyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(addonTokenInput.value);
+      addonTokenCopyBtn.addEventListener('click', async () => {
+        await this.copyToClipboard(addonTokenInput.value, addonTokenInput);
+        if (addonTokenCopyBtn) {
+          const orig = addonTokenCopyBtn.textContent;
+          addonTokenCopyBtn.textContent = '✓';
+          setTimeout(() => { addonTokenCopyBtn.textContent = orig; }, 1500);
+        }
         showTokenStatus('✓ Token copied');
       });
     }
@@ -1146,7 +1152,7 @@ class PencariMovieApp {
       }
 
       if (manifestLanInput) {
-        manifestLanInput.value = lanUrl || localUrl;
+        manifestLanInput.value = lanUrl || (this.lanIp ? `http://${this.lanIp}${portSuffix}${tokenPrefix}/manifest.json` : '');
       }
 
       if (manifestTunnelInput) {
@@ -1190,8 +1196,9 @@ class PencariMovieApp {
           : 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
       }
       if (addonLanField) {
-        // User requested: hide Wi-Fi / LAN Manifest completely
-        addonLanField.classList.add('hidden');
+        // Show Wi-Fi / LAN Manifest whenever lanUrl exists, or on local network with detected IP
+        const showLan = Boolean(lanUrl || isLocal || this.lanIp);
+        addonLanField.classList.toggle('hidden', !showLan);
       }
       if (addonLocalField) {
         // Show server/local field unless specifically browsing on an active tunnel domain or when duplicate
@@ -1275,34 +1282,50 @@ class PencariMovieApp {
       }
     };
 
+    const flashCopyBtn = (btn, defaultText = '📋 Copy') => {
+      if (!btn) return;
+      btn.textContent = '✓ Copied!';
+      btn.style.background = '#00d26a';
+      btn.style.color = '#fff';
+      setTimeout(() => {
+        btn.textContent = defaultText;
+        btn.style.background = '';
+        btn.style.color = '';
+      }, 1500);
+    };
+
     if (copyAddonLanBtn && manifestLanInput) {
-      copyAddonLanBtn.addEventListener('click', () => {
+      copyAddonLanBtn.addEventListener('click', async () => {
         manifestLanInput.select();
-        navigator.clipboard.writeText(manifestLanInput.value);
+        await this.copyToClipboard(manifestLanInput.value, manifestLanInput);
+        flashCopyBtn(copyAddonLanBtn);
         showCopiedFeedback('✓ Copied Wi-Fi / LAN URL to clipboard!');
       });
     }
 
     if (copyAddonBtn && manifestInput) {
-      copyAddonBtn.addEventListener('click', () => {
+      copyAddonBtn.addEventListener('click', async () => {
         manifestInput.select();
-        navigator.clipboard.writeText(manifestInput.value);
-        showCopiedFeedback('✓ Copied Localhost URL to clipboard!');
+        await this.copyToClipboard(manifestInput.value, manifestInput);
+        flashCopyBtn(copyAddonBtn);
+        showCopiedFeedback('✓ Copied Manifest URL to clipboard!');
       });
     }
 
     if (copyAddonTunnelBtn && manifestTunnelInput) {
-      copyAddonTunnelBtn.addEventListener('click', () => {
+      copyAddonTunnelBtn.addEventListener('click', async () => {
         manifestTunnelInput.select();
-        navigator.clipboard.writeText(manifestTunnelInput.value);
+        await this.copyToClipboard(manifestTunnelInput.value, manifestTunnelInput);
+        flashCopyBtn(copyAddonTunnelBtn);
         showCopiedFeedback('✓ Copied Cloudflare tunnel URL to clipboard!');
       });
     }
 
     if (copyAddonEclipseBtn && manifestEclipseInput) {
-      copyAddonEclipseBtn.addEventListener('click', () => {
+      copyAddonEclipseBtn.addEventListener('click', async () => {
         manifestEclipseInput.select();
-        navigator.clipboard.writeText(manifestEclipseInput.value);
+        await this.copyToClipboard(manifestEclipseInput.value, manifestEclipseInput);
+        flashCopyBtn(copyAddonEclipseBtn);
         showCopiedFeedback('✓ Copied Eclipse Music Addon URL to clipboard!');
       });
     }
@@ -1737,16 +1760,11 @@ class PencariMovieApp {
     }
 
     if (copyBtn && input) {
-      copyBtn.addEventListener('click', () => {
+      copyBtn.addEventListener('click', async () => {
         const value = String(input.value || '').trim();
         if (!value) return;
-        input.select();
-        navigator.clipboard.writeText(value).catch(() => {});
-        const original = copyBtn.textContent;
-        copyBtn.textContent = 'Copied';
-        setTimeout(() => {
-          copyBtn.textContent = original || '📋 Copy';
-        }, 1600);
+        await this.copyToClipboard(value, input);
+        flashCopyBtn(copyBtn);
       });
     }
 
@@ -2718,6 +2736,50 @@ class PencariMovieApp {
     else if (/\b(repack|proper)\b/i.test(text)) edition = 'Proper';
 
     return { resolution: res, source, platform, codec, audio, visual, edition };
+  }
+
+  async copyToClipboard(text, inputEl = null) {
+    const val = String(text || '').trim();
+    if (!val) return false;
+    let copied = false;
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(val);
+        copied = true;
+      } catch (e) {
+        copied = false;
+      }
+    }
+    if (!copied) {
+      try {
+        if (inputEl && typeof inputEl.select === 'function') {
+          inputEl.focus();
+          inputEl.select();
+          if (typeof inputEl.setSelectionRange === 'function') {
+            inputEl.setSelectionRange(0, 99999);
+          }
+          copied = document.execCommand('copy');
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = val;
+          ta.style.position = 'fixed';
+          ta.style.left = '-9999px';
+          ta.style.top = '0';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          if (typeof ta.setSelectionRange === 'function') {
+            ta.setSelectionRange(0, 99999);
+          }
+          copied = document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+      } catch (e) {
+        copied = false;
+      }
+    }
+    return copied;
   }
 
   formatSize(bytes) {

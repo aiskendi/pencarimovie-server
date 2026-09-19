@@ -488,7 +488,7 @@ do_start() {
         -w "$ROOT_DIR" \
         -b "$ROOT_DIR:$ROOT_DIR" \
         -b "$TMP_DIR:/tmp" \
-        /bin/sh -c 'export PATH="$1/bin:$7/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export PREFIX="$7"; export LAN_IP="$6"; exec "$2" php-server --listen "$3:$4" --root "$5"' \
+        /bin/sh -c 'export PATH="$1/bin:$7/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export PREFIX="$7"; export LAN_IP="$6"; if [ -f "$5/Caddyfile" ]; then exec "$2" run --config "$5/Caddyfile"; else exec "$2" php-server --listen "$3:$4" --root "$5"; fi' \
         sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" "$TERMUX_PREFIX" >>"$LOG_FILE" 2>&1 &
       PID="$!"
 

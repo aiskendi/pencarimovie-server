@@ -90,7 +90,10 @@ Or using `docker-compose.yml`:
 ```yaml
 services:
   pencarimovie:
-    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    image: pencarimovie-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:

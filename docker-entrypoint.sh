@@ -5,6 +5,11 @@ export MALLOC_ARENA_MAX=2
 export XDG_DATA_HOME="${XDG_DATA_HOME:-/tmp/caddy/data}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/caddy/config}"
 
+# On Heroku / Docker: scale FrankenPHP thread pool to use all available CPU cores
+CORES=$(nproc 2>/dev/null || echo 8)
+export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-$((CORES * 2))}"
+export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-$((CORES * 4))}"
+
 mkdir -p /tmp/caddy/data /tmp/caddy/config /app/storage 2>/dev/null || true
 chmod 777 /app/storage 2>/dev/null || true
 

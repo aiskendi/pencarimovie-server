@@ -7218,7 +7218,9 @@ function fd_tunnel_metrics_ports(int $pid = 0, int $preferred = 0): array
     if ($fromState > 0) {
         $ports[] = $fromState;
     }
-    $ports[] = 20241;
+    if (empty($ports)) {
+        $ports[] = 20241;
+    }
 
     if ($pid > 1) {
         if (fd_is_windows()) {
@@ -13393,11 +13395,17 @@ if (str_starts_with($path, '/api/')) {
 
         @set_time_limit(0);
         if (function_exists('ignore_user_abort')) {
-            @ignore_user_abort(true);
+            @ignore_user_abort(false);
         }
 
         $downloadAttempt = 0;
         $maxDownloadAttempts = ($shortCode !== '') ? 2 : 1;
+
+        $abortCallback = static function ($percent = 0, $speed = 0, $time = 0): void {
+            if (connection_aborted()) {
+                throw new \RuntimeException('Client disconnected');
+            }
+        };
 
         while ($downloadAttempt < $maxDownloadAttempts) {
             $downloadAttempt++;
@@ -13418,10 +13426,14 @@ if (str_starts_with($path, '/api/')) {
                     'method' => $_SERVER['REQUEST_METHOD'] ?? 'GET',
                     'ip' => $_SERVER['REMOTE_ADDR'] ?? '',
                 ]);
-                $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
+                $madeline->downloadToBrowser($fileId, $abortCallback, $fileSize, $fileName, $fileMime);
                 return true;
             } catch (Throwable $throwable) {
                 $errStr = $throwable->getMessage();
+                if (connection_aborted() || stripos($errStr, 'Client disconnected') !== false || stripos($errStr, 'Broken pipe') !== false) {
+                    fd_log('client disconnected during stream, aborting cleanly', ['short_code' => $shortCode]);
+                    return true;
+                }
                 fd_log('downloadToBrowser failed', [
                     'error' => $errStr,
                     'attempt' => $downloadAttempt,

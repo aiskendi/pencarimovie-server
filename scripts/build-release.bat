@@ -142,15 +142,6 @@ if errorlevel 1 echo ERROR: Standalone server packaging failed
 REM Clean build tmp
 if exist "%ROOT%\dist\.build-tmp" rmdir /s /q "%ROOT%\dist\.build-tmp"
 
-REM Standalone one-file installers
-copy /Y "%ROOT%\pencarimovie-linux.sh" "%ROOT%\dist\" >nul 2>nul
-copy /Y "%ROOT%\pencarimovie-termux.sh" "%ROOT%\dist\" >nul 2>nul
-copy /Y "%ROOT%\pencarimovie-docker.sh" "%ROOT%\dist\" >nul 2>nul
-copy /Y "%ROOT%\pencarimovie-windows.bat" "%ROOT%\dist\" >nul 2>nul
-if exist "%ROOT%\pencarimovie-windows.ps1" copy /Y "%ROOT%\pencarimovie-windows.ps1" "%ROOT%\dist\" >nul 2>nul
-if exist "%ROOT%\update.ps1" copy /Y "%ROOT%\update.ps1" "%ROOT%\dist\" >nul 2>nul
-powershell -NoProfile -Command "foreach ($f in @('pencarimovie-linux.sh','pencarimovie-termux.sh','pencarimovie-docker.sh')) { $p = Join-Path '%ROOT%\dist' $f; if (Test-Path $p) { $t = [IO.File]::ReadAllText($p) -replace \"`r\", ''; [IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding $false)) } }"
-
 echo.
 echo Done. Built packages are in "%ROOT%\dist":
 dir /b "%ROOT%\dist"

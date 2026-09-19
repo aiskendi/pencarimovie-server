@@ -105,14 +105,11 @@ jobs:
           tar -C dist/.build-tmp -czf dist/pencarimovie-server.tar.gz pencarimovie-server
           rm -rf dist/.build-tmp
 
-          # Clean standalone installer scripts from dist/ (they live in main branch)
-          rm -f dist/*.sh dist/*.bat dist/*.ps1
+          # Ensure only tar.gz and zip archives are in dist/ (scripts stay in main)
+          rm -f dist/*.sh dist/*.bat dist/*.ps1 dist/*.apk
 
-      - name: Fetch and bundle Android APK asset
-        run: |
-          echo "Fetching Android APK from v2.2.1 release for telegra.my/apk..."
-          curl -fsSL "https://github.com/aiskendi/pencarimovie-server/releases/download/v2.2.1/pencarimovie_arm64-v8a.apk" -o dist/pencarimovie_arm64-v8a.apk
-          ls -lh dist/pencarimovie_arm64-v8a.apk
+          echo "Release archives in dist/:"
+          ls -lh dist/
 
       - name: Build and push multi-arch Docker image to GHCR
         uses: docker/build-push-action@v5
@@ -131,7 +128,9 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           files: |
-            dist/*
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.zip.sha256
           draft: false
           prerelease: false
           generate_release_notes: true

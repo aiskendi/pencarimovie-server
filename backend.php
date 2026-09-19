@@ -1144,10 +1144,17 @@ function fd_auth_load(): array
             $data = $decoded;
         }
     }
-    if (empty($data['password_hash'])) {
+    $envPw = trim((string) (fd_env('SERVER_PASSWORD') ?: ''));
+    if ($envPw !== '') {
+        $data['password_hash'] = password_hash($envPw, PASSWORD_DEFAULT);
+    } elseif (empty($data['password_hash'])) {
         $data['password_hash'] = password_hash(FD_AUTH_DEFAULT_PASSWORD, PASSWORD_DEFAULT);
     }
-    if (empty($data['token'])) {
+    $envToken = trim((string) (fd_env('SERVER_TOKEN') ?: ''));
+    if ($envToken !== '') {
+        // If comma-separated tokens provided, take the primary one as default
+        $data['token'] = trim(explode(',', $envToken)[0]);
+    } elseif (empty($data['token'])) {
         $data['token'] = bin2hex(random_bytes(16));
     }
     if (!isset($data['enabled'])) {
@@ -1157,6 +1164,25 @@ function fd_auth_load(): array
         fd_auth_save($data);
     }
     return $data;
+}
+
+function fd_auth_valid_tokens(): array
+{
+    $tokens = [];
+    $main = fd_auth_token();
+    if ($main !== '') {
+        $tokens[] = strtolower($main);
+    }
+    $envTokens = trim((string) (fd_env('SERVER_TOKEN') ?: ''));
+    if ($envTokens !== '') {
+        foreach (explode(',', $envTokens) as $t) {
+            $t = strtolower(trim($t));
+            if ($t !== '' && !in_array($t, $tokens, true)) {
+                $tokens[] = $t;
+            }
+        }
+    }
+    return $tokens;
 }
 
 function fd_auth_save(array $data): void
@@ -1327,8 +1353,16 @@ function fd_is_authenticated(): bool
     if (fd_is_local_request()) {
         return true;
     }
-    $token = fd_auth_token_from_request();
-    return $token !== '' && hash_equals(fd_auth_token(), $token);
+    $token = strtolower(fd_auth_token_from_request());
+    if ($token === '') {
+        return false;
+    }
+    foreach (fd_auth_valid_tokens() as $valid) {
+        if (hash_equals($valid, $token)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function fd_require_auth(): void

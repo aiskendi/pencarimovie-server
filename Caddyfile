@@ -1,33 +1,32 @@
 {
-    frankenphp {
-        # 8 threads balances two constraints:
-        #   - Memory: each PHP thread can hold 30-50MB once MadelineProto is
-        #     loaded, so 8 stays within a 1GB-RAM device's budget.
-        #   - Concurrency: /manifest.json and /catalog/* make blocking
-        #     WordPress calls (12s timeout). At 4 threads those calls occupy
-        #     the whole pool and C=100 returned 0 OK; 8 gives enough headroom
-        #     to keep serving while a few upstream calls are in flight.
-        #
-        # Requests no longer save the MadelineProto session:
-        # fd_boot_madeline() clears FD_FORCE_FULL_BOOT right after
-        # construction, so every boot takes the IPC client path where
-        # APIWrapper::serialize() returns early. Previously each request did a
-        # full-mode save holding an exclusive flock on safe.php.lock and
-        # lightState.php.lock, which serialized all requests and wedged the
-        # server permanently.
-        #
-        # Do NOT use `max_threads auto`: autoscaling spawns threads that all
-        # contend on the same WordPress call and session lock, which measured
-        # WORSE than a fixed pool (98 vs 322 successful requests at C=50).
-        num_threads 8
+	frankenphp {
+		# Concurrency & thread pool:
+		#   - Starts with 16 worker threads, automatically upscaling to 64 threads under load.
+		#   - Allows 40+ concurrent active video/audio streams while leaving ample headroom
+		#     for instant catalog, metadata, and search requests without thread starvation.
+		#   - Idle threads above num_threads are automatically reclaimed after 10s.
+		#   - On low-end 1GB devices, set FRANKENPHP_NUM_THREADS=8 FRANKENPHP_MAX_THREADS=16.
+		num_threads {$FRANKENPHP_NUM_THREADS:16}
+		max_threads {$FRANKENPHP_MAX_THREADS:64}
+		max_idle_time 10s
 
-        # Cap how long a request waits for a free thread. Without this the
-        # default is "disabled", so a saturated pool makes requests hang
-        # indefinitely instead of failing fast. 30s is above the slowest
-        # legitimate upstream call (WordPress search-music, 15s timeout).
-        max_wait_time 30s
-    }
-    order php_server before file_server
+		# Disable PHP execution timeout so long-running media streams (movies, music)
+		# and large file downloads are never abruptly terminated mid-playback.
+		php_ini max_execution_time 0
+
+		# Cap how long a queued request waits for a thread during extreme spikes before failing fast.
+		max_wait_time {$FRANKENPHP_MAX_WAIT_TIME:60s}
+	}
+	order php_server before file_server
+	servers {
+		enable_full_duplex
+		timeouts {
+			read_body 10m
+			read_header 30s
+			write 10m
+			idle 2m
+		}
+	}
 }
 
 # NOTE: keep this as a bare `:8088` port, NOT `localhost:8088`.

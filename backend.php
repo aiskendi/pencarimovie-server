@@ -262,6 +262,13 @@ define('FD_CURL_RESOLVE', (string) (fd_env('FD_CURL_RESOLVE', '')));
 
 function fd_is_debug_enabled(): bool
 {
+    $env = fd_env('DEBUG') ?: fd_env('DEBUG_MODE');
+    if ($env !== null && $env !== false && $env !== '') {
+        $env = strtolower(trim((string) $env));
+        if ($env === '1' || $env === 'true' || $env === 'on' || $env === 'yes') {
+            return true;
+        }
+    }
     $file = FD_DEBUG_TOGGLE_PATH;
     if (is_file($file)) {
         $val = trim((string) @file_get_contents($file));
@@ -6449,12 +6456,12 @@ function fd_stremio_stream_filename(string $fileName, string $mime = ''): string
 function fd_build_stremio_stream_url(string $baseUrl, string $payloadB64, string $fileName, string $mime = ''): string
 {
     $safe = fd_stremio_stream_filename($fileName, $mime);
-    // Carry the auth token as a query param so remote players can fetch the
-    // file. Localhost/LAN requests ignore it. The real filename + extension
-    // from fd_stremio_stream_filename() are preserved untouched.
+    // Carry the auth token as a clean path segment: /<token>/api/download/<payload>/<filename>
+    // so the stream URL ends with .mp4 (required for Stremio Web HTML5 url.endsWith('.mp4') check).
+    // If the client already included a query or token, keep path clean.
     $token = fd_auth_enabled() ? fd_auth_token() : '';
-    $query = $token !== '' ? '?token=' . rawurlencode($token) : '';
-    return rtrim($baseUrl, '/') . '/api/download/' . rawurlencode($payloadB64) . '/' . rawurlencode($safe) . $query;
+    $tokenSegment = ($token !== '') ? '/' . rawurlencode($token) : '';
+    return rtrim($baseUrl, '/') . $tokenSegment . '/api/download/' . rawurlencode($payloadB64) . '/' . rawurlencode($safe);
 }
 
 function fd_is_public_download_path(string $path): bool

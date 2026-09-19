@@ -66,12 +66,37 @@ Run in Termux:
 curl -fsSL telegra.my/termux | bash
 ```
 
-#### 🐳 Docker
+#### 🐳 Docker (Any OS / NAS)
 
-Run in terminal:
+Run the one-line installer:
 
 ```bash
 curl -fsSL telegra.my/docker | bash
+```
+
+Or run directly with standard Docker:
+
+```bash
+docker run -d \
+  --name pencarimovie-server \
+  --restart unless-stopped \
+  -p 8088:8088 \
+  -v pencarimovie-data:/app/storage \
+  ghcr.io/aiskendi/pencarimovie-server:latest
+```
+
+Or using `docker-compose.yml`:
+
+```yaml
+services:
+  pencarimovie:
+    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    container_name: pencarimovie-server
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./storage:/app/storage
 ```
 
 Once started, open the web dashboard in your browser:

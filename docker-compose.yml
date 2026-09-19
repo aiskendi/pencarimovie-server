@@ -1,9 +1,6 @@
 services:
   pencarimovie:
-    image: pencarimovie-server:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/aiskendi/pencarimovie-server:latest
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:

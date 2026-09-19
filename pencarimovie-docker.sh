@@ -115,18 +115,30 @@ do_start() {
   cd "$APP_DIR"
 
   echo "Starting PencariMovie Server in Docker..."
-  if compose_cmd up -d --build; then
+  if docker pull "ghcr.io/$REPO:latest" >/dev/null 2>&1; then
+    echo "Using pre-built Docker image from GHCR..."
+  fi
+
+  if compose_cmd up -d; then
     :
   else
     echo "Falling back to standalone docker run..."
-    docker build -t pencarimovie-server:latest .
     docker rm -f pencarimovie-server 2>/dev/null || true
     docker run -d \
       --name pencarimovie-server \
       --restart unless-stopped \
       -p "${PORT}:8088" \
       -v "$APP_DIR/storage:/app/storage" \
-      pencarimovie-server:latest
+      "ghcr.io/$REPO:latest" 2>/dev/null || {
+        echo "Building local image..."
+        docker build -t pencarimovie-server:latest .
+        docker run -d \
+          --name pencarimovie-server \
+          --restart unless-stopped \
+          -p "${PORT}:8088" \
+          -v "$APP_DIR/storage:/app/storage" \
+          pencarimovie-server:latest
+      }
   fi
 
   local lan_ip

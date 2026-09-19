@@ -101,7 +101,12 @@ references/
 plans/
 
 # Internal release build scripts
-scripts/
+scripts/*
+!scripts/build-release.bat
+!scripts/build-release.sh
+!scripts/package-unix.sh
+!scripts/package-windows.bat
+!scripts/download-frankenphp.ps1
 
 # Cloudflare infrastructure / internal deploy files
 cloudflare-worker*.js

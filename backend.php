@@ -1066,6 +1066,39 @@ function fd_is_local_request(): bool
         return false;
     }
 
+    // Public cloud hosting domains (Heroku, Railway, Render, Fly) are remote public requests.
+    $hosts = [
+        (string) ($_SERVER['HTTP_HOST'] ?? ''),
+        (string) ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? ''),
+    ];
+    foreach ($hosts as $raw) {
+        foreach (explode(',', $raw) as $part) {
+            $h = strtolower(explode(':', trim($part))[0]);
+            if ($h !== '' && (
+                str_ends_with($h, '.herokuapp.com')
+                || $h === 'herokuapp.com'
+                || str_ends_with($h, '.up.railway.app')
+                || str_ends_with($h, '.onrender.com')
+                || str_ends_with($h, '.fly.dev')
+            )) {
+                return false;
+            }
+        }
+    }
+
+    // If request passed through a reverse proxy (Heroku router, Cloudflare, AWS ALB),
+    // check the originating client IP from forwarded headers.
+    $forwardedFor = trim((string) ($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''));
+    if ($forwardedFor !== '') {
+        $clientIp = trim(explode(',', $forwardedFor)[0]);
+        if ($clientIp !== '' && filter_var($clientIp, FILTER_VALIDATE_IP)) {
+            // If originating client IP is a public internet address, it is not local.
+            if (filter_var($clientIp, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false) {
+                return false;
+            }
+        }
+    }
+
     $remoteAddr = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
     if ($remoteAddr === '') {
         return true;
@@ -1168,6 +1201,13 @@ function fd_auth_client_ip(): string
 {
     if (fd_is_cloudflare_tunnel_request() && !empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
         return (string) $_SERVER['HTTP_CF_CONNECTING_IP'];
+    }
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $parts = explode(',', (string) $_SERVER['HTTP_X_FORWARDED_FOR']);
+        $clientIp = trim($parts[0]);
+        if ($clientIp !== '' && filter_var($clientIp, FILTER_VALIDATE_IP)) {
+            return $clientIp;
+        }
     }
     return (string) ($_SERVER['REMOTE_ADDR'] ?? '127.0.0.1');
 }
@@ -12021,10 +12061,13 @@ if (str_starts_with($path, '/api/')) {
 
         fd_auth_record_success($clientIp);
         $token = fd_auth_token();
+        $forwardedProto = strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0]));
+        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || $forwardedProto === 'https';
         setcookie(FD_AUTH_COOKIE, $token, [
             'expires' => time() + 86400 * 365,
             'path' => '/',
             'httponly' => true,
+            'secure' => $isHttps,
             'samesite' => 'Lax',
         ]);
         fd_json(['ok' => 1, 'token' => $token]);

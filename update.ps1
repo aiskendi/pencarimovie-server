@@ -27,14 +27,9 @@ $ErrorActionPreference = 'Stop'
 
 $base = "https://github.com/$Repo/releases/download/$Tag"
 
-if ($Installed -eq 0) {
-    $primary = @{ Url = "$base/pencarimovie-downloader-windows-x86_64.zip"; Name = 'pencarimovie.zip' }
-    $fallback = @{ Url = "$base/pencarimovie-server.tar.gz"; Name = 'pencarimovie.tar.gz' }
-}
-else {
-    $primary = @{ Url = "$base/pencarimovie-server.tar.gz"; Name = 'pencarimovie.tar.gz' }
-    $fallback = @{ Url = "$base/pencarimovie-downloader-windows-x86_64.zip"; Name = 'pencarimovie.zip' }
-}
+# Always use the native Windows package as primary to preserve Windows bin/ runtime and DLL configs
+$primary = @{ Url = "$base/pencarimovie-downloader-windows-x86_64.zip"; Name = 'pencarimovie.zip' }
+$fallback = @{ Url = "$base/pencarimovie-server.tar.gz"; Name = 'pencarimovie.tar.gz' }
 
 $otaTmp = Join-Path $env:TEMP ("pencarimovie-ota-" + (Get-Random))
 New-Item -ItemType Directory -Path $otaTmp -Force | Out-Null
@@ -120,6 +115,27 @@ if (-not (Test-Path -LiteralPath (Join-Path $AppDir 'backend.php'))) {
     Write-Host "File copy failed."
     Remove-Item -Recurse -Force $otaTmp -ErrorAction SilentlyContinue
     exit 1
+}
+
+# Ensure bin\php.ini has Windows extension=fileinfo enabled
+$iniPath = Join-Path $AppDir 'bin\php.ini'
+$extDll = Join-Path $AppDir 'bin\ext\php_fileinfo.dll'
+if ((Test-Path -LiteralPath $extDll) -and ((-not (Test-Path -LiteralPath $iniPath)) -or ((Get-Content $iniPath -ErrorAction SilentlyContinue | Select-String -Pattern '^\s*extension=fileinfo') -eq $null))) {
+    $defaultIni = @'
+; TG FastDownloader bundled PHP/FrankenPHP config
+extension_dir="ext"
+extension=fileinfo
+extension=curl
+extension=mbstring
+extension=openssl
+extension=zip
+
+memory_limit = 512M
+
+opcache.enable=0
+opcache.enable_cli=0
+'@
+    Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
 }
 
 Set-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII

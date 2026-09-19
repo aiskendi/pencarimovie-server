@@ -3373,6 +3373,10 @@ function fd_require_fileinfo(): bool
         return true;
     }
 
+    $msg = PHP_OS_FAMILY === 'Windows'
+        ? 'MadelineProto requires the fileinfo extension. Ensure extension=fileinfo is enabled in bin/php.ini.'
+        : 'MadelineProto requires the fileinfo extension to run. Try running sudo apt-get install php-fileinfo.';
+
     if (!headers_sent()) {
         http_response_code(501);
         header('Content-Type: application/json; charset=utf-8');
@@ -3380,7 +3384,7 @@ function fd_require_fileinfo(): bool
     }
     echo json_encode([
         'ok' => 0,
-        'message' => 'MadelineProto requires the fileinfo extension to run. Try running sudo apt-get install php8.5-fileinfo.',
+        'message' => $msg,
         'hint' => 'Install MadelineProto dependencies and ensure a bot session is configured.',
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;

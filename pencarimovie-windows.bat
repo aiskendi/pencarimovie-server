@@ -94,6 +94,28 @@ if not exist "%APP_DIR%" (
     exit /b 1
 )
 cd /d "%APP_DIR%"
+
+rem Ensure bin\php.ini exists and has required Windows extensions enabled
+if exist "bin\ext\php_fileinfo.dll" (
+    findstr /R /C:"^[ ]*extension=fileinfo" "bin\php.ini" >nul 2>nul
+    if errorlevel 1 (
+        (
+            echo ; TG FastDownloader bundled PHP/FrankenPHP config
+            echo extension_dir="ext"
+            echo extension=fileinfo
+            echo extension=curl
+            echo extension=mbstring
+            echo extension=openssl
+            echo extension=zip
+            echo.
+            echo memory_limit = 512M
+            echo.
+            echo opcache.enable=0
+            echo opcache.enable_cli=0
+        ) > "bin\php.ini"
+    )
+)
+
 echo Starting PencariMovie Server in the background...
 if exist "%cd%\tray.ps1" (
     call :start_tray 1

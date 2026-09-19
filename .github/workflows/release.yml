@@ -110,6 +110,15 @@ jobs:
           tar -C dist/.build-tmp -czf dist/pencarimovie-server.tar.gz pencarimovie-server
           rm -rf dist/.build-tmp
 
+          # Verify Windows package integrity (must contain bin/php.ini with extension=fileinfo)
+          if [ -f "dist/pencarimovie-downloader-windows-x86_64.zip" ]; then
+            if ! unzip -l dist/pencarimovie-downloader-windows-x86_64.zip | grep -q "bin/php.ini"; then
+              echo "ERROR: dist/pencarimovie-downloader-windows-x86_64.zip is missing bin/php.ini!"
+              exit 1
+            fi
+            echo "Verified: dist/pencarimovie-downloader-windows-x86_64.zip contains bin/php.ini"
+          fi
+
           # Ensure only tar.gz and zip archives are in dist/ (scripts stay in main)
           rm -f dist/*.sh dist/*.bat dist/*.ps1 dist/*.apk
 

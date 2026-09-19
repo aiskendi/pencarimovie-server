@@ -22,6 +22,9 @@ copy_public_root_windows() {
   if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
     cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
   fi
+  if [ -f "$ROOT_DIR/.release-tag" ]; then
+    cp "$ROOT_DIR/.release-tag" "$dest/.release-tag"
+  fi
 }
 
 copy_public_root_unix() {
@@ -40,6 +43,9 @@ copy_public_root_unix() {
   cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json" 2>/dev/null || true
   if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
     cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
+  fi
+  if [ -f "$ROOT_DIR/.release-tag" ]; then
+    cp "$ROOT_DIR/.release-tag" "$dest/.release-tag"
   fi
 }
 
@@ -99,6 +105,12 @@ build_windows_package() {
   # Extract bin/ from the official FrankenPHP Windows release ZIP only
   # Files are extracted to root (not a bin/ subdir), so copy everything
   cp -R "$extracted/"* "$build_dir/bin/"
+
+  # Overlay repo php.ini for Windows runtime (CRITICAL: enables fileinfo, curl, mbstring, openssl, zip DLLs)
+  if [ -f "$ROOT_DIR/bin/php.ini" ]; then
+    echo "Overlaying repo php.ini for Windows runtime..."
+    cp "$ROOT_DIR/bin/php.ini" "$build_dir/bin/php.ini"
+  fi
 
   # Prune unused PHP dev/test binaries that trigger antivirus false positives.
   # php_dl_test.dll is a test-only extension (never loaded in production) and is a

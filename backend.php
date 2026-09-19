@@ -436,6 +436,14 @@ function fd_get_bot_id(): string
         return $fromMeta;
     }
 
+    $envBotToken = trim((string) (fd_env('BOT_TOKEN') ?: fd_env('TG_BOT_TOKEN')));
+    if ($envBotToken !== '') {
+        $parts = explode(':', $envBotToken, 2);
+        if ($parts[0] !== '' && is_numeric($parts[0])) {
+            return $parts[0];
+        }
+    }
+
     // Fallback: pick the first active bot from bot_pool.json file directly (without calling fd_get_bot_pool to avoid recursion)
     $poolPath = FD_BOT_POOL_PATH;
     if (is_file($poolPath)) {
@@ -922,6 +930,29 @@ function fd_auto_provision_guest(): ?array
 
     $lastError = null;
     try {
+        // If a static BOT_TOKEN or TG_BOT_TOKEN is supplied via environment, use it directly
+        // to ensure persistent bot identity across container restarts (e.g. on Heroku / Docker).
+        $envBotToken = trim((string) (fd_env('BOT_TOKEN') ?: fd_env('TG_BOT_TOKEN')));
+        if ($envBotToken !== '') {
+            $parts = explode(':', $envBotToken, 2);
+            $envBotId = ($parts[0] !== '' && is_numeric($parts[0])) ? $parts[0] : '';
+            [$madeline, $error] = fd_boot_madeline($envBotToken, [], $envBotId);
+            if ($madeline) {
+                if ($lockFp) {
+                    @flock($lockFp, LOCK_UN);
+                    @fclose($lockFp);
+                }
+                $meta = fd_load_session_meta();
+                return [
+                    'bot_id' => $meta['bot_id'] ?? $envBotId,
+                    'bot_username' => (string) ($meta['bot_username'] ?? ''),
+                    'bot_name' => (string) ($meta['bot_name'] ?? ''),
+                    'madeline' => $madeline,
+                ];
+            }
+            fd_log('BOT_TOKEN from environment failed to boot', ['error' => $error]);
+        }
+
         // Try up to 2 times with a fast 6s timeout so page load doesn't hang
         for ($pAttempt = 0; $pAttempt < 2; $pAttempt++) {
             $provisionUrl = FD_WP_API_BASE . '/provision-session?_nocache=' . time() . '_' . mt_rand(1000, 9999);

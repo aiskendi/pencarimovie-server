@@ -534,3 +534,25 @@ index 05e2406..a873ea5 100644
          if (class_exists(Installer::class)) {
              Installer::unlock();
          }
+diff --git a/src/Ipc/Runner/entry.php b/src/Ipc/Runner/entry.php
+index e7f2597..3fcfcbb 100644
+--- a/src/Ipc/Runner/entry.php
++++ b/src/Ipc/Runner/entry.php
+@@ -115,3 +115,17 @@
+             $API->initSelfRestart();
+             $session->storeIpcState(new IpcState($runnerId));
++
++            // Monitor worker memory usage and periodically run GC to combat glibc fragmentation
++            \Revolt\EventLoop::repeat(30.0, static function () use ($API): void {
++                \gc_collect_cycles();
++                if (\function_exists('gc_mem_caches')) {
++                    \gc_mem_caches();
++                }
++                $maxBytes = (int) (getenv('MADELINE_WORKER_MAX_MEMORY') ?: (512 * 1024 * 1024)); // 512 MiB default
++                if (\memory_get_usage(true) > $maxBytes) {
++                    Logger::log("IPC worker memory limit exceeded (" . \round(\memory_get_usage(true) / 1048576) . " MiB > " . \round($maxBytes / 1048576) . " MiB). Restarting worker to release heap fragmentation.", Logger::FATAL_ERROR);
++                    $API->restart();
++                }
++            });
++
+             while (true) {

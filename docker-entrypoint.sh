@@ -1,6 +1,8 @@
 #!/bin/sh
 set -e
 
+export MALLOC_ARENA_MAX=2
+
 mkdir -p /app/storage
 
 # 1. Pre-spawn MadelineProto IPC workers

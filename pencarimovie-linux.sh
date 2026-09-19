@@ -657,6 +657,9 @@ After=network.target
 [Service]
 Type=forking
 WorkingDirectory=$APP_DIR
+Environment=MALLOC_ARENA_MAX=2
+MemoryHigh=1.5G
+MemoryMax=2G
 ExecStart=/usr/bin/env bash $start_script start
 ExecStop=/usr/bin/env bash $APP_DIR/stop.sh
 Restart=on-failure

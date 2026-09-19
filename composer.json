@@ -12,6 +12,9 @@
       "danog/madelineproto": {
         "Fix Windows IPC stream_socket_server notice": "patches/madelineproto-windows-ipc.patch"
       },
+      "danog/async-orm": {
+        "Cap MemoryArray in-memory driver size": "patches/async-orm-memory-limit.patch"
+      },
       "danog/ipc": {
         "Prefer TCP loopback IPC server": "patches/ipc-tcp-default.patch"
       }

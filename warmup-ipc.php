@@ -52,6 +52,10 @@ if (empty($pool)) {
     exit(0);
 }
 
+if (\function_exists('putenv') && !getenv('MALLOC_ARENA_MAX')) {
+    @putenv('MALLOC_ARENA_MAX=2');
+}
+
 $root = fd_get_app_root();
 // Always spawn workers through the bundled bin/php wrapper (or bin/php.exe on
 // Windows). On FrankenPHP the wrapper execs `frankenphp php-cli`, which is the

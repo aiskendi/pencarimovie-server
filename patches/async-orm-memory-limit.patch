@@ -1,0 +1,15 @@
+diff --git a/src/Driver/MemoryArray.php b/src/Driver/MemoryArray.php
+index 1b8d5a1..c3f9b2d 100644
+--- a/src/Driver/MemoryArray.php
++++ b/src/Driver/MemoryArray.php
+@@ -64,7 +64,10 @@ final class MemoryArray extends DbArray
+     #[\Override]
+     public function set(string|int $key, mixed $value): void
+     {
++        if (\count($this->data) >= 2000) {
++            $this->data = \array_slice($this->data, 200, null, true);
++        }
+         $this->data[$key] = $value;
+     }
+     #[\Override]
+     public function get(string|int $key): mixed

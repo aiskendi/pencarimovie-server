@@ -1,14 +1,15 @@
 {
 	frankenphp {
 		# Concurrency & thread pool:
-		#   - Starts with 16 worker threads, automatically upscaling to 64 threads under load.
-		#   - Allows 40+ concurrent active video/audio streams while leaving ample headroom
-		#     for instant catalog, metadata, and search requests without thread starvation.
+		#   - Starts with 8 worker threads, capping at 16 threads under load to prevent
+		#     massive memory consumption from in-flight video/audio stream chunk buffers.
 		#   - Idle threads above num_threads are automatically reclaimed after 10s.
-		#   - On low-end 1GB devices, set FRANKENPHP_NUM_THREADS=8 FRANKENPHP_MAX_THREADS=16.
-		num_threads {$FRANKENPHP_NUM_THREADS:16}
-		max_threads {$FRANKENPHP_MAX_THREADS:64}
+		num_threads {$FRANKENPHP_NUM_THREADS:8}
+		max_threads {$FRANKENPHP_MAX_THREADS:16}
 		max_idle_time 10s
+
+		# Limit per-request memory usage to prevent runaway heap allocations.
+		php_ini memory_limit {$PHP_MEMORY_LIMIT:512M}
 
 		# Disable PHP execution timeout so long-running media streams (movies, music)
 		# and large file downloads are never abruptly terminated mid-playback.

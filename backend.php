@@ -21,6 +21,11 @@ if (is_dir($fdBinDir)) {
     }
 }
 
+// Cap glibc malloc arenas to prevent virtual memory inflation and swap thrashing
+if (\function_exists('putenv') && !getenv('MALLOC_ARENA_MAX')) {
+    @putenv('MALLOC_ARENA_MAX=2');
+}
+
 /**
  * API credentials are no longer hardcoded here.
  * They are fetched from the WordPress REST API endpoint (/save-bot-token)
@@ -3747,6 +3752,22 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     }
 
     $settings = new \danog\MadelineProto\Settings();
+
+    // If external database is configured, offload MadelineProto ORM to Redis/MySQL/Postgres
+    if ($redisUri = getenv('REDIS_URI') ?: getenv('MADELINE_REDIS_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Redis)->setUri($redisUri));
+    } elseif ($mysqlUri = getenv('MYSQL_URI') ?: getenv('MADELINE_MYSQL_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Mysql)->setUri($mysqlUri));
+    } elseif ($pgUri = getenv('POSTGRES_URI') ?: getenv('MADELINE_POSTGRES_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Postgres)->setUri($pgUri));
+    }
+
+    // Limit peer database in-memory retention to avoid ballooning memory
+    $settings->getPeer()
+        ->setFullInfoCacheTime(300)
+        ->setFullFetch(false)
+        ->setCacheAllPeersOnStartup(false);
+
     $settings->getAppInfo()
         ->setApiId($apiId)
         ->setApiHash($apiHash);
@@ -3796,8 +3817,8 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     // and drop timeout to 180s stops unnecessary state request stalls.
     $settings->getRpc()->setRpcDropTimeout(180);
     $settings->getRpc()->setRpcResendTimeout(12);
-    // Reduce parallel download chunks from 20 to 8 on mobile/Android to prevent socket saturation
-    $settings->getFiles()->setDownloadParallelChunks(8);
+    // Reduce parallel download chunks to 4 to prevent socket saturation and in-flight chunk buffer bloat
+    $settings->getFiles()->setDownloadParallelChunks(4);
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.

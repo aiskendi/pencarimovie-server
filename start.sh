@@ -107,6 +107,7 @@ if [ -x "$FRANKENPHP_BIN" ]; then
   export PATH="$ROOT_DIR/bin:$PATH"
   export PHP_BINDIR="$ROOT_DIR/bin"
   export PHPRC="$ROOT_DIR/bin"
+  export MALLOC_ARENA_MAX=2
   if [ -f "$ROOT_DIR/Caddyfile" ]; then
     nohup "$FRANKENPHP_BIN" run --config "$ROOT_DIR/Caddyfile" >/dev/null 2>&1 &
   else

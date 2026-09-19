@@ -99,8 +99,9 @@ jobs:
           chmod +x dist/.build-tmp/pencarimovie-server/bin/ffmpeg 2>/dev/null || true
           rm -rf "$FFMPEG_TMP"
 
-          # Bundle vendor and release tag
+          # Bundle vendor, patches and release tag
           if [ -d "vendor" ]; then cp -r vendor dist/.build-tmp/pencarimovie-server/; fi
+          if [ -d "patches" ]; then cp -r patches dist/.build-tmp/pencarimovie-server/; fi
           if [ -f ".release-tag" ]; then cp .release-tag dist/.build-tmp/pencarimovie-server/; fi
           tar -C dist/.build-tmp -czf dist/pencarimovie-server.tar.gz pencarimovie-server
           rm -rf dist/.build-tmp

@@ -17,6 +17,8 @@ html_errors = 0
 display_errors = 0
 log_errors = 1
 
+memory_limit = 512M
+
 ; Disable opcache for FrankenPHP static builds.
 opcache.enable=0
 opcache.enable_cli=0

@@ -5788,6 +5788,10 @@ function fd_is_usable_lan_ipv4(string $ip): bool
         str_starts_with($ip, '127.') ||
         str_starts_with($ip, '169.254.') ||
         str_starts_with($ip, '172.17.') ||
+        str_starts_with($ip, '172.18.') ||
+        str_starts_with($ip, '172.19.') ||
+        str_starts_with($ip, '172.20.') ||
+        str_starts_with($ip, '172.21.') ||
         str_starts_with($ip, '192.168.56.') ||
         $ip === '0.0.0.0'
     ) {

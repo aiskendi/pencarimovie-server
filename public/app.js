@@ -1196,8 +1196,8 @@ class PencariMovieApp {
           : 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
       }
       if (addonLanField) {
-        // Show Wi-Fi / LAN Manifest whenever lanUrl exists, or on local network with detected IP
-        const showLan = Boolean(lanUrl || isLocal || this.lanIp);
+        // Wi-Fi / LAN Manifest is ONLY for non-VPS local PC devices (localhost / 127.0.0.1)
+        const showLan = isLocal && !onTunnel && Boolean(lanUrl || this.lanIp);
         addonLanField.classList.toggle('hidden', !showLan);
       }
       if (addonLocalField) {

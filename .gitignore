@@ -132,6 +132,7 @@ pencarimovie*
 !pencarimovie-termux-test.sh
 !pencarimovie-windows.bat
 !pencarimovie-windows.ps1
+!pencarimovie-docker.sh
 proot*
 libtalloc*
 libtirpc*

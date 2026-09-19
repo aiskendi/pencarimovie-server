@@ -14,6 +14,10 @@ mkdir -p /app/storage
     fi
 ) &
 
-# 3. Start FrankenPHP server
-echo "[Docker] Starting PencariMovie Server with FrankenPHP on 0.0.0.0:8088..."
-exec /app/bin/frankenphp php-server --listen 0.0.0.0:8088 --root /app
+# 2. Start FrankenPHP server
+echo "[Docker] Starting PencariMovie Server on 0.0.0.0:${PORT:-8088}..."
+if [ -f "/app/Caddyfile" ]; then
+    exec /app/bin/frankenphp run --config /app/Caddyfile
+else
+    exec /app/bin/frankenphp php-server --listen "0.0.0.0:${PORT:-8088}" --root /app
+fi

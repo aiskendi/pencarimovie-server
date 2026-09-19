@@ -66,6 +66,14 @@ Run in Termux:
 curl -fsSL telegra.my/termux | bash
 ```
 
+#### 🐳 Docker
+
+Run in terminal:
+
+```bash
+curl -fsSL telegra.my/docker | bash
+```
+
 Once started, open the web dashboard in your browser:
 👉 **`http://127.0.0.1:8088`** _(or your local LAN IP printed in terminal)_
 

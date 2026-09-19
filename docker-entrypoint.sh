@@ -5,10 +5,34 @@ export MALLOC_ARENA_MAX=2
 export XDG_DATA_HOME="${XDG_DATA_HOME:-/tmp/caddy/data}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/caddy/config}"
 
-# On Heroku / Docker: scale FrankenPHP thread pool to use all available CPU cores
-CORES=$(nproc 2>/dev/null || echo 8)
-export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-$((CORES * 2))}"
-export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-$((CORES * 4))}"
+# Detect container memory quota from cgroups to prevent R14 / swap thrashing
+MEM_LIMIT=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || cat /sys/fs/cgroup/memory.max 2>/dev/null || echo 536870912)
+if [ "$MEM_LIMIT" = "max" ] || [ -z "$MEM_LIMIT" ] || [ "$MEM_LIMIT" -gt 34359738368 ] 2>/dev/null; then
+    MEM_LIMIT=536870912
+fi
+MEM_MB=$((MEM_LIMIT / 1024 / 1024))
+
+# Auto-tune concurrency & memory limits for dyno RAM (Basic/Eco/Standard-1X: 512MB)
+if [ "$MEM_MB" -le 512 ]; then
+    export GOMEMLIMIT="${GOMEMLIMIT:-380MiB}"
+    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"
+    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-6}"
+    export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
+    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-10s}"
+elif [ "$MEM_MB" -le 1024 ]; then
+    export GOMEMLIMIT="${GOMEMLIMIT:-800MiB}"
+    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-8}"
+    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-12}"
+    export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-256M}"
+    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-15s}"
+else
+    TARGET_GOMEM=$((MEM_MB * 85 / 100))
+    export GOMEMLIMIT="${GOMEMLIMIT:-${TARGET_GOMEM}MiB}"
+    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-12}"
+    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-24}"
+    export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-512M}"
+    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
+fi
 
 mkdir -p /tmp/caddy/data /tmp/caddy/config /app/storage 2>/dev/null || true
 chmod 777 /app/storage 2>/dev/null || true

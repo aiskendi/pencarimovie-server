@@ -54,8 +54,12 @@
 	@blocked path /storage/* /vendor/* /bin/* /patches/* /src/* /.* /Caddyfile* /*.sh /*.bat /*.key /*.log /*.lock /*.md /*.yml /*.yaml /composer.json /package.json
 	error @blocked 404
 
-	# Tune for low-end / 1GB RAM devices:
-	# Disable symlink resolution to save filesystem syscalls on slow flash/eMMC storage
+	# Serve static assets directly via native Go file_server without using PHP worker threads
+	@static path /public/* /favicon.ico /robots.txt
+	handle @static {
+		file_server
+	}
+
 	# Rewrite 32-hex token prefixes directly to index.php (e.g. /<token>/manifest.json -> /index.php)
 	# so FrankenPHP handles the tokenized route instead of failing try_files on disk.
 	@tokenized path_regexp token ^/[0-9a-fA-F]{32}(/.*)?$

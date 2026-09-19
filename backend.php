@@ -2816,10 +2816,6 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
                     'short_code' => $shortCode,
                     'winner_bot' => $winnerBotId,
                 ]);
-                // Look up or attach IMDb ID if missing so the web player can load OpenSubtitles automatically
-                if (empty($winner['imdb_id']) && !empty($winner['title'])) {
-                    $winner['imdb_id'] = fd_find_imdb_id_for_title((string) $winner['title']);
-                }
                 return $winner;
             }
         }
@@ -2846,9 +2842,6 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
     if (!$bypassCache) {
         $cached = fd_resolve_shortcode_cached($shortCode, $botId);
         if ($cached !== null) {
-            if (empty($cached['imdb_id']) && !empty($cached['title'])) {
-                $cached['imdb_id'] = fd_find_imdb_id_for_title((string) $cached['title']);
-            }
             return $cached;
         }
     }
@@ -2876,9 +2869,6 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
 
     $res = fd_http_json($url, $params, 'GET', 6);
     if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
-        if (empty($res['imdb_id']) && !empty($res['title'])) {
-            $res['imdb_id'] = fd_find_imdb_id_for_title((string) $res['title']);
-        }
         fd_save_resolve_cache($shortCode, $botId, $res);
         return $res;
     }
@@ -2889,9 +2879,6 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
         usleep($delayUs);
         $res = fd_http_json($url, $params, 'GET', 6);
         if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
-            if (empty($res['imdb_id']) && !empty($res['title'])) {
-                $res['imdb_id'] = fd_find_imdb_id_for_title((string) $res['title']);
-            }
             fd_save_resolve_cache($shortCode, $botId, $res);
             return $res;
         }

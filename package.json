@@ -1,6 +1,6 @@
 {
   "name": "pencarimovie-downloader",
-  "version": "2.2.0",
+  "version": "2.2.2",
   "type": "module",
   "private": true,
   "description": "Local browser-based Telegram file downloader with a PHP backend and MadelineProto streaming.",

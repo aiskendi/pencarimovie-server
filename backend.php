@@ -9,20 +9,37 @@ ini_set('html_errors', '0');
 error_reporting(E_ALL);
 
 
+/**
+ * Safe environment variable getter. Checks $_ENV, $_SERVER, and getenv().
+ */
+function fd_env(string $key, mixed $default = null): mixed
+{
+    $val = $_ENV[$key] ?? $_SERVER[$key] ?? null;
+    if ($val !== null && $val !== '') {
+        return $val;
+    }
+    $env = getenv($key);
+    if ($env !== false && $env !== '') {
+        return $env;
+    }
+    return $default;
+}
+
 // Ensure bundled bin/ directory is added to PATH so MadelineProto ProcessRunner can locate PHP/FrankenPHP for IPC
 $fdBinDir = __DIR__ . DIRECTORY_SEPARATOR . 'bin';
 if (is_dir($fdBinDir)) {
-    $existingPath = (string) ($_SERVER['PATH'] ?? ($_ENV['PATH'] ?? ''));
+    $existingPath = (string) fd_env('PATH', '');
     if (!str_contains($existingPath, $fdBinDir)) {
         if (\function_exists('putenv')) {
             @putenv('PATH=' . $fdBinDir . PATH_SEPARATOR . $existingPath);
         }
         $_SERVER['PATH'] = $fdBinDir . PATH_SEPARATOR . $existingPath;
+        $_ENV['PATH'] = $fdBinDir . PATH_SEPARATOR . $existingPath;
     }
 }
 
 // Cap glibc malloc arenas to prevent virtual memory inflation and swap thrashing
-if (\function_exists('putenv') && !getenv('MALLOC_ARENA_MAX')) {
+if (\function_exists('putenv') && !fd_env('MALLOC_ARENA_MAX')) {
     @putenv('MALLOC_ARENA_MAX=2');
 }
 
@@ -241,7 +258,7 @@ function fd_prune_cache_files(bool $force = false): void
  * Overridable via the FD_CURL_RESOLVE environment variable so a blocked
  * primary host can be pinned to a black-hole IP for fallback testing.
  */
-define('FD_CURL_RESOLVE', (string) (getenv('FD_CURL_RESOLVE') ?: ''));
+define('FD_CURL_RESOLVE', (string) (fd_env('FD_CURL_RESOLVE', '')));
 
 function fd_is_debug_enabled(): bool
 {
@@ -3545,7 +3562,7 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
     $root = fd_get_app_root();
     $phpBin = PHP_BINARY;
     if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
-        $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
+        $prefix = (string) fd_env('PREFIX', '');
         if ($prefix !== '' && is_file($prefix . '/bin/php')) {
             $phpBin = $prefix . '/bin/php';
         } else {
@@ -3754,12 +3771,12 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     $settings = new \danog\MadelineProto\Settings();
 
     // If external database is configured, offload MadelineProto ORM to Redis/MySQL/Postgres
-    if ($redisUri = getenv('REDIS_URI') ?: getenv('MADELINE_REDIS_URI')) {
-        $settings->setDb((new \danog\MadelineProto\Settings\Database\Redis)->setUri($redisUri));
-    } elseif ($mysqlUri = getenv('MYSQL_URI') ?: getenv('MADELINE_MYSQL_URI')) {
-        $settings->setDb((new \danog\MadelineProto\Settings\Database\Mysql)->setUri($mysqlUri));
-    } elseif ($pgUri = getenv('POSTGRES_URI') ?: getenv('MADELINE_POSTGRES_URI')) {
-        $settings->setDb((new \danog\MadelineProto\Settings\Database\Postgres)->setUri($pgUri));
+    if ($redisUri = fd_env('REDIS_URI') ?: fd_env('MADELINE_REDIS_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Redis)->setUri((string) $redisUri));
+    } elseif ($mysqlUri = fd_env('MYSQL_URI') ?: fd_env('MADELINE_MYSQL_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Mysql)->setUri((string) $mysqlUri));
+    } elseif ($pgUri = fd_env('POSTGRES_URI') ?: fd_env('MADELINE_POSTGRES_URI')) {
+        $settings->setDb((new \danog\MadelineProto\Settings\Database\Postgres)->setUri((string) $pgUri));
     }
 
     // Limit peer database in-memory retention to avoid ballooning memory
@@ -5962,10 +5979,9 @@ function fd_lan_ip_from_php_ifaces(): string
 
 function fd_is_android_runtime(): bool
 {
-    $prefix = (string) ($_SERVER['PREFIX'] ?? $_ENV['PREFIX'] ?? '');
+    $prefix = (string) fd_env('PREFIX', '');
     return is_file('/system/bin/getprop')
-        || isset($_SERVER['ANDROID_ROOT'])
-        || isset($_ENV['ANDROID_ROOT'])
+        || fd_env('ANDROID_ROOT') !== null
         || str_contains($prefix, 'com.termux')
         || str_contains($prefix, 'com.pencarimovie')
         || is_dir('/data/data/com.pencarimovie.downloader')
@@ -5974,9 +5990,7 @@ function fd_is_android_runtime(): bool
 
 function fd_cached_lan_ip(): string
 {
-    // Do not use getenv() — it was removed from this file because it can
-    // fatal on the Android/proot FrankenPHP build (disabled or missing).
-    $env = trim((string) ($_SERVER['LAN_IP'] ?? $_ENV['LAN_IP'] ?? ''));
+    $env = trim((string) fd_env('LAN_IP', ''));
     if (fd_is_usable_lan_ipv4($env)) {
         return $env;
     }
@@ -5995,7 +6009,7 @@ function fd_cached_lan_ip(): string
 }
 
 /**
- * Safe LAN IP for JSON APIs. Never shells out and never calls getenv().
+ * Safe LAN IP for JSON APIs. Never shells out.
  * Empty LAN_IP on old APKs must not fail session/auth.
  */
 function fd_get_lan_ip_fast(): string
@@ -6378,10 +6392,10 @@ function fd_is_public_download_path(string $path): bool
  */
 function fd_acquire_stream_slot(): mixed
 {
-    $maxStreams = (int) (getenv('FD_MAX_CONCURRENT_STREAMS') ?: 0);
+    $maxStreams = (int) (fd_env('FD_MAX_CONCURRENT_STREAMS') ?: 0);
     if ($maxStreams <= 0) {
-        $maxThreads = (int) (getenv('FRANKENPHP_MAX_THREADS') ?: 64);
-        $numThreads = (int) (getenv('FRANKENPHP_NUM_THREADS') ?: 16);
+        $maxThreads = (int) (fd_env('FRANKENPHP_MAX_THREADS') ?: 16);
+        $numThreads = (int) (fd_env('FRANKENPHP_NUM_THREADS') ?: 8);
         // Reserve at least 25% of threads (min 4, max numThreads) for API, catalog, and search requests
         $reserved = max(4, min($numThreads, (int) round($maxThreads * 0.25)));
         $maxStreams = max(1, $maxThreads - $reserved);
@@ -6442,7 +6456,7 @@ function fd_get_listen_port(): int
     if ($port > 0 && $port < 65536) {
         return $port;
     }
-    $env = (int) ($_SERVER['PORT'] ?? $_ENV['PORT'] ?? 0);
+    $env = (int) (fd_env('PORT') ?: 0);
     if ($env > 0 && $env < 65536) {
         return $env;
     }
@@ -7626,13 +7640,13 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
 
         // Minimal safe environment with TUNNEL_TRANSPORT_PROTOCOL=http2 and system root
         $env = [
-            'SystemRoot' => getenv('SystemRoot') ?: 'C:\\Windows',
-            'WINDIR' => getenv('WINDIR') ?: 'C:\\Windows',
-            'PATH' => getenv('PATH') ?: 'C:\\Windows\\System32;C:\\Windows',
+            'SystemRoot' => (string) (fd_env('SystemRoot') ?: 'C:\\Windows'),
+            'WINDIR' => (string) (fd_env('WINDIR') ?: 'C:\\Windows'),
+            'PATH' => (string) (fd_env('PATH') ?: 'C:\\Windows\\System32;C:\\Windows'),
             'TUNNEL_TRANSPORT_PROTOCOL' => 'http2',
-            'USERPROFILE' => getenv('USERPROFILE') ?: 'C:\\Users\\ewangtlex',
-            'LOCALAPPDATA' => getenv('LOCALAPPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Local',
-            'APPDATA' => getenv('APPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Roaming',
+            'USERPROFILE' => (string) (fd_env('USERPROFILE') ?: 'C:\\Users\\ewangtlex'),
+            'LOCALAPPDATA' => (string) (fd_env('LOCALAPPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Local'),
+            'APPDATA' => (string) (fd_env('APPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Roaming'),
             'TEMP' => sys_get_temp_dir(),
             'TMP' => sys_get_temp_dir(),
         ];
@@ -7676,7 +7690,7 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
     if (fd_is_android_runtime() || (!fd_is_windows() && (!is_file('/etc/resolv.conf') || !is_file('/etc/ssl/certs/ca-certificates.crt')))) {
         $resolvBody = "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1\nnameserver 8.8.4.4\n";
         $prefixCandidates = array_filter([
-            (string) ($_SERVER['PREFIX'] ?? $_ENV['PREFIX'] ?? ''),
+            (string) fd_env('PREFIX', ''),
             '/data/data/com.pencarimovie.downloader/files/usr',
             '/data/data/com.termux/files/usr',
         ]);
@@ -13194,7 +13208,7 @@ if (str_starts_with($path, '/api/')) {
         $slotFp = fd_acquire_stream_slot();
         if (!$slotFp) {
             fd_log('maximum concurrent streams reached, rejecting with 429', [
-                'max' => (int) (getenv('FD_MAX_CONCURRENT_STREAMS') ?: 48),
+                'max' => (int) (fd_env('FD_MAX_CONCURRENT_STREAMS') ?: 48),
                 'path' => $path,
             ]);
             header('Retry-After: 5');

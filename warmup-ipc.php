@@ -52,7 +52,7 @@ if (empty($pool)) {
     exit(0);
 }
 
-if (\function_exists('putenv') && !getenv('MALLOC_ARENA_MAX')) {
+if (\function_exists('putenv') && !fd_env('MALLOC_ARENA_MAX')) {
     @putenv('MALLOC_ARENA_MAX=2');
 }
 

@@ -26,7 +26,7 @@
 		timeouts {
 			read_body 10m
 			read_header 30s
-			write 10m
+			write 0
 			idle 2m
 		}
 	}

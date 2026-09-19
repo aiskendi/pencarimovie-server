@@ -2,6 +2,8 @@ name: Release Builder & Docker Publish
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -29,8 +31,10 @@ jobs:
         run: |
           if [ -n "${{ github.event.inputs.tag }}" ]; then
             TAG="${{ github.event.inputs.tag }}"
-          else
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="latest"
           fi
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "tag=$TAG" >> $GITHUB_OUTPUT
@@ -121,11 +125,11 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ env.TAG }}
+            ${{ env.TAG != 'latest' && format('ghcr.io/{0}:{1}', github.repository, env.TAG) || '' }}
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != ''
+        if: startsWith(github.ref, 'refs/tags/') || (github.event.inputs.tag != '' && github.event.inputs.tag != null)
         with:
           tag_name: ${{ env.TAG }}
           files: |

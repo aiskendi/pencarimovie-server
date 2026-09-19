@@ -63,21 +63,16 @@ setup_files() {
   mkdir -p "$APP_DIR/storage"
   cd "$APP_DIR"
 
-  # If files don't exist locally, fetch them from repository
-  if [ ! -f "Dockerfile" ]; then
-    echo "Fetching Dockerfile..."
-    curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile
-  fi
+  # Always sync latest docker-compose.yml from repository
+  curl -fsSL "$GITHUB_RAW/docker-compose.yml" -o docker-compose.yml.new 2>/dev/null && mv docker-compose.yml.new docker-compose.yml || true
 
-  if [ ! -f "docker-compose.yml" ]; then
-    echo "Fetching docker-compose.yml..."
-    curl -fsSL "$GITHUB_RAW/docker-compose.yml" -o docker-compose.yml
+  if [ ! -f "Dockerfile" ]; then
+    curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile 2>/dev/null || true
   fi
 
   if [ ! -f "docker-entrypoint.sh" ]; then
-    echo "Fetching docker-entrypoint.sh..."
-    curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh
-    chmod +x docker-entrypoint.sh
+    curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh 2>/dev/null || true
+    chmod +x docker-entrypoint.sh 2>/dev/null || true
   fi
 }
 
@@ -115,18 +110,19 @@ do_start() {
   cd "$APP_DIR"
 
   echo "Starting PencariMovie Server in Docker..."
-  if compose_cmd up -d --build; then
+  compose_cmd pull 2>/dev/null || true
+  if compose_cmd up -d; then
     :
   else
     echo "Falling back to standalone docker run..."
-    docker build -t pencarimovie-server:latest .
+    docker pull ghcr.io/aiskendi/pencarimovie-server:latest 2>/dev/null || true
     docker rm -f pencarimovie-server 2>/dev/null || true
     docker run -d \
       --name pencarimovie-server \
       --restart unless-stopped \
       -p "${PORT}:8088" \
       -v "$APP_DIR/storage:/app/storage" \
-      pencarimovie-server:latest
+      ghcr.io/aiskendi/pencarimovie-server:latest
   fi
 
   local lan_ip
@@ -179,13 +175,16 @@ do_status() {
 }
 
 do_update() {
+  ensure_docker
+  setup_files
   cd "$APP_DIR"
-  echo "Updating Docker setup..."
-  curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile
-  curl -fsSL "$GITHUB_RAW/docker-compose.yml" -o docker-compose.yml
-  curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh
-  chmod +x docker-entrypoint.sh
-  do_restart
+  echo "Updating PencariMovie Server Docker..."
+  curl -fsSL "$GITHUB_RAW/pencarimovie-docker.sh" -o "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
+  chmod +x "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
+  compose_cmd pull
+  compose_cmd up -d --force-recreate
+  docker image prune -f 2>/dev/null || true
+  echo "Updated to latest version."
 }
 
 do_uninstall() {

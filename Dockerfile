@@ -44,24 +44,18 @@ RUN set -e; \
     else \
         echo "Downloading runtime package from GitHub..."; \
         curl -fsSL -o /tmp/server.tar.gz "https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
-        tar -xzf /tmp/server.tar.gz -C /tmp/extract; \
+        tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
         rm -f /tmp/server.tar.gz; \
         echo "Overlaying latest code from main branch..."; \
         curl -fsSL "https://github.com/aiskendi/pencarimovie-server/archive/refs/heads/main.tar.gz" -o /tmp/main.tar.gz; \
         tar -xzf /tmp/main.tar.gz --strip-components=1 -C /tmp/extract 2>/dev/null || true; \
         rm -f /tmp/main.tar.gz; \
     fi; \
-    SRC_DIR="/tmp/extract"; \
-    if [ ! -f "$SRC_DIR/backend.php" ]; then \
-        SUB_DIR="$(find /tmp/extract -mindepth 1 -maxdepth 2 -name backend.php -exec dirname {} \; | head -n 1)"; \
-        if [ -n "$SUB_DIR" ] && [ -d "$SUB_DIR" ]; then \
-            SRC_DIR="$SUB_DIR"; \
-        fi; \
-    fi; \
-    cp -a "$SRC_DIR/." /app/; \
+    cp -a /tmp/extract/. /app/; \
     rm -rf /tmp/extract /tmp/repo; \
     mkdir -p /app/storage; \
-    chmod +x /app/bin/frankenphp /app/bin/php 2>/dev/null || true
+    chmod +x /app/bin/frankenphp /app/bin/php /app/bin/ffmpeg 2>/dev/null || true; \
+    test -x /app/bin/frankenphp || (echo "FATAL: /app/bin/frankenphp is missing or not executable!" && exit 1)
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

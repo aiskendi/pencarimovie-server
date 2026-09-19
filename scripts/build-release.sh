@@ -8,30 +8,17 @@ TMP_DIR="$DIST_DIR/.build-tmp"
 copy_public_root_windows() {
   local dest="$1"
 
-  cp "$ROOT_DIR/backend.php" "$dest/"
-  if [ -f "$dest/backend.php" ]; then
-    sed -i.bak \
-      -e "s|https://pencarimovie.com|https://telegram-webhook.pencarimovie.com|g" \
-      -e "s|define('FD_CURL_RESOLVE', getenv('FD_CURL_RESOLVE') ?: '');|define('FD_CURL_RESOLVE', getenv('FD_CURL_RESOLVE') ?: 'telegram-webhook.pencarimovie.com:443:159.195.95.182');|g" \
-      "$dest/backend.php" && rm -f "$dest/backend.php.bak"
-    php -r '$f=$argv[1];$c=file_get_contents($f);$c=preg_replace("/function fd_log\\(string \\\$message, array \\\$context = \\[\\]\\): void\r?\n\\{.*?\r?\n\\}/s","function fd_log(string \$message, array \$context = []): void {}",$c);file_put_contents($f,$c);' "$dest/backend.php"
-  fi
-  cp "$ROOT_DIR/index.php" "$dest/"
-  cp "$ROOT_DIR/router.php" "$dest/"
-  cp "$ROOT_DIR/install.bat" "$dest/"
-  cp "$ROOT_DIR/start.bat" "$dest/"
-  cp "$ROOT_DIR/restart.bat" "$dest/"
-  cp "$ROOT_DIR/stop.bat" "$dest/"
-  cp "$ROOT_DIR/tunnel-spawn.ps1" "$dest/"
-  cp "$ROOT_DIR/update.ps1" "$dest/"
-  cp "$ROOT_DIR/package.json" "$dest/"
-  cp "$ROOT_DIR/README.md" "$dest/"
-  cp "$ROOT_DIR/LICENSE" "$dest/"
-  cp "$ROOT_DIR/SECURITY.md" "$dest/"
+  for f in Caddyfile backend.php index.php router.php install.bat start.bat stop.bat restart.bat \
+           pencarimovie-windows.bat update.ps1 auth-write.ps1 tray.ps1 tray.ico tray.png \
+           start-hidden.ps1 tunnel-spawn.ps1 spawn-ipc-worker.ps1 warmup-ipc.php \
+           package.json README.md LICENSE SECURITY.md; do
+    if [ -f "$ROOT_DIR/$f" ]; then cp "$ROOT_DIR/$f" "$dest/"; fi
+  done
   cp -R "$ROOT_DIR/public" "$dest/public"
+  if [ -d "$ROOT_DIR/patches" ]; then cp -R "$ROOT_DIR/patches" "$dest/patches"; fi
   mkdir -p "$dest/storage"
   cp "$ROOT_DIR/storage/.gitkeep" "$dest/storage/.gitkeep" 2>/dev/null || true
-  cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json"
+  cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json" 2>/dev/null || true
   if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
     cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
   fi
@@ -40,34 +27,17 @@ copy_public_root_windows() {
 copy_public_root_unix() {
   local dest="$1"
 
-  cp "$ROOT_DIR/backend.php" "$dest/"
-  if [ -f "$dest/backend.php" ]; then
-    sed -i.bak \
-      -e "s|https://pencarimovie.com|https://telegram-webhook.pencarimovie.com|g" \
-      -e "s|define('FD_CURL_RESOLVE', getenv('FD_CURL_RESOLVE') ?: '');|define('FD_CURL_RESOLVE', getenv('FD_CURL_RESOLVE') ?: 'telegram-webhook.pencarimovie.com:443:159.195.95.182');|g" \
-      "$dest/backend.php" && rm -f "$dest/backend.php.bak"
-    php -r '$f=$argv[1];$c=file_get_contents($f);$c=preg_replace("/function fd_log\\(string \\\$message, array \\\$context = \\[\\]\\): void\r?\n\\{.*?\r?\n\\}/s","function fd_log(string \$message, array \$context = []): void {}",$c);file_put_contents($f,$c);' "$dest/backend.php"
-  fi
-  cp "$ROOT_DIR/index.php" "$dest/"
-  cp "$ROOT_DIR/router.php" "$dest/"
-  cp "$ROOT_DIR/install.sh" "$dest/"
-  cp "$ROOT_DIR/install-termux.sh" "$dest/"
-  cp "$ROOT_DIR/install-samsung.sh" "$dest/"
-  cp "$ROOT_DIR/start.sh" "$dest/"
-  cp "$ROOT_DIR/start-termux.sh" "$dest/"
-  cp "$ROOT_DIR/start-samsung.sh" "$dest/"
-  cp "$ROOT_DIR/restart.sh" "$dest/"
-  cp "$ROOT_DIR/restart-termux.sh" "$dest/"
-  cp "$ROOT_DIR/restart-samsung.sh" "$dest/"
-  cp "$ROOT_DIR/stop.sh" "$dest/"
-  cp "$ROOT_DIR/package.json" "$dest/"
-  cp "$ROOT_DIR/README.md" "$dest/"
-  cp "$ROOT_DIR/LICENSE" "$dest/"
-  cp "$ROOT_DIR/SECURITY.md" "$dest/"
+  for f in Caddyfile backend.php index.php router.php install.sh install-termux.sh \
+           start.sh start-termux.sh restart.sh restart-termux.sh stop.sh \
+           pencarimovie-linux.sh pencarimovie-termux.sh pencarimovie-docker.sh \
+           warmup-ipc.php package.json README.md LICENSE SECURITY.md; do
+    if [ -f "$ROOT_DIR/$f" ]; then cp "$ROOT_DIR/$f" "$dest/"; fi
+  done
   cp -R "$ROOT_DIR/public" "$dest/public"
+  if [ -d "$ROOT_DIR/patches" ]; then cp -R "$ROOT_DIR/patches" "$dest/patches"; fi
   mkdir -p "$dest/storage"
   cp "$ROOT_DIR/storage/.gitkeep" "$dest/storage/.gitkeep" 2>/dev/null || true
-  cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json"
+  cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json" 2>/dev/null || true
   if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
     cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
   fi

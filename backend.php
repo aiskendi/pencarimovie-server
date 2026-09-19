@@ -6378,9 +6378,13 @@ function fd_is_public_download_path(string $path): bool
  */
 function fd_acquire_stream_slot(): mixed
 {
-    $maxStreams = (int) (getenv('FD_MAX_CONCURRENT_STREAMS') ?: 48);
+    $maxStreams = (int) (getenv('FD_MAX_CONCURRENT_STREAMS') ?: 0);
     if ($maxStreams <= 0) {
-        $maxStreams = 48;
+        $maxThreads = (int) (getenv('FRANKENPHP_MAX_THREADS') ?: 64);
+        $numThreads = (int) (getenv('FRANKENPHP_NUM_THREADS') ?: 16);
+        // Reserve at least 25% of threads (min 4, max numThreads) for API, catalog, and search requests
+        $reserved = max(4, min($numThreads, (int) round($maxThreads * 0.25)));
+        $maxStreams = max(1, $maxThreads - $reserved);
     }
     $slotsDir = fd_storage_path('storage/cache/stream_slots');
     if (!is_dir($slotsDir)) {
@@ -13082,6 +13086,30 @@ if (str_starts_with($path, '/api/')) {
         }
         $wpUrl .= '?' . http_build_query($queryParams);
 
+        // Cache short-lived streaming metadata to avoid exhausting worker threads on repeat category/home queries
+        $cacheTtl = match ($action) {
+            'categories' => 3600,
+            'trending' => 600,
+            'posts', 'post_files', 'get_post' => 300,
+            'search', 'search_files' => 120,
+            default => 60,
+        };
+        $cacheDir = fd_storage_path('storage/cache/proxy_stream');
+        if (!is_dir($cacheDir)) {
+            @mkdir($cacheDir, 0777, true);
+        }
+        $cacheKey = md5($wpUrl);
+        $cacheFile = $cacheDir . DIRECTORY_SEPARATOR . $cacheKey . '.json';
+        if (is_file($cacheFile) && (time() - (int) @filemtime($cacheFile)) < $cacheTtl) {
+            $cached = @file_get_contents($cacheFile);
+            if ($cached !== false && $cached !== '') {
+                header('Content-Type: application/json; charset=utf-8');
+                header('X-Cache: HIT');
+                echo $cached;
+                return true;
+            }
+        }
+
         try {
             $body = fd_http_get_contents($wpUrl, [
                 'method' => 'GET',
@@ -13099,6 +13127,10 @@ if (str_starts_with($path, '/api/')) {
         // Try to decode as JSON to return proper Content-Type
         $decoded = json_decode($body, true);
         if (is_array($decoded)) {
+            // Cache successful WordPress AJAX responses on disk
+            if (!empty($decoded['success']) || isset($decoded['data'])) {
+                @file_put_contents($cacheFile, $body, LOCK_EX);
+            }
             // When stream_post_files or stream_search_files returns files, pre-warm them in batch
             if (in_array($action, ['post_files', 'search_files'], true)) {
                 $files = $decoded['data']['files'] ?? ($decoded['files'] ?? null);

@@ -55,9 +55,20 @@
 	error @blocked 404
 
 	# Serve static assets directly via native Go file_server without using PHP worker threads
-	@static path /public/* /favicon.ico /robots.txt
-	handle @static {
+	@static_public path /app.js /stream-theme.css /styles.css
+	handle @static_public {
+		root * public
 		file_server
+	}
+
+	@static_dir path /public/*
+	handle @static_dir {
+		file_server
+	}
+
+	@empty_static path /favicon.ico /robots.txt
+	handle @empty_static {
+		respond "" 204
 	}
 
 	# Rewrite 32-hex token prefixes directly to index.php (e.g. /<token>/manifest.json -> /index.php)

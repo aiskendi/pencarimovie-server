@@ -4450,12 +4450,11 @@ class PencariMovieApp {
     const container = this.$('#streamContent');
     if (!container) return;
 
-    let html = '';
-
+    container.innerHTML = '';
 
     // If catalogs are disabled in manifest and no categories exist, show minimal informative placeholder
     if (this.manifest && Array.isArray(this.manifest.catalogs) && this.manifest.catalogs.length === 0) {
-      html += `
+      container.innerHTML = `
         <div style="padding: 40px 20px; text-align: center; color: rgba(255,255,255,0.6);">
           <div style="font-size: 2rem; margin-bottom: 12px;">⚡</div>
           <h3 style="color: #fff; margin-bottom: 8px;">Catalogs are currently disabled</h3>
@@ -4464,73 +4463,37 @@ class PencariMovieApp {
           </p>
         </div>
       `;
+      return;
     }
 
-    // Category & Keyword rows
-    for (const cat of this.categories) {
-      try {
-        let posts = [];
-        if (cat.is_topkw) {
-          // If this is a top-keyword files catalog, search files
-          const q = cat.search_query || '';
-          const sfRes = await this.fetchStream('search_files', { search: q, limit: 10 }).catch(() => null);
-          if (sfRes?.files && Array.isArray(sfRes.files) && sfRes.files.length > 0) {
-            posts = sfRes.files.map((f) => ({
-              id: f.short_code,
-              short_code: f.short_code,
-              title: f.title || 'Telegram File',
-              thumbnail_url: f.thumbnail_url || '',
-              thumbnail: f.thumbnail_url || '',
-              is_file: true,
-              file_size: f.file_size,
-              size: f.file_size
-            }));
+    // Attach delegated click listener on container once
+    if (!this._categoryRowsBound) {
+      this._categoryRowsBound = true;
+      container.addEventListener('click', (e) => {
+        // Scroll arrows
+        const arrowBtn = e.target.closest('.stream-content-row__arrow');
+        if (arrowBtn) {
+          const trackId = arrowBtn.getAttribute('data-track');
+          const track = this.$(`#track-${trackId}`);
+          if (track) {
+            const dir = arrowBtn.classList.contains('stream-content-row__arrow--left') ? -1 : 1;
+            track.scrollBy({ left: dir * 300, behavior: 'smooth' });
           }
-        } else {
-          const params = { category: cat.slug, limit: 10 };
-          if (cat.media_type) {
-            params.media_type = cat.media_type;
+          return;
+        }
+
+        // "View All" button → Category Page
+        const viewAllBtn = e.target.closest('.stream-content-row__view-all');
+        if (viewAllBtn) {
+          const slug = viewAllBtn.getAttribute('data-category');
+          const cat = this.categories.find(c => c.slug === slug);
+          if (slug === 'latest') {
+            this.openCategoryPage(slug, 'Latest Releases');
+          } else {
+            this.openCategoryPage(slug, cat ? cat.name : slug);
           }
-          posts = await this.fetchStream('posts', params);
+          return;
         }
-
-        if (Array.isArray(posts) && posts.length > 0) {
-          this.posts[cat.slug] = posts;
-          html += this._buildTrackHtml(cat.slug, cat.name, posts);
-        }
-      } catch (err) {
-        // Silently skip failed categories
-      }
-    }
-
-    container.innerHTML = html;
-
-    // Add scroll arrow functionality
-    container.querySelectorAll('.stream-content-row__arrow').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const trackId = btn.getAttribute('data-track');
-        const track = this.$(`#track-${trackId}`);
-        if (!track) return;
-        const dir = btn.classList.contains('stream-content-row__arrow--left') ? -1 : 1;
-        track.scrollBy({ left: dir * 300, behavior: 'smooth' });
-      });
-    });
-
-    // "View All" button → Category Page
-    container.addEventListener('click', (e) => {
-      const viewAllBtn = e.target.closest('.stream-content-row__view-all');
-      if (viewAllBtn) {
-        const slug = viewAllBtn.getAttribute('data-category');
-        const cat = this.categories.find(c => c.slug === slug);
-        // 'latest' is a pseudo-category (not in this.categories), so provide
-        // a human-readable name for the category page title.
-        if (slug === 'latest') {
-          this.openCategoryPage(slug, 'Latest Releases');
-        } else {
-          this.openCategoryPage(slug, cat ? cat.name : slug);
-        }
-        return;
-      }
 
       // File card clicks → File Detail Page
       const fileCard = e.target.closest('.stream-file-card, .stream-card[data-short-code]');
@@ -4572,6 +4535,50 @@ class PencariMovieApp {
         }
       }
     });
+    }
+
+    // Fetch and render category rows progressively in parallel batches of 4
+    const loadCategory = async (cat) => {
+      try {
+        let posts = [];
+        if (cat.is_topkw) {
+          const q = cat.search_query || '';
+          const sfRes = await this.fetchStream('search_files', { search: q, limit: 10 }).catch(() => null);
+          if (sfRes?.files && Array.isArray(sfRes.files) && sfRes.files.length > 0) {
+            posts = sfRes.files.map((f) => ({
+              id: f.short_code,
+              short_code: f.short_code,
+              title: f.title || 'Telegram File',
+              thumbnail_url: f.thumbnail_url || '',
+              thumbnail: f.thumbnail_url || '',
+              is_file: true,
+              file_size: f.file_size,
+              size: f.file_size
+            }));
+          }
+        } else {
+          const params = { category: cat.slug, limit: 10 };
+          if (cat.media_type) {
+            params.media_type = cat.media_type;
+          }
+          posts = await this.fetchStream('posts', params);
+        }
+
+        if (Array.isArray(posts) && posts.length > 0) {
+          this.posts[cat.slug] = posts;
+          const rowHtml = this._buildTrackHtml(cat.slug, cat.name, posts);
+          container.insertAdjacentHTML('beforeend', rowHtml);
+        }
+      } catch (err) {
+        // Silently skip failed categories
+      }
+    };
+
+    const batchSize = 4;
+    for (let i = 0; i < this.categories.length; i += batchSize) {
+      const batch = this.categories.slice(i, i + batchSize);
+      await Promise.all(batch.map(cat => loadCategory(cat)));
+    }
   }
 
   _buildTrackHtml(trackId, title, items) {

@@ -102,6 +102,16 @@ services:
       - ./storage:/app/storage
 ```
 
+#### 🚀 Heroku (Docker Container)
+
+Deploy directly with `heroku.yml`:
+
+```bash
+heroku create my-pencarimovie-app
+heroku stack:set container
+git push heroku main
+```
+
 Once started, open the web dashboard in your browser:
 👉 **`http://127.0.0.1:8088`** _(or your local LAN IP printed in terminal)_
 

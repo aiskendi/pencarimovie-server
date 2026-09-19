@@ -167,7 +167,7 @@ define('FD_WP_AJAX_URL', 'https://pencarimovie.com/wp-admin/admin-ajax.php');
 define('FD_WP_FALLBACK_HOST', 'telegra.my');
 define('FD_WP_API_BASE_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-json/pencarimovie-server/v1');
 define('FD_WP_AJAX_URL_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-admin/admin-ajax.php');
-define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.2.6');
+define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.2.7');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));

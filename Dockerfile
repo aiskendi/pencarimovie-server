@@ -22,7 +22,7 @@ COPY . /tmp/repo/
 
 RUN set -e; \
     ARCH_SUFFIX=""; \
-    if [ "$TARGETARCH" = "arm64" ]; then \
+    if [ "$TARGETARCH" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then \
         ARCH_SUFFIX="linux-aarch64"; \
     else \
         ARCH_SUFFIX="linux-x86_64"; \
@@ -46,14 +46,16 @@ RUN set -e; \
         curl -fsSL -o /tmp/server.tar.gz "https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
         tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
         rm -f /tmp/server.tar.gz; \
-        echo "Overlaying latest code from main branch..."; \
-        curl -fsSL "https://github.com/aiskendi/pencarimovie-server/archive/refs/heads/main.tar.gz" -o /tmp/main.tar.gz; \
-        tar -xzf /tmp/main.tar.gz --strip-components=1 -C /tmp/extract 2>/dev/null || true; \
-        rm -f /tmp/main.tar.gz; \
+        echo "Overlaying repository files..."; \
+        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/repo/warmup-ipc.php /tmp/extract/ 2>/dev/null || true; \
+        if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
+        if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
+        if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \
     fi; \
     cp -a /tmp/extract/. /app/; \
     rm -rf /tmp/extract /tmp/repo; \
     mkdir -p /app/storage; \
+    chmod -R 777 /app/storage; \
     chmod +x /app/bin/frankenphp /app/bin/php /app/bin/ffmpeg 2>/dev/null || true; \
     test -x /app/bin/frankenphp || (echo "FATAL: /app/bin/frankenphp is missing or not executable!" && exit 1)
 
@@ -66,6 +68,5 @@ ENV PHPRC="/app/bin"
 
 EXPOSE 8088
 
-VOLUME ["/app/storage"]
-
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["start"]

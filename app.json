@@ -1,0 +1,17 @@
+{
+  "name": "pencarimovie-server",
+  "description": "PencariMovie Server - Telegram file streamer and Stremio/Eclipse media addon",
+  "keywords": [
+    "telegram",
+    "stremio",
+    "frankenphp",
+    "madelineproto",
+    "streamer"
+  ],
+  "stack": "container",
+  "formation": {
+    "web": {
+      "quantity": 1
+    }
+  }
+}

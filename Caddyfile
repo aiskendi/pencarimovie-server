@@ -1,4 +1,5 @@
 {
+	auto_https off
 	frankenphp {
 		# Concurrency & thread pool (tuned for low-end VPS / devices: 1GB-2GB RAM, 1-2 vCPUs):
 		#   - Starts with 8 worker threads, scaling up to 16 threads under load.
@@ -46,12 +47,12 @@
 #
 # Changing this to `localhost:8088` would silently enable auto-HTTPS and
 # redirect HTTP -> HTTPS, breaking every LAN client.
-:8088 {
+:{$PORT:8088} {
 	root * .
 	encode zstd gzip
 
 	# Security: block direct HTTP access to internal directories, hidden files, and source configs
-	@blocked path /storage/* /vendor/* /bin/* /patches/* /src/* /.* /Caddyfile* /*.sh /*.bat /*.key /*.log /*.lock /*.md /*.yml /*.yaml /composer.json /package.json
+	@blocked path /storage/* /vendor/* /bin/* /patches/* /src/* /.* /Caddyfile* /*.sh /*.bat /*.key /*.log /*.lock /*.md /*.yml /*.yaml /composer.json /package.json /app.json
 	error @blocked 404
 
 	# Serve static assets directly via native Go file_server without using PHP worker threads

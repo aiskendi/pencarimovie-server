@@ -107,6 +107,7 @@ scripts/*
 !scripts/package-unix.sh
 !scripts/package-windows.bat
 !scripts/download-frankenphp.ps1
+!scripts/release-apk.bat
 
 # Cloudflare infrastructure / internal deploy files
 cloudflare-worker*.js

@@ -125,11 +125,11 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:latest
-            ${{ env.TAG != 'latest' && format('ghcr.io/{0}:{1}', github.repository, env.TAG) || '' }}
+            ghcr.io/${{ github.repository }}:${{ env.TAG }}
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || (github.event.inputs.tag != '' && github.event.inputs.tag != null)
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != ''
         with:
           tag_name: ${{ env.TAG }}
           files: |

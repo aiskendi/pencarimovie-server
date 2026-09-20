@@ -78,42 +78,7 @@ fi
 cp "$FRANKENPHP_SOURCE" "$BUILD_DIR/bin/frankenphp"
 cp "$ROOT_DIR/bin/php" "$BUILD_DIR/bin/php"
 
-# Bundle the audio-encode FFmpeg binary (ALAC -> FLAC conversion).
-# Pick the acoustid asset matching the package target's OS/CPU.
-case "$PACKAGE_TARGET" in
-  mac-arm64)   FFMPEG_ASSET="ffmpeg-8.1.2-audio-encode-arm64-apple-macos11" ;;
-  mac-x86_64)  FFMPEG_ASSET="ffmpeg-8.1.2-audio-encode-x86_64-apple-macos10.9" ;;
-  *aarch64*)   FFMPEG_ASSET="ffmpeg-8.1.2-audio-encode-arm64-linux-gnu" ;;
-  *)           FFMPEG_ASSET="ffmpeg-8.1.2-audio-encode-x86_64-linux-gnu" ;;
-esac
-FFMPEG_URL="https://github.com/acoustid/ffmpeg-build/releases/download/v8.1.2-1/${FFMPEG_ASSET}.tar.gz"
-
-if [ -f "$ROOT_DIR/storage/bin/ffmpeg" ]; then
-  echo "Bundling audio-encode ffmpeg from storage/bin..."
-  cp "$ROOT_DIR/storage/bin/ffmpeg" "$BUILD_DIR/bin/ffmpeg"
-elif command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
-  echo "Downloading audio-encode ffmpeg ($FFMPEG_ASSET)..."
-  FFMPEG_TMP="$(mktemp -d)"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$FFMPEG_URL" -o "$FFMPEG_TMP/ffmpeg.tar.gz" || true
-  else
-    wget -q "$FFMPEG_URL" -O "$FFMPEG_TMP/ffmpeg.tar.gz" || true
-  fi
-  if [ -s "$FFMPEG_TMP/ffmpeg.tar.gz" ]; then
-    tar -xzf "$FFMPEG_TMP/ffmpeg.tar.gz" -C "$FFMPEG_TMP" 2>/dev/null || true
-    FFMPEG_FOUND="$(find "$FFMPEG_TMP" -type f -name ffmpeg | head -n 1)"
-    if [ -n "$FFMPEG_FOUND" ]; then
-      cp "$FFMPEG_FOUND" "$BUILD_DIR/bin/ffmpeg"
-    else
-      echo "WARNING: ffmpeg binary not found in archive. ALAC tracks will fall back to a runtime download."
-    fi
-  else
-    echo "WARNING: Failed to download ffmpeg. ALAC tracks will fall back to a runtime download."
-  fi
-  rm -rf "$FFMPEG_TMP"
-else
-  echo "WARNING: curl/wget unavailable; skipping ffmpeg bundling. ALAC tracks will fall back to a runtime download."
-fi
+# No FFmpeg is bundled. Audio is served as-is (AAC/MP3/FLAC/ALAC decoded natively by clients).
 
 # Rename php.ini.unix → php.ini for the package (start.sh expects bin/php.ini)
 if [ -f "$ROOT_DIR/bin/php.ini.unix" ]; then

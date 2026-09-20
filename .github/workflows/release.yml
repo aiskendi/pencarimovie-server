@@ -94,14 +94,7 @@ jobs:
           mkdir -p dist/.build-tmp/pencarimovie-server/bin dist/.build-tmp/pencarimovie-server/storage
           cp bin/php.ini.unix dist/.build-tmp/pencarimovie-server/bin/php.ini 2>/dev/null || true
           cp bin/php dist/.build-tmp/pencarimovie-server/bin/php 2>/dev/null || true
-
-          # Bundle arm64 ffmpeg for Termux/proot standalone server
-          FFMPEG_URL="https://github.com/acoustid/ffmpeg-build/releases/download/v8.1.2-1/ffmpeg-8.1.2-audio-encode-arm64-linux-gnu.tar.gz"
-          FFMPEG_TMP=$(mktemp -d)
-          curl -fsSL "$FFMPEG_URL" -o "$FFMPEG_TMP/ffmpeg.tar.gz" && tar -xzf "$FFMPEG_TMP/ffmpeg.tar.gz" -C "$FFMPEG_TMP"
-          cp "$FFMPEG_TMP/ffmpeg" dist/.build-tmp/pencarimovie-server/bin/ffmpeg 2>/dev/null || true
-          chmod +x dist/.build-tmp/pencarimovie-server/bin/ffmpeg 2>/dev/null || true
-          rm -rf "$FFMPEG_TMP"
+          cp storage/.gitkeep storage/config.example.json storage/catalog_settings.json dist/.build-tmp/pencarimovie-server/storage/ 2>/dev/null || true
 
           # Bundle vendor, patches and release tag
           if [ -d "vendor" ]; then cp -r vendor dist/.build-tmp/pencarimovie-server/; fi

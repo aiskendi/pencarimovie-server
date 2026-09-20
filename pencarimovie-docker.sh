@@ -63,17 +63,10 @@ setup_files() {
   mkdir -p "$APP_DIR/storage"
   cd "$APP_DIR"
 
-  # Always sync latest docker-compose.yml from repository
+  # Always sync latest docker-compose.yml, Dockerfile, and docker-entrypoint.sh from repository
   curl -fsSL "$GITHUB_RAW/docker-compose.yml" -o docker-compose.yml.new 2>/dev/null && mv docker-compose.yml.new docker-compose.yml || true
-
-  if [ ! -f "Dockerfile" ]; then
-    curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile 2>/dev/null || true
-  fi
-
-  if [ ! -f "docker-entrypoint.sh" ]; then
-    curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh 2>/dev/null || true
-    chmod +x docker-entrypoint.sh 2>/dev/null || true
-  fi
+  curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile.new 2>/dev/null && mv Dockerfile.new Dockerfile || true
+  curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh.new 2>/dev/null && mv docker-entrypoint.sh.new docker-entrypoint.sh && chmod +x docker-entrypoint.sh || true
 }
 
 # ── Register CLI Helper ──────────────────────────────────────────────────────
@@ -206,7 +199,12 @@ main() {
   case "$action" in
     install|start)
       register_cli
-      do_start
+      if [ "$action" = "install" ] && (docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^pencarimovie-server$'); then
+        echo "Existing PencariMovie Server Docker installation detected. Updating..."
+        do_update
+      else
+        do_start
+      fi
       ;;
     stop)
       do_stop

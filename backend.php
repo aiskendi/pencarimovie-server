@@ -1481,6 +1481,9 @@ button:disabled{opacity:.6;cursor:default}
 <button id="b" type="submit">Connect</button>
 <div class="err" id="e"></div>
 </form>
+<div style="margin-top:16px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;font-size:.78rem;color:#aaa;line-height:1.45;text-align:left">
+PencariMovie Server is completely free &mdash; we never sell access or subscriptions. If this is not your personal server, you can easily run your own for free on your phone, PC, or TV &mdash; get the installer at <a href="https://telegra.my" target="_blank" rel="noopener" style="color:#ff6b35;text-decoration:underline">telegra.my</a>.
+</div>
 </div>
 <script>
 document.getElementById('f').addEventListener('submit', async function(ev){

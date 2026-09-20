@@ -63,10 +63,12 @@ setup_files() {
   mkdir -p "$APP_DIR/storage"
   cd "$APP_DIR"
 
-  # Always sync latest docker-compose.yml, Dockerfile, and docker-entrypoint.sh from repository
-  curl -fsSL "$GITHUB_RAW/docker-compose.yml" -o docker-compose.yml.new 2>/dev/null && mv docker-compose.yml.new docker-compose.yml || true
-  curl -fsSL "$GITHUB_RAW/Dockerfile" -o Dockerfile.new 2>/dev/null && mv Dockerfile.new Dockerfile || true
-  curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh" -o docker-entrypoint.sh.new 2>/dev/null && mv docker-entrypoint.sh.new docker-entrypoint.sh && chmod +x docker-entrypoint.sh || true
+  # Always sync latest docker-compose.yml, Dockerfile, and docker-entrypoint.sh from repository (with cache buster)
+  local ts
+  ts="$(date +%s 2>/dev/null || echo 1)"
+  curl -fsSL "$GITHUB_RAW/docker-compose.yml?t=$ts" -o docker-compose.yml.new 2>/dev/null && mv docker-compose.yml.new docker-compose.yml || true
+  curl -fsSL "$GITHUB_RAW/Dockerfile?t=$ts" -o Dockerfile.new 2>/dev/null && mv Dockerfile.new Dockerfile || true
+  curl -fsSL "$GITHUB_RAW/docker-entrypoint.sh?t=$ts" -o docker-entrypoint.sh.new 2>/dev/null && mv docker-entrypoint.sh.new docker-entrypoint.sh && chmod +x docker-entrypoint.sh || true
 }
 
 # ── Register CLI Helper ──────────────────────────────────────────────────────

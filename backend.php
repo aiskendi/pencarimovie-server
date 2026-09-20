@@ -6298,7 +6298,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'tunnel',
             'id' => 'org.pencarimovie.addon.tunnel',
-            'name' => 'PencariMovie (Cloudflare Tunnel)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram via Cloudflare Tunnel HTTPS. Address: ' . ($tunnelOrigin !== '' ? $tunnelOrigin : $origin),
         ];
     }
@@ -6307,7 +6307,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'localhost',
             'id' => 'org.pencarimovie.addon.local',
-            'name' => 'PencariMovie (Localhost)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram on this device only. Address: ' . $localOrigin,
         ];
     }
@@ -6319,7 +6319,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'lan',
             'id' => 'org.pencarimovie.addon.lan',
-            'name' => 'PencariMovie (Wi-Fi / LAN)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram on your Wi-Fi / LAN. Address: ' . $lanOrigin,
         ];
     }
@@ -6327,7 +6327,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'server',
             'id' => 'org.pencarimovie.addon.server',
-            'name' => 'PencariMovie (Server)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram on your server. Address: ' . $origin,
         ];
     }
@@ -6336,7 +6336,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'tunnel',
             'id' => 'org.pencarimovie.addon.tunnel',
-            'name' => 'PencariMovie (Cloudflare Tunnel)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram via Cloudflare Tunnel HTTPS. Address: ' . ($tunnelOrigin !== '' ? $tunnelOrigin : $origin),
         ];
     }
@@ -6345,7 +6345,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'localhost',
             'id' => 'org.pencarimovie.addon.local',
-            'name' => 'PencariMovie (Localhost)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram on this device only. Address: ' . $origin,
         ];
     }
@@ -6354,7 +6354,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'lan',
             'id' => 'org.pencarimovie.addon.lan',
-            'name' => 'PencariMovie (Wi-Fi / LAN)',
+            'name' => 'PencariMovie',
             'description' => 'Stream movies and series from Telegram on your Wi-Fi / LAN. Address: ' . $origin,
         ];
     }
@@ -6362,7 +6362,7 @@ function fd_stremio_manifest_identity(): array
     return [
         'mode' => 'server',
         'id' => 'org.pencarimovie.addon.server',
-        'name' => 'PencariMovie (Server)',
+        'name' => 'PencariMovie',
         'description' => 'Stream movies and series from Telegram on your server. Address: ' . $origin,
     ];
 }
@@ -10227,11 +10227,16 @@ if ($isNuvioRoute) {
         ];
 
 
+        $logoUrl = str_starts_with($baseUrl, 'https://')
+            ? rtrim($baseUrl, '/') . '/logo.png'
+            : 'https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/public/logo.png';
         $manifest = [
             'id' => $identity['id'],
             'version' => FD_APP_VERSION,
             'name' => $identity['name'],
             'description' => $identity['description'],
+            'logo' => $logoUrl,
+            'background' => $logoUrl,
             'resources' => $resources,
             'types' => ['movie', 'series', 'other'],
             'idPrefixes' => ['pm_', 'pm:', 'tt', 'tmdb:', 'kitsu:', 'kitsu', 'mal:', 'anilist:', 'tvdb:'],

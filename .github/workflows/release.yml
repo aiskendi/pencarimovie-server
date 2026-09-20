@@ -112,8 +112,9 @@ jobs:
             echo "Verified: dist/pencarimovie-downloader-windows-x86_64.zip contains bin/php.ini"
           fi
 
-          # Ensure only tar.gz and zip archives are in dist/ (scripts stay in main)
+          # Ensure only tar.gz, zip archives, and logo asset are in dist/ (scripts stay in main)
           rm -f dist/*.sh dist/*.bat dist/*.ps1 dist/*.apk
+          cp public/logo.png dist/logo.png 2>/dev/null || true
 
           echo "Release archives in dist/:"
           ls -lh dist/
@@ -138,6 +139,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.zip.sha256
+            dist/logo.png
           draft: false
           prerelease: false
           generate_release_notes: true

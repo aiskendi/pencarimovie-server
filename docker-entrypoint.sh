@@ -14,6 +14,9 @@ if [ -n "$DYNO" ]; then
     fi
     MEM_MB=$((MEM_LIMIT / 1024 / 1024))
 
+    export GODEBUG="${GODEBUG:-madvdontneed=1}"
+    export GOGC="${GOGC:-80}"
+
     if [ "$MEM_MB" -le 512 ]; then
         export GOMEMLIMIT="${GOMEMLIMIT:-350MiB}"
         export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"

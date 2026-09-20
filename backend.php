@@ -211,6 +211,8 @@ function fd_prune_cache_files(bool $force = false): void
     $ttls = [
         'resolve_cache_' => 7200,   // 2h
         'stream_cache_'  => 300,    // 5m
+        'cat_cache_'     => 600,    // 10m
+        'meta_cache_'    => 3600,   // 1h
         'up_cat_'        => 600,    // 10m
         'up_meta_'       => 3600,   // 1h
         'sub_cache_'     => 1800,   // 30m
@@ -10337,6 +10339,27 @@ if ($isNuvioRoute) {
         $skip = (int) ($extra['skip'] ?? 0);
         $limit = ($searchQuery !== '') ? 60 : 24;
 
+        $catCacheFile = '';
+        if ($searchQuery === '') {
+            $catCacheKey = md5($catalogType . '_' . $catalogId . '_' . $genre . '_' . $year . '_' . $skip);
+            $catCacheFile = fd_cache_path('cat_cache_' . $catCacheKey . '.json');
+            if (is_file($catCacheFile) && (time() - (int)filemtime($catCacheFile)) < 600) {
+                $cachedCat = json_decode((string)@file_get_contents($catCacheFile), true);
+                if (is_array($cachedCat) && isset($cachedCat['metas'])) {
+                    fd_stremio_json($cachedCat, 200, 'max-age=600, public');
+                }
+            }
+        } else {
+            $catCacheKey = md5('search_' . $catalogType . '_' . strtolower(trim($searchQuery)) . '_' . $skip);
+            $catCacheFile = fd_cache_path('cat_cache_' . $catCacheKey . '.json');
+            if (is_file($catCacheFile) && (time() - (int)filemtime($catCacheFile)) < 300) {
+                $cachedCat = json_decode((string)@file_get_contents($catCacheFile), true);
+                if (is_array($cachedCat) && isset($cachedCat['metas'])) {
+                    fd_stremio_json($cachedCat, 200, 'max-age=300, public');
+                }
+            }
+        }
+
         $metas = [];
 
         if ($searchQuery !== '') {
@@ -10623,6 +10646,10 @@ if ($isNuvioRoute) {
             }
         }
 
+        if (!empty($catCacheFile) && !empty($metas)) {
+            @file_put_contents($catCacheFile, json_encode(['metas' => $metas], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
+
         fd_stremio_json(['metas' => $metas], 200, 'max-age=600, public');
     }
 
@@ -10647,6 +10674,15 @@ if ($isNuvioRoute) {
             } else {
                 $shortCode = substr($itemId, strlen('pm:file:'));
             }
+
+            $metaFileCache = fd_cache_path('meta_cache_' . md5('file_' . $shortCode) . '.json');
+            if (is_file($metaFileCache) && (time() - (int)filemtime($metaFileCache)) < 3600) {
+                $cachedMeta = json_decode((string)@file_get_contents($metaFileCache), true);
+                if (is_array($cachedMeta) && isset($cachedMeta['meta'])) {
+                    fd_stremio_json($cachedMeta, 200, 'max-age=3600, public');
+                }
+            }
+
             $botId = fd_get_bot_id();
 
             $title = '';
@@ -10716,6 +10752,10 @@ if ($isNuvioRoute) {
                 'genres' => $genres,
             ];
 
+            if (!empty($metaFileCache) && !empty($meta['name'])) {
+                @file_put_contents($metaFileCache, json_encode(['meta' => $meta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            }
+
             fd_stremio_json(['meta' => $meta], 200, 'max-age=600, public');
         }
 
@@ -10728,6 +10768,15 @@ if ($isNuvioRoute) {
             } else {
                 $postId = (int) substr($itemId, strlen('pm:post:'));
             }
+
+            $metaPostCache = fd_cache_path('meta_cache_' . md5('post_' . $postId . '_' . $itemType) . '.json');
+            if (is_file($metaPostCache) && (time() - (int)filemtime($metaPostCache)) < 1800) {
+                $cachedMeta = json_decode((string)@file_get_contents($metaPostCache), true);
+                if (is_array($cachedMeta) && isset($cachedMeta['meta'])) {
+                    fd_stremio_json($cachedMeta, 200, 'max-age=1800, public');
+                }
+            }
+
             $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
             $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
 
@@ -10927,7 +10976,11 @@ if ($isNuvioRoute) {
                 'genres' => $meta['genres'] ?? [],
             ]);
 
-            fd_stremio_json(['meta' => $meta], 200, 'max-age=600, public');
+            if (!empty($metaPostCache) && !empty($meta['name'])) {
+                @file_put_contents($metaPostCache, json_encode(['meta' => $meta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            }
+
+            fd_stremio_json(['meta' => $meta], 200, 'max-age=1800, public');
         }
 
         // ── Meta Bridge: If not a local pm_ ID, proxy from upstream manifests or Cinemeta ──

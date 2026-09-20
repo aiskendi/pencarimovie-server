@@ -11,7 +11,7 @@ index 93441c7..88ff266 100644
              if (\strlen($uri) <= 104) {
                  $types []= self::TYPE_UNIX;
              }
-             if ($isLinux && !getenv('ANDROID_DATA') && !is_dir('/system/bin')) {
+             if ($isLinux) {
                  $types []= self::TYPE_FIFO;
              }
 -            $types []= self::TYPE_TCP;

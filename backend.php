@@ -3940,8 +3940,9 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     // and drop timeout to 180s stops unnecessary state request stalls.
     $settings->getRpc()->setRpcDropTimeout(180);
     $settings->getRpc()->setRpcResendTimeout(12);
-    // Reduce parallel download chunks to 4 to prevent socket saturation and in-flight chunk buffer bloat
-    $settings->getFiles()->setDownloadParallelChunks(4);
+    // Reduce parallel download chunks to prevent socket saturation and in-flight chunk buffer bloat
+    $parallelChunks = (int) (fd_env('FD_DOWNLOAD_PARALLEL_CHUNKS') ?: 4);
+    $settings->getFiles()->setDownloadParallelChunks(max(1, $parallelChunks));
 
     // ── Retry construction loop ───────────────────────────────────────────────
     // Under FrankenPHP, multiple workers service requests concurrently.

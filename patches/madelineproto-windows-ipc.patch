@@ -538,6 +538,14 @@ diff --git a/src/Ipc/Runner/entry.php b/src/Ipc/Runner/entry.php
 index e7f2597..3fcfcbb 100644
 --- a/src/Ipc/Runner/entry.php
 +++ b/src/Ipc/Runner/entry.php
+@@ -94,8 +94,9 @@
+         $isAndroid = !empty(getenv('ANDROID_DATA')) || is_dir('/system/bin');
+         if (\function_exists('cli_set_process_title') && !$isAndroid) {
+             @cli_set_process_title("MadelineProto worker $session");
+         }
+         if (\function_exists('posix_setsid') && !$isAndroid) {
+             @posix_setsid();
+         }
 @@ -115,3 +115,17 @@
              $API->initSelfRestart();
              $session->storeIpcState(new IpcState($runnerId));

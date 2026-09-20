@@ -24,34 +24,7 @@ done
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 APP_DIR="$(dirname "$BIN_DIR")"
 
-# 1. Native Termux PHP via PREFIX.
-if [ -n "$PREFIX" ] && [ -x "$PREFIX/bin/php" ]; then
-  exec "$PREFIX/bin/php" "$@"
-fi
-
-# 2. Known Termux / custom Android app data directories.
-if [ -x "/data/data/com.pencarimovie.downloader/files/usr/bin/php" ]; then
-  export PREFIX="/data/data/com.pencarimovie.downloader/files/usr"
-  export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
-  exec "$PREFIX/bin/php" "$@"
-fi
-
-if [ -x "/data/data/com.termux/files/usr/bin/php" ]; then
-  export PREFIX="/data/data/com.termux/files/usr"
-  export LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH"
-  exec "$PREFIX/bin/php" "$@"
-fi
-
-# 3. System php on PATH — but never recurse into this wrapper.
-if command -v php >/dev/null 2>&1; then
-  REAL_PHP="$(command -v php)"
-  if [ "$REAL_PHP" != "$SELF" ] && [ "$REAL_PHP" != "$BIN_DIR/php" ]; then
-    exec "$REAL_PHP" "$@"
-  fi
-fi
-
-# 4. FrankenPHP php-cli (last resort). FrankenPHP's php-cli does not accept -d
-#    flags, so strip any leading -d* options before exec.
+# 1. FrankenPHP php-cli in the same bin/ directory (preferred for standalone & pure FrankenPHP).
 FP="$BIN_DIR/frankenphp"
 [ -x "$FP" ] || FP="$APP_DIR/frankenphp"
 if [ -x "$FP" ]; then
@@ -63,6 +36,19 @@ if [ -x "$FP" ]; then
     esac
   done
   exec "$FP" php-cli "$@"
+fi
+
+# 2. Native Termux PHP via PREFIX (fallback when running inside Termux without bundled FrankenPHP).
+if [ -n "$PREFIX" ] && [ -x "$PREFIX/bin/php" ]; then
+  exec "$PREFIX/bin/php" "$@"
+fi
+
+# 3. System php on PATH — but never recurse into this wrapper.
+if command -v php >/dev/null 2>&1; then
+  REAL_PHP="$(command -v php)"
+  if [ "$REAL_PHP" != "$SELF" ] && [ "$REAL_PHP" != "$BIN_DIR/php" ]; then
+    exec "$REAL_PHP" "$@"
+  fi
 fi
 
 echo "bin/php: could not locate a usable PHP CLI" >&2

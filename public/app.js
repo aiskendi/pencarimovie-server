@@ -88,28 +88,27 @@ class PencariMovieApp {
   async init() {
     this.detectTelegram();
     this.bindGlobalEvents();
-    this.loadLanIp();
 
     // ── Auth gate — must pass before anything else loads ──
     if (!(await this.checkAuth())) {
       return; // Auth gate is showing; stop init until the user logs in
     }
 
+    await this.continueInit();
+  }
+
+  async continueInit() {
+    this.loadLanIp();
+
     // ── Instant Modal Opening if requested by hash (zero waiting) ──
     const initHash = window.location.hash;
     if (initHash === '#configure' || initHash === '#addon') {
-      if (this.hasSession) {
-        const addonM = document.getElementById('addonModal');
-        if (addonM) {
-          addonM.classList.remove('hidden');
-          addonM.setAttribute('aria-hidden', 'false');
-        }
-        this.openAddonModal?.();
-      } else {
-        // Ensure modal is hidden and loading screen is visible while auto-provision runs
-        const addonM = document.getElementById('addonModal');
-        if (addonM) addonM.classList.add('hidden');
+      const addonM = document.getElementById('addonModal');
+      if (addonM) {
+        addonM.classList.remove('hidden');
+        addonM.setAttribute('aria-hidden', 'false');
       }
+      this.openAddonModal?.();
     } else if (initHash === '#settings') {
       if (this.hasSession) {
         const sGate = document.getElementById('settingsGate');
@@ -258,11 +257,15 @@ class PencariMovieApp {
     } else {
       const gateMessage = tokenAddResult?.message || this.provisionError || null;
       const isClockErr = gateMessage && (gateMessage.toLowerCase().includes('clock') || gateMessage.toLowerCase().includes('ntp') || gateMessage.toLowerCase().includes('time'));
-      this.showSettingsGate({
-        forceToken: true,
-        message: gateMessage,
-        messageType: tokenAddResult?.success ? 'success' : (isClockErr ? 'error' : (this.provisionError ? 'info' : 'error'))
-      });
+      if (hash === '#configure' || hash === '#addon') {
+        this.openAddonModal?.();
+      } else {
+        this.showSettingsGate({
+          forceToken: true,
+          message: gateMessage,
+          messageType: tokenAddResult?.success ? 'success' : (isClockErr ? 'error' : (this.provisionError ? 'info' : 'error'))
+        });
+      }
       if (tokenAddResult && !tokenAddResult.success && tokenAddResult.token) {
         const input = this.$('#botTokenInput');
         if (input) input.value = tokenAddResult.token;
@@ -3849,6 +3852,10 @@ class PencariMovieApp {
   showAuthGate() {
     const gate = this.$('#authGate');
     if (!gate) return;
+    const addonM = this.$('#addonModal');
+    if (addonM) addonM.classList.add('hidden');
+    const settingsGate = this.$('#settingsGate');
+    if (settingsGate) settingsGate.classList.add('hidden');
     gate.classList.remove('hidden');
     gate.setAttribute('aria-hidden', 'false');
     this._hideLoadingScreen?.();
@@ -3881,7 +3888,11 @@ class PencariMovieApp {
       if (data?.ok && data.token) {
         this._authToken = data.token;
         localStorage.setItem('pm.auth', data.token);
-        window.location.reload();
+        this.hideAuthGate();
+        this._updateAddonModalUrls?.();
+        const addonTokenInput = this.$('#addonTokenInput');
+        if (addonTokenInput) addonTokenInput.value = data.token;
+        await this.continueInit();
         return;
       }
       if (status) status.textContent = data?.message || 'Wrong password';

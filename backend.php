@@ -1099,6 +1099,30 @@ function fd_is_cloudflare_tunnel_request(): bool
         || !empty($_SERVER['HTTP_CF_VISITOR']);
 }
 
+function fd_is_https_request(): bool
+{
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        return true;
+    }
+    $forwardedProto = strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0]));
+    if ($forwardedProto === 'https') {
+        return true;
+    }
+    if (!empty($_SERVER['HTTP_CF_VISITOR']) && str_contains($_SERVER['HTTP_CF_VISITOR'], '"scheme":"https"')) {
+        return true;
+    }
+    if (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && strtolower($_SERVER['HTTP_X_FORWARDED_SSL']) === 'on') {
+        return true;
+    }
+    if (!empty($_SERVER['HTTP_FRONT_END_HTTPS']) && strtolower($_SERVER['HTTP_FRONT_END_HTTPS']) === 'on') {
+        return true;
+    }
+    if (fd_is_cloudflare_tunnel_request()) {
+        return true;
+    }
+    return false;
+}
+
 function fd_is_local_request(): bool
 {
     // cloudflared proxies as 127.0.0.1. Treat TryCloudflare / CF headers as remote.
@@ -1495,7 +1519,13 @@ document.getElementById('f').addEventListener('submit', async function(ev){
   try{
     var r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
     var d=await r.json();
-    if(d.ok){location.reload();return;}
+    if(d.ok){
+      if(d.token){
+        try{ localStorage.setItem('pm.auth', d.token); }catch(_){}
+      }
+      location.reload();
+      return;
+    }
     if(r.status===429&&d.retryAfter){
       var rem=d.retryAfter;
       e.textContent='Too many attempts. Locked for '+rem+'s.';
@@ -9450,6 +9480,17 @@ if ($isNuvioRoute) {
 
     // Handle Stremio's standard /configure route -> redirects directly to dashboard with #configure
     if ($path === '/configure' || $path === '/configure/' || $addonPath === '/configure' || $addonPath === '/configure/') {
+        $tokenFromReq = fd_auth_token_from_request();
+        if ($tokenFromReq !== '') {
+            $isHttps = fd_is_https_request();
+            setcookie(FD_AUTH_COOKIE, $tokenFromReq, [
+                'expires' => time() + 86400 * 365,
+                'path' => '/',
+                'httponly' => true,
+                'secure' => $isHttps,
+                'samesite' => 'Lax',
+            ]);
+        }
         header('Location: /#addon', true, 302);
         exit;
     }
@@ -12189,8 +12230,7 @@ if (str_starts_with($path, '/api/')) {
 
         fd_auth_record_success($clientIp);
         $token = fd_auth_token();
-        $forwardedProto = strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0]));
-        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || $forwardedProto === 'https';
+        $isHttps = fd_is_https_request();
         setcookie(FD_AUTH_COOKIE, $token, [
             'expires' => time() + 86400 * 365,
             'path' => '/',

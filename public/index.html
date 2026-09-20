@@ -1051,7 +1051,7 @@
             <span class="addon-catalog-card__badge" id="addonTokenBadge">Active</span>
           </div>
           <p style="font-size: 0.74rem; color: #aaa; margin: 4px 0 8px 0; line-height: 1.35;">
-            Remote devices (VPS, Cloudflare Tunnel) need this token in the manifest URL.
+            Remote devices (Server, Cloudflare Tunnel) need this token in the manifest URL.
             Localhost and Wi-Fi/LAN do not. Regenerating creates a new token and invalidates the old one.
           </p>
           <div style="display: flex; gap: 8px; align-items: center;">
@@ -1119,6 +1119,9 @@
               📋 Copy
             </button>
           </div>
+          <p style="font-size: 0.74rem; color: #888; margin: 6px 0 0 0; line-height: 1.35;">
+            💡 <em>Note: Local LAN IP is not static and may change. Configure a static DHCP IP reservation on your router so TV/external devices don't lose connection.</em>
+          </p>
         </div>
 
         <!-- Localhost Manifest Field (This PC Only) -->

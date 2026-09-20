@@ -6254,15 +6254,43 @@ function fd_stremio_manifest_identity(): array
     }
 
     $hostName = strtolower((string) (parse_url('http://' . $hostHeader, PHP_URL_HOST) ?: $hostHeader));
-    $isTunnel = fd_is_cloudflare_tunnel_request()
-        || str_ends_with($hostName, '.trycloudflare.com')
+    $tunnelOrigin = fd_get_live_tunnel_https_origin();
+    $liveTunnelHost = $tunnelOrigin !== '' ? strtolower((string) (parse_url($tunnelOrigin, PHP_URL_HOST) ?: '')) : '';
+
+    $isTunnelHost = str_ends_with($hostName, '.trycloudflare.com')
         || $hostName === 'trycloudflare.com'
         || str_ends_with($hostName, '.tunnel.pencarimovie.com')
         || str_ends_with($hostName, '-tunnel.pencarimovie.com')
-        || $hostName === 'tunnel.pencarimovie.com';
-    $tunnelOrigin = fd_get_live_tunnel_https_origin();
-    $scheme = $isTunnel ? 'https' : 'http';
-    $origin = ($isTunnel && $tunnelOrigin !== '') ? $tunnelOrigin : ($scheme . '://' . $hostHeader);
+        || $hostName === 'tunnel.pencarimovie.com'
+        || ($liveTunnelHost !== '' && $hostName === $liveTunnelHost);
+
+    if (!$isTunnelHost) {
+        $tunnelState = fd_load_tunnel_state();
+        $customDomain = strtolower(trim((string) ($tunnelState['custom_domain'] ?? '')));
+        if ($customDomain !== '' && $hostName === $customDomain) {
+            $isTunnelHost = true;
+        }
+        if (!$isTunnelHost && !empty($tunnelState['custom_domains']) && is_array($tunnelState['custom_domains'])) {
+            foreach ($tunnelState['custom_domains'] as $cd) {
+                if (strtolower(trim((string) $cd)) === $hostName) {
+                    $isTunnelHost = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    $cfVisitor = (string) ($_SERVER['HTTP_CF_VISITOR'] ?? '');
+    $isHttps = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== '' && $_SERVER['HTTPS'] !== 'off')
+        || (isset($_SERVER['SERVER_PORT']) && (int) $_SERVER['SERVER_PORT'] === 443)
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https'
+        || str_contains($cfVisitor, '"scheme":"https"')
+        || $isTunnelHost;
+
+    $scheme = $isHttps ? 'https' : 'http';
+    $origin = ($isTunnelHost && $tunnelOrigin !== '' && $hostName === $liveTunnelHost)
+        ? $tunnelOrigin
+        : ($scheme . '://' . $hostHeader);
     $listenPort = fd_get_listen_port();
     $modeOverride = strtolower(trim((string) ($_GET['mode'] ?? '')));
 
@@ -6270,7 +6298,7 @@ function fd_stremio_manifest_identity(): array
         return [
             'mode' => 'tunnel',
             'id' => 'org.pencarimovie.addon.tunnel',
-            'name' => 'PencariMovie (Cloudflare)',
+            'name' => 'PencariMovie (Cloudflare Tunnel)',
             'description' => 'Stream movies and series from Telegram via Cloudflare Tunnel HTTPS. Address: ' . ($tunnelOrigin !== '' ? $tunnelOrigin : $origin),
         ];
     }
@@ -6300,15 +6328,15 @@ function fd_stremio_manifest_identity(): array
             'mode' => 'server',
             'id' => 'org.pencarimovie.addon.server',
             'name' => 'PencariMovie (Server)',
-            'description' => 'Stream movies and series from Telegram. Address: ' . $origin,
+            'description' => 'Stream movies and series from Telegram on your server. Address: ' . $origin,
         ];
     }
 
-    if ($isTunnel) {
+    if ($isTunnelHost) {
         return [
             'mode' => 'tunnel',
             'id' => 'org.pencarimovie.addon.tunnel',
-            'name' => 'PencariMovie (Cloudflare)',
+            'name' => 'PencariMovie (Cloudflare Tunnel)',
             'description' => 'Stream movies and series from Telegram via Cloudflare Tunnel HTTPS. Address: ' . ($tunnelOrigin !== '' ? $tunnelOrigin : $origin),
         ];
     }
@@ -6332,10 +6360,10 @@ function fd_stremio_manifest_identity(): array
     }
 
     return [
-        'mode' => 'default',
-        'id' => 'org.pencarimovie.addon',
-        'name' => 'PencariMovie',
-        'description' => 'Stream movies and series from Telegram. Address: ' . $origin,
+        'mode' => 'server',
+        'id' => 'org.pencarimovie.addon.server',
+        'name' => 'PencariMovie (Server)',
+        'description' => 'Stream movies and series from Telegram on your server. Address: ' . $origin,
     ];
 }
 
@@ -6348,22 +6376,29 @@ function fd_get_stremio_base_url(): string
         $host = '127.0.0.1:8088';
     }
 
+    $hostName = strtolower((string) (parse_url('http://' . $host, PHP_URL_HOST) ?: $host));
+    $tunnelOrigin = fd_get_live_tunnel_https_origin();
+    $liveTunnelHost = $tunnelOrigin !== '' ? strtolower((string) (parse_url($tunnelOrigin, PHP_URL_HOST) ?: '')) : '';
+
+    $isTunnelHost = str_ends_with($hostName, '.trycloudflare.com')
+        || $hostName === 'trycloudflare.com'
+        || str_ends_with($hostName, '.tunnel.pencarimovie.com')
+        || str_ends_with($hostName, '-tunnel.pencarimovie.com')
+        || $hostName === 'tunnel.pencarimovie.com'
+        || ($liveTunnelHost !== '' && $hostName === $liveTunnelHost);
+
     $forwardedProto = strtolower(trim(explode(',', (string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? ''))[0]));
     $cfVisitor = (string) ($_SERVER['HTTP_CF_VISITOR'] ?? '');
-    $isTunnel = fd_is_cloudflare_tunnel_request();
     $isHttps = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== '' && $_SERVER['HTTPS'] !== 'off')
         || $forwardedProto === 'https'
         || str_contains($cfVisitor, '"scheme":"https"')
-        || $isTunnel;
+        || $isTunnelHost;
     $scheme = $isHttps ? 'https' : 'http';
     $origin = $scheme . '://' . $host;
 
-    // If request actually comes through tunnel, use custom subdomain or tunnel origin
-    if ($isTunnel) {
-        $tunnelOrigin = fd_get_live_tunnel_https_origin();
-        if ($tunnelOrigin !== '') {
-            return $tunnelOrigin;
-        }
+    // If request actually comes through a tunnel host, use the live tunnel origin
+    if ($isTunnelHost && $tunnelOrigin !== '') {
+        return $tunnelOrigin;
     }
 
     return $origin;

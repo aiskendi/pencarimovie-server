@@ -68,13 +68,7 @@ curl -fsSL telegra.my/termux | bash
 
 #### 🐳 Docker (Any OS / NAS)
 
-Run the one-line installer:
-
-```bash
-curl -fsSL telegra.my/docker | bash
-```
-
-Or run directly with standard Docker:
+Run with standard Docker:
 
 ```bash
 docker run -d \
@@ -90,10 +84,7 @@ Or using `docker-compose.yml`:
 ```yaml
 services:
   pencarimovie:
-    image: pencarimovie-server:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/aiskendi/pencarimovie-server:latest
     container_name: pencarimovie-server
     restart: unless-stopped
     ports:

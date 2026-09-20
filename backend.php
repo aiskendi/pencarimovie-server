@@ -6528,38 +6528,6 @@ function fd_is_public_download_path(string $path): bool
     return $path === '/api/download' || str_starts_with($path, '/api/download/');
 }
 
-/**
- * Acquire an exclusive concurrency slot for video/media streaming.
- * Keeps active streaming threads capped so API/catalog requests are never starved.
- *
- * @return resource|null File handle representing the held slot, or null if capacity reached.
- */
-function fd_acquire_stream_slot(): mixed
-{
-    $maxStreams = (int) (fd_env('FD_MAX_CONCURRENT_STREAMS') ?: 0);
-    if ($maxStreams <= 0) {
-        $maxThreads = (int) (fd_env('FRANKENPHP_MAX_THREADS') ?: 16);
-        $numThreads = (int) (fd_env('FRANKENPHP_NUM_THREADS') ?: 8);
-        // Reserve at least 25% of threads (min 4, max numThreads) for API, catalog, and search requests
-        $reserved = max(4, min($numThreads, (int) round($maxThreads * 0.25)));
-        $maxStreams = max(1, $maxThreads - $reserved);
-    }
-    $slotsDir = fd_storage_path('storage/cache/stream_slots');
-    if (!is_dir($slotsDir)) {
-        @mkdir($slotsDir, 0777, true);
-    }
-    for ($i = 1; $i <= $maxStreams; $i++) {
-        $fp = @fopen($slotsDir . DIRECTORY_SEPARATOR . 'slot_' . $i . '.lock', 'c');
-        if ($fp && @flock($fp, LOCK_EX | LOCK_NB)) {
-            return $fp;
-        }
-        if ($fp) {
-            @fclose($fp);
-        }
-    }
-    return null;
-}
-
 function fd_extract_download_payload_from_path(string $path): string
 {
     if (!preg_match('#^/api/download/([^/]+)(?:/|$)#', $path, $m)) {
@@ -13406,20 +13374,6 @@ if (str_starts_with($path, '/api/')) {
             'mime' => $fileMime,
             'ob_level' => ob_get_level(),
         ]);
-
-        // Acquire a streaming slot to ensure active streams never starve API & catalog threads
-        $slotFp = fd_acquire_stream_slot();
-        if (!$slotFp) {
-            fd_log('maximum concurrent streams reached, rejecting with 429', [
-                'max' => (int) (fd_env('FD_MAX_CONCURRENT_STREAMS') ?: 48),
-                'path' => $path,
-            ]);
-            header('Retry-After: 5');
-            fd_json([
-                'ok' => 0,
-                'error' => 'Server is currently at maximum streaming capacity. Please retry in a few seconds.',
-            ], 429);
-        }
 
         // If Telegram Bot is not connected or session missing, attempt auto-provisioning
         $activeBotId = fd_get_bot_id();

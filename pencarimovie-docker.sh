@@ -177,7 +177,7 @@ do_update() {
   echo "Updating PencariMovie Server Docker..."
   curl -fsSL "$GITHUB_RAW/pencarimovie-docker.sh" -o "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
   chmod +x "$APP_DIR/pencarimovie-docker.sh" 2>/dev/null || true
-  if compose_cmd pull 2>/dev/null && compose_cmd up -d --force-recreate; then
+  if compose_cmd pull && compose_cmd up -d --force-recreate; then
     :
   else
     compose_cmd build --no-cache

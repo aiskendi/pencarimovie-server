@@ -108,6 +108,27 @@ if [ -x "$FRANKENPHP_BIN" ]; then
   export PHP_BINDIR="$ROOT_DIR/bin"
   export PHPRC="$ROOT_DIR/bin"
   export MALLOC_ARENA_MAX=2
+  export GODEBUG="${GODEBUG:-madvdontneed=1}"
+  export GOGC="${GOGC:-80}"
+
+  # Auto-tune memory on low-RAM Linux systems (e.g. 1GB-2GB VPS / Raspberry Pi)
+  if [ -z "$GOMEMLIMIT" ] && [ -r /proc/meminfo ]; then
+    TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+    if [ "$TOTAL_MEM_MB" -gt 0 ] && [ "$TOTAL_MEM_MB" -le 1024 ]; then
+      export GOMEMLIMIT="550MiB"
+      export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"
+      export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-8}"
+      export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
+      export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
+    elif [ "$TOTAL_MEM_MB" -gt 0 ] && [ "$TOTAL_MEM_MB" -le 2048 ]; then
+      export GOMEMLIMIT="1200MiB"
+      export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
+      export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-12}"
+      export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-3}"
+    fi
+  fi
+
   if [ -f "$ROOT_DIR/Caddyfile" ]; then
     nohup "$FRANKENPHP_BIN" run --config "$ROOT_DIR/Caddyfile" >/dev/null 2>&1 &
   else

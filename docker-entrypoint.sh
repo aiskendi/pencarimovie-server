@@ -5,17 +5,19 @@ export MALLOC_ARENA_MAX=2
 export XDG_DATA_HOME="${XDG_DATA_HOME:-/tmp/caddy/data}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/tmp/caddy/config}"
 
-# Heroku Dyno optimization: on 512MB dynos (Basic/Eco/Standard-1X), auto-tune to prevent R14/H12.
-# Standard standalone Docker containers outside Heroku use the default Caddyfile settings unhindered.
-if [ -n "$DYNO" ]; then
-    MEM_LIMIT=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || cat /sys/fs/cgroup/memory.max 2>/dev/null || echo 536870912)
-    if [ "$MEM_LIMIT" = "max" ] || [ -z "$MEM_LIMIT" ]; then
-        MEM_LIMIT=536870912
-    fi
-    MEM_MB=$((MEM_LIMIT / 1024 / 1024))
+# Container memory optimization: auto-detect cgroup memory limits (Heroku, Docker, K8s, Fly.io)
+# to prevent OOM/R14 and balance thread concurrency with available RAM.
+export GODEBUG="${GODEBUG:-madvdontneed=1}"
+export GOGC="${GOGC:-80}"
 
-    export GODEBUG="${GODEBUG:-madvdontneed=1}"
-    export GOGC="${GOGC:-80}"
+MEM_LIMIT=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "")
+if [ "$MEM_LIMIT" = "max" ]; then
+    MEM_LIMIT=""
+fi
+
+# On 64-bit systems, unlimited memory in cgroup v1 is 9223372036854771712 or 9223372036854775807
+if [ -n "$MEM_LIMIT" ] && [ "$MEM_LIMIT" -gt 0 ] 2>/dev/null && [ "$MEM_LIMIT" -le 34359738368 ]; then
+    MEM_MB=$((MEM_LIMIT / 1024 / 1024))
 
     if [ "$MEM_MB" -le 512 ]; then
         export GOMEMLIMIT="${GOMEMLIMIT:-350MiB}"
@@ -40,6 +42,14 @@ if [ -n "$DYNO" ]; then
         export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
         export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-3}"
     fi
+elif [ -n "$DYNO" ]; then
+    # Fallback default for Heroku dynos if cgroup read was empty
+    export GOMEMLIMIT="${GOMEMLIMIT:-550MiB}"
+    export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
+    export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-10}"
+    export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
+    export FRANKENPHP_MAX_WAIT_TIME="${FRANKENPHP_MAX_WAIT_TIME:-20s}"
+    export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
 fi
 
 mkdir -p /tmp/caddy/data /tmp/caddy/config /app/storage 2>/dev/null || true

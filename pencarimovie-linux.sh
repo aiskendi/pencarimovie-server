@@ -658,6 +658,8 @@ After=network.target
 Type=forking
 WorkingDirectory=$APP_DIR
 Environment=MALLOC_ARENA_MAX=2
+Environment=GODEBUG=madvdontneed=1
+Environment=GOGC=80
 MemoryHigh=1.5G
 MemoryMax=2G
 ExecStart=/usr/bin/env bash $start_script start

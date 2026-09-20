@@ -550,7 +550,7 @@ EOF
         -b "$ROOT_DIR:$ROOT_DIR" \
         -b "$TMP_DIR:/tmp" \
         -b "$TMP_DIR/resolv.conf:/etc/resolv.conf" \
-        /bin/sh -c 'export PATH="$1/bin:$7/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export PREFIX="$7"; export LAN_IP="$6"; if [ -f "$5/Caddyfile" ]; then exec "$2" run --config "$5/Caddyfile"; else exec "$2" php-server --listen "$3:$4" --root "$5"; fi' \
+        /bin/sh -c 'export PATH="$1/bin:$7/bin:$PATH"; export PHP_BINDIR="$1/bin"; export PHPRC="$1/bin"; export PREFIX="$7"; export LAN_IP="$6"; export MALLOC_ARENA_MAX=2; export GODEBUG="${GODEBUG:-madvdontneed=1}"; export GOGC="${GOGC:-80}"; export GOMEMLIMIT="${GOMEMLIMIT:-450MiB}"; export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"; export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-6}"; export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-96M}"; export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"; if [ -f "$5/Caddyfile" ]; then exec "$2" run --config "$5/Caddyfile"; else exec "$2" php-server --listen "$3:$4" --root "$5"; fi' \
         sh "$ROOT_DIR" "$FRANKENPHP_BIN" "$HOST" "$PORT" "$ROOT_DIR" "${LAN_IP:-}" "$TERMUX_PREFIX" >>"$LOG_FILE" 2>&1 &
       PID="$!"
 

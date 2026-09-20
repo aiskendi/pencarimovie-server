@@ -12,6 +12,7 @@ rem Configure FrankenPHP/Caddy via environment variables (per https://github.com
 set CADDY_GLOBAL_OPTIONS=skip_install_trust
 set FRANKENPHP_CONFIG=
 set CADDY_EXTRA_CONFIG=
+if not defined GOGC set GOGC=80
 
 rem Detect LAN IP via default gateway route (avoids virtual adapter IPs)
 set "LAN_IP="

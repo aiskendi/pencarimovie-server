@@ -1,15 +1,18 @@
 name: Release Builder & Docker Publish
 
+# Manual only. This workflow publishes the server tarballs that the in-app
+# OTA downloads, and it also pushes a multi-arch Docker image. Running it on
+# every push to main meant a release was cut for every commit, and a stray
+# `v*` tag could publish a release that shadows /releases/latest.
+#
+# To cut a release: Actions -> "Release Builder & Docker Publish" -> Run
+# workflow, and supply the tag (e.g. v2.3.4). Leave the tag empty to build
+# and publish the Docker image only, without creating a GitHub release.
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v2.2.3)"
+        description: "Release tag (e.g. v2.3.4). Leave empty to build the Docker image only."
         required: false
         default: ""
 
@@ -29,15 +32,27 @@ jobs:
       - name: Set release tag
         id: vars
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+
+          if [ -n "$TAG" ]; then
+            # A tag was supplied: validate it before it is used as a release
+            # name. A bare "latest" would collide with the /releases/latest
+            # endpoint that the in-app OTA resolves.
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::Tag '$TAG' must look like v1.2.3"
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           else
+            # No tag: build and push the Docker image only, no GitHub release.
             TAG="latest"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "No tag supplied — building the Docker image only."
           fi
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "$TAG" > .release-tag
 
       - name: Setup PHP & Composer
@@ -132,7 +147,9 @@ jobs:
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != ''
+        # Only when a tag was supplied. Without one this run is a Docker-only
+        # build and must not create a release.
+        if: steps.vars.outputs.publish == 'true'
         with:
           tag_name: ${{ env.TAG }}
           files: |

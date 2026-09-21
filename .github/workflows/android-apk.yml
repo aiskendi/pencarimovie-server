@@ -85,23 +85,30 @@ jobs:
           elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             NAME="${GITHUB_REF#refs/tags/v}"
           else
-            NAME="0.0.0-dev"
+            NAME="0.0.1-dev"
           fi
 
           # versionName must be valid semver (app/build.gradle validates it).
           # A tag like v2.3.3 -> 2.3.3 is already valid; anything else gets a
           # numeric fallback so the build never fails on a malformed tag.
           if ! [[ "$NAME" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::warning::'$NAME' is not valid semver; falling back to 0.0.0-dev"
-            NAME="0.0.0-dev"
+            echo "::warning::'$NAME' is not valid semver; falling back to 0.0.1-dev"
+            NAME="0.0.1-dev"
           fi
 
-          # versionCode must be a monotonically increasing integer. Derive it
-          # from the semver parts so it tracks versionName automatically.
+          # versionCode must be a positive, monotonically increasing integer.
+          # Derive it from the semver parts so it tracks versionName, then clamp
+          # to >= 1: Android rejects versionCode 0, and a 0.0.0 version would
+          # otherwise produce exactly that.
           MAJOR=$(echo "$NAME" | cut -d. -f1)
           MINOR=$(echo "$NAME" | cut -d. -f2)
           PATCH=$(echo "$NAME" | cut -d. -f3 | sed 's/[-+].*//')
+          # Guard against empty/non-numeric parts from a malformed tag.
+          [[ "$MAJOR" =~ ^[0-9]+$ ]] || MAJOR=0
+          [[ "$MINOR" =~ ^[0-9]+$ ]] || MINOR=0
+          [[ "$PATCH" =~ ^[0-9]+$ ]] || PATCH=0
           CODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          [ "$CODE" -ge 1 ] || CODE=1
 
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"

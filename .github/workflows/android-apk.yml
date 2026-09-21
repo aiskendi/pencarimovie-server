@@ -49,6 +49,12 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action defaults to `tools platform-tools`, but the `tools`
+          # package no longer exists in the SDK repository and sdkmanager
+          # fails with "Failed to find package 'tools'". Install only what
+          # the build needs; platform 36 is added in the next step.
+          packages: "platform-tools"
 
       # compileSdkVersion=36 (see gradle.properties) is not installed by
       # setup-android by default, and the build fails without it.
@@ -177,13 +183,19 @@ jobs:
           clears the Termux bootstrap and the MadelineProto session in \`storage/\`."
 
           # Create the release if it does not exist yet.
+          #
+          # --latest=false is essential: the server tarball OTA resolves
+          # github.com/<repo>/releases/latest and downloads
+          # pencarimovie-server.tar.gz from that tag. If this rolling APK
+          # release were marked "latest" it would shadow the server release
+          # and the tarball update would 404.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --title "$TITLE" \
               --notes "$NOTES" \
               --latest=false
           else
-            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --latest=false
           fi
 
           gh release upload "$TAG" \
@@ -192,7 +204,10 @@ jobs:
             dist-apk/version.json \
             --clobber
 
-      # A versioned tag also gets its own APK, next to the server tarball.
+      # A versioned tag also gets its own APK, attached to the release that
+      # release.yml creates for the same tag. This workflow never creates that
+      # release itself — doing so would race release.yml and could publish a
+      # release without the server tarball, breaking the tarball OTA.
       - name: Attach APK to versioned release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -200,18 +215,36 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/}"
-          # The release may not exist yet if release.yml has not run; wait briefly.
-          for i in $(seq 1 10); do
-            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
-            echo "Waiting for release $TAG to exist ($i/10)..."
+
+          # release.yml runs in parallel and creates the release. Wait for it.
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG is available"
+              break
+            fi
+            echo "Waiting for release $TAG ($i/20)..."
             sleep 15
           done
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              dist-apk/pencarimovie_arm64-v8a.apk \
-              dist-apk/pencarimovie_arm64-v8a.apk.sha256 \
-              dist-apk/version.json \
-              --clobber
-          else
-            echo "::warning::Release $TAG not found; skipping versioned APK upload"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Release $TAG was not created by release.yml; skipping APK upload"
+            exit 0
           fi
+
+          # Verify the server tarball is present before touching the release.
+          # If it is missing, uploading here would leave a release that the
+          # tarball OTA cannot use.
+          if ! gh release view "$TAG" --json assets --jq '.assets[].name' | grep -q 'pencarimovie-server.tar.gz'; then
+            echo "::warning::Release $TAG has no pencarimovie-server.tar.gz yet; skipping APK upload"
+            exit 0
+          fi
+
+          gh release upload "$TAG" \
+            dist-apk/pencarimovie_arm64-v8a.apk \
+            dist-apk/pencarimovie_arm64-v8a.apk.sha256 \
+            dist-apk/version.json \
+            --clobber
+
+          # Never let a versioned APK release become "latest" — the tarball
+          # OTA depends on /releases/latest pointing at a server release.
+          gh release edit "$TAG" --latest=false

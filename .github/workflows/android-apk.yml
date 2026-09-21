@@ -88,6 +88,11 @@ jobs:
             NAME="0.0.1-dev"
           fi
 
+          # Accept a leading "v" from either source: the tag path strips it,
+          # but a manual input like "v0.0.2" would otherwise fail the semver
+          # check below and silently fall back to the default version.
+          NAME="${NAME#v}"
+
           # versionName must be valid semver (app/build.gradle validates it).
           # A tag like v2.3.3 -> 2.3.3 is already valid; anything else gets a
           # numeric fallback so the build never fails on a malformed tag.

@@ -5363,6 +5363,50 @@ function fd_file_matches_episode(array $parsed, int $targetSeason, int $targetEp
     return $e === $targetEpisode;
 }
 
+function fd_is_series_file(string $title, string $caption = ''): bool
+{
+    $text = fd_clean_media_title($title);
+    if ($caption !== '' && preg_match('/^(?:video(?:\.\d+)*|\d+|document|file)\.(?:mp4|mkv|avi|mov|ts|flv)$/i', trim($text))) {
+        $firstCap = trim(explode("\n", $caption)[0]);
+        if ($firstCap !== '') {
+            $text = fd_clean_media_title($firstCap);
+        }
+    }
+
+    // 1. Explicit SxxExx or Sxx.Exx / SxxEPxx / SxxEpxx / SxxE01-E14
+    if (preg_match('/(?:^|[^a-z0-9])S\d{1,2}\s*[ ._-]*E(?:P|PS|PISODE)?\s*[ ._-]*\d{1,4}(?:[^a-z0-9]|$)/i', $text)) {
+        return true;
+    }
+    // 2. Explicit 1x05 / 01x12
+    if (preg_match('/(?:^|[^a-z0-9])\d{1,2}\s*[xX]\s*\d{1,4}(?![0-9])(?:[^a-z0-9]|$)/', $text)) {
+        return true;
+    }
+    // 3. Season / Musim keywords followed by digits: Season 1, Musim 2, etc.
+    if (preg_match('/(?:^|[^a-z0-9])(?:season|musim)\s*[ ._-]*\d{1,2}(?:[^a-z0-9]|$)/i', $text)) {
+        return true;
+    }
+    // 4. EP / EPS / EPISODE / EPISOD / BAHAGIAN followed by digits (e.g. EP04, Episode 5) - not 4-digit years
+    if (preg_match('/(?:^|[^a-z0-9])(?:EP|EPS|EPISODE|EPISOD|BAHAGIAN|BABAK)\s*[ ._-]*0*(\d{1,4})(?:[^a-z0-9]|$)/i', $text, $m)) {
+        $n = (int) $m[1];
+        if ($n > 0 && ($n < 1900 || $n > 2100)) {
+            return true;
+        }
+    }
+    // 5. Token starting with E followed by digits (e.g. .E04., .E32., E01) - excluding 4-digit years
+    if (preg_match('/(?:^|[^a-z0-9])E[ ._-]*0*(\d{1,4})(?:[^a-z0-9]|$)/i', $text, $m)) {
+        $n = (int) $m[1];
+        if ($n > 0 && ($n < 1900 || $n > 2100)) {
+            return true;
+        }
+    }
+    // 6. Isolated S01, S02 (e.g. Title.S01.1080p, Show S1 Complete)
+    if (preg_match('/(?:^|[^a-z0-9])S(\d{1,2})(?=[ ._\[\(-]+(?:2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|web|bluray|hdtv|complete|batch|ongoing|x264|x265|hevc)|$)/i', $text)) {
+        return true;
+    }
+
+    return false;
+}
+
 function fd_fetch_stream_ajax(string $action, array $params = []): array
 {
     $streamAction = 'stream_' . $action;
@@ -11259,7 +11303,7 @@ if ($isNuvioRoute) {
                     $fTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
 
                     // Exclude series episodes from movie streams
-                    if (preg_match('/[sS]\d{1,2}\s*[eE]\d{1,2}|(?:season|episod|episode|ep\.)\s*\d+/i', $fTitle)) {
+                    if (fd_is_series_file($fTitle, (string) ($pf['caption'] ?? ''))) {
                         continue;
                     }
 
@@ -11301,7 +11345,7 @@ if ($isNuvioRoute) {
 
                 // If matched files found, use them; otherwise fallback to postFiles
                 $seenCodes = [];
-                $postFilesToUse = !empty($matchedFiles) ? $matchedFiles : $postFiles;
+                $postFilesToUse = !empty($matchedFiles) ? $matchedFiles : array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
                 foreach ($postFilesToUse as $pf) {
                     if (!empty($pf['short_code']) && !isset($seenCodes[$pf['short_code']])) {
                         $seenCodes[$pf['short_code']] = true;
@@ -11320,7 +11364,7 @@ if ($isNuvioRoute) {
                                 if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
                                 $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
 
-                                if (preg_match('/[sS]\d{1,2}\s*[eE]\d{1,2}|(?:season|episod|episode|ep\.)\s*\d+/i', $fTitle)) {
+                                if (fd_is_series_file($fTitle, (string) ($f['caption'] ?? ''))) {
                                     continue;
                                 }
 
@@ -11450,6 +11494,11 @@ if ($isNuvioRoute) {
                         $sf = fd_fetch_stream_ajax('search_files', ['search' => $mQuery, 'limit' => 30]);
                         if (is_array($sf) && !empty($sf['files'])) {
                             foreach ($sf['files'] as $f) {
+                                $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                $fCaption = (string) ($f['caption'] ?? '');
+                                if (fd_is_series_file($fTitle, $fCaption)) {
+                                    continue;
+                                }
                                 $filesToStream[] = $f;
                             }
                         }
@@ -11464,10 +11513,20 @@ if ($isNuvioRoute) {
                             foreach ($sp as $p) {
                                 $pId = $p['id'] ?? 0;
                                 if (!$pId) continue;
+                                $pTitle = (string) ($p['title'] ?? '');
+                                $pCats = (array) ($p['categories'] ?? []);
+                                if (preg_match('/tvseries|series|season|episode|drama/i', $pTitle . ' ' . implode(' ', $pCats))) {
+                                    continue;
+                                }
                                 $pFilesRes = fd_fetch_stream_ajax('post_files', ['post_id' => $pId, 'limit' => 20]);
                                 $pFiles = (array) ($pFilesRes['files'] ?? []);
                                 foreach ($pFiles as $pf) {
                                     if (!empty($pf['short_code'])) {
+                                        $pfTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
+                                        $pfCaption = (string) ($pf['caption'] ?? '');
+                                        if (fd_is_series_file($pfTitle, $pfCaption)) {
+                                            continue;
+                                        }
                                         $filesToStream[] = $pf;
                                     }
                                 }
@@ -11490,6 +11549,12 @@ if ($isNuvioRoute) {
                         $filteredMovieFiles = [];
                         foreach ($filesToStream as $mf) {
                             $fTitle = $mf['title'] ?? '';
+                            $fCaption = $mf['caption'] ?? '';
+
+                            // Never allow series files in movie streams
+                            if (fd_is_series_file($fTitle, $fCaption)) {
+                                continue;
+                            }
 
                             // 1. Strict Year check if year is present in filename
                             if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
@@ -11509,6 +11574,10 @@ if ($isNuvioRoute) {
                             } else {
                                 $baseF = preg_replace('/\b(19\d\d|20\d\d)\b.*/', '', $baseF);
                             }
+                            $baseF = trim($baseF);
+
+                            // Strip common movie edition suffixes
+                            $baseF = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion)\b.*/i', '', $baseF);
                             $baseF = trim($baseF);
 
                             // Strip leading release channels/groups (e.g. "prakytv the runner" -> "the runner")
@@ -11531,13 +11600,20 @@ if ($isNuvioRoute) {
                             $filteredMovieFiles[] = $mf;
                         }
 
-                        // If strict guard found exact matches, use them; otherwise fallback only if none found
+                        // If strict guard found exact matches, use them; otherwise strip any series files from fallback
                         if (!empty($filteredMovieFiles)) {
                             $filesToStream = $filteredMovieFiles;
+                        } else {
+                            $filesToStream = array_values(array_filter($filesToStream, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
                         }
                     }
                 }
             }
+        }
+
+        // Ensure movie streams NEVER contain series files
+        if ($itemType === 'movie' || ($targetSeason === null && $targetEpisode === null && !str_contains($itemId, ':'))) {
+            $filesToStream = array_values(array_filter($filesToStream, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
         }
 
         // Automatically group and combine multi-part split videos (part001, part002, ...)

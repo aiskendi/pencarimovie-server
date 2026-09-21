@@ -79,7 +79,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          GRADLE=android/termux-app-fork/app/build.gradle
+          # Relative to the job's working-directory (android/termux-app-fork).
+          GRADLE=app/build.gradle
 
           # versionCode is a plain incrementing integer, bumped by hand in
           # app/build.gradle before each release. CI only reads it — it must be

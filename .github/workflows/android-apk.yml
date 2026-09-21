@@ -136,9 +136,15 @@ jobs:
             find app/build/outputs -type f || true
             exit 1
           fi
-          mkdir -p ../../dist-apk
+
+          # Absolute output dir. The job sets working-directory to the Android
+          # project, so a relative path here would not match the relative paths
+          # used by the upload steps below.
+          OUT="$GITHUB_WORKSPACE/dist-apk"
+          mkdir -p "$OUT"
+
           # Stable, arch-suffixed name so the download URL never changes.
-          DEST="../../dist-apk/pencarimovie_arm64-v8a.apk"
+          DEST="$OUT/pencarimovie_arm64-v8a.apk"
           cp "$SRC" "$DEST"
           echo "path=$DEST" >> "$GITHUB_OUTPUT"
           ls -lh "$DEST"
@@ -146,7 +152,7 @@ jobs:
 
           # version.json is what the app polls to detect an update. It is a
           # separate asset so the check is a tiny request, not a 15 MB download.
-          cat > ../../dist-apk/version.json <<EOF
+          cat > "$OUT/version.json" <<EOF
           {
             "versionName": "${{ steps.ver.outputs.name }}",
             "versionCode": ${{ steps.ver.outputs.code }},
@@ -156,16 +162,18 @@ jobs:
             "commit": "${GITHUB_SHA::7}"
           }
           EOF
-          cat ../../dist-apk/version.json
+          cat "$OUT/version.json"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: pencarimovie-apk-${{ steps.ver.outputs.name }}
+          # Absolute path: the job's working-directory is the Android project,
+          # but the APK is staged at the repository root.
           path: |
-            dist-apk/*.apk
-            dist-apk/*.sha256
-            dist-apk/version.json
+            ${{ github.workspace }}/dist-apk/*.apk
+            ${{ github.workspace }}/dist-apk/*.sha256
+            ${{ github.workspace }}/dist-apk/version.json
           if-no-files-found: error
 
       # Rolling release: always the same tag, so the public download link is
@@ -206,9 +214,9 @@ jobs:
           fi
 
           gh release upload "$TAG" \
-            dist-apk/pencarimovie_arm64-v8a.apk \
-            dist-apk/pencarimovie_arm64-v8a.apk.sha256 \
-            dist-apk/version.json \
+            "$GITHUB_WORKSPACE/dist-apk/pencarimovie_arm64-v8a.apk" \
+            "$GITHUB_WORKSPACE/dist-apk/pencarimovie_arm64-v8a.apk.sha256" \
+            "$GITHUB_WORKSPACE/dist-apk/version.json" \
             --clobber
 
       # A versioned tag also gets its own APK, attached to the release that
@@ -247,9 +255,9 @@ jobs:
           fi
 
           gh release upload "$TAG" \
-            dist-apk/pencarimovie_arm64-v8a.apk \
-            dist-apk/pencarimovie_arm64-v8a.apk.sha256 \
-            dist-apk/version.json \
+            "$GITHUB_WORKSPACE/dist-apk/pencarimovie_arm64-v8a.apk" \
+            "$GITHUB_WORKSPACE/dist-apk/pencarimovie_arm64-v8a.apk.sha256" \
+            "$GITHUB_WORKSPACE/dist-apk/version.json" \
             --clobber
 
           # Never let a versioned APK release become "latest" — the tarball

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paths exposed through the FileProvider declared in AndroidManifest.xml.
+
+  Only the update-download directory is shared, so the package installer can
+  read the APK without exposing the rest of the app's private storage.
+  cacheDir/updates maps to /data/data/<pkg>/cache/updates.
+-->
+<paths>
+    <cache-path
+        name="updates"
+        path="updates/" />
+</paths>

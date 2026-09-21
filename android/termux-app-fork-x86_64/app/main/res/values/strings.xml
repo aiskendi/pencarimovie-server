@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="application_name">PencariMovie Server</string>
+    <string name="app_name">PencariMovie Server</string>
+    <string name="start_server">Start Server</string>
+    <string name="stop_server">Stop Server</string>
+    <string name="open_browser">Open Browser</string>
+    <string name="status_idle">Status: Idle</string>
+    <string name="status_running">Status: Running</string>
+    <string name="status_error">Status: Error</string>
+    <string name="status_starting">Status: Starting...</string>
+    <string name="status_stopping">Status: Stopping...</string>
+    <string name="auto_start_on_boot">Auto start on boot</string>
+    <string name="battery_saver_mode">Battery Saver (Smart WakeLock)</string>
+    <string name="update_download">Download Update</string>
+    <string name="update_available">Update available: v%1$s (installed v%2$s)</string>
+    <string name="update_downloading">Downloading…</string>
+    <string name="update_downloading_pct">Downloading… %1$d%%</string>
+    <string name="update_installing">Opening installer…</string>
+    <string name="update_download_failed">Download failed. Opening the release page instead.</string>
+    <string name="update_install_failed">Could not open the installer. Opening the release page instead.</string>
+</resources>

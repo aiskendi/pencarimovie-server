@@ -84,8 +84,39 @@ errors_db.txt
 storage/*.madeline.lock
 storage/*.madeline.safe.php
 
-# Android project (excluded from repository)
-android/
+# Android project.
+#
+# android/termux-app-fork and android/termux-app-fork-x86_64 ARE tracked: the
+# GitHub Actions workflow .github/workflows/android-apk.yml builds them, so the
+# source must be in the repository. The older android/ project (Phase 1/2,
+# proot-distro + rootfs) stays excluded.
+#
+# NOTE: the re-include rules for these two projects live at the END of this
+# file. Git evaluates patterns in order and does not descend into an excluded
+# directory, so negations must come after every broad rule that would match
+# (pencarimovie*, *.zip, *.jks).
+android/*
+
+# Build output and IDE state inside the tracked Android projects.
+android/termux-app-fork/build/
+android/termux-app-fork/app/build/
+android/termux-app-fork/.gradle/
+android/termux-app-fork/.gradle_cache/
+android/termux-app-fork/.gradle_home/
+android/termux-app-fork/.gradle_user_home/
+android/termux-app-fork/.kotlin/
+android/termux-app-fork/.idea/
+android/termux-app-fork/local.properties
+android/termux-app-fork-x86_64/build/
+android/termux-app-fork-x86_64/app/build/
+android/termux-app-fork-x86_64/.gradle/
+android/termux-app-fork-x86_64/.gradle_cache/
+android/termux-app-fork-x86_64/.gradle_home/
+android/termux-app-fork-x86_64/.gradle_user_home/
+android/termux-app-fork-x86_64/.kotlin/
+android/termux-app-fork-x86_64/.idea/
+android/termux-app-fork-x86_64/local.properties
+
 build-proot-termux.sh
 build-rootfs-termux.sh
 scripts/package-android.*
@@ -182,3 +213,51 @@ storage/benchmark.js
 storage/test-ip-pin.sh
 *.jks
 release-keystore-password.txt
+
+# ---------------------------------------------------------------------------
+# Android projects tracked for CI (must stay at the end of this file).
+#
+# These negations have to come after every broad rule above, because git does
+# not descend into an excluded directory and evaluates patterns in order.
+# ---------------------------------------------------------------------------
+
+# Re-include the two projects the APK workflow builds.
+!android/termux-app-fork/
+!android/termux-app-fork-x86_64/
+
+# Sources live under com/pencarimovie/, which `pencarimovie*` would exclude.
+!android/termux-app-fork/app/main/java/com/pencarimovie/
+!android/termux-app-fork/app/main/java/com/pencarimovie/**
+!android/termux-app-fork-x86_64/app/main/java/com/pencarimovie/
+!android/termux-app-fork-x86_64/app/main/java/com/pencarimovie/**
+
+# Bootstrap ZIPs are build inputs, not release artifacts.
+!android/termux-app-fork/app/main/assets/
+!android/termux-app-fork/app/main/assets/*.zip
+!android/termux-app-fork-x86_64/app/main/assets/
+!android/termux-app-fork-x86_64/app/main/assets/*.zip
+
+# Signing keystores — development keys, already public in this project's
+# history. CI needs them to sign the release APK.
+!android/termux-app-fork/app/*.jks
+!android/termux-app-fork-x86_64/app/*.jks
+
+# Keep build output and IDE state out even inside the tracked projects.
+android/termux-app-fork/build/
+android/termux-app-fork/app/build/
+android/termux-app-fork/.gradle/
+android/termux-app-fork/.gradle_cache/
+android/termux-app-fork/.gradle_home/
+android/termux-app-fork/.gradle_user_home/
+android/termux-app-fork/.kotlin/
+android/termux-app-fork/.idea/
+android/termux-app-fork/local.properties
+android/termux-app-fork-x86_64/build/
+android/termux-app-fork-x86_64/app/build/
+android/termux-app-fork-x86_64/.gradle/
+android/termux-app-fork-x86_64/.gradle_cache/
+android/termux-app-fork-x86_64/.gradle_home/
+android/termux-app-fork-x86_64/.gradle_user_home/
+android/termux-app-fork-x86_64/.kotlin/
+android/termux-app-fork-x86_64/.idea/
+android/termux-app-fork-x86_64/local.properties

@@ -29,12 +29,16 @@ android {
         minSdkVersion project.properties.minSdkVersion.toInteger()
         targetSdkVersion project.properties.targetSdkVersion.toInteger()
 
-        // Version can be overridden from CI so the APK tracks the release tag:
-        //   ./gradlew :app:assembleRelease -PversionNameOverride=2.3.3 -PversionCodeOverride=20303
-        // Falls back to the checked-in values for local builds.
+        // versionCode is a plain incrementing integer, independent of
+        // versionName. Bump it for every release — Android refuses to install
+        // an APK whose versionCode is not higher than the installed one.
+        //
+        // CI reads this value (see .github/workflows/android-apk.yml) and can
+        // override both fields:
+        //   ./gradlew :app:assembleRelease -PversionNameOverride=2.0.1 -PversionCodeOverride=21
         def versionNameOverride = project.findProperty("versionNameOverride")
         def versionCodeOverride = project.findProperty("versionCodeOverride")
-        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 20
+        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 21
         versionName versionNameOverride != null ? versionNameOverride.toString() : "2.0.0"
 
         validateVersionName(versionName)

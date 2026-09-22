@@ -112,7 +112,7 @@ if [ -x "$FRANKENPHP_BIN" ]; then
   export GOGC="${GOGC:-80}"
 
   # Auto-tune memory on low-RAM Linux systems (e.g. 1GB-2GB VPS / Raspberry Pi)
-  if [ -z "$GOMEMLIMIT" ] && [ -r /proc/meminfo ]; then
+  if [ -z "${GOMEMLIMIT:-}" ] && [ -r /proc/meminfo ]; then
     TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
     if [ "$TOTAL_MEM_MB" -gt 0 ] && [ "$TOTAL_MEM_MB" -le 1024 ]; then

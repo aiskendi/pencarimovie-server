@@ -1,4 +1,8 @@
 {
+	# Production/PaaS (Render, Docker, VPS): the admin API on :2019 is unused
+	# and Caddy rejects Host headers other than localhost, which makes Render's
+	# internal HEAD / health check log `host not allowed: *.onrender.com` 403.
+	admin off
 	auto_https off
 	frankenphp {
 		# Concurrency & thread pool (tuned for low-end VPS / devices: 1GB-2GB RAM, 1-2 vCPUs):
@@ -28,6 +32,9 @@
 			read_header 30s
 			write 0
 			idle 2m
+			# Caddy 2.10+ defaults `request` to 60s. That aborts movie/music
+			# streams with "maximum request handling time exceeded". 0 = unlimited.
+			request 0
 		}
 	}
 }

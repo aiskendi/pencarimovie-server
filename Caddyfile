@@ -32,9 +32,6 @@
 			read_header 30s
 			write 0
 			idle 2m
-			# Caddy 2.10+ defaults `request` to 60s. That aborts movie/music
-			# streams with "maximum request handling time exceeded". 0 = unlimited.
-			request 0
 		}
 	}
 }
@@ -87,5 +84,8 @@
 	php_server {
 		resolve_root_symlink false
 		try_files {path} index.php
+		# Idle cutoff on request-body reads (default 60s). 0 = disable.
+		# Does not replace Caddy 2.10 timeouts.request (injected at Docker start).
+		request_body_timeout 0
 	}
 }

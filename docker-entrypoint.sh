@@ -64,7 +64,25 @@ fi
 PORT="${PORT:-8088}"
 echo "[Docker] Starting PencariMovie Server on 0.0.0.0:${PORT}..."
 if [ -f "/app/Caddyfile" ]; then
-    exec /app/bin/frankenphp run --config /app/Caddyfile
+    CADDYFILE="/tmp/Caddyfile"
+    JSON="/tmp/caddy.json"
+    cp /app/Caddyfile "$CADDYFILE"
+    # Caddy 2.10 defaults timeouts.request to 60s ("maximum request handling
+    # time exceeded") but this FrankenPHP Caddyfile adapter rejects that token.
+    # request_body_timeout is the documented php_server 60s idle-body cutoff;
+    # older binaries may reject it too — strip and retry adapt.
+    adapt() {
+        /app/bin/frankenphp adapt --config "$CADDYFILE" --adapter caddyfile > "$JSON" 2>/tmp/caddy-adapt.err
+    }
+    if ! adapt; then
+        sed -i '/request_body_timeout/d' "$CADDYFILE"
+        adapt || true
+    fi
+    if grep -q '"timeouts"' "$JSON" 2>/dev/null; then
+        sed -i 's/"timeouts":{/"timeouts":{"request":0,/g' "$JSON"
+        exec /app/bin/frankenphp run --config "$JSON"
+    fi
+    exec /app/bin/frankenphp run --config "$CADDYFILE"
 else
     exec /app/bin/frankenphp php-server --listen "0.0.0.0:${PORT:-8088}" --root /app
 fi

@@ -91,6 +91,34 @@ if exist "%ROOT%\vendor\autoload.php" (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "Copy-Item -LiteralPath '%ROOT%\vendor' -Destination '%BUILD%\vendor' -Recurse -Force"
 )
 
+REM Apply the MadelineProto IPC patch to the COPIED vendor tree so the release
+REM always ships the patched getSlow()/ProcessRunner/ClientAbstract, regardless
+REM of whether the dev tree's vendor/ was patched by composer-patches. Without
+REM this a release built from an unpatched vendor/ ships the old
+REM `getSlow()` (Magic::$isIpcWorker || PHP_OS_FAMILY === 'Windows'), which
+REM forces a full-mode boot on Windows and produces the
+REM "It seems like the session is busy." / "Could not connect to MadelineProto"
+REM storm on a fresh install.
+if exist "%BUILD%\vendor\danog\madelineproto" (
+  if exist "%ROOT%\patches\madelineproto-windows-ipc.patch" (
+    pushd "%BUILD%\vendor\danog\madelineproto"
+    git apply --recount --whitespace=nowarn "%ROOT%\patches\madelineproto-windows-ipc.patch" 2>nul
+    if errorlevel 1 (
+      echo NOTE: git apply reported issues; verifying getSlow() directly...
+    )
+    popd
+  )
+)
+
+REM Hard guarantee: if the patch could not be applied (no git, or already
+REM applied), rewrite getSlow() in the copied vendor tree so the release can
+REM never ship the Windows full-boot form.
+REM
+REM Write with a BOM-less UTF8 encoding: Set-Content -Encoding UTF8 prepends a
+REM BOM, which makes `declare(strict_types=1)` fail with
+REM "strict_types declaration must be the very first statement".
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = '%BUILD%\vendor\danog\madelineproto\src\Settings\Ipc.php'; if (Test-Path $p) { $c = [System.IO.File]::ReadAllText($p); $old = 'return Magic::$isIpcWorker || \PHP_OS_FAMILY === ''Windows'';'; $new = 'return Magic::$isIpcWorker || !empty($GLOBALS[''FD_FORCE_FULL_BOOT'']);'; if ($c.Contains($old)) { $c = $c.Replace($old, $new); [System.IO.File]::WriteAllText($p, $c, (New-Object System.Text.UTF8Encoding $false)); Write-Host 'getSlow() patched in release vendor tree' } elseif ($c.Contains($new)) { Write-Host 'getSlow() already patched' } else { Write-Host 'WARNING: getSlow() form not recognised' } }"
+
 if exist "%ROOT%\.release-tag" (
   copy /Y "%ROOT%\.release-tag" "%BUILD%\.release-tag" >nul
 )

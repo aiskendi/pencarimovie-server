@@ -69,6 +69,43 @@ jobs:
         run: |
           composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
 
+      - name: Apply MadelineProto IPC patch to vendor/ and verify
+        run: |
+          set -euo pipefail
+          # cweagans/composer-patches normally applies this during composer
+          # install, but it is skipped when the patch is already applied in the
+          # dev tree or when composer.lock predates the patch change. A release
+          # built from an unpatched vendor/ ships the old getSlow()
+          # (Magic::$isIpcWorker || PHP_OS_FAMILY === 'Windows'), which forces a
+          # full-mode boot on Windows and produces the
+          # "It seems like the session is busy." / "Could not connect to
+          # MadelineProto" storm on a fresh install. Apply it explicitly and
+          # fail the build if the patched form is not present.
+          PATCH="patches/madelineproto-windows-ipc.patch"
+          if [ -f "$PATCH" ]; then
+            ( cd vendor/danog/madelineproto && git apply --recount --whitespace=nowarn "../../../../$PATCH" ) || true
+          fi
+
+          # Use PHP for the in-place rewrite: it avoids all shell/sed escaping
+          # pitfalls with `$`, `\` and quotes in the target line.
+          php -r '
+            $p = "vendor/danog/madelineproto/src/Settings/Ipc.php";
+            if (!is_file($p)) { fwrite(STDERR, "missing $p\n"); exit(1); }
+            $c = file_get_contents($p);
+            $old = "return Magic::\$isIpcWorker || \\PHP_OS_FAMILY === \x27Windows\x27;";
+            $new = "return Magic::\$isIpcWorker || !empty(\$GLOBALS[\x27FD_FORCE_FULL_BOOT\x27]);";
+            if (str_contains($c, $old)) {
+                $c = str_replace($old, $new, $c);
+                file_put_contents($p, $c);
+                echo "Rewrote getSlow() in $p\n";
+            }
+            if (!str_contains($c, "FD_FORCE_FULL_BOOT")) {
+                fwrite(STDERR, "ERROR: $p does not contain the patched getSlow() form\n");
+                exit(1);
+            }
+            echo "Verified: $p has the patched getSlow()\n";
+          '
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 

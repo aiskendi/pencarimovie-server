@@ -4261,12 +4261,14 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
                         } catch (Throwable $_t) {
                         }
                     }
-                    // Login succeeded — spawn a detached IPC worker for this bot so
-                    // subsequent requests connect via IPC instead of full boots.
-                    $newSessionPath = fd_get_bot_session_path((string) $self['id']);
-                    if (is_dir($newSessionPath) || is_file($newSessionPath)) {
-                        fd_ensure_ipc_worker($newSessionPath);
-                    }
+                    // Login succeeded. Do NOT spawn an IPC worker here: this
+                    // request still holds the full-mode $madeline instance, which
+                    // owns the session lock until the request ends. A worker
+                    // spawned now cannot acquire that lock and dies with
+                    // "It seems like the session is busy." (observed: two
+                    // "MadelineProto is ready!" lines then a stuck second boot).
+                    // The NEXT request spawns the worker via the normal
+                    // fd_ensure_ipc_worker() path once this instance is gone.
                     while (ob_get_level() > $bootObLevel) {
                         ob_end_clean();
                     }
@@ -4443,6 +4445,17 @@ function fd_find_orphan_session_bot_id(): string
         $sess = $dir . DIRECTORY_SEPARATOR . 'session.madeline';
         if (is_file($sess) || is_dir($sess)) {
             return '';
+        }
+        // An EMPTY dir is debris left by a partial clear, not a failed login.
+        // Remove it and keep scanning instead of blocking provisioning forever
+        // (observed: an empty storage/sessions/<id>/ dir made every /api/provision
+        // return "A previous login did not finish").
+        $contents = @scandir($dir);
+        $real = $contents ? array_diff($contents, ['.', '..']) : [];
+        if (empty($real)) {
+            @rmdir($dir);
+            fd_log('removed empty orphan session dir', ['bot_id' => (string) $entry]);
+            continue;
         }
         return (string) $entry;
     }

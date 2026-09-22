@@ -12919,6 +12919,22 @@ if (str_starts_with($path, '/api/')) {
             ], 500);
         }
 
+        // Release the full-mode instance fd_auto_provision_guest() returned.
+        // This route only needs the bot_id; keeping the instance alive holds the
+        // session lock until the request ends, so a concurrent /api/download
+        // (the frontend provisions by hitting /api/download) cannot boot the
+        // same session and dies with "It seems like the session is busy.".
+        // Disconnecting lets the next request spawn/connect the IPC worker.
+        if (!empty($provisioned['madeline']) && is_object($provisioned['madeline'])) {
+            try {
+                if (method_exists($provisioned['madeline'], 'disconnect')) {
+                    $provisioned['madeline']->disconnect();
+                }
+            } catch (Throwable $_t) {
+            }
+            unset($provisioned['madeline']);
+        }
+
         fd_json([
             'ok' => 1,
             'message' => 'Guest bot session initialized successfully.',

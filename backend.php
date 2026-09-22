@@ -6022,11 +6022,19 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
 
     // 2. Fast keyword probe to discover external/Telegram channel releases (MalaySub, Fanszz, DramaOST, etc.)
     if (count($all) < $maxFiles && $keyword !== '') {
-        $tokens = sprintf('(E%02d | S%02dE%02d | EP%02d', $episode, $season, $episode, $episode);
+        // Build the individual episode tokens. Different uploaders name the same
+        // episode differently (S01E01, E01, EP01, EP1, E1), so we query each
+        // shape separately as well as in one OR-group.
+        $episodeTokens = [
+            sprintf('E%02d', $episode),
+            sprintf('S%02dE%02d', $season, $episode),
+            sprintf('EP%02d', $episode),
+        ];
         if ($episode < 10) {
-            $tokens .= sprintf(' | EP%d | E%d', $episode, $episode);
+            $episodeTokens[] = sprintf('EP%d', $episode);
+            $episodeTokens[] = sprintf('E%d', $episode);
         }
-        $tokens .= ')';
+        $tokens = '(' . implode(' | ', $episodeTokens) . ')';
 
         $q = "{$keyword} {$tokens}";
         $res = fd_fetch_stream_ajax('search_files', [
@@ -6034,7 +6042,43 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             'limit' => 50,
             'offset' => 0,
         ]);
-        $add((array) ($res['files'] ?? []));
+        $groupFiles = (array) ($res['files'] ?? []);
+        $add($groupFiles);
+
+        // The OR-group is ranked by relevance, so a naming convention with many
+        // matches (e.g. dozens of S01E01 variants) can fill the whole 50-result
+        // page and crowd out a rarer convention (e.g. a single EP1 release).
+        // When the group query came back full (i.e. it was truncated), run a
+        // targeted query per token so every convention gets its own window.
+        //
+        // Manticore uses AND semantics for multi-word queries, so a file that
+        // puts the year between the title and the episode token
+        // (e.g. "Agent.Kim.Reactivated.2026.EP01.MalaySub.mclub.mp4") is NOT
+        // matched by "keyword EP01" — the query omits the year the file
+        // contains. When postYear is known we therefore also probe each token
+        // WITH the year, which is the only shape that finds those releases.
+        if (count($groupFiles) >= 50) {
+            foreach ($episodeTokens as $tok) {
+                if (count($all) >= $maxFiles) {
+                    break;
+                }
+                $resTok = fd_fetch_stream_ajax('search_files', [
+                    'search' => "{$keyword} {$tok}",
+                    'limit' => 50,
+                    'offset' => 0,
+                ]);
+                $add((array) ($resTok['files'] ?? []));
+
+                if ($postYear !== null && count($all) < $maxFiles) {
+                    $resTokYear = fd_fetch_stream_ajax('search_files', [
+                        'search' => "{$keyword} {$postYear} {$tok}",
+                        'limit' => 50,
+                        'offset' => 0,
+                    ]);
+                    $add((array) ($resTokYear['files'] ?? []));
+                }
+            }
+        }
 
         // Also query with episode token first (e.g. "(E01 | ...) Keyword") to find releases
         // that place the episode tag before the title (e.g. "OLD.E01.To.My.Beloved.Thief...").
@@ -6048,8 +6092,13 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             $add((array) ($resLeading['files'] ?? []));
         }
 
-        // If very few files and postYear is known, try with postYear
-        if (count($all) < 15 && $postYear !== null) {
+        // Year-qualified OR-group. Files that place the year between the title
+        // and the episode token (e.g. "Agent.Kim.Reactivated.2026.EP01...") are
+        // only reachable when the year is part of the query, because Manticore
+        // ANDs every term. This must run whenever the year is known — not only
+        // when few files were found — otherwise a title with many SxxExx
+        // variants fills the page and the year-qualified releases stay hidden.
+        if ($postYear !== null && count($all) < $maxFiles) {
             $qYear = "{$keyword} {$postYear} {$tokens}";
             $resYear = fd_fetch_stream_ajax('search_files', [
                 'search' => $qYear,

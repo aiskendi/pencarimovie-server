@@ -3485,6 +3485,90 @@ function fd_require_fileinfo(): bool
 }
 
 /**
+ * Preflight check for the runtime requirements MadelineProto needs.
+ *
+ * Without this, a missing dependency (vendor/, fileinfo, openssl, mbstring,
+ * curl) or a 32-bit PHP build makes every boot fail with a low-level error that
+ * the frontend cannot explain, so the user only ever sees the bot-token gate
+ * and assumes their token is wrong.
+ *
+ * Returns a list of human-readable problems. An empty list means the runtime is
+ * usable. The result is cached for 60s so /api/session stays cheap.
+ *
+ * @return array{ok: bool, fatal: bool, problems: string[], hints: string[]}
+ */
+function fd_environment_preflight(): array
+{
+    static $cached = null;
+    static $cachedAt = 0;
+    if ($cached !== null && (time() - $cachedAt) < 60) {
+        return $cached;
+    }
+
+    $problems = [];
+    $hints = [];
+
+    // ── 1. 64-bit PHP ────────────────────────────────────────────────────────
+    // MadelineProto hard-throws on 32-bit PHP in Magic::start():
+    //   "A 64-bit build of PHP is required to run MadelineProto"
+    // This is NOT about sending messages — the Telegram MTProto transport
+    // itself needs 64-bit integer math (message IDs are `time() << 32`, and
+    // the auth-key exchange packs 64-bit ints). Even a pure download must
+    // complete that handshake first, so 32-bit PHP can never work.
+    //
+    // Every PencariMovie release ships a 64-bit runtime in bin/, so this only
+    // fires when the app is running under a DIFFERENT, 32-bit system PHP
+    // (e.g. a 32-bit XAMPP/WAMP, or a 32-bit OS). The fix is therefore to run
+    // the bundled runtime, not to "install a 64-bit build".
+    if (PHP_INT_SIZE < 8) {
+        $problems[] = 'The server is running under a 32-bit PHP build. The Telegram protocol requires 64-bit PHP, so downloads cannot work.';
+        $hints[] = 'Start the server with the bundled runtime (start.bat / ./start.sh) instead of a system PHP. If it still reports 32-bit, the operating system itself is 32-bit and needs reinstalling as 64-bit.';
+    }
+
+    // ── 2. Composer dependencies (vendor/) ───────────────────────────────────
+    // NOTE: class_exists() must be called WITHOUT the second `false` argument
+    // here. With `false` it does not trigger the Composer autoloader, so the
+    // class is never actually loaded and the check always reports a failure
+    // even when vendor/ is perfectly healthy.
+    if (!fd_ensure_autoload()) {
+        $problems[] = 'MadelineProto dependencies are missing (vendor/autoload.php was not found).';
+        $hints[] = 'Run install.bat (Windows) or ./install.sh (Linux/Termux) to install dependencies, then restart the server.';
+    } elseif (!class_exists('\\danog\\MadelineProto\\API')) {
+        $problems[] = 'MadelineProto could not be loaded from the installed dependencies.';
+        $hints[] = 'Re-run install.bat / ./install.sh to repair the vendor/ directory, then restart the server.';
+    }
+
+    // ── 3. Required PHP extensions ───────────────────────────────────────────
+    $requiredExtensions = [
+        'fileinfo' => 'MadelineProto requires the fileinfo extension.',
+        'openssl'  => 'MadelineProto requires the openssl extension for the MTProto handshake.',
+        'mbstring' => 'MadelineProto requires the mbstring extension.',
+        'curl'     => 'PencariMovie Server requires the curl extension to reach the PencariMovie API.',
+    ];
+    foreach ($requiredExtensions as $ext => $why) {
+        if (!extension_loaded($ext)) {
+            $problems[] = $why;
+            $hints[] = PHP_OS_FAMILY === 'Windows'
+                ? "Enable extension={$ext} in bin/php.ini, then restart the server."
+                : "Install the php-{$ext} package (e.g. sudo apt-get install php-{$ext}), then restart the server.";
+        }
+    }
+
+    $result = [
+        'ok' => empty($problems),
+        // A missing dependency or a 32-bit build can never be fixed by entering
+        // a bot token, so the frontend must show an error instead of the gate.
+        'fatal' => !empty($problems),
+        'problems' => array_values(array_unique($problems)),
+        'hints' => array_values(array_unique($hints)),
+    ];
+
+    $cached = $result;
+    $cachedAt = time();
+    return $result;
+}
+
+/**
  * Decrypt api_id/api_hash that were encrypted by WordPress using the bot token.
  *
  * @param string $encryptedB64 Base64-encoded ciphertext.
@@ -12758,6 +12842,15 @@ if (str_starts_with($path, '/api/')) {
         }
 
         $isProvisioning = fd_is_guest_provision_in_progress();
+
+        // Runtime preflight: a missing dependency or a 32-bit PHP build can
+        // never be fixed by entering a bot token, so report it here and let the
+        // frontend show an error instead of the bot-token gate.
+        $env = fd_environment_preflight();
+        if (!$env['ok']) {
+            fd_log('environment preflight failed', ['problems' => $env['problems']]);
+        }
+
         fd_json([
             'ok' => 1,
             'version' => FD_APP_VERSION,
@@ -12770,6 +12863,10 @@ if (str_starts_with($path, '/api/')) {
             'device_id' => fd_get_device_id(),
             'bot_count' => count($pool),
             'bot_pool' => $pool,
+            'environment_ok' => $env['ok'],
+            'environment_fatal' => $env['fatal'],
+            'environment_problems' => $env['problems'],
+            'environment_hints' => $env['hints'],
         ]);
     }
 
@@ -13840,7 +13937,11 @@ if (str_starts_with($path, '/api/')) {
         }
 
         $downloadAttempt = 0;
-        $maxDownloadAttempts = ($shortCode !== '') ? 2 : 1;
+        // Allow extra attempts so a stream can recover when its IPC worker/bot is
+        // torn down mid-flight (e.g. the user disconnects all bots and provisions
+        // a fresh guest bot while watching). On an IPC-death error we re-boot with
+        // whichever bot/IPC worker is currently active and retry the same file.
+        $maxDownloadAttempts = ($shortCode !== '') ? 4 : 1;
 
         // The abort callback is a Closure. Over IPC, MadelineProto wraps it in
         // danog\MadelineProto\Ipc\Wrapper, which cannot serialize a Closure —
@@ -13922,6 +14023,78 @@ if (str_starts_with($path, '/api/')) {
                         $fileId = $newFileId;
                         $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
                         continue;
+                    }
+                }
+
+                // The IPC worker/bot died mid-stream (e.g. the user disconnected all
+                // bots and provisioned a fresh guest bot while watching). Re-boot with
+                // whichever bot/IPC worker is currently active and retry the same file
+                // so the stream continues after provisioning succeeds.
+                $isIpcDeath = stripos($errStr, 'endpoint does not exist') !== false
+                    || stripos($errStr, 'could not connect to madelineproto') !== false
+                    || stripos($errStr, 'disconnected from ipc') !== false
+                    || stripos($errStr, 'session is busy') !== false
+                    || stripos($errStr, 'exclusive session lock') !== false;
+                // Only retry when nothing has been written to the client yet.
+                // Once headers/bytes are sent a retry would corrupt the stream.
+                if ($isIpcDeath && $downloadAttempt < $maxDownloadAttempts && !headers_sent()) {
+                    // Pick the freshest active bot: the pool's active entry first,
+                    // then any pool bot that has a local session.
+                    $retryBotId = fd_get_bot_id();
+                    if ($retryBotId === '' || !fd_has_local_session($retryBotId)) {
+                        $picked = fd_pick_pool_bot();
+                        $retryBotId = !empty($picked['bot_id']) ? (string) $picked['bot_id'] : '';
+                    }
+                    if ($retryBotId === '' || !fd_has_local_session($retryBotId)) {
+                        foreach (fd_get_bot_pool() as $pBot) {
+                            $pId = (string) ($pBot['bot_id'] ?? '');
+                            if ($pId !== '' && fd_has_local_session($pId)) {
+                                $retryBotId = $pId;
+                                break;
+                            }
+                        }
+                    }
+                    fd_log('download retry after IPC death', [
+                        'attempt' => $downloadAttempt,
+                        'retry_bot_id' => $retryBotId,
+                        'error' => $errStr,
+                    ]);
+                    if ($retryBotId !== '') {
+                        // Give the replacement worker a moment to publish its endpoint.
+                        usleep(500000);
+                        [$retryMadeline, $retryErr] = fd_boot_madeline(null, [], $retryBotId);
+                        if ($retryMadeline) {
+                            $madeline = $retryMadeline;
+                            $botId = $retryBotId;
+                            $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+                            $abortCallback = $isIpcClient ? null : $abortCallback;
+                            continue;
+                        }
+                        fd_log('download retry boot failed', ['retry_bot_id' => $retryBotId, 'error' => $retryErr]);
+                    }
+
+                    // Self-heal: the active bot's session is broken (e.g. it was left
+                    // in a bad state by repeated worker kills). Mint a fresh guest bot
+                    // and retry with it so playback recovers without a manual restart.
+                    fd_log('download self-heal: provisioning fresh guest bot', ['attempt' => $downloadAttempt]);
+                    $healProv = fd_auto_provision_guest();
+                    if ($healProv && !empty($healProv['bot_id'])) {
+                        $healBotId = (string) $healProv['bot_id'];
+                        $healMadeline = $healProv['madeline'] ?? null;
+                        if (!$healMadeline) {
+                            [$healMadeline, $healErr] = fd_boot_madeline(null, [], $healBotId);
+                        }
+                        if ($healMadeline) {
+                            $madeline = $healMadeline;
+                            $botId = $healBotId;
+                            $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+                            $abortCallback = $isIpcClient ? null : $abortCallback;
+                            fd_log('download self-heal succeeded', ['bot_id' => $healBotId]);
+                            continue;
+                        }
+                        fd_log('download self-heal boot failed', ['bot_id' => $healBotId, 'error' => $healErr ?? null]);
+                    } elseif ($healProv && !empty($healProv['error'])) {
+                        fd_log('download self-heal provision failed', ['error' => $healProv['error']]);
                     }
                 }
 

@@ -1061,6 +1061,103 @@
   50% { opacity: 1; }
 }
 
+/* ─── Fatal error overlay (missing dependency / unsupported OS) ── */
+
+.fatal-error {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: var(--bg-primary, #141414);
+}
+
+.fatal-error__card {
+  width: 100%;
+  max-width: 520px;
+  background: #1c1c1c;
+  border: 1px solid rgba(255, 107, 53, 0.35);
+  border-radius: 14px;
+  padding: 28px 24px;
+  text-align: center;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+}
+
+.fatal-error__icon {
+  font-size: 2.4rem;
+  line-height: 1;
+  margin-bottom: 12px;
+}
+
+.fatal-error__title {
+  margin: 0 0 10px;
+  font-size: 1.25rem;
+  color: #fff;
+}
+
+.fatal-error__desc {
+  margin: 0 0 16px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.fatal-error__list {
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+  text-align: left;
+}
+
+.fatal-error__list li {
+  position: relative;
+  padding: 8px 10px 8px 26px;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: #ffb4a2;
+  background: rgba(255, 107, 53, 0.08);
+  border: 1px solid rgba(255, 107, 53, 0.2);
+  border-radius: 8px;
+}
+
+.fatal-error__list li::before {
+  content: '•';
+  position: absolute;
+  left: 10px;
+  color: var(--accent, #ff6b35);
+}
+
+.fatal-error__hints {
+  margin: 0 0 18px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.55);
+  text-align: left;
+}
+
+.fatal-error__hints p {
+  margin: 0 0 6px;
+}
+
+.fatal-error__btn {
+  display: inline-block;
+  padding: 10px 26px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent, #ff6b35);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.fatal-error__btn:hover {
+  filter: brightness(1.1);
+}
+
 /* ─── File detail resolving state ───────────────────────────── */
 
 .file-detail__resolving {

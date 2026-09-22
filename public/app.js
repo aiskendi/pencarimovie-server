@@ -2191,6 +2191,19 @@ class PencariMovieApp {
       const hasSession = Boolean(data?.has_session);
       const isProvisioning = Boolean(data?.is_provisioning);
 
+      // ── Runtime preflight ────────────────────────────────────────────────
+      // A missing dependency (vendor/, fileinfo, openssl, mbstring, curl) or a
+      // 32-bit PHP build can never be fixed by entering a bot token. Show a
+      // dedicated error instead of the bot-token gate so the user knows what
+      // is actually wrong.
+      if (data?.environment_fatal) {
+        this.showFatalError({
+          problems: data.environment_problems || [],
+          hints: data.environment_hints || []
+        });
+        return;
+      }
+
       if (hasSession) {
         this.botId = String(data.bot_id || this.botId || '').trim();
         this.botUsername = String(data.bot_username || this.botUsername || '');
@@ -2316,6 +2329,59 @@ class PencariMovieApp {
       this._clearCachedSession();
       this.showSettingsGate({ forceToken: true, message: msg });
     });
+  }
+
+  /**
+   * Show the fatal runtime error overlay (missing dependency / unsupported OS).
+   * Used when the backend reports `environment_fatal` — a condition that
+   * entering a bot token can never fix.
+   */
+  showFatalError(options = {}) {
+    this._hideLoadingScreen();
+
+    const overlay = this.$('#fatalErrorOverlay');
+    if (!overlay) return;
+
+    const problems = Array.isArray(options.problems) ? options.problems : [];
+    const hints = Array.isArray(options.hints) ? options.hints : [];
+
+    const listEl = this.$('#fatalErrorProblems');
+    if (listEl) {
+      listEl.innerHTML = '';
+      problems.forEach((p) => {
+        const li = document.createElement('li');
+        li.textContent = String(p);
+        listEl.appendChild(li);
+      });
+    }
+
+    const hintsEl = this.$('#fatalErrorHints');
+    if (hintsEl) {
+      hintsEl.innerHTML = '';
+      hints.forEach((h) => {
+        const p = document.createElement('p');
+        p.textContent = String(h);
+        hintsEl.appendChild(p);
+      });
+    }
+
+    // Hide every other gate so only the fatal error is visible.
+    ['#settingsGate', '#authGate', '#streamApp'].forEach((sel) => {
+      const el = this.$(sel);
+      if (el) {
+        el.classList.add('hidden');
+        el.setAttribute('aria-hidden', 'true');
+      }
+    });
+
+    overlay.classList.remove('hidden');
+    overlay.setAttribute('aria-hidden', 'false');
+
+    const retryBtn = this.$('#fatalErrorRetry');
+    if (retryBtn && !retryBtn.dataset.bound) {
+      retryBtn.dataset.bound = '1';
+      retryBtn.addEventListener('click', () => window.location.reload());
+    }
   }
 
   showSettingsGate(options = {}) {

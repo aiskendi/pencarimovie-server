@@ -183,6 +183,14 @@ define('FD_DEBUG_TOGGLE_PATH', fd_storage_path('storage/debug_mode.txt'));
 define('FD_CACHE_DIR', fd_storage_path('storage/cache'));
 define('FD_MAX_LOG_SIZE', 5 * 1024 * 1024); // 5 MB max per log file
 
+// Default upstream metadata addon shipped with fresh installs. AIOMetadata is
+// TMDB/TVDB/IMDB-backed and resolves titles that Cinemeta does not know (e.g.
+// small Malaysian/Indonesian releases), so it is used as the default upstream
+// for external-ID resolution. Users can remove or replace it in Catalog
+// Configuration; an existing storage/catalog_settings.json always wins.
+define('FD_DEFAULT_UPSTREAM_MANIFEST_URL', 'https://aiometadata.elfhosted.com/stremio/136f7ae5-2f15-471d-8f3f-79ee335bbd24/manifest.json');
+define('FD_DEFAULT_UPSTREAM_MANIFEST_NAME', 'AIOMetadata');
+
 function fd_cache_path(string $file): string
 {
     $dir = FD_CACHE_DIR;
@@ -2399,6 +2407,25 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $imdbId = $m[1];
         $season = isset($m[2]) ? (int)$m[2] : null;
         $episode = isset($m[3]) ? (int)$m[3] : null;
+
+        // 1a. Standalone media_ids_idx lookup FIRST. The table is self-contained
+        // (title/year/imdb_id/media_type live on the row), so a seeded row lets
+        // us resolve titles that Cinemeta does not know (e.g. small Malaysian
+        // releases) WITHOUT any upstream addon. This mirrors the generic
+        // prefix:value lookup below, which previously bypassed bare `tt` IDs.
+        $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
+        if (empty($localImdb['title'])) {
+            $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
+        }
+        if (!empty($localImdb['title'])) {
+            return [
+                'title'    => (string) $localImdb['title'],
+                'year'     => (string) ($localImdb['year'] ?? ''),
+                'season'   => $season,
+                'episode'  => $episode,
+                'imdb_id'  => $imdbId,
+            ];
+        }
 
         $cacheFile = fd_storage_path('storage/cinemeta_' . md5($imdbId) . '.json');
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
@@ -7097,7 +7124,16 @@ function fd_load_catalog_settings(): array
             'other' => true,
         ],
         'enabled_catalogs' => [],
-        'upstream_manifests' => [],
+        // Fresh installs ship with AIOMetadata as the default upstream so
+        // external IDs (tt/tmdb/tvdb/mal/kitsu/...) resolve to real titles even
+        // when Cinemeta has no entry. An existing storage/catalog_settings.json
+        // always overrides this (see the merge below), so user edits are kept.
+        'upstream_manifests' => [
+            [
+                'url'  => FD_DEFAULT_UPSTREAM_MANIFEST_URL,
+                'name' => FD_DEFAULT_UPSTREAM_MANIFEST_NAME,
+            ],
+        ],
         'stream_config' => [
             'resolutions' => [
                 '4k' => true,
@@ -7166,10 +7202,20 @@ function fd_load_catalog_settings(): array
                     $defaults['enabled_catalogs'][$cid] = (bool) $val;
                 }
             }
+            // Only override the default upstream when the file actually lists
+            // one or more valid manifests. An empty array (e.g. a settings file
+            // written before the default existed, or a user who cleared the
+            // list) must NOT wipe the built-in AIOMetadata default — otherwise
+            // external IDs stop resolving on upgrade. To intentionally remove
+            // the default, the user deletes the entry in Catalog Configuration,
+            // which writes a non-empty list of the remaining manifests.
             if (isset($data['upstream_manifests']) && is_array($data['upstream_manifests'])) {
-                $defaults['upstream_manifests'] = array_values(array_filter($data['upstream_manifests'], function ($m) {
+                $fileManifests = array_values(array_filter($data['upstream_manifests'], function ($m) {
                     return is_array($m) && !empty($m['url']);
                 }));
+                if (!empty($fileManifests)) {
+                    $defaults['upstream_manifests'] = $fileManifests;
+                }
             }
             if (isset($data['stream_config']) && is_array($data['stream_config'])) {
                 $sc = $data['stream_config'];

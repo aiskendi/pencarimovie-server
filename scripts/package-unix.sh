@@ -69,9 +69,10 @@ fi
 mkdir -p "$BUILD_DIR/storage"
 cp "$ROOT_DIR/storage/.gitkeep" "$BUILD_DIR/storage/.gitkeep" 2>/dev/null || true
 cp "$ROOT_DIR/storage/config.example.json" "$BUILD_DIR/storage/config.example.json"
-if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
-  cp "$ROOT_DIR/storage/catalog_settings.json" "$BUILD_DIR/storage/catalog_settings.json"
-fi
+# NOTE: storage/catalog_settings.json is intentionally NOT shipped. It is
+# per-user state; shipping the developer's copy would override the built-in
+# defaults in fd_load_catalog_settings() (including the default AIOMetadata
+# upstream manifest) on every fresh install.
 
 # Runtime binaries for Unix
 cp "$FRANKENPHP_SOURCE" "$BUILD_DIR/bin/frankenphp"

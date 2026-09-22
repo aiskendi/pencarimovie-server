@@ -53,7 +53,10 @@ if exist "%ROOT%\patches" (
 mkdir "%BUILD%\storage"
 copy /Y "%ROOT%\storage\.gitkeep" "%BUILD%\storage\.gitkeep" >nul 2>nul
 copy /Y "%ROOT%\storage\config.example.json" "%BUILD%\storage\config.example.json" >nul
-if exist "%ROOT%\storage\catalog_settings.json" copy /Y "%ROOT%\storage\catalog_settings.json" "%BUILD%\storage\catalog_settings.json" >nul
+REM NOTE: storage\catalog_settings.json is intentionally NOT shipped. It is
+REM per-user state; shipping the developer's copy would override the built-in
+REM defaults in fd_load_catalog_settings() (including the default AIOMetadata
+REM upstream manifest) on every fresh install.
 
 REM Extract bin/ from official FrankenPHP Windows release ZIP directly to BUILD/bin
 REM Then overlay repo php.ini (official ZIP only has php.ini-development/production templates)

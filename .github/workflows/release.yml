@@ -156,7 +156,12 @@ jobs:
           mkdir -p dist/.build-tmp/pencarimovie-server/bin dist/.build-tmp/pencarimovie-server/storage
           cp bin/php.ini.unix dist/.build-tmp/pencarimovie-server/bin/php.ini 2>/dev/null || true
           cp bin/php dist/.build-tmp/pencarimovie-server/bin/php 2>/dev/null || true
-          cp storage/.gitkeep storage/config.example.json storage/catalog_settings.json dist/.build-tmp/pencarimovie-server/storage/ 2>/dev/null || true
+          # NOTE: storage/catalog_settings.json is intentionally NOT shipped.
+          # It is per-user state (enabled catalogs, upstream manifests, stream
+          # filters). Shipping the developer's copy would override the built-in
+          # defaults in fd_load_catalog_settings() — including the default
+          # AIOMetadata upstream manifest — on every fresh install.
+          cp storage/.gitkeep storage/config.example.json dist/.build-tmp/pencarimovie-server/storage/ 2>/dev/null || true
 
           # Bundle vendor, patches and release tag
           if [ -d "vendor" ]; then cp -r vendor dist/.build-tmp/pencarimovie-server/; fi

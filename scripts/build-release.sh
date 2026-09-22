@@ -19,9 +19,10 @@ copy_public_root_windows() {
   mkdir -p "$dest/storage"
   cp "$ROOT_DIR/storage/.gitkeep" "$dest/storage/.gitkeep" 2>/dev/null || true
   cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json" 2>/dev/null || true
-  if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
-    cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
-  fi
+  # NOTE: storage/catalog_settings.json is intentionally NOT shipped. It is
+  # per-user state; shipping the developer's copy would override the built-in
+  # defaults in fd_load_catalog_settings() (including the default AIOMetadata
+  # upstream manifest) on every fresh install.
   if [ -f "$ROOT_DIR/.release-tag" ]; then
     cp "$ROOT_DIR/.release-tag" "$dest/.release-tag"
   fi
@@ -41,9 +42,10 @@ copy_public_root_unix() {
   mkdir -p "$dest/storage"
   cp "$ROOT_DIR/storage/.gitkeep" "$dest/storage/.gitkeep" 2>/dev/null || true
   cp "$ROOT_DIR/storage/config.example.json" "$dest/storage/config.example.json" 2>/dev/null || true
-  if [ -f "$ROOT_DIR/storage/catalog_settings.json" ]; then
-    cp "$ROOT_DIR/storage/catalog_settings.json" "$dest/storage/catalog_settings.json"
-  fi
+  # NOTE: storage/catalog_settings.json is intentionally NOT shipped. It is
+  # per-user state; shipping the developer's copy would override the built-in
+  # defaults in fd_load_catalog_settings() (including the default AIOMetadata
+  # upstream manifest) on every fresh install.
   if [ -f "$ROOT_DIR/.release-tag" ]; then
     cp "$ROOT_DIR/.release-tag" "$dest/.release-tag"
   fi

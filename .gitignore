@@ -1,7 +1,23 @@
 AGENTS.md
+HANDOFF.md
 
 # Dependencies installed locally; release artifacts may bundle vendor/ separately.
 vendor/
+
+# Composer bootstrap helpers. install.bat / install.sh fall back to a global
+# `composer` when these are absent, so they are not needed in the repo.
+composer-setup.php
+composer.phar
+
+# Unused legacy Node static server (npm start runs start.bat -> FrankenPHP).
+server.js
+
+# Local-only catalog ID backfill tooling (talks to the WordPress REST API).
+backfill-ids.php
+backfill-ids.bat
+
+# Superseded by pencarimovie-termux.sh.
+pencarimovie-termux-test.sh
 
 # Bundled native runtime binaries (distributed via GitHub releases, not committed directly)
 bin/*.exe
@@ -166,9 +182,7 @@ frankenphp-*
 pencarimovie*
 !pencarimovie-linux.sh
 !pencarimovie-termux.sh
-!pencarimovie-termux-test.sh
 !pencarimovie-windows.bat
-!pencarimovie-windows.ps1
 !pencarimovie-docker.sh
 proot*
 libtalloc*

@@ -151,6 +151,8 @@ jobs:
           # Package standalone universal server (pencarimovie-server.tar.gz)
           mkdir -p dist/.build-tmp/pencarimovie-server
           cp -r public backend.php index.php router.php Caddyfile install.sh install-termux.sh start.sh start-termux.sh restart.sh restart-termux.sh stop.sh pencarimovie-linux.sh pencarimovie-termux.sh pencarimovie-docker.sh package.json README.md LICENSE SECURITY.md dist/.build-tmp/pencarimovie-server/ 2>/dev/null || true
+          # NOTE: composer.phar / composer-setup.php are intentionally NOT shipped.
+          # install.sh falls back to a global `composer` when vendor/ is absent.
           mkdir -p dist/.build-tmp/pencarimovie-server/bin dist/.build-tmp/pencarimovie-server/storage
           cp bin/php.ini.unix dist/.build-tmp/pencarimovie-server/bin/php.ini 2>/dev/null || true
           cp bin/php dist/.build-tmp/pencarimovie-server/bin/php 2>/dev/null || true

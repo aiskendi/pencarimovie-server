@@ -25,7 +25,7 @@ Release packages also include a bundled [`php.ini`](bin/php.ini) so the required
 
 If `vendor/autoload.php` exists, `install.bat` and `install.sh` skip Composer.
 
-If `vendor/autoload.php` is missing, Composer or `composer.phar` is used as a source-install fallback.
+If `vendor/autoload.php` is missing, a global `composer` on `PATH` is used as a source-install fallback.
 
 ## Windows package
 

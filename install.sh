@@ -58,10 +58,9 @@ elif [ ! -x "$RUNTIME" ]; then
 fi
 if command -v composer >/dev/null 2>&1; then
   composer install --no-interaction --prefer-dist
-elif [ -f composer.phar ]; then
-  "$RUNTIME" composer.phar install --no-interaction --prefer-dist
 else
   echo "Composer is only required when vendor dependencies are missing."
   echo "This package does not contain vendor/autoload.php and Composer was not found."
+  echo "Install Composer from https://getcomposer.org/download/ and run ./install.sh again."
   exit 1
 fi

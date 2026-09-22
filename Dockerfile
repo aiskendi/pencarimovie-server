@@ -34,7 +34,7 @@ RUN set -e; \
         tar -xzf "$TAR_PATH" -C /tmp/extract; \
     elif [ -f "/tmp/repo/backend.php" ] && [ -x "/tmp/repo/bin/frankenphp" ] && [ -d "/tmp/repo/vendor" ]; then \
         echo "Copying workspace files directly..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/repo/warmup-ipc.php /tmp/extract/ 2>/dev/null || true; \
+        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
         cp -r /tmp/repo/vendor /tmp/extract/; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
         mkdir -p /tmp/extract/bin; \
@@ -47,7 +47,7 @@ RUN set -e; \
         tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
         rm -f /tmp/server.tar.gz; \
         echo "Overlaying repository files..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/repo/warmup-ipc.php /tmp/extract/ 2>/dev/null || true; \
+        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
         if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
         if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \

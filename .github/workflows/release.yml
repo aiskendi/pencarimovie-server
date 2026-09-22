@@ -33,7 +33,10 @@ jobs:
         id: vars
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag }}"
+          # Trim surrounding whitespace: a stray leading/trailing space in the
+          # workflow_dispatch input (e.g. " v2.3.5") would otherwise fail the
+          # version regex below and abort the whole release.
+          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
 
           if [ -n "$TAG" ]; then
             # A tag was supplied: validate it before it is used as a release

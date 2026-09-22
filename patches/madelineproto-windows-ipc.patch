@@ -501,7 +501,7 @@ diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
 index 0ba694d..27180d9 100644
 --- a/src/Settings/Ipc.php
 +++ b/src/Settings/Ipc.php
-@@ -34,6 +34,19 @@ final class Ipc extends SettingsAbstract
+@@ -34,6 +34,18 @@ final class Ipc extends SettingsAbstract
       */
      public function getSlow(): bool
      {

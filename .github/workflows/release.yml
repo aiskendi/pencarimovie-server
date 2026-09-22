@@ -81,9 +81,14 @@ jobs:
           # "It seems like the session is busy." / "Could not connect to
           # MadelineProto" storm on a fresh install. Apply it explicitly and
           # fail the build if the patched form is not present.
-          PATCH="patches/madelineproto-windows-ipc.patch"
+          PATCH="$PWD/patches/madelineproto-windows-ipc.patch"
           if [ -f "$PATCH" ]; then
-            ( cd vendor/danog/madelineproto && git apply --recount --whitespace=nowarn "../../../../$PATCH" ) || true
+            # Apply from the package root with -p1 so the a/src/... paths in the
+            # patch resolve against vendor/danog/madelineproto. Using an absolute
+            # patch path avoids the relative-path mistakes that made the earlier
+            # `cd vendor/danog/madelineproto && git apply ../../../../patches/...`
+            # fail with "can't open patch".
+            git -C vendor/danog/madelineproto apply --recount --whitespace=nowarn "$PATCH" || true
           fi
 
           # Use PHP for the in-place rewrite: it avoids all shell/sed escaping

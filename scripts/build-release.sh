@@ -10,7 +10,7 @@ copy_public_root_windows() {
 
   for f in Caddyfile backend.php index.php router.php install.bat start.bat stop.bat restart.bat \
            pencarimovie-windows.bat update.ps1 auth-write.ps1 tray.ps1 tray.ico tray.png \
-           start-hidden.ps1 tunnel-spawn.ps1 spawn-ipc-worker.ps1 warmup-ipc.php \
+           start-hidden.ps1 tunnel-spawn.ps1 \
            package.json README.md LICENSE SECURITY.md; do
     if [ -f "$ROOT_DIR/$f" ]; then cp "$ROOT_DIR/$f" "$dest/"; fi
   done
@@ -33,7 +33,7 @@ copy_public_root_unix() {
   for f in Caddyfile backend.php index.php router.php install.sh install-termux.sh \
            start.sh start-termux.sh restart.sh restart-termux.sh stop.sh \
            pencarimovie-linux.sh pencarimovie-termux.sh pencarimovie-docker.sh \
-           warmup-ipc.php package.json README.md LICENSE SECURITY.md; do
+           package.json README.md LICENSE SECURITY.md; do
     if [ -f "$ROOT_DIR/$f" ]; then cp "$ROOT_DIR/$f" "$dest/"; fi
   done
   cp -R "$ROOT_DIR/public" "$dest/public"

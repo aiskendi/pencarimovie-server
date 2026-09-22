@@ -536,17 +536,6 @@ do_start() {
     fi
   fi
 
-  # Pre-spawn persistent MadelineProto IPC workers. Under FrankenPHP, workers
-  # spawned from within a web request die when the request ends, so they must
-  # be detached here (outside any request) for fd_boot_madeline() to connect
-  # to them as IPC clients instead of doing slow full direct-mode boots.
-  echo "Warming up IPC workers..."
-  if command -v php >/dev/null 2>&1; then
-    php "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
-  else
-    "$ROOT_DIR/bin/php" "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
-  fi
-
   echo ""
   echo "PencariMovie Server is running"
   echo "  Local:    http://127.0.0.1:$PORT"

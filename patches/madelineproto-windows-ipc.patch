@@ -501,14 +501,24 @@ diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
 index 0ba694d..27180d9 100644
 --- a/src/Settings/Ipc.php
 +++ b/src/Settings/Ipc.php
-@@ -34,6 +34,8 @@ final class Ipc extends SettingsAbstract
+@@ -34,6 +34,19 @@ final class Ipc extends SettingsAbstract
       */
      public function getSlow(): bool
      {
 -        return Magic::$isIpcWorker || \PHP_OS_FAMILY === 'Windows';
-+        // Force full boot only when executing inside the spawned CLI IPC worker itself
-+        // or during a fresh bot login before any session file exists.
-+        return Magic::$isIpcWorker || defined('MADELINE_WORKER') || !empty($GLOBALS['FD_FORCE_FULL_BOOT']);
++        // Force full boot only when executing inside the spawned CLI IPC worker
++        // itself (Magic::$isIpcWorker) or during a fresh bot login before any
++        // session file exists (FD_FORCE_FULL_BOOT).
++        //
++        // Do NOT add `defined('MADELINE_WORKER')` here. MADELINE_WORKER is
++        // defined by entry.php, but under FrankenPHP the PHP process is REUSED
++        // across requests, so the constant leaks into later web requests in the
++        // same worker thread. That made every `new API()` do a full-mode boot
++        // (is_ipc:false) even though an IPC worker was ready, and a full-mode
++        // instance SAVES THE SESSION on shutdown, destroying the live IPC
++        // worker and making concurrent requests fail with
++        // "The endpoint does not exist!" after a 30s tryConnect() retry loop.
++        return Magic::$isIpcWorker || !empty($GLOBALS['FD_FORCE_FULL_BOOT']);
      }
  }
 diff --git a/src/Shutdown.php b/src/Shutdown.php

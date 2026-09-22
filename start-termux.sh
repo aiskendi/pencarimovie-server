@@ -211,9 +211,6 @@ if [ "$started" -eq 0 ]; then
   fi
 fi
 
-echo "Warming up IPC workers..."
-php "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
-
 echo ""
 echo "PencariMovie Server is running"
 echo "  Local:    http://127.0.0.1:$PORT"

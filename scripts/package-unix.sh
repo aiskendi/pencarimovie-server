@@ -45,7 +45,6 @@ if [ -f "$BUILD_DIR/backend.php" ]; then
 fi
 cp "$ROOT_DIR/index.php" "$BUILD_DIR/"
 cp "$ROOT_DIR/router.php" "$BUILD_DIR/"
-cp "$ROOT_DIR/warmup-ipc.php" "$BUILD_DIR/"
 cp "$ROOT_DIR/package.json" "$BUILD_DIR/"
 cp "$ROOT_DIR/README.md" "$BUILD_DIR/"
 cp "$ROOT_DIR/LICENSE" "$BUILD_DIR/"

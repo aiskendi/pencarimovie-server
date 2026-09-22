@@ -3657,6 +3657,35 @@ function fd_ipc_worker_running(string $sessionDir): bool
 }
 
 /**
+ * Check whether an IPC worker has FULLY finished booting for the given session.
+ *
+ * fd_ipc_worker_running() only proves the `ipc` endpoint is connectable. The
+ * worker publishes `ipc` BEFORE it finishes `new API()` and writes
+ * `ipcState.php`, so a web request that connects in that window gets a socket
+ * that is not serving yet. MadelineProto's Serialization::tryConnect() then
+ * burns its 25 x 1s retry loop (~25-31s) before giving up, which is the
+ * "session resumed {"elapsed_ms":31024}" + "The endpoint does not exist!"
+ * symptom under concurrent load.
+ *
+ * A worker is ready only when `ipc` is connectable AND `ipcState.php` exists
+ * with a non-exception state (the exception state is ~1904 bytes; the success
+ * state is ~220-261 bytes).
+ */
+function fd_ipc_worker_ready(string $sessionDir): bool
+{
+    if (!fd_ipc_worker_running($sessionDir)) {
+        return false;
+    }
+    $stateFile = rtrim($sessionDir, '/\\') . DIRECTORY_SEPARATOR . 'ipcState.php';
+    if (!is_file($stateFile)) {
+        return false;
+    }
+    // The exception state is much larger than the success state. Treat a large
+    // state file as "worker died during boot" so the caller can respawn.
+    return filesize($stateFile) < 1024;
+}
+
+/**
  * Ensure a persistent MadelineProto IPC worker is running for a session directory.
  *
  * Under FrankenPHP each web request is a short-lived process, so workers spawned
@@ -3664,36 +3693,48 @@ function fd_ipc_worker_running(string $sessionDir): bool
  * reliable we spawn the worker as a DETACHED background process that survives the
  * request, then let fd_boot_madeline() connect to it as an IPC client (~40-60ms).
  *
+ * Concurrency: the spawn decision is serialized with a dedicated spawn lock held
+ * for the whole spawn+wait window. Without it, two concurrent requests (e.g. a
+ * guest-bot provision racing an /api/download) both see "no worker" and both
+ * spawn one. The second worker then blocks on the session lock, its failure path
+ * overwrites ipcState.php with an exception, and the web request fails with
+ * "Could not connect to MadelineProto". The session's own `lock` file cannot be
+ * used for this: the worker only takes it AFTER Magic::start() and the cold
+ * Diffie-Hellman handshake, so during the boot window it is unheld.
+ *
  * @param string $sessionDir Absolute session directory (e.g. .../session.madeline)
  * @return bool True if a worker is running (or was just started).
  */
 function fd_ensure_ipc_worker(string $sessionDir): bool
 {
-    if (fd_ipc_worker_running($sessionDir)) {
+    if (fd_ipc_worker_ready($sessionDir)) {
         return true;
     }
 
-    // If an IPC daemon is currently starting and holding the session lock, do not spawn another duplicate.
-    $normalizedDir = rtrim(str_replace('\\', '/', $sessionDir), '/');
-    $lockPath = $normalizedDir . '/lock';
-    if (file_exists($lockPath)) {
-        $fp = @fopen($lockPath, 'c');
-        if ($fp) {
-            $canLock = @flock($fp, LOCK_EX | LOCK_NB);
-            if (!$canLock) {
-                // Another process/worker is already holding the exclusive lock (initializing or running).
-                @fclose($fp);
-                // Wait briefly for it to finish socket binding
-                for ($i = 0; $i < 20; $i++) {
-                    if (fd_ipc_worker_running($sessionDir)) {
-                        return true;
-                    }
-                    usleep(100000); // 100ms
-                }
-                return fd_ipc_worker_running($sessionDir);
+    // Serialize the spawn decision. Held for the entire spawn+wait window so a
+    // concurrent caller waits for THIS worker instead of spawning a competitor.
+    $spawnLockPath = rtrim($sessionDir, '/\\') . DIRECTORY_SEPARATOR . 'ipc-spawn.lock';
+    $spawnFp = @fopen($spawnLockPath, 'c');
+    if ($spawnFp) {
+        $spawnWaitStart = microtime(true);
+        // Wait up to 30s for the in-flight spawner to publish a READY endpoint.
+        // Cold Diffie-Hellman + DC handshake regularly exceeds 8s on Windows.
+        while (!@flock($spawnFp, LOCK_EX | LOCK_NB)) {
+            if (fd_ipc_worker_ready($sessionDir)) {
+                @fclose($spawnFp);
+                return true;
             }
-            @flock($fp, LOCK_UN);
-            @fclose($fp);
+            if ((microtime(true) - $spawnWaitStart) > 30) {
+                // Holder died without publishing; take over the spawn ourselves.
+                break;
+            }
+            usleep(200000); // 200ms
+        }
+        // Re-check after acquiring: the previous holder may have just published.
+        if (fd_ipc_worker_ready($sessionDir)) {
+            @flock($spawnFp, LOCK_UN);
+            @fclose($spawnFp);
+            return true;
         }
     }
 
@@ -3712,6 +3753,10 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
     }
     $entry = $root . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'danog' . DIRECTORY_SEPARATOR . 'madelineproto' . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Ipc' . DIRECTORY_SEPARATOR . 'Runner' . DIRECTORY_SEPARATOR . 'entry.php';
     if (!is_file($entry)) {
+        if ($spawnFp) {
+            @flock($spawnFp, LOCK_UN);
+            @fclose($spawnFp);
+        }
         return false;
     }
 
@@ -3735,14 +3780,29 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
     }
 
-    // Wait up to ~8s for the worker to come up.
-    for ($i = 0; $i < 40; $i++) {
-        if (fd_ipc_worker_running($sessionDir)) {
-            return true;
+    // Wait up to ~30s for the worker to become READY (ipc connectable AND
+    // ipcState.php written). Waiting only for `ipc` lets a peer connect to a
+    // half-booted worker, which makes MadelineProto's tryConnect() burn its
+    // 25 x 1s retry loop (~25-31s) and then fail with "The endpoint does not
+    // exist!". Cold Diffie-Hellman + DC handshake regularly exceeds 8s.
+    $running = false;
+    for ($i = 0; $i < 150; $i++) {
+        if (fd_ipc_worker_ready($sessionDir)) {
+            $running = true;
+            break;
         }
         usleep(200000); // 200ms
     }
-    return fd_ipc_worker_running($sessionDir);
+    if (!$running) {
+        $running = fd_ipc_worker_ready($sessionDir);
+    }
+
+    // Release the spawn lock so a later caller can spawn if this worker died.
+    if ($spawnFp) {
+        @flock($spawnFp, LOCK_UN);
+        @fclose($spawnFp);
+    }
+    return $running;
 }
 
 /**
@@ -3797,6 +3857,16 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
     // MadelineProto boot instead of trying to start an IPC server, which fails
     // under FrankenPHP's short-lived requests. getSlow() (patched) checks this
     // global. After login the session exists and IPC client connect is used.
+    //
+    // IMPORTANT: this flag is a process-global and MUST be recomputed on every
+    // call. A single request can boot more than one session (e.g. the guest
+    // provision boots the NEW bot with a token, then boots the EXISTING bot
+    // with no token). If the flag is left set from the first boot, the second
+    // boot becomes a FULL-MODE instance, which SAVES THE SESSION on shutdown
+    // (APIWrapper::serialize() returns early only for IPC clients). That save
+    // takes safe.php.lock/lightState.php.lock, destroys the live IPC worker,
+    // and makes concurrent requests fail with "The endpoint does not exist!"
+    // after a 30s tryConnect() retry loop.
     $GLOBALS['FD_FORCE_FULL_BOOT'] = ($botToken !== null && $botToken !== '')
         && !(is_dir($sessionPath) || is_file($sessionPath));
 
@@ -4141,13 +4211,23 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], strin
                 'error' => $lastError,
                 'attempt' => $bootAttempt + 1,
             ]);
-            // If session is busy or locked, clear only transient .lock files (NOT the entire session data directory)
+            // If session is busy or locked, clear only STALE transient .lock artifacts.
+            //
+            // NEVER unlink `lock`. It is the live IPC worker's exclusive session lock
+            // (Serialization::unserialize() takes it via Tools::flock()). Deleting it
+            // lets a concurrent request acquire the lock and start a competing boot,
+            // which clobbers the worker's `ipc` endpoint and produces
+            // "The endpoint does not exist!" plus a 30s lock wait for every peer.
+            // Observed: 3 concurrent boots -> endpoint destroyed -> elapsed_ms 30635.
+            //
+            // The .lock artifacts below are only safe to remove when genuinely stale
+            // (no holder for >45s); a live worker refreshes them continuously.
             if (str_contains(strtolower($lastError), 'busy') || str_contains(strtolower($lastError), 'lock') || str_contains(strtolower($lastError), 'could not connect')) {
-                fd_log('clearing session transient locks due to lock/busy error', ['target_bot_id' => $targetBotId]);
+                fd_log('clearing stale session transient locks due to lock/busy error', ['target_bot_id' => $targetBotId]);
                 if (is_dir($sessionPath)) {
-                    foreach (['/lightState.php.lock', '/safe.php.lock', '/ipcState.php.lock', '/lock'] as $lockName) {
+                    foreach (['/lightState.php.lock', '/safe.php.lock', '/ipcState.php.lock'] as $lockName) {
                         $lockPath = $sessionPath . $lockName;
-                        if (is_file($lockPath)) {
+                        if (is_file($lockPath) && (time() - (int) @filemtime($lockPath)) > 45) {
                             @unlink($lockPath);
                         }
                     }
@@ -13762,7 +13842,14 @@ if (str_starts_with($path, '/api/')) {
         $downloadAttempt = 0;
         $maxDownloadAttempts = ($shortCode !== '') ? 2 : 1;
 
-        $abortCallback = static function ($percent = 0, $speed = 0, $time = 0): void {
+        // The abort callback is a Closure. Over IPC, MadelineProto wraps it in
+        // danog\MadelineProto\Ipc\Wrapper, which cannot serialize a Closure —
+        // the call fails with "Cannot assign null to property
+        // danog\MadelineProto\Ipc\Wrapper::$remoteId of type int".
+        // Only pass it when running in-process (full boot); over IPC pass null
+        // and rely on the client-disconnect detection in the catch block below.
+        $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+        $abortCallback = $isIpcClient ? null : static function ($percent = 0, $speed = 0, $time = 0): void {
             if (connection_aborted()) {
                 throw new \RuntimeException('Client disconnected');
             }
@@ -13788,9 +13875,31 @@ if (str_starts_with($path, '/api/')) {
                     'ip' => $_SERVER['REMOTE_ADDR'] ?? '',
                 ]);
                 $madeline->downloadToBrowser($fileId, $abortCallback, $fileSize, $fileName, $fileMime);
+                // Detach the IPC client cleanly. Without this, ClientAbstract sees
+                // "Disconnected from IPC server!" during shutdown and RECONNECTS by
+                // calling Server::startMe() -> ProcessRunner::start(), spawning a
+                // replacement worker. That kills the endpoint every peer is using,
+                // so a concurrent request fails with "The endpoint does not exist!"
+                // after a 30s tryConnect() retry loop. disconnect() sets run=false
+                // so the reconnect branch is skipped.
+                if ($isIpcClient && method_exists($madeline, 'disconnect')) {
+                    try {
+                        $madeline->disconnect();
+                    } catch (Throwable $_t) {
+                    }
+                }
                 return true;
             } catch (Throwable $throwable) {
                 $errStr = $throwable->getMessage();
+                // Detach the IPC client on the error path too, so a failed
+                // download does not leave a reconnecting client that spawns a
+                // replacement worker and invalidates the endpoint for peers.
+                if ($isIpcClient && method_exists($madeline, 'disconnect')) {
+                    try {
+                        $madeline->disconnect();
+                    } catch (Throwable $_t) {
+                    }
+                }
                 if (connection_aborted() || stripos($errStr, 'Client disconnected') !== false || stripos($errStr, 'Broken pipe') !== false) {
                     fd_log('client disconnected during stream, aborting cleanly', ['short_code' => $shortCode]);
                     return true;
@@ -13831,7 +13940,7 @@ if (str_starts_with($path, '/api/')) {
 
 // ─── Static file serving ────────────────────────────────────────────────────
 
-// If running in CLI / warmup-ipc mode, do not attempt to serve static files
+// If running under the CLI SAPI, do not attempt to serve static files
 if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
     return true;
 }

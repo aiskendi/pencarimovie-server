@@ -42,12 +42,6 @@ call :print_urls
 echo   Stop:     "%~dp0stop.bat"
 echo   Tray:     right-click the PencariMovie icon in the system tray
 echo.
-echo Warming up IPC workers...
-if exist "%ROOT%\bin\php.exe" (
-  "%ROOT%\bin\php.exe" "%ROOT%\warmup-ipc.php" >nul 2>&1
-) else (
-  php "%ROOT%\warmup-ipc.php" >nul 2>&1
-)
 endlocal
 goto :eof
 

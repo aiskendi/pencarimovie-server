@@ -55,17 +55,6 @@ fi
 mkdir -p /tmp/caddy/data /tmp/caddy/config /app/storage 2>/dev/null || true
 chmod 777 /app/storage 2>/dev/null || true
 
-# 1. Pre-spawn MadelineProto IPC workers
-(
-    sleep 2
-    echo "[Docker] Warming up IPC workers..."
-    if [ -x "/app/bin/php" ]; then
-        /app/bin/php /app/warmup-ipc.php || true
-    elif command -v php >/dev/null 2>&1; then
-        php /app/warmup-ipc.php || true
-    fi
-) &
-
 # If custom arguments were passed (and not self or 'start'), execute them
 if [ $# -gt 0 ] && [ "$1" != "/usr/local/bin/docker-entrypoint.sh" ] && [ "$1" != "start" ]; then
     exec "$@"

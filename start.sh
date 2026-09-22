@@ -137,12 +137,6 @@ if [ -x "$FRANKENPHP_BIN" ]; then
   echo $! > "$ROOT_DIR/.frankenphp.pid"
   print_urls
   echo "FrankenPHP server started (PID $(cat "$ROOT_DIR/.frankenphp.pid"))."
-  echo "Warming up IPC workers..."
-  if [ -x "$ROOT_DIR/bin/php" ]; then
-    "$ROOT_DIR/bin/php" "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
-  else
-    php "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true
-  fi
   exit 0
 fi
 
@@ -156,5 +150,3 @@ nohup php -S "$HOST:$PORT" "$ROOT_DIR/router.php" >/dev/null 2>&1 &
 echo $! > "$ROOT_DIR/.php-server.pid"
 print_urls
 echo "PHP server started (PID $(cat "$ROOT_DIR/.php-server.pid"))."
-echo "Warming up IPC workers..."
-php "$ROOT_DIR/warmup-ipc.php" >/dev/null 2>&1 || true

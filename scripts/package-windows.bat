@@ -41,8 +41,6 @@ call :copy_file tray.ico
 call :copy_file tray.png
 call :copy_file start-hidden.ps1
 call :copy_file tunnel-spawn.ps1
-call :copy_file spawn-ipc-worker.ps1
-call :copy_file warmup-ipc.php
 call :copy_file package.json
 call :copy_file README.md
 call :copy_file LICENSE

@@ -10520,9 +10520,47 @@ if ($isNuvioRoute) {
 
                     // Namespace catalog ID to avoid collisions: up_{index}_{id}
                     $bridgeCatId = 'up_' . $uIdx . '_' . $uCat['id'];
-                    $bridgeCat = $uCat;
-                    $bridgeCat['id'] = $bridgeCatId;
-                    $bridgeCat['name'] = ($uCat['name'] ?? 'Catalog') . " ({$mName})";
+
+                    // Build a TRIMMED catalog. Copying the upstream object verbatim
+                    // carried every `extra` option list (AIOMetadata alone ships
+                    // ~6,700 options across 157 catalogs), which inflated the
+                    // manifest past Stremio's descriptor limit and broke
+                    // AddonCollectionSet with "Max descriptor size reached".
+                    //
+                    // Stremio only needs the option NAMES to render the filter UI;
+                    // the actual values are forwarded to the upstream addon at
+                    // request time. So we keep `name`/`isRequired` and drop the
+                    // `options` arrays.
+                    $bridgeCat = [
+                        'type' => $uType,
+                        'id'   => $bridgeCatId,
+                        'name' => ($uCat['name'] ?? 'Catalog') . " ({$mName})",
+                    ];
+                    if (!empty($uCat['genres']) && is_array($uCat['genres'])) {
+                        $bridgeCat['genres'] = $uCat['genres'];
+                    }
+                    if (!empty($uCat['extra']) && is_array($uCat['extra'])) {
+                        $trimmedExtra = [];
+                        foreach ($uCat['extra'] as $ex) {
+                            if (!is_array($ex) || empty($ex['name'])) {
+                                continue;
+                            }
+                            $entry = ['name' => (string) $ex['name']];
+                            if (isset($ex['isRequired'])) {
+                                $entry['isRequired'] = (bool) $ex['isRequired'];
+                            }
+                            // Keep a small option list (<= 12) so simple filters
+                            // still render; drop the huge ones (languages, seasons,
+                            // studios, decades) that blow up the descriptor.
+                            if (!empty($ex['options']) && is_array($ex['options']) && count($ex['options']) <= 12) {
+                                $entry['options'] = array_values($ex['options']);
+                            }
+                            $trimmedExtra[] = $entry;
+                        }
+                        if (!empty($trimmedExtra)) {
+                            $bridgeCat['extra'] = $trimmedExtra;
+                        }
+                    }
                     $filteredCatalogs[] = $bridgeCat;
                 }
             }

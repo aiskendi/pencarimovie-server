@@ -1896,6 +1896,76 @@ function fd_amphp_http_request(string $url, string $method, array $headers, stri
 }
 
 /**
+ * Fetch many URLs concurrently via Amp\Http\Client, returning raw bodies.
+ *
+ * This is the preferred concurrency primitive for this codebase. It replaces
+ * the hand-rolled curl_multi loops (which are kept only as a fallback when Amp
+ * is unavailable) so every concurrent fetch shares the pooled connections and
+ * the Anycast DNS resolver configured by fd_get_amphp_client().
+ *
+ * @param array<string,string> $urls Map of caller key => URL.
+ * @param array{headers?:string[],timeout?:int} $options
+ * @return array{ok:bool,results:array<string,array{body:string,http:int,error:?string}>}
+ *         `ok` is false when Amp is unavailable so the caller can fall back.
+ */
+function fd_http_get_many_amp(array $urls, array $options = []): array
+{
+    $client = fd_get_amphp_client();
+    if ($client === null || !function_exists('Amp\\async') || !function_exists('Amp\\Future\\await')) {
+        return ['ok' => false, 'results' => []];
+    }
+    if (empty($urls)) {
+        return ['ok' => true, 'results' => []];
+    }
+
+    $headers = (array) ($options['headers'] ?? []);
+    $timeout = max(10, (int) ($options['timeout'] ?? 12));
+
+    $futures = [];
+    foreach ($urls as $key => $url) {
+        $futures[$key] = \Amp\async(static function () use ($client, $url, $headers, $timeout): array {
+            try {
+                $request = new \Amp\Http\Client\Request($url, 'GET');
+                foreach ($headers as $h) {
+                    $parts = explode(':', $h, 2);
+                    if (count($parts) === 2) {
+                        $request->setHeader(trim($parts[0]), trim($parts[1]));
+                    }
+                }
+                $cancellation = new \Amp\TimeoutCancellation($timeout);
+                $response = $client->request($request, $cancellation);
+                $status = $response->getStatus();
+                $body = $response->getBody()->buffer($cancellation);
+                return [
+                    'body' => is_string($body) ? $body : '',
+                    'http' => $status,
+                    'error' => null,
+                ];
+            } catch (\Throwable $e) {
+                return ['body' => '', 'http' => 0, 'error' => $e->getMessage()];
+            }
+        });
+    }
+
+    $results = [];
+    try {
+        $resolved = \Amp\Future\await($futures);
+        foreach ($resolved as $key => $row) {
+            $results[$key] = is_array($row) ? $row : ['body' => '', 'http' => 0, 'error' => 'invalid'];
+        }
+    } catch (\Throwable $e) {
+        // await() only throws if a future throws; ours never do. Guard anyway.
+        foreach (array_keys($urls) as $key) {
+            if (!isset($results[$key])) {
+                $results[$key] = ['body' => '', 'http' => 0, 'error' => $e->getMessage()];
+            }
+        }
+    }
+
+    return ['ok' => true, 'results' => $results];
+}
+
+/**
  * Rewrite a pencarimovie.com URL to the telegra.my Cloudflare Worker fallback.
  *
  * Used when an in-path DPI firewall resets the TLS handshake on the
@@ -2727,11 +2797,9 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         return fd_resolve_shortcode($shortCode, $bId);
     }
 
-    // Race all candidate bots simultaneously via curl_multi
+    // Race all candidate bots simultaneously. Amp is the preferred client;
+    // curl_multi is only used when Amp is unavailable.
     $secret = fd_get_api_secret();
-    $mh = curl_multi_init();
-    $handles = [];
-
     $headers = [
         'Accept: application/json',
         'User-Agent: pencarimovie-server/' . FD_APP_VERSION,
@@ -2747,80 +2815,105 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         'bots' => $candidateBots,
     ]);
 
-    foreach ($candidateBots as $bId) {
-        $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
-            'short_code' => $shortCode,
-            'bot_id' => $bId,
-        ]);
-
-        $ch = curl_init($targetUrl);
-        $resOpts = [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 12,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_RESOLVE => fd_curl_resolve_entries(),
-        ];
-        curl_setopt_array($ch, $resOpts);
-        curl_multi_add_handle($mh, $ch);
-        $handles[$bId] = $ch;
-    }
-
-    $running = null;
     $winner = null;
     $winnerBotId = null;
     $lastErrorResult = null;
     $botStatuses = [];
 
-    do {
-        $status = curl_multi_exec($mh, $running);
-        if ($status > 0) {
-            break;
-        }
+    $raceUrls = [];
+    foreach ($candidateBots as $bId) {
+        $raceUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
+            'short_code' => $shortCode,
+            'bot_id' => $bId,
+        ]);
+    }
 
-        while ($info = curl_multi_info_read($mh)) {
-            $ch = $info['handle'];
-            $bId = (string) array_search($ch, $handles, true);
-            $raw = curl_multi_getcontent($ch);
-            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlErr = curl_error($ch);
+    $ampRace = fd_http_get_many_amp($raceUrls, ['headers' => $headers, 'timeout' => 12]);
+    if ($ampRace['ok']) {
+        foreach ($ampRace['results'] as $bId => $row) {
+            $httpCode = (int) ($row['http'] ?? 0);
+            $raw = (string) ($row['body'] ?? '');
+            $botStatuses[$bId] = ['http' => $httpCode, 'err' => $row['error'] ?? null];
 
-            $botStatuses[$bId] = [
-                'http' => $httpCode,
-                'err' => $curlErr ?: null,
-            ];
-
-            if ($httpCode >= 200 && $httpCode < 300 && is_string($raw) && $raw !== '') {
+            if ($httpCode >= 200 && $httpCode < 300 && $raw !== '') {
                 $json = json_decode($raw, true);
                 if (is_array($json)) {
                     if (!empty($json['file_id_mt']) || !empty($json['file_id'])) {
                         $winner = $json;
-                        $winnerBotId = $bId;
-                        break 2; // Found first winning resolution!
+                        $winnerBotId = (string) $bId;
+                        break; // First winning resolution wins.
                     }
                     $lastErrorResult = $json;
                 }
-            } elseif (is_string($raw) && $raw !== '') {
+            } elseif ($raw !== '') {
                 $json = json_decode($raw, true);
                 if (is_array($json)) {
                     $lastErrorResult = $json;
                 }
             }
         }
-
-        if ($running > 0) {
-            curl_multi_select($mh, 0.02);
+    } else {
+        // Fallback: curl_multi (Amp unavailable).
+        $mh = curl_multi_init();
+        $handles = [];
+        foreach ($raceUrls as $bId => $targetUrl) {
+            $ch = curl_init($targetUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 12,
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_RESOLVE => fd_curl_resolve_entries(),
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$bId] = $ch;
         }
-    } while ($running > 0);
 
-    foreach ($handles as $ch) {
-        curl_multi_remove_handle($mh, $ch);
+        $running = null;
+        do {
+            $status = curl_multi_exec($mh, $running);
+            if ($status > 0) {
+                break;
+            }
+            while ($info = curl_multi_info_read($mh)) {
+                $ch = $info['handle'];
+                $bId = (string) array_search($ch, $handles, true);
+                $raw = curl_multi_getcontent($ch);
+                $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr = curl_error($ch);
+                $botStatuses[$bId] = ['http' => $httpCode, 'err' => $curlErr ?: null];
+
+                if ($httpCode >= 200 && $httpCode < 300 && is_string($raw) && $raw !== '') {
+                    $json = json_decode($raw, true);
+                    if (is_array($json)) {
+                        if (!empty($json['file_id_mt']) || !empty($json['file_id'])) {
+                            $winner = $json;
+                            $winnerBotId = $bId;
+                            break 2;
+                        }
+                        $lastErrorResult = $json;
+                    }
+                } elseif (is_string($raw) && $raw !== '') {
+                    $json = json_decode($raw, true);
+                    if (is_array($json)) {
+                        $lastErrorResult = $json;
+                    }
+                }
+            }
+            if ($running > 0) {
+                curl_multi_select($mh, 0.02);
+            }
+        } while ($running > 0);
+
+        foreach ($handles as $ch) {
+            curl_multi_remove_handle($mh, $ch);
+        }
+        curl_multi_close($mh);
     }
-    curl_multi_close($mh);
 
-    fd_log('concurrent resolve multi-curl complete', [
+    fd_log('concurrent resolve complete', [
         'short_code' => $shortCode,
         'winner_bot' => $winnerBotId,
         'statuses' => $botStatuses,
@@ -2846,58 +2939,77 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         foreach ($delays as $retryIdx => $sleepUs) {
             usleep($sleepUs);
 
-            // Re-race candidate bots
-            $mhRetry = curl_multi_init();
-            $retryHandles = [];
+            // Re-race candidate bots (Amp preferred, curl_multi fallback).
+            $retryUrls = [];
             foreach ($candidateBots as $bId) {
-                $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
+                $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
                     'short_code' => $shortCode,
                     'bot_id' => $bId,
                 ]);
-
-                $ch = curl_init($targetUrl);
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_TIMEOUT => 6,
-                    CURLOPT_CONNECTTIMEOUT => 3,
-                    CURLOPT_HTTPHEADER => $headers,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_SSL_VERIFYHOST => 2,
-                    CURLOPT_RESOLVE => fd_curl_resolve_entries(),
-                ]);
-                curl_multi_add_handle($mhRetry, $ch);
-                $retryHandles[$bId] = $ch;
             }
 
-            $rRunning = null;
-            do {
-                $status = curl_multi_exec($mhRetry, $rRunning);
-                if ($status > 0) break;
-
-                while ($info = curl_multi_info_read($mhRetry)) {
-                    $ch = $info['handle'];
-                    $bId = (string) array_search($ch, $retryHandles, true);
-                    $raw = curl_multi_getcontent($ch);
-                    $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-                    if ($httpCode >= 200 && $httpCode < 300 && is_string($raw) && $raw !== '') {
+            $ampRetry = fd_http_get_many_amp($retryUrls, ['headers' => $headers, 'timeout' => 6]);
+            if ($ampRetry['ok']) {
+                foreach ($ampRetry['results'] as $bId => $row) {
+                    $httpCode = (int) ($row['http'] ?? 0);
+                    $raw = (string) ($row['body'] ?? '');
+                    if ($httpCode >= 200 && $httpCode < 300 && $raw !== '') {
                         $json = json_decode($raw, true);
                         if (is_array($json) && (!empty($json['file_id_mt']) || !empty($json['file_id']))) {
                             $winner = $json;
-                            $winnerBotId = $bId;
-                            break 2;
+                            $winnerBotId = (string) $bId;
+                            break;
                         }
                     }
                 }
-                if ($rRunning > 0) {
-                    curl_multi_select($mhRetry, 0.02);
+            } else {
+                $mhRetry = curl_multi_init();
+                $retryHandles = [];
+                foreach ($retryUrls as $bId => $targetUrl) {
+                    $ch = curl_init($targetUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_TIMEOUT => 6,
+                        CURLOPT_CONNECTTIMEOUT => 3,
+                        CURLOPT_HTTPHEADER => $headers,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_SSL_VERIFYHOST => 2,
+                        CURLOPT_RESOLVE => fd_curl_resolve_entries(),
+                    ]);
+                    curl_multi_add_handle($mhRetry, $ch);
+                    $retryHandles[$bId] = $ch;
                 }
-            } while ($rRunning > 0);
 
-            foreach ($retryHandles as $ch) {
-                curl_multi_remove_handle($mhRetry, $ch);
+                $rRunning = null;
+                do {
+                    $status = curl_multi_exec($mhRetry, $rRunning);
+                    if ($status > 0) break;
+
+                    while ($info = curl_multi_info_read($mhRetry)) {
+                        $ch = $info['handle'];
+                        $bId = (string) array_search($ch, $retryHandles, true);
+                        $raw = curl_multi_getcontent($ch);
+                        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+                        if ($httpCode >= 200 && $httpCode < 300 && is_string($raw) && $raw !== '') {
+                            $json = json_decode($raw, true);
+                            if (is_array($json) && (!empty($json['file_id_mt']) || !empty($json['file_id']))) {
+                                $winner = $json;
+                                $winnerBotId = $bId;
+                                break 2;
+                            }
+                        }
+                    }
+                    if ($rRunning > 0) {
+                        curl_multi_select($mhRetry, 0.02);
+                    }
+                } while ($rRunning > 0);
+
+                foreach ($retryHandles as $ch) {
+                    curl_multi_remove_handle($mhRetry, $ch);
+                }
+                curl_multi_close($mhRetry);
             }
-            curl_multi_close($mhRetry);
 
             if ($winner !== null && $winnerBotId !== null) {
                 $winner['bot_id'] = $winnerBotId;
@@ -3169,57 +3281,73 @@ function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chu
     }
 
     // 3. Retry the batch misses individually (the batch endpoint can skip codes
-    //    whose Telegram relay was not yet ready). Run these in parallel via
-    //    curl_multi so a large miss set does not serialize into minutes.
+    //    whose Telegram relay was not yet ready). Run these concurrently via Amp
+    //    (curl_multi fallback) so a large miss set does not serialize into minutes.
     $stillFailed = [];
     if (!empty($failedCodes)) {
         $retryChunks = array_chunk($failedCodes, 12);
+        $secret = fd_get_api_secret();
+        $headers = [
+            'Accept: application/json',
+            'User-Agent: pencarimovie-server/' . FD_APP_VERSION,
+            'X-App-Version: ' . FD_APP_VERSION,
+        ];
+        if ($secret !== '') {
+            $headers[] = 'X-API-Secret: ' . $secret;
+        }
         foreach ($retryChunks as $retryChunk) {
-            $multi = curl_multi_init();
-            $handles = [];
-            $secret = fd_get_api_secret();
-            $headers = [
-                'Accept: application/json',
-                'User-Agent: pencarimovie-server/' . FD_APP_VERSION,
-                'X-App-Version: ' . FD_APP_VERSION,
-            ];
-            if ($secret !== '') {
-                $headers[] = 'X-API-Secret: ' . $secret;
-            }
+            $retryUrls = [];
             foreach ($retryChunk as $sc) {
-                $targetUrl = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
+                $retryUrls[$sc] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
                     'short_code' => $sc,
                     'bot_id' => $botId,
                     'force' => 1,
                     'nocache' => 1,
                 ]);
-                $ch = curl_init($targetUrl);
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_TIMEOUT => 15,
-                    CURLOPT_CONNECTTIMEOUT => 5,
-                    CURLOPT_HTTPHEADER => $headers,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_SSL_VERIFYHOST => 2,
-                    CURLOPT_RESOLVE => fd_curl_resolve_entries(),
-                ]);
-                curl_multi_add_handle($multi, $ch);
-                $handles[$sc] = $ch;
             }
 
-            $running = null;
-            do {
-                curl_multi_exec($multi, $running);
-                if ($running > 0) {
-                    curl_multi_select($multi, 0.5);
+            $bodies = [];
+            $ampRetry = fd_http_get_many_amp($retryUrls, ['headers' => $headers, 'timeout' => 15]);
+            if ($ampRetry['ok']) {
+                foreach ($ampRetry['results'] as $sc => $row) {
+                    $bodies[$sc] = (string) ($row['body'] ?? '');
                 }
-            } while ($running > 0);
+            } else {
+                $multi = curl_multi_init();
+                $handles = [];
+                foreach ($retryUrls as $sc => $targetUrl) {
+                    $ch = curl_init($targetUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_TIMEOUT => 15,
+                        CURLOPT_CONNECTTIMEOUT => 5,
+                        CURLOPT_HTTPHEADER => $headers,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_SSL_VERIFYHOST => 2,
+                        CURLOPT_RESOLVE => fd_curl_resolve_entries(),
+                    ]);
+                    curl_multi_add_handle($multi, $ch);
+                    $handles[$sc] = $ch;
+                }
 
-            foreach ($handles as $sc => $ch) {
-                $body = (string) curl_multi_getcontent($ch);
-                curl_multi_remove_handle($multi, $ch);
-                curl_close($ch);
-                $row = json_decode($body, true);
+                $running = null;
+                do {
+                    curl_multi_exec($multi, $running);
+                    if ($running > 0) {
+                        curl_multi_select($multi, 0.5);
+                    }
+                } while ($running > 0);
+
+                foreach ($handles as $sc => $ch) {
+                    $bodies[$sc] = (string) curl_multi_getcontent($ch);
+                    curl_multi_remove_handle($multi, $ch);
+                    curl_close($ch);
+                }
+                curl_multi_close($multi);
+            }
+
+            foreach ($retryChunk as $sc) {
+                $row = json_decode((string) ($bodies[$sc] ?? ''), true);
                 if (is_array($row) && (!empty($row['file_id_mt']) || !empty($row['file_id']))) {
                     if (empty($row['bot_id'])) {
                         $row['bot_id'] = $botId;
@@ -3230,7 +3358,6 @@ function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chu
                     $stillFailed[] = $sc;
                 }
             }
-            curl_multi_close($multi);
         }
     }
 
@@ -5907,6 +6034,125 @@ function fd_episode_stream_filter(int $season, int $episode): callable
 }
 
 /**
+ * Run many `search_files` queries concurrently via Amp\Http\Client.
+ *
+ * The episode resolver needs up to 13 independent `search_files` probes
+ * (EP1/E1/EP01/E01/S01E01, each optionally year-qualified, plus the OR-groups).
+ * Run serially they cost the SUM of every round-trip — measured 3.7s when
+ * WordPress is warm and 24.3s when it is slow. They are fully independent, so
+ * racing them collapses the wall-clock to the SLOWEST single query instead.
+ *
+ * Uses Amp (the preferred client in this codebase) rather than curl_multi so
+ * the requests share the pooled connections and the Anycast DNS resolver that
+ * fd_get_amphp_client() already configures. Falls back to the serial
+ * fd_fetch_stream_ajax() path when Amp is unavailable.
+ *
+ * @param string[] $queries Search strings (already fully built).
+ * @return array<string,array> Map of query string => decoded `files` array.
+ */
+function fd_search_files_parallel(array $queries): array
+{
+    $queries = array_values(array_unique(array_filter($queries, static fn($q) => trim((string) $q) !== '')));
+    if (empty($queries)) {
+        return [];
+    }
+
+    $client = fd_get_amphp_client();
+    if ($client === null || !function_exists('Amp\\async') || !function_exists('Amp\\Future\\await')) {
+        // Amp unavailable — fall back to the serial path so behaviour is unchanged.
+        $out = [];
+        foreach ($queries as $q) {
+            $res = fd_fetch_stream_ajax('search_files', ['search' => $q, 'limit' => 50, 'offset' => 0]);
+            $out[$q] = (array) ($res['files'] ?? []);
+        }
+        return $out;
+    }
+
+    $wpUrl = defined('FD_WP_AJAX_URL') ? FD_WP_AJAX_URL : 'https://pencarimovie.com/wp-admin/admin-ajax.php';
+    $activeBotId = fd_get_bot_id();
+    $country = '';
+    $detected = fd_detect_country();
+    if (!empty($detected['country_code'])) {
+        $country = (string) $detected['country_code'];
+    }
+
+    $tStart = microtime(true);
+    $futures = [];
+    foreach ($queries as $q) {
+        $params = [
+            'search' => $q,
+            'limit' => 50,
+            'offset' => 0,
+            'action' => 'stream_search_files',
+        ];
+        if ($activeBotId !== '') {
+            $params['bot_id'] = $activeBotId;
+        }
+        if ($country !== '') {
+            $params['country'] = $country;
+        }
+        $url = $wpUrl . '?' . http_build_query($params);
+
+        $futures[$q] = \Amp\async(static function () use ($client, $url): array {
+            try {
+                $request = new \Amp\Http\Client\Request($url, 'GET');
+                $request->setHeader('X-Requested-With', 'XMLHttpRequest');
+                $request->setHeader('Accept', 'application/json');
+                $request->setHeader('User-Agent', 'pencarimovie-server/' . FD_APP_VERSION);
+                $request->setHeader('X-App-Version', FD_APP_VERSION);
+
+                $cancellation = new \Amp\TimeoutCancellation(12);
+                $response = $client->request($request, $cancellation);
+                $status = $response->getStatus();
+                if ($status < 200 || $status >= 300) {
+                    return [];
+                }
+                $raw = $response->getBody()->buffer($cancellation);
+                if (!is_string($raw) || $raw === '') {
+                    return [];
+                }
+                $decoded = json_decode($raw, true);
+                if (!is_array($decoded)) {
+                    return [];
+                }
+                if (isset($decoded['success']) && $decoded['success']) {
+                    return (array) ($decoded['data']['files'] ?? []);
+                }
+                if (isset($decoded['files'])) {
+                    return (array) $decoded['files'];
+                }
+                return [];
+            } catch (\Throwable $e) {
+                return [];
+            }
+        });
+    }
+
+    $results = [];
+    try {
+        $resolved = \Amp\Future\await($futures);
+        foreach ($resolved as $q => $files) {
+            $results[$q] = is_array($files) ? $files : [];
+        }
+    } catch (\Throwable $e) {
+        // await() throws only if a future itself throws; our futures never do,
+        // but guard anyway and fill any missing keys with [].
+        foreach ($queries as $q) {
+            if (!isset($results[$q])) {
+                $results[$q] = [];
+            }
+        }
+    }
+
+    fd_log('search_files parallel batch', [
+        'queries' => count($queries),
+        'duration_seconds' => round(microtime(true) - $tStart, 3),
+    ]);
+
+    return $results;
+}
+
+/**
  * Playable files for one series episode only.
  * SxxExx MATCH misses E01-style names; search_files backfills those.
  * Never dump mixed/unfiltered post files onto an episode page.
@@ -6058,65 +6304,38 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         // matched by "keyword EP01" — the query omits the year the file
         // contains. When postYear is known we therefore also probe each token
         // WITH the year, which is the only shape that finds those releases.
+        // Build the FULL ordered query list up front, then race them all in one
+        // concurrent Amp batch. Order is preserved so $add() still fills the cap
+        // in the same priority order (rare conventions first, OR-groups last).
+        $orderedQueries = [];
         foreach ($episodeTokens as $tok) {
-            if (count($all) >= $maxFiles) {
-                break;
-            }
-            $resTok = fd_fetch_stream_ajax('search_files', [
-                'search' => "{$keyword} {$tok}",
-                'limit' => 50,
-                'offset' => 0,
-            ]);
-            $add((array) ($resTok['files'] ?? []));
-
-            if ($postYear !== null && count($all) < $maxFiles) {
-                $resTokYear = fd_fetch_stream_ajax('search_files', [
-                    'search' => "{$keyword} {$postYear} {$tok}",
-                    'limit' => 50,
-                    'offset' => 0,
-                ]);
-                $add((array) ($resTokYear['files'] ?? []));
+            $orderedQueries[] = "{$keyword} {$tok}";
+            if ($postYear !== null) {
+                $orderedQueries[] = "{$keyword} {$postYear} {$tok}";
             }
         }
-
         // Year-qualified OR-group. Files that place the year between the title
         // and the episode token (e.g. "Agent.Kim.Reactivated.2026.EP01...") are
         // only reachable when the year is part of the query, because Manticore
         // ANDs every term. This must run whenever the year is known — not only
         // when few files were found — otherwise a title with many SxxExx
         // variants fills the page and the year-qualified releases stay hidden.
-        if ($postYear !== null && count($all) < $maxFiles) {
-            $qYear = "{$keyword} {$postYear} {$tokens}";
-            $resYear = fd_fetch_stream_ajax('search_files', [
-                'search' => $qYear,
-                'limit' => 50,
-                'offset' => 0,
-            ]);
-            $add((array) ($resYear['files'] ?? []));
+        if ($postYear !== null) {
+            $orderedQueries[] = "{$keyword} {$postYear} {$tokens}";
         }
-
         // Broad OR-group last: fills any remaining slots with the common
         // conventions (S01E01, E01, ...) once the rare ones are secured.
-        if (count($all) < $maxFiles) {
-            $q = "{$keyword} {$tokens}";
-            $res = fd_fetch_stream_ajax('search_files', [
-                'search' => $q,
-                'limit' => 50,
-                'offset' => 0,
-            ]);
-            $add((array) ($res['files'] ?? []));
-        }
-
+        $orderedQueries[] = "{$keyword} {$tokens}";
         // Also query with episode token first (e.g. "(E01 | ...) Keyword") to find releases
         // that place the episode tag before the title (e.g. "OLD.E01.To.My.Beloved.Thief...").
-        if (count($all) < $maxFiles) {
-            $qLeading = "{$tokens} {$keyword}";
-            $resLeading = fd_fetch_stream_ajax('search_files', [
-                'search' => $qLeading,
-                'limit' => 50,
-                'offset' => 0,
-            ]);
-            $add((array) ($resLeading['files'] ?? []));
+        $orderedQueries[] = "{$tokens} {$keyword}";
+
+        $parallelResults = fd_search_files_parallel($orderedQueries);
+        foreach ($orderedQueries as $q) {
+            if (count($all) >= $maxFiles) {
+                break;
+            }
+            $add((array) ($parallelResults[$q] ?? []));
         }
     }
 

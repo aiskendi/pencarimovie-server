@@ -4153,15 +4153,21 @@ class PencariMovieApp {
       // If manifest is available, align app categories and rows with manifest.catalogs
       if (this.manifest) {
         const rawCatalogs = Array.isArray(this.manifest.catalogs) ? this.manifest.catalogs : [];
-        if (rawCatalogs.length === 0) {
-          // Catalogs disabled in manifest
+        // Upstream-bridged catalogs (id starts with `up_`) are for Stremio/Nuvio
+        // only — they are NOT local PencariMovie rows. Exclude them so the
+        // dashboard does not try to fetch 146 non-existent WordPress categories
+        // (which made the homepage spin forever when local catalogs were off
+        // but upstream was on).
+        const localCatalogs = rawCatalogs.filter((cat) => !String(cat.id || '').startsWith('up_'));
+        if (localCatalogs.length === 0) {
+          // No local catalogs enabled (upstream-only or fully disabled)
           this.categories = [];
         } else {
           // Build category list from enabled manifest catalogs (excluding search/telegram files)
           const derivedCategories = [];
           const seenSlugs = new Set();
 
-          rawCatalogs.forEach((cat) => {
+          localCatalogs.forEach((cat) => {
             const id = cat.id || '';
             // Skip search, special, and telegram-only catalogs from category rows
             if (id === 'pm_search_movie' || id === 'pm_search_series' || id === 'pm_search_files') {
@@ -4279,10 +4285,11 @@ class PencariMovieApp {
         heroPosts = this.trending;
       }
 
-      // Check if hero should be shown based on enabled catalogs
+      // Check if hero should be shown based on enabled LOCAL catalogs.
+      // Upstream-only manifests have no local rows, so the hero must hide.
       const heroSection = this.$('#streamHero');
       if (heroSection) {
-        if (this.categories.length === 0 && (!this.manifest || !Array.isArray(this.manifest.catalogs) || this.manifest.catalogs.length === 0)) {
+        if (this.categories.length === 0) {
           heroSection.classList.add('hidden');
         } else {
           heroSection.classList.remove('hidden');
@@ -4561,14 +4568,23 @@ class PencariMovieApp {
 
     container.innerHTML = '';
 
-    // If catalogs are disabled in manifest and no categories exist, show minimal informative placeholder
-    if (this.manifest && Array.isArray(this.manifest.catalogs) && this.manifest.catalogs.length === 0) {
+    // Show the placeholder when there are NO local PencariMovie catalogs to
+    // render. Upstream-bridged catalogs (`up_*`) do not count — they are for
+    // Stremio/Nuvio only, so an upstream-only manifest must still show this
+    // message instead of spinning forever trying to fetch non-existent
+    // WordPress categories.
+    const manifestCatalogs = (this.manifest && Array.isArray(this.manifest.catalogs)) ? this.manifest.catalogs : [];
+    const hasLocalCatalogs = manifestCatalogs.some((cat) => !String(cat.id || '').startsWith('up_'));
+    if (this.manifest && !hasLocalCatalogs) {
+      const upstreamOnly = manifestCatalogs.length > 0;
       container.innerHTML = `
         <div style="padding: 40px 20px; text-align: center; color: rgba(255,255,255,0.6);">
           <div style="font-size: 2rem; margin-bottom: 12px;">⚡</div>
           <h3 style="color: #fff; margin-bottom: 8px;">Catalogs are currently disabled</h3>
           <p style="max-width: 480px; margin: 0 auto; font-size: 0.88rem; line-height: 1.5;">
-            Addon is configured for streams only via Streams matched by ID (IMDb, TMDB, Kitsu, and more). You can search files or enable catalogs in Addon Settings.
+            ${upstreamOnly
+              ? 'PencariMovie catalogs are off. Upstream addon catalogs are still bridged for Stremio/Nuvio, but they are not shown here. Enable PencariMovie catalogs in Addon Settings to browse them on this page.'
+              : 'Addon is configured for streams only via Streams matched by ID (IMDb, TMDB, Kitsu, and more). You can search files or enable catalogs in Addon Settings.'}
           </p>
         </div>
       `;

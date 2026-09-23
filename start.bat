@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 title PencariMovie Server
 if not defined PENCARIMOVIE_NO_BANNER call :print_banner
 for %%I in ("%~dp0.") do set "ROOT=%%~fI"

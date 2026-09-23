@@ -84,8 +84,11 @@
 	php_server {
 		resolve_root_symlink false
 		try_files {path} index.php
-		# Idle cutoff on request-body reads (default 60s). 0 = disable.
-		# Does not replace Caddy 2.10 timeouts.request (injected at Docker start).
-		request_body_timeout 0
+		# NOTE: do NOT add `request_body_timeout` here. This FrankenPHP build's
+		# php_server only accepts: hot_reload, name, root, split, env,
+		# resolve_root_symlink, worker. Adding it fails config adaptation with
+		# `unknown "php or php_server" subdirective: request_body_timeout` and
+		# the server never starts. The request-body idle cutoff is already set
+		# globally via `servers { timeouts { read_body 10m } }` above.
 	}
 }

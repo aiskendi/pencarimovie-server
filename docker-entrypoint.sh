@@ -67,16 +67,19 @@ if [ -f "/app/Caddyfile" ]; then
     CADDYFILE="/tmp/Caddyfile"
     JSON="/tmp/caddy.json"
     cp /app/Caddyfile "$CADDYFILE"
+    # NOTE: the Caddyfile must NOT contain `request_body_timeout` in php_server.
+    # This FrankenPHP build only accepts: hot_reload, name, root, split, env,
+    # resolve_root_symlink, worker. The directive was removed from the repo
+    # Caddyfile, so no strip-and-retry workaround is needed here anymore.
+    #
     # Caddy 2.10 defaults timeouts.request to 60s ("maximum request handling
-    # time exceeded") but this FrankenPHP Caddyfile adapter rejects that token.
-    # request_body_timeout is the documented php_server 60s idle-body cutoff;
-    # older binaries may reject it too — strip and retry adapt.
+    # time exceeded"), which would abort long media streams. Inject request:0
+    # into the adapted JSON when a timeouts block is present.
     adapt() {
         /app/bin/frankenphp adapt --config "$CADDYFILE" --adapter caddyfile > "$JSON" 2>/tmp/caddy-adapt.err
     }
     if ! adapt; then
-        sed -i '/request_body_timeout/d' "$CADDYFILE"
-        adapt || true
+        cat /tmp/caddy-adapt.err >&2 2>/dev/null || true
     fi
     if grep -q '"timeouts"' "$JSON" 2>/dev/null; then
         sed -i 's/"timeouts":{/"timeouts":{"request":0,/g' "$JSON"

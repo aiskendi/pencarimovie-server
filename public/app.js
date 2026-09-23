@@ -541,6 +541,7 @@ class PencariMovieApp {
     const upstreamAddonInput = this.$('#upstreamAddonInput');
     const upstreamAddonAddBtn = this.$('#upstreamAddonAddBtn');
     const upstreamAddonStatus = this.$('#upstreamAddonStatus');
+    const upstreamEnabledToggle = this.$('#upstreamEnabledToggle');
 
     const renderUpstreamAddons = () => {
       if (!upstreamAddonsList) return;
@@ -641,6 +642,28 @@ class PencariMovieApp {
       });
     }
 
+    // Master upstream toggle: one switch disables every bridged upstream
+    // catalog/stream/subtitle. The configured list is kept so re-enabling
+    // restores it without re-adding URLs.
+    const updateUpstreamEnabledUI = () => {
+      const on = catalogSettingsState.upstream_enabled !== false;
+      if (upstreamEnabledToggle) upstreamEnabledToggle.checked = on;
+      if (upstreamAddonsList) {
+        upstreamAddonsList.style.opacity = on ? '1' : '0.45';
+        upstreamAddonsList.style.pointerEvents = on ? 'auto' : 'none';
+      }
+      if (upstreamAddonInput) upstreamAddonInput.disabled = !on;
+      if (upstreamAddonAddBtn) upstreamAddonAddBtn.disabled = !on;
+    };
+
+    if (upstreamEnabledToggle) {
+      upstreamEnabledToggle.addEventListener('change', () => {
+        catalogSettingsState.upstream_enabled = upstreamEnabledToggle.checked;
+        updateUpstreamEnabledUI();
+        updateCatalogModeUI();
+      });
+    }
+
     const updateCatalogModeUI = () => {
       const isEnabled = catalogSettingsState.catalogs_enabled;
       if (catalogModeEnabled) catalogModeEnabled.checked = isEnabled;
@@ -722,6 +745,8 @@ class PencariMovieApp {
         if (res?.ok) {
           catalogSettingsState = res.settings || catalogSettingsState;
           catalogOptionsState = res.catalog_options || catalogOptionsState;
+
+          updateUpstreamEnabledUI();
 
           if (catTypeMovies) {
             catTypeMovies.checked = catalogSettingsState.enabled_types?.movie !== false;
@@ -915,7 +940,14 @@ class PencariMovieApp {
               other: !!(catTypeOther && catTypeOther.checked)
             },
             enabled_catalogs: catalogSettingsState.enabled_catalogs,
-            upstream_manifests: catalogSettingsState.upstream_manifests || [],
+            upstream_enabled: catalogSettingsState.upstream_enabled !== false,
+            // When upstreams are disabled, omit the list entirely so the
+            // backend keeps the stored manifests (re-enabling restores them
+            // without re-adding every URL).
+            upstream_manifests:
+              catalogSettingsState.upstream_enabled === false
+                ? undefined
+                : catalogSettingsState.upstream_manifests || [],
             stream_config: {
               resolutions: {
                 '4k': res4kEl ? res4kEl.checked : true,

@@ -3356,7 +3356,10 @@ function fd_get_item_subtitles(string $itemType, string $itemId): array
     ];
 
     $catSettings = fd_load_catalog_settings();
-    $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+    // Respect the master upstream switch — no upstream subtitle bridging when off.
+    $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+        ? (array) ($catSettings['upstream_manifests'] ?? [])
+        : [];
     foreach ($configuredUpstreams as $upstream) {
         $manifestUrl = trim((string)($upstream['url'] ?? ''));
         if ($manifestUrl === '') continue;
@@ -7181,6 +7184,13 @@ function fd_load_catalog_settings(): array
             'other' => true,
         ],
         'enabled_catalogs' => [],
+        // Master switch for ALL upstream addons. When false, no upstream
+        // catalog/meta/stream/subtitle is bridged into the manifest — the
+        // configured list is kept on disk so the user can re-enable later
+        // without re-adding every URL. This is the single toggle that stops
+        // AIOMetadata (and any other upstream) from injecting unwanted
+        // catalogs into Nuvio/Stremio.
+        'upstream_enabled' => true,
         // Fresh installs ship with AIOMetadata as the default upstream so
         // external IDs (tt/tmdb/tvdb/mal/kitsu/...) resolve to real titles even
         // when Cinemeta has no entry. An existing storage/catalog_settings.json
@@ -7259,13 +7269,22 @@ function fd_load_catalog_settings(): array
                     $defaults['enabled_catalogs'][$cid] = (bool) $val;
                 }
             }
+            // Master upstream switch. An explicit `false` disables ALL upstream
+            // bridging and also suppresses the built-in AIOMetadata default, so
+            // the user can turn the whole feature off with one toggle instead of
+            // deleting every manifest URL (which the default would resurrect).
+            if (array_key_exists('upstream_enabled', $data)) {
+                $defaults['upstream_enabled'] = (bool) $data['upstream_enabled'];
+            }
+
             // Only override the default upstream when the file actually lists
             // one or more valid manifests. An empty array (e.g. a settings file
-            // written before the default existed, or a user who cleared the
-            // list) must NOT wipe the built-in AIOMetadata default — otherwise
-            // external IDs stop resolving on upgrade. To intentionally remove
-            // the default, the user deletes the entry in Catalog Configuration,
-            // which writes a non-empty list of the remaining manifests.
+            // written before the default existed) must NOT wipe the built-in
+            // AIOMetadata default — otherwise external IDs stop resolving on
+            // upgrade. To intentionally remove the default, the user flips
+            // `upstream_enabled` to false (the list is preserved so re-enabling
+            // restores it), or deletes the entry in Catalog Configuration, which
+            // writes a non-empty list of the remaining manifests.
             if (isset($data['upstream_manifests']) && is_array($data['upstream_manifests'])) {
                 $fileManifests = array_values(array_filter($data['upstream_manifests'], function ($m) {
                     return is_array($m) && !empty($m['url']);
@@ -10501,8 +10520,14 @@ if ($isNuvioRoute) {
         if (!empty($enabledTypes['other'])) $activeTypes[] = 'other';
         if (empty($activeTypes)) $activeTypes = ['movie', 'series', 'other'];
 
-        // Import and bridge catalogs from configured upstream manifests INDEPENDENTLY of local catalogs toggle
-        $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+        // Import and bridge catalogs from configured upstream manifests
+        // INDEPENDENTLY of the local catalogs toggle — but ONLY when the master
+        // upstream switch is on. `upstream_enabled: false` is the single toggle
+        // that keeps AIOMetadata (and every other upstream) out of the manifest
+        // so it stops injecting unwanted catalogs into Nuvio/Stremio.
+        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+            ? (array) ($catSettings['upstream_manifests'] ?? [])
+            : [];
         foreach ($configuredUpstreams as $uIdx => $upstream) {
             $mUrl = trim((string)($upstream['url'] ?? ''));
             if ($mUrl === '') continue;
@@ -10637,7 +10662,11 @@ if ($isNuvioRoute) {
             $uIdx = (int) $upMatch[1];
             $realCatId = $upMatch[2];
             $catSettings = fd_load_catalog_settings();
-            $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+            // Master upstream switch: when off, upstream catalogs are not
+            // bridged into the manifest, so any stale up_* request 404s.
+            $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+                ? (array) ($catSettings['upstream_manifests'] ?? [])
+                : [];
             if (isset($configuredUpstreams[$uIdx])) {
                 $mUrl = trim((string)($configuredUpstreams[$uIdx]['url'] ?? ''));
                 if ($mUrl !== '') {
@@ -11365,9 +11394,12 @@ if ($isNuvioRoute) {
                 }
             }
 
-            // 1. Try upstream manifests first
+            // 1. Try upstream manifests first (only when the master upstream
+            //    switch is on — otherwise fall straight through to Cinemeta).
             $catSettings = fd_load_catalog_settings();
-            $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+            $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+                ? (array) ($catSettings['upstream_manifests'] ?? [])
+                : [];
             foreach ($configuredUpstreams as $upstream) {
                 $mUrl = trim((string)($upstream['url'] ?? ''));
                 if ($mUrl === '') continue;
@@ -12507,9 +12539,12 @@ if ($isNuvioRoute) {
             $streams[] = $streamObj;
         }
 
-        // Fetch & merge streams from configured upstream addons
+        // Fetch & merge streams from configured upstream addons (only when the
+        // master upstream switch is on).
         $catSettings = fd_load_catalog_settings();
-        $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+            ? (array) ($catSettings['upstream_manifests'] ?? [])
+            : [];
         foreach ($configuredUpstreams as $upstream) {
             $manifestUrl = trim((string)($upstream['url'] ?? ''));
             if ($manifestUrl === '') continue;
@@ -12816,6 +12851,15 @@ if (str_starts_with($path, '/api/')) {
             }
         }
 
+        // Master upstream switch. Persisted even when the list is empty so the
+        // user can disable every upstream addon with one toggle and have it
+        // stick (the loader would otherwise resurrect the AIOMetadata default).
+        $upstreamDisabled = array_key_exists('upstream_enabled', $input)
+            && !$input['upstream_enabled'];
+        if (array_key_exists('upstream_enabled', $input)) {
+            $current['upstream_enabled'] = (bool) $input['upstream_enabled'];
+        }
+
         if (isset($input['upstream_manifests']) && is_array($input['upstream_manifests'])) {
             $cleanedManifests = [];
             foreach ($input['upstream_manifests'] as $m) {
@@ -12828,7 +12872,14 @@ if (str_starts_with($path, '/api/')) {
                     ];
                 }
             }
-            $current['upstream_manifests'] = $cleanedManifests;
+            // When the master switch is being turned OFF and the incoming list
+            // is empty, KEEP the stored list. The frontend sends [] because the
+            // UI hides the rows while disabled — wiping it would force the user
+            // to re-add every URL just to re-enable. An explicit non-empty list
+            // (a real add/remove) is always honoured.
+            if (!($upstreamDisabled && empty($cleanedManifests))) {
+                $current['upstream_manifests'] = $cleanedManifests;
+            }
         }
 
         if (isset($input['stream_config']) && is_array($input['stream_config'])) {

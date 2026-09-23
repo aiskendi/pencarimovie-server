@@ -4315,6 +4315,18 @@ class PencariMovieApp {
     const container = this.$('#streamNavLinks');
     if (!container) return;
 
+    // When catalogs are disabled there are no local categories to link to.
+    // Do NOT fall back to the hardcoded genre list — those links would open
+    // empty category pages. Clear the nav instead.
+    const manifestCatalogs = (this.manifest && Array.isArray(this.manifest.catalogs)) ? this.manifest.catalogs : [];
+    const hasLocalCatalogs = manifestCatalogs.some((cat) => !String(cat.id || '').startsWith('up_'));
+    if (this.categories.length === 0 && !hasLocalCatalogs) {
+      container.innerHTML = '';
+      const mobileEmpty = this.$('#mobileNavLinks');
+      if (mobileEmpty) mobileEmpty.innerHTML = '';
+      return;
+    }
+
     const categories = this.categories.length > 0 ? this.categories : [
       { name: 'Animation', slug: 'animation' },
       { name: 'Action', slug: 'action' },
@@ -4538,6 +4550,20 @@ class PencariMovieApp {
   renderTrending() {
     const container = this.$('#trendingPills');
     if (!container) return;
+
+    // Hide the trending pills when catalogs are disabled — they are a
+    // catalog-browsing affordance and would otherwise still show on an
+    // otherwise-empty homepage.
+    const manifestCatalogs = (this.manifest && Array.isArray(this.manifest.catalogs)) ? this.manifest.catalogs : [];
+    const hasLocalCatalogs = manifestCatalogs.some((cat) => !String(cat.id || '').startsWith('up_'));
+    if (this.categories.length === 0 && !hasLocalCatalogs) {
+      container.innerHTML = '';
+      const trendingSection = this.$('#streamTrending');
+      if (trendingSection) trendingSection.classList.add('hidden');
+      return;
+    }
+    const trendingSection = this.$('#streamTrending');
+    if (trendingSection) trendingSection.classList.remove('hidden');
 
     if (!this.trending || this.trending.length === 0) {
       container.innerHTML = '';

@@ -2398,18 +2398,14 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         // us resolve titles that Cinemeta does not know (e.g. small Malaysian
         // releases) WITHOUT any upstream addon. This mirrors the generic
         // prefix:value lookup below, which previously bypassed bare `tt` IDs.
+        //
+        // The stored title may be an AKA (e.g. tt37594685 is "Libang Libu" in
+        // the catalog but "Restless and Anxious" in the metadata DB). We keep it
+        // as the primary title but ALSO resolve Cinemeta's name so the caller
+        // can retry with it when the primary yields no files.
         $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
         if (empty($localImdb['title'])) {
             $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
-        }
-        if (!empty($localImdb['title'])) {
-            return [
-                'title'    => (string) $localImdb['title'],
-                'year'     => (string) ($localImdb['year'] ?? ''),
-                'season'   => $season,
-                'episode'  => $episode,
-                'imdb_id'  => $imdbId,
-            ];
         }
 
         $cacheFile = fd_storage_path('storage/cinemeta_' . md5($imdbId) . '.json');
@@ -2437,6 +2433,21 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
         }
 
+        // Prefer the Cinemeta title (it matches the catalog filenames) and expose
+        // the media_ids_idx title as an AKA fallback. When only one is known, use
+        // it as the primary and leave the AKA empty.
+        $akaTitle = '';
+        if (!empty($localImdb['title'])) {
+            if ($title === '') {
+                $title = (string) $localImdb['title'];
+                if ($year === '') {
+                    $year = (string) ($localImdb['year'] ?? '');
+                }
+            } elseif (strcasecmp((string) $localImdb['title'], $title) !== 0) {
+                $akaTitle = (string) $localImdb['title'];
+            }
+        }
+
         if ($title !== '') {
             // Auto-populate media_ids_idx for IMDb IDs so they are independently stored
             $numericImdb = (int) preg_replace('/\D/', '', $imdbId);
@@ -2445,11 +2456,12 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         }
 
         return [
-            'title' => $title,
-            'year' => $year,
-            'season' => $season,
-            'episode' => $episode,
-            'imdb_id' => $imdbId,
+            'title'    => $title,
+            'aka'      => $akaTitle,
+            'year'     => $year,
+            'season'   => $season,
+            'episode'  => $episode,
+            'imdb_id'  => $imdbId,
         ];
     }
 
@@ -11750,10 +11762,16 @@ if ($isNuvioRoute) {
             $targetSeason = $resolvedMeta['season'] ?? null;
             $targetEpisode = $resolvedMeta['episode'] ?? null;
             $imdbId = (string) ($resolvedMeta['imdb_id'] ?? '');
+            // Alternate title (AKA). The catalog files may be named with either
+            // the primary title or the AKA (e.g. "Libang Libu" vs "Restless and
+            // Anxious"), so both are searched. Comes from the media_ids_idx row,
+            // so no extra network call is needed.
+            $searchedAka = (string) ($resolvedMeta['aka'] ?? '');
 
             fd_log('external id resolved', [
                 'itemId' => $itemId,
                 'title' => $searchedTitle,
+                'aka' => $searchedAka,
                 'year' => $searchedYear,
                 'imdb_id' => $imdbId,
             ]);
@@ -11768,6 +11786,15 @@ if ($isNuvioRoute) {
                     // 1. Exact Series Post Match: Try matching the title with year first (e.g. "Glory 2025")
                     // This targets the exact post in 1 query instead of looping over 5 unrelated posts!
                     $queriesToSearch = fd_build_search_query_variants($searchedTitle !== '' ? $searchedTitle : $searchQuery, $searchedYear);
+
+                    // Also try the AKA title (see the movie branch below).
+                    if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
+                        foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
+                            if (!in_array($akaQuery, $queriesToSearch, true)) {
+                                $queriesToSearch[] = $akaQuery;
+                            }
+                        }
+                    }
 
                     $matchedPostId = null;
                     $matchedPostData = null;
@@ -11832,6 +11859,18 @@ if ($isNuvioRoute) {
                 } else {
                     // For Movie: search direct files and posts using all query variants (handling &, dan, and, entities)
                     $queriesToTry = fd_build_search_query_variants($searchedTitle !== '' ? $searchedTitle : $searchQuery, $searchedYear);
+
+                    // Also try the AKA title. Catalog files may be named with
+                    // either the primary title or the alternate one, so both are
+                    // searched. The AKA comes from the media_ids_idx row, so this
+                    // adds no network round-trip.
+                    if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
+                        foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
+                            if (!in_array($akaQuery, $queriesToTry, true)) {
+                                $queriesToTry[] = $akaQuery;
+                            }
+                        }
+                    }
 
                     foreach ($queriesToTry as $mQuery) {
                         $sf = fd_fetch_stream_ajax('search_files', ['search' => $mQuery, 'limit' => 30]);

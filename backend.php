@@ -2256,31 +2256,12 @@ function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
 }
 
 /**
- * Open a connection to the local Manticore instance (MySQL protocol, 127.0.0.1:9306).
+ * Look up a stored external ID via the WordPress `media_ids_idx` API.
  *
- * @return \mysqli|null
- */
-function fd_manticore_connect(): ?\mysqli
-{
-    if (!function_exists('mysqli_connect')) {
-        return null;
-    }
-    // PHP 8.1+ throws mysqli_sql_exception by default; suppress so a missing
-    // local Manticore just returns null instead of fataling the request.
-    if (function_exists('mysqli_report')) {
-        @mysqli_report(MYSQLI_REPORT_OFF);
-    }
-    $conn = @mysqli_connect('127.0.0.1', '', '', '', 9306);
-    return $conn instanceof \mysqli ? $conn : null;
-}
-
-/**
- * Standalone lookup for a stored external ID via the generic `media_ids_idx`
- * table (prefix + value attributes).
- *
- * `media_ids_idx` is self-contained: it stores title, year, imdb_id and
- * media_type alongside the (prefix, value) pair, so stream resolution for
- * other addons works WITHOUT needing wp_posts or posts_idx.
+ * The Manticore connection lives on the WordPress host, so the local backend
+ * never talks to Manticore directly — it goes through the plugin's
+ * `/lookup-id` route. This works on every runtime (no mysqli extension needed)
+ * and keeps a single writer/reader for the table.
  *
  * @return array{title:string,year:string,imdb_id:string,media_type:string}
  */
@@ -2289,41 +2270,34 @@ function fd_manticore_lookup_by_id(string $prefix, string $value): array
     $empty = ['title' => '', 'year' => '', 'imdb_id' => '', 'media_type' => ''];
     $prefix = strtolower(trim($prefix));
     $value = trim($value);
-    if ($prefix === '' || $value === '') {
+    if ($prefix === '' || $value === '' || !defined('FD_WP_API_BASE')) {
         return $empty;
     }
 
-    $conn = fd_manticore_connect();
-    if ($conn === null) {
-        return $empty;
-    }
-
-    $escPrefix = @mysqli_real_escape_string($conn, $prefix);
-    $escValue = @mysqli_real_escape_string($conn, $value);
-    $sql = "SELECT post_id, title, year, imdb_id, media_type FROM media_ids_idx "
-        . "WHERE prefix = '{$escPrefix}' AND value = '{$escValue}' LIMIT 1";
-    $res = @mysqli_query($conn, $sql);
-    $row = $res ? @mysqli_fetch_assoc($res) : null;
-    @mysqli_close($conn);
-
-    if (empty($row['title'])) {
+    $res = fd_http_json(
+        FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => $prefix, 'id' => $value]),
+        [],
+        'GET',
+        5
+    );
+    if (empty($res['title'])) {
         return $empty;
     }
 
     return [
-        'title'      => (string) $row['title'],
-        'year'       => !empty($row['year']) ? (string) $row['year'] : '',
-        'imdb_id'    => (string) ($row['imdb_id'] ?? ''),
-        'media_type' => (string) ($row['media_type'] ?? ''),
+        'title'      => (string) $res['title'],
+        'year'       => !empty($res['year']) ? (string) $res['year'] : '',
+        'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
+        'media_type' => (string) ($res['media_type'] ?? ''),
     ];
 }
 
 /**
  * Upsert one or more (prefix => value) ID rows into the standalone
- * `media_ids_idx` table.
+ * `media_ids_idx` table via the WordPress API.
  *
- * This is the ONLY write path needed to make external IDs resolvable for
- * other addons. It does not require wp_posts or posts_idx to exist.
+ * The plugin owns the Manticore connection, so this is the single write path
+ * for the table. It does not require wp_posts or posts_idx to exist.
  *
  * @param int                  $postId    Catalog post id (used as the row key)
  * @param array<string,string> $mediaIds  Map of prefix => value
@@ -2335,58 +2309,69 @@ function fd_manticore_lookup_by_id(string $prefix, string $value): array
  */
 function fd_media_ids_upsert(int $postId, array $mediaIds, string $title, int $year = 0, string $imdbId = '', string $mediaType = 'movie'): int
 {
-    if ($postId <= 0 || empty($mediaIds)) {
+    if ($postId <= 0 || empty($mediaIds) || $title === '' || !defined('FD_WP_API_BASE')) {
         return 0;
     }
 
-    $conn = fd_manticore_connect();
-    if ($conn === null) {
-        return 0;
-    }
-
-    $escTitle = @mysqli_real_escape_string($conn, $title);
-    $escImdb = @mysqli_real_escape_string($conn, $imdbId);
-    $escType = @mysqli_real_escape_string($conn, $mediaType);
-
-    $rows = [];
+    $clean = [];
     foreach ($mediaIds as $prefix => $value) {
         $prefix = strtolower(trim((string) $prefix));
         $value = trim((string) $value);
-        if ($prefix === '' || $value === '') {
-            continue;
+        if ($prefix !== '' && $value !== '') {
+            $clean[$prefix] = $value;
         }
-        $escPrefix = @mysqli_real_escape_string($conn, $prefix);
-        $escValue = @mysqli_real_escape_string($conn, $value);
-        $rows[] = "({$postId}, '{$escPrefix}', '{$escValue}', '{$escTitle}', {$year}, '{$escImdb}', '{$escType}')";
     }
-
-    if (empty($rows)) {
-        @mysqli_close($conn);
+    if (empty($clean)) {
         return 0;
     }
 
-    $sql = "REPLACE INTO media_ids_idx(post_id, prefix, value, title, year, imdb_id, media_type) VALUES "
-        . implode(', ', $rows);
-    $ok = @mysqli_query($conn, $sql);
-    @mysqli_close($conn);
+    $res = fd_http_json(
+        FD_WP_API_BASE . '/media-ids',
+        [
+            'post_id'    => $postId,
+            'media_ids'  => $clean,
+            'title'      => $title,
+            'year'       => $year,
+            'imdb_id'    => $imdbId,
+            'media_type' => $mediaType,
+        ],
+        'POST',
+        8
+    );
 
-    return $ok ? count($rows) : 0;
+    return !empty($res['ok']) ? (int) ($res['written'] ?? count($clean)) : 0;
 }
 
 /**
- * Delete all `media_ids_idx` rows for a post id.
+ * Delete `media_ids_idx` rows by (prefix, value) pairs via the WordPress API.
+ *
+ * `post_id` is no longer stored in the table — the document id is a hash of
+ * (prefix, value) — so deletion keys on the same pair the lookup uses.
+ *
+ * @param array<string,string> $pairs Map of prefix => value
  */
-function fd_media_ids_delete(int $postId): void
+function fd_media_ids_delete(array $pairs): void
 {
-    if ($postId <= 0) {
+    if (empty($pairs) || !defined('FD_WP_API_BASE')) {
         return;
     }
-    $conn = fd_manticore_connect();
-    if ($conn === null) {
+    $list = [];
+    foreach ($pairs as $prefix => $value) {
+        $prefix = strtolower(trim((string) $prefix));
+        $value  = trim((string) $value);
+        if ($prefix !== '' && $value !== '') {
+            $list[] = $prefix . ':' . $value;
+        }
+    }
+    if (empty($list)) {
         return;
     }
-    @mysqli_query($conn, "DELETE FROM media_ids_idx WHERE post_id = {$postId}");
-    @mysqli_close($conn);
+    fd_http_json(
+        FD_WP_API_BASE . '/media-ids?' . http_build_query(['media_ids' => implode(',', $list)]),
+        [],
+        'DELETE',
+        8
+    );
 }
 
 function fd_resolve_external_media_metadata(string $itemId, string $itemType = 'movie'): array
@@ -11630,9 +11615,35 @@ if ($isNuvioRoute) {
                     $matchedFiles[] = $pf;
                 }
 
-                // If matched files found, use them; otherwise fallback to postFiles
+                // If matched files found, use them. Otherwise fall back to the
+                // post's own files — but ONLY when the post has no year, or when
+                // no file carries a year at all. If the post HAS a year and the
+                // attached files all carry a DIFFERENT year, the post is
+                // mis-tagged (e.g. "The Lovers 2026" with only 2017 files
+                // attached); dumping them would show the wrong movie. In that
+                // case we keep the list empty and let the search_files
+                // supplement below try to find the correct-year releases.
                 $seenCodes = [];
-                $postFilesToUse = !empty($matchedFiles) ? $matchedFiles : array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
+                if (!empty($matchedFiles)) {
+                    $postFilesToUse = $matchedFiles;
+                } elseif ($postYear === null) {
+                    // No year on the post: keep the previous behaviour.
+                    $postFilesToUse = array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
+                } else {
+                    // Post has a year. Keep only files that either carry the
+                    // matching year or carry no year at all (unlabelled files
+                    // are assumed to belong to the post).
+                    $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postYear) {
+                        $t = (string) ($f['title'] ?? '');
+                        if (fd_is_series_file($t, (string) ($f['caption'] ?? ''))) {
+                            return false;
+                        }
+                        if (preg_match('/\b(19\d\d|20\d\d)\b/', $t, $ym)) {
+                            return $ym[1] === $postYear;
+                        }
+                        return true;
+                    }));
+                }
                 foreach ($postFilesToUse as $pf) {
                     if (!empty($pf['short_code']) && !isset($seenCodes[$pf['short_code']])) {
                         $seenCodes[$pf['short_code']] = true;
@@ -11701,6 +11712,13 @@ if ($isNuvioRoute) {
             $targetSeason = $resolvedMeta['season'] ?? null;
             $targetEpisode = $resolvedMeta['episode'] ?? null;
             $imdbId = (string) ($resolvedMeta['imdb_id'] ?? '');
+
+            fd_log('external id resolved', [
+                'itemId' => $itemId,
+                'title' => $searchedTitle,
+                'year' => $searchedYear,
+                'imdb_id' => $imdbId,
+            ]);
 
             // Query search index with resolved title
             $searchQuery = $searchedTitle !== '' ? $searchedTitle : $itemId;
@@ -11887,11 +11905,26 @@ if ($isNuvioRoute) {
                             $filteredMovieFiles[] = $mf;
                         }
 
-                        // If strict guard found exact matches, use them; otherwise strip any series files from fallback
+                        // If the strict guard found exact matches, use them.
+                        //
+                        // Otherwise: when a year is known, the guard rejected
+                        // every candidate because none matched that year — the
+                        // post is mis-tagged (e.g. "The Lovers 2026" whose only
+                        // indexed files are "The Lovers 2017"). Falling back to
+                        // the unfiltered list here would re-introduce exactly
+                        // the wrong-year files the guard just rejected, so we
+                        // keep the list empty and show "No Streams Found"
+                        // instead of the wrong movie.
+                        //
+                        // Only when NO year is known do we fall back to the
+                        // unfiltered list (minus series files), preserving the
+                        // previous behaviour for year-less titles.
                         if (!empty($filteredMovieFiles)) {
                             $filesToStream = $filteredMovieFiles;
-                        } else {
+                        } elseif ($searchedYear === '') {
                             $filesToStream = array_values(array_filter($filesToStream, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
+                        } else {
+                            $filesToStream = [];
                         }
                     }
                 }
@@ -12814,18 +12847,31 @@ if (str_starts_with($path, '/api/')) {
     // table. This is what makes external IDs resolvable for other addons
     // WITHOUT needing wp_posts or posts_idx.
     //
-    // POST body: { post_id, media_ids: {prefix: value, ...}, title, year, imdb_id, media_type }
-    // DELETE:    ?post_id=N  (removes all rows for that post)
+    // The document id is a hash of (prefix, value); post_id is not stored.
+    //
+    // POST body: { media_ids: {prefix: value, ...}, title, year, imdb_id, media_type }
+    // DELETE:    ?media_ids=prefix:value,prefix:value
     if ($path === '/api/media-ids' && in_array($method, ['POST', 'DELETE'], true)) {
         fd_require_auth();
 
         if ($method === 'DELETE') {
-            $postId = (int) ($_REQUEST['post_id'] ?? 0);
-            if ($postId <= 0) {
-                fd_json(['ok' => 0, 'error' => 'Missing post_id'], 400);
+            $raw = (string) ($_REQUEST['media_ids'] ?? '');
+            $pairs = [];
+            foreach (explode(',', $raw) as $chunk) {
+                $chunk = trim($chunk);
+                if ($chunk === '') {
+                    continue;
+                }
+                $parts = explode(':', $chunk, 2);
+                if (count($parts) === 2 && $parts[0] !== '' && $parts[1] !== '') {
+                    $pairs[$parts[0]] = $parts[1];
+                }
             }
-            fd_media_ids_delete($postId);
-            fd_json(['ok' => 1, 'deleted' => $postId]);
+            if (empty($pairs)) {
+                fd_json(['ok' => 0, 'error' => 'Missing media_ids (prefix:value list)'], 400);
+            }
+            fd_media_ids_delete($pairs);
+            fd_json(['ok' => 1, 'deleted' => count($pairs)]);
         }
 
         $input = json_decode((string) file_get_contents('php://input'), true);
@@ -12833,15 +12879,14 @@ if (str_starts_with($path, '/api/')) {
             fd_json(['ok' => 0, 'error' => 'Invalid JSON body'], 400);
         }
 
-        $postId = (int) ($input['post_id'] ?? 0);
         $mediaIds = (array) ($input['media_ids'] ?? []);
         $title = trim((string) ($input['title'] ?? ''));
         $year = (int) ($input['year'] ?? 0);
         $imdbId = trim((string) ($input['imdb_id'] ?? ''));
         $mediaType = trim((string) ($input['media_type'] ?? 'movie'));
 
-        if ($postId <= 0 || empty($mediaIds) || $title === '') {
-            fd_json(['ok' => 0, 'error' => 'post_id, media_ids and title are required'], 400);
+        if (empty($mediaIds) || $title === '') {
+            fd_json(['ok' => 0, 'error' => 'media_ids and title are required'], 400);
         }
 
         $written = fd_media_ids_upsert($postId, $mediaIds, $title, $year, $imdbId, $mediaType);

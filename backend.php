@@ -6025,31 +6025,32 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         // Build the individual episode tokens. Different uploaders name the same
         // episode differently (S01E01, E01, EP01, EP1, E1), so we query each
         // shape separately as well as in one OR-group.
-        $episodeTokens = [
-            sprintf('E%02d', $episode),
-            sprintf('S%02dE%02d', $season, $episode),
-            sprintf('EP%02d', $episode),
-        ];
+        //
+        // ORDER MATTERS: $add() stops at $maxFiles, so the tokens are ordered
+        // RAREST FIRST. The common conventions (S01E01, E01) can each return
+        // dozens of files and would exhaust the cap before a rare convention
+        // (EP1, EP01, E1) is ever queried. Putting the rare ones first
+        // guarantees they are captured; the common ones then fill the rest.
+        $episodeTokens = [];
         if ($episode < 10) {
+            // Rare, unpadded forms first (EP1, E1) — few uploaders use these.
             $episodeTokens[] = sprintf('EP%d', $episode);
             $episodeTokens[] = sprintf('E%d', $episode);
         }
+        // Padded EP form (EP01) — also uncommon.
+        $episodeTokens[] = sprintf('EP%02d', $episode);
+        // Common forms last (E01, S01E01) — these return the most results.
+        $episodeTokens[] = sprintf('E%02d', $episode);
+        $episodeTokens[] = sprintf('S%02dE%02d', $season, $episode);
         $tokens = '(' . implode(' | ', $episodeTokens) . ')';
 
-        $q = "{$keyword} {$tokens}";
-        $res = fd_fetch_stream_ajax('search_files', [
-            'search' => $q,
-            'limit' => 50,
-            'offset' => 0,
-        ]);
-        $groupFiles = (array) ($res['files'] ?? []);
-        $add($groupFiles);
-
-        // The OR-group is ranked by relevance, so a naming convention with many
-        // matches (e.g. dozens of S01E01 variants) can fill the whole 50-result
-        // page and crowd out a rarer convention (e.g. a single EP1 release).
-        // When the group query came back full (i.e. it was truncated), run a
-        // targeted query per token so every convention gets its own window.
+        // IMPORTANT ORDERING: the targeted per-token queries run BEFORE the
+        // broad OR-group. The OR-group is ranked by relevance, so a naming
+        // convention with many matches (e.g. dozens of S01E01 variants) fills
+        // the whole result page and — because $add() stops at $maxFiles — would
+        // exhaust the cap before a rarer convention (e.g. a single EP1 release)
+        // is ever seen. Querying the specific tokens first guarantees the rare
+        // conventions are captured, then the OR-group fills the remaining slots.
         //
         // Manticore uses AND semantics for multi-word queries, so a file that
         // puts the year between the title and the episode token
@@ -6057,39 +6058,25 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         // matched by "keyword EP01" — the query omits the year the file
         // contains. When postYear is known we therefore also probe each token
         // WITH the year, which is the only shape that finds those releases.
-        if (count($groupFiles) >= 50) {
-            foreach ($episodeTokens as $tok) {
-                if (count($all) >= $maxFiles) {
-                    break;
-                }
-                $resTok = fd_fetch_stream_ajax('search_files', [
-                    'search' => "{$keyword} {$tok}",
-                    'limit' => 50,
-                    'offset' => 0,
-                ]);
-                $add((array) ($resTok['files'] ?? []));
-
-                if ($postYear !== null && count($all) < $maxFiles) {
-                    $resTokYear = fd_fetch_stream_ajax('search_files', [
-                        'search' => "{$keyword} {$postYear} {$tok}",
-                        'limit' => 50,
-                        'offset' => 0,
-                    ]);
-                    $add((array) ($resTokYear['files'] ?? []));
-                }
+        foreach ($episodeTokens as $tok) {
+            if (count($all) >= $maxFiles) {
+                break;
             }
-        }
-
-        // Also query with episode token first (e.g. "(E01 | ...) Keyword") to find releases
-        // that place the episode tag before the title (e.g. "OLD.E01.To.My.Beloved.Thief...").
-        if (count($all) < $maxFiles) {
-            $qLeading = "{$tokens} {$keyword}";
-            $resLeading = fd_fetch_stream_ajax('search_files', [
-                'search' => $qLeading,
+            $resTok = fd_fetch_stream_ajax('search_files', [
+                'search' => "{$keyword} {$tok}",
                 'limit' => 50,
                 'offset' => 0,
             ]);
-            $add((array) ($resLeading['files'] ?? []));
+            $add((array) ($resTok['files'] ?? []));
+
+            if ($postYear !== null && count($all) < $maxFiles) {
+                $resTokYear = fd_fetch_stream_ajax('search_files', [
+                    'search' => "{$keyword} {$postYear} {$tok}",
+                    'limit' => 50,
+                    'offset' => 0,
+                ]);
+                $add((array) ($resTokYear['files'] ?? []));
+            }
         }
 
         // Year-qualified OR-group. Files that place the year between the title
@@ -6106,6 +6093,30 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
                 'offset' => 0,
             ]);
             $add((array) ($resYear['files'] ?? []));
+        }
+
+        // Broad OR-group last: fills any remaining slots with the common
+        // conventions (S01E01, E01, ...) once the rare ones are secured.
+        if (count($all) < $maxFiles) {
+            $q = "{$keyword} {$tokens}";
+            $res = fd_fetch_stream_ajax('search_files', [
+                'search' => $q,
+                'limit' => 50,
+                'offset' => 0,
+            ]);
+            $add((array) ($res['files'] ?? []));
+        }
+
+        // Also query with episode token first (e.g. "(E01 | ...) Keyword") to find releases
+        // that place the episode tag before the title (e.g. "OLD.E01.To.My.Beloved.Thief...").
+        if (count($all) < $maxFiles) {
+            $qLeading = "{$tokens} {$keyword}";
+            $resLeading = fd_fetch_stream_ajax('search_files', [
+                'search' => $qLeading,
+                'limit' => 50,
+                'offset' => 0,
+            ]);
+            $add((array) ($resLeading['files'] ?? []));
         }
     }
 
@@ -11516,11 +11527,15 @@ if ($isNuvioRoute) {
             $targetSeason = (int) $m[2];
             $targetEpisode = (int) $m[3];
 
+            // 60 (not 40): the rare episode-token conventions (EP1, EP01, E1)
+            // are queried first, then the common ones (E01, S01E01) fill the
+            // rest. A 40 cap was exhausted by the common conventions alone,
+            // hiding the rare releases entirely.
             $filesToStream = fd_fetch_episode_stream_files(
                 $postId,
                 $targetSeason,
                 $targetEpisode,
-                40
+                60
             );
 
             // Sort episode streams using comprehensive media ranking:
@@ -11743,7 +11758,7 @@ if ($isNuvioRoute) {
                     }
 
                     if ($matchedPostId !== null) {
-                        $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 40, $matchedPostData);
+                        $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 60, $matchedPostData);
                     }
 
                     // Fallback: If no post matched or post returned 0 files, probe search_files directly

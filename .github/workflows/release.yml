@@ -19,6 +19,7 @@ on:
 permissions:
   contents: write
   packages: write
+  workflows: write
 
 jobs:
   build-and-release:
@@ -251,10 +252,15 @@ jobs:
           if ! git diff --quiet "$WORKFLOW_FILE"; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add "$WORKFLOW_FILE"
 
-            NEXT_SUGGESTION=$(grep -oP 'Release tag \(e\.g\. \K[^\)]+' "$WORKFLOW_FILE" || echo "next")
+            NEXT_SUGGESTION=$(grep -m1 -oP 'description: "Release tag \(e\.g\. \K[^.\)]+\.[^.\)]+\.[^.\)]+' "$WORKFLOW_FILE" || echo "next")
+
+            # Stage only the workflow file and discard other build artifacts
+            git add "$WORKFLOW_FILE"
             git commit -m "chore(release): update next release tag suggestion to $NEXT_SUGGESTION [skip ci]"
+
+            # Stash untracked/unstaged build artifacts so git pull rebase works cleanly
+            git stash --include-untracked || true
 
             TARGET_BRANCH="${GITHUB_REF_NAME:-main}"
             git pull --rebase origin "$TARGET_BRANCH" || true

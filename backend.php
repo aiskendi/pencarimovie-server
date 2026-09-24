@@ -2476,6 +2476,31 @@ function fd_media_ids_delete(array $pairs): void
     );
 }
 
+/**
+ * Upstream resolver manifests used to resolve external metadata (tt, tmdb, kitsu, mal, etc.)
+ * and populate media_ids_idx on demand.
+ * This runs EVEN IF `upstream_enabled` is false in catalog configuration, ensuring
+ * that playing an external media ID from any other addon will always resolve metadata,
+ * index it to media_ids_idx, and return streams.
+ */
+function fd_get_upstream_resolver_manifests(): array
+{
+    $catSettings = fd_load_catalog_settings();
+    $raw = (array) ($catSettings['upstream_manifests'] ?? []);
+    $valid = array_values(array_filter($raw, function ($m) {
+        return is_array($m) && !empty($m['url']);
+    }));
+    if (empty($valid)) {
+        $valid = [
+            [
+                'url'  => FD_DEFAULT_UPSTREAM_MANIFEST_URL,
+                'name' => FD_DEFAULT_UPSTREAM_MANIFEST_NAME,
+            ],
+        ];
+    }
+    return $valid;
+}
+
 function fd_resolve_external_media_metadata(string $itemId, string $itemType = 'movie'): array
 {
     $title = '';
@@ -2520,10 +2545,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
 
             if ($title === '') {
-                $catSettings = fd_load_catalog_settings();
-                $configuredUpstreams = !empty($catSettings['upstream_enabled'])
-                    ? (array) ($catSettings['upstream_manifests'] ?? [])
-                    : [];
+                $configuredUpstreams = fd_get_upstream_resolver_manifests();
                 $resolvedType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
 
                 foreach ($configuredUpstreams as $upstream) {
@@ -2568,9 +2590,8 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         ];
     }
 
-    // Check if user has configured custom upstream manifests in catalog settings
-    $catSettings = fd_load_catalog_settings();
-    $configuredUpstreams = (array) ($catSettings['upstream_manifests'] ?? []);
+    // Upstream resolver manifests for prefixed IDs (TMDB, Kitsu, etc.)
+    $configuredUpstreams = fd_get_upstream_resolver_manifests();
 
     // 1b. Local catalog lookup for ANY prefixed ID (tmdb:, kitsu:, mal:, anilist:,
     // tvdb:, anidb:, or a custom prefix from a user's manifest.json).
@@ -2602,7 +2623,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $episode = isset($m[3]) ? (int)$m[3] : null;
         $resolvedType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
 
-        $cacheFile = fd_storage_path('storage/cinemeta_' . md5('tmdb:' . $tmdbNumeric) . '.json');
+        $cacheFile = fd_cache_path('ext_meta_' . md5('tmdb:' . $tmdbNumeric) . '.json');
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
             $cData = json_decode((string)@file_get_contents($cacheFile), true);
             if (is_array($cData) && !empty($cData['name'])) {
@@ -2658,7 +2679,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $episode = isset($m[2]) ? (int)$m[2] : null;
         $season = 1;
 
-        $cacheFile = fd_storage_path('storage/cinemeta_' . md5('kitsu:' . $kitsuId) . '.json');
+        $cacheFile = fd_cache_path('ext_meta_' . md5('kitsu:' . $kitsuId) . '.json');
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
             $cData = json_decode((string)@file_get_contents($cacheFile), true);
             if (is_array($cData) && !empty($cData['name'])) {
@@ -11751,12 +11772,9 @@ if ($isNuvioRoute) {
                 }
             }
 
-            // 2. Query configured upstream bridged manifests
+            // 2. Query configured upstream bridged manifests (fallback to AIOMetadata for background resolution)
             $metaUrlsToQuery = [];
-            $catSettings = fd_load_catalog_settings();
-            $configuredUpstreams = !empty($catSettings['upstream_enabled'])
-                ? (array) ($catSettings['upstream_manifests'] ?? [])
-                : [];
+            $configuredUpstreams = fd_get_upstream_resolver_manifests();
             foreach ($configuredUpstreams as $idx => $upstream) {
                 $mUrl = trim((string)($upstream['url'] ?? ''));
                 if ($mUrl === '') continue;

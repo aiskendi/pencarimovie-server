@@ -6304,19 +6304,31 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         }
     };
 
-    // 1. Probe post files for exact SxxExx MATCH (1 page, 50 items)
-    $exactFiles = fd_fetch_post_files_paged($postId, [
-        'page_size' => 50,
-        'max_files' => $maxFiles,
-        'season' => $season,
-        'episode' => $episode,
-        'filter' => $filter,
-        'max_pages' => 1,
-    ]);
-    $add($exactFiles);
+    // 1. Fast path: Server-side native Manticore stream resolution in 1 single round-trip
+    if ($keyword !== '') {
+        $apiBase = FD_WP_API_BASE;
+        $url = "{$apiBase}/stream-files?title=" . urlencode($keyword) . "&type=series&season={$season}&episode={$episode}&post_id={$postId}&limit={$maxFiles}";
+        $res = fd_http_json($url, [], 'GET', 10);
+        if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+            $add($res['items']);
+        }
+    }
     $exactCount = count($all);
 
-    // 2. Fast keyword probe to discover external/Telegram channel releases (MalaySub, Fanszz, DramaOST, etc.)
+    // 2. Fallback probe post files for exact SxxExx MATCH (1 page, 50 items) if fast path didn't fill
+    if (count($all) < 15 && $postId > 0) {
+        $exactFiles = fd_fetch_post_files_paged($postId, [
+            'page_size' => 50,
+            'max_files' => $maxFiles,
+            'season' => $season,
+            'episode' => $episode,
+            'filter' => $filter,
+            'max_pages' => 1,
+        ]);
+        $add($exactFiles);
+    }
+
+    // 3. Fast keyword probe to discover external/Telegram channel releases (MalaySub, Fanszz, DramaOST, etc.)
     if (count($all) < $maxFiles && $keyword !== '') {
         // Build the individual episode tokens. Different uploaders name the same
         // episode differently (S01E01, E01, EP01, EP1, E1), so we query each
@@ -12190,66 +12202,85 @@ if ($isNuvioRoute) {
                         }
                     }
                 } else {
-                    // For Movie: search direct files and posts using all query variants (handling &, dan, and, entities)
-                    $queriesToTry = fd_build_search_query_variants($searchedTitle !== '' ? $searchedTitle : $searchQuery, $searchedYear);
-
-                    // Also try the AKA title. Catalog files may be named with
-                    // either the primary title or the alternate one, so both are
-                    // searched. The AKA comes from the media_ids_idx row, so this
-                    // adds no network round-trip.
-                    if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
-                        foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
-                            if (!in_array($akaQuery, $queriesToTry, true)) {
-                                $queriesToTry[] = $akaQuery;
+                    // For Movie: Fast path server-side native Manticore stream resolution in 1 round trip
+                    $primaryMovieTitle = $searchedTitle !== '' ? $searchedTitle : $searchQuery;
+                    if ($primaryMovieTitle !== '') {
+                        $apiBase = FD_WP_API_BASE;
+                        $mUrl = "{$apiBase}/stream-files?title=" . urlencode($primaryMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
+                        $res = fd_http_json($mUrl, [], 'GET', 10);
+                        if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+                            foreach ($res['items'] as $f) {
+                                $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                $fCaption = (string) ($f['caption'] ?? '');
+                                if (!fd_is_series_file($fTitle, $fCaption)) {
+                                    $filesToStream[] = $f;
+                                }
                             }
                         }
                     }
 
-                    foreach ($queriesToTry as $mQuery) {
-                        $sf = fd_fetch_stream_ajax('search_files', ['search' => $mQuery, 'limit' => 30]);
-                        if (is_array($sf) && !empty($sf['files'])) {
-                            foreach ($sf['files'] as $f) {
-                                $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                                $fCaption = (string) ($f['caption'] ?? '');
-                                if (fd_is_series_file($fTitle, $fCaption)) {
-                                    continue;
+                    // Fallback to query variants if fast path returned no files
+                    if (empty($filesToStream)) {
+                        $queriesToTry = fd_build_search_query_variants($primaryMovieTitle, $searchedYear);
+
+                        // Also try the AKA title. Catalog files may be named with
+                        // either the primary title or the alternate one, so both are
+                        // searched. The AKA comes from the media_ids_idx row, so this
+                        // adds no network round-trip.
+                        if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
+                            foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
+                                if (!in_array($akaQuery, $queriesToTry, true)) {
+                                    $queriesToTry[] = $akaQuery;
                                 }
-                                $filesToStream[] = $f;
                             }
                         }
 
-                        // If files found directly in search_files, no need to make additional slow WP post queries
-                        if (count($filesToStream) > 0) {
-                            break;
-                        }
-
-                        $sp = fd_fetch_stream_ajax('search', ['search' => $mQuery, 'limit' => 5]);
-                        if (is_array($sp)) {
-                            foreach ($sp as $p) {
-                                $pId = $p['id'] ?? 0;
-                                if (!$pId) continue;
-                                $pTitle = (string) ($p['title'] ?? '');
-                                $pCats = (array) ($p['categories'] ?? []);
-                                if (preg_match('/tvseries|series|season|episode|drama/i', $pTitle . ' ' . implode(' ', $pCats))) {
-                                    continue;
+                        foreach ($queriesToTry as $mQuery) {
+                            $sf = fd_fetch_stream_ajax('search_files', ['search' => $mQuery, 'limit' => 30]);
+                            if (is_array($sf) && !empty($sf['files'])) {
+                                foreach ($sf['files'] as $f) {
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCaption = (string) ($f['caption'] ?? '');
+                                    if (fd_is_series_file($fTitle, $fCaption)) {
+                                        continue;
+                                    }
+                                    $filesToStream[] = $f;
                                 }
-                                $pFilesRes = fd_fetch_stream_ajax('post_files', ['post_id' => $pId, 'limit' => 20]);
-                                $pFiles = (array) ($pFilesRes['files'] ?? []);
-                                foreach ($pFiles as $pf) {
-                                    if (!empty($pf['short_code'])) {
-                                        $pfTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
-                                        $pfCaption = (string) ($pf['caption'] ?? '');
-                                        if (fd_is_series_file($pfTitle, $pfCaption)) {
-                                            continue;
+                            }
+
+                            // If files found directly in search_files, no need to make additional slow WP post queries
+                            if (count($filesToStream) > 0) {
+                                break;
+                            }
+
+                            $sp = fd_fetch_stream_ajax('search', ['search' => $mQuery, 'limit' => 5]);
+                            if (is_array($sp)) {
+                                foreach ($sp as $p) {
+                                    $pId = $p['id'] ?? 0;
+                                    if (!$pId) continue;
+                                    $pTitle = (string) ($p['title'] ?? '');
+                                    $pCats = (array) ($p['categories'] ?? []);
+                                    if (preg_match('/tvseries|series|season|episode|drama/i', $pTitle . ' ' . implode(' ', $pCats))) {
+                                        continue;
+                                    }
+                                    $pFilesRes = fd_fetch_stream_ajax('post_files', ['post_id' => $pId, 'limit' => 20]);
+                                    $pFiles = (array) ($pFilesRes['files'] ?? []);
+                                    foreach ($pFiles as $pf) {
+                                        if (!empty($pf['short_code'])) {
+                                            $pfTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
+                                            $pfCaption = (string) ($pf['caption'] ?? '');
+                                            if (fd_is_series_file($pfTitle, $pfCaption)) {
+                                                continue;
+                                            }
+                                            $filesToStream[] = $pf;
                                         }
-                                        $filesToStream[] = $pf;
                                     }
                                 }
                             }
-                        }
 
-                        if (count($filesToStream) > 0) {
-                            break;
+                            if (count($filesToStream) > 0) {
+                                break;
+                            }
                         }
                     }
 

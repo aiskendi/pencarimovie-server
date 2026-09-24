@@ -2289,11 +2289,20 @@ function fd_http_get_contents(string $url, array $options = []): string|false
  */
 function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
 {
+    static $memoryCache = [];
     $empty = ['title' => '', 'year' => '', 'imdb_id' => '', 'media_type' => ''];
     $prefix = strtolower(trim($prefix));
     $value = trim($value);
     if ($prefix === '' || $value === '') {
         return $empty;
+    }
+
+    // In-process memory cache: a single request resolves the same ID up to 3x
+    // (tt, imdb, and the stream route), and each miss costs a 1.5-7s WordPress
+    // round-trip. This collapses them to one.
+    $memKey = $prefix . ':' . $value;
+    if (isset($memoryCache[$memKey])) {
+        return $memoryCache[$memKey];
     }
 
     // Disk cache check to avoid repeat remote round-trips (24h positive, 2h negative)
@@ -2308,6 +2317,7 @@ function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
                 $isHit = !empty($cached['title']);
                 $ttl = $isHit ? 86400 : 7200;
                 if ((time() - $mtime) < $ttl) {
+                    $memoryCache[$memKey] = $cached;
                     return $cached;
                 }
             }
@@ -2318,10 +2328,12 @@ function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
     $hit = fd_manticore_lookup_by_id($prefix, $value);
     if (!empty($hit['title'])) {
         @file_put_contents($cacheFile, json_encode($hit, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        $memoryCache[$memKey] = $hit;
         return $hit;
     }
 
     @file_put_contents($cacheFile, json_encode($empty, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    $memoryCache[$memKey] = $empty;
     return $empty;
 }
 
@@ -2520,40 +2532,64 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $season = isset($m[2]) ? (int)$m[2] : null;
         $episode = isset($m[3]) ? (int)$m[3] : null;
 
-        // 1. Check local catalog (Manticore media_ids_idx) first (fastest, ~1ms, zero external calls)
-        $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
-        if (empty($localImdb['title'])) {
-            $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
-        }
-
+        // 1. Local disk cache FIRST. The WordPress /lookup-id round-trip costs
+        //    2.5-8s (WP bootstrap + TLS on the VPS) while this file read is ~1ms.
+        //    Checking it before the network call is what makes a repeat stream
+        //    request fast; previously the network call always ran first.
+        $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
         $akaTitle = '';
-        if (!empty($localImdb['title'])) {
-            $title = (string) $localImdb['title'];
-            $year = (string) ($localImdb['year'] ?? '');
-            $akaTitle = (string) ($localImdb['aka'] ?? '');
+        if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
+            $cData = json_decode((string)@file_get_contents($cacheFile), true);
+            if (is_array($cData) && !empty($cData['name'])) {
+                $title = (string) $cData['name'];
+                $year = (string) ($cData['year'] ?? '');
+                $akaTitle = (string) ($cData['aka'] ?? '');
+            }
         }
 
-        // 2. If missing from media_ids_idx, query configured upstream Stremio addons
-        if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
-            $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
-            if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
-                $cData = json_decode((string)@file_get_contents($cacheFile), true);
-                if (is_array($cData)) {
-                    $title = (string) ($cData['name'] ?? '');
-                    $year = (string) ($cData['year'] ?? '');
-                }
+        // 2. Check local catalog (Manticore media_ids_idx) via WordPress.
+        //    The `tt` and `imdb` prefixes are the SAME row in media_ids_idx, so only
+        //    one lookup is needed — the second was a guaranteed duplicate round-trip
+        //    (measured 1.4-9.5s each on a cold cache) that doubled the miss latency.
+        if ($title === '') {
+            $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
+            if (!empty($localImdb['title'])) {
+                $title = (string) $localImdb['title'];
+                $year = (string) ($localImdb['year'] ?? '');
+                $akaTitle = (string) ($localImdb['aka'] ?? '');
+                @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'aka' => $akaTitle]), LOCK_EX);
             }
+        }
 
+        // 3. If still missing, query configured upstream Stremio addons
+        if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
             if ($title === '') {
                 $configuredUpstreams = fd_get_upstream_resolver_manifests();
                 $resolvedType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
 
-                foreach ($configuredUpstreams as $upstream) {
+                // Race every upstream meta endpoint concurrently. Serially this was
+                // the dominant cost of a cold resolve (each upstream costs 0.5-3s).
+                $metaUrls = [];
+                foreach ($configuredUpstreams as $idx => $upstream) {
                     $manifestUrl = trim((string)($upstream['url'] ?? ''));
                     if ($manifestUrl === '') continue;
                     $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-                    $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/" . rawurlencode($imdbId) . ".json";
-                    $res = fd_http_json($metaUrl, [], 'GET', 3);
+                    $metaUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/" . rawurlencode($imdbId) . ".json";
+                }
+                $ampRes = fd_http_get_many_amp($metaUrls, ['timeout' => 4]);
+                $bodies = [];
+                if (!empty($ampRes['ok'])) {
+                    foreach ($ampRes['results'] as $row) {
+                        $bodies[] = (string) ($row['body'] ?? '');
+                    }
+                } else {
+                    foreach ($metaUrls as $u) {
+                        $bodies[] = (string) @file_get_contents($u);
+                    }
+                }
+                foreach ($bodies as $raw) {
+                    if ($raw === '') continue;
+                    $res = json_decode($raw, true);
                     if (!empty($res['meta']['name'])) {
                         $title = (string) $res['meta']['name'];
                         $relInfo = (string) ($res['meta']['releaseInfo'] ?? ($res['meta']['year'] ?? ''));
@@ -2634,13 +2670,28 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         }
 
         if ($title === '') {
-            // Check configured upstream addons that declare 'meta' support
-            foreach ($configuredUpstreams as $upstream) {
+            // Race every upstream meta endpoint concurrently (serial cost 0.5-4s each)
+            $metaUrls = [];
+            foreach ($configuredUpstreams as $idx => $upstream) {
                 $manifestUrl = trim((string)($upstream['url'] ?? ''));
                 if ($manifestUrl === '') continue;
                 $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-                $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/tmdb:{$tmdbNumeric}.json";
-                $res = fd_http_json($metaUrl, [], 'GET', 4);
+                $metaUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/tmdb:{$tmdbNumeric}.json";
+            }
+            $ampRes = fd_http_get_many_amp($metaUrls, ['timeout' => 4]);
+            $bodies = [];
+            if (!empty($ampRes['ok'])) {
+                foreach ($ampRes['results'] as $row) {
+                    $bodies[] = (string) ($row['body'] ?? '');
+                }
+            } else {
+                foreach ($metaUrls as $u) {
+                    $bodies[] = (string) @file_get_contents($u);
+                }
+            }
+            foreach ($bodies as $raw) {
+                if ($raw === '') continue;
+                $res = json_decode($raw, true);
                 if (!empty($res['meta']['name'])) {
                     $title = (string) $res['meta']['name'];
                     $year = (string) ($res['meta']['year'] ?? ($res['meta']['releaseInfo'] ?? ''));
@@ -2690,16 +2741,29 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         }
 
         if ($title === '') {
-            foreach ($configuredUpstreams as $upstream) {
+            // Race both anime/ and series/ meta endpoints for every upstream concurrently.
+            $metaUrls = [];
+            foreach ($configuredUpstreams as $idx => $upstream) {
                 $manifestUrl = trim((string)($upstream['url'] ?? ''));
                 if ($manifestUrl === '') continue;
                 $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-                $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/anime/kitsu:{$kitsuId}.json";
-                $res = fd_http_json($metaUrl, [], 'GET', 3);
-                if (empty($res['meta']['name'])) {
-                    $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/series/kitsu:{$kitsuId}.json";
-                    $res = fd_http_json($metaUrl, [], 'GET', 3);
+                $metaUrls['up_' . $idx . '_anime']  = rtrim($baseAddonUrl, '/') . "/meta/anime/kitsu:{$kitsuId}.json";
+                $metaUrls['up_' . $idx . '_series'] = rtrim($baseAddonUrl, '/') . "/meta/series/kitsu:{$kitsuId}.json";
+            }
+            $ampRes = fd_http_get_many_amp($metaUrls, ['timeout' => 4]);
+            $bodies = [];
+            if (!empty($ampRes['ok'])) {
+                foreach ($ampRes['results'] as $row) {
+                    $bodies[] = (string) ($row['body'] ?? '');
                 }
+            } else {
+                foreach ($metaUrls as $u) {
+                    $bodies[] = (string) @file_get_contents($u);
+                }
+            }
+            foreach ($bodies as $raw) {
+                if ($raw === '') continue;
+                $res = json_decode($raw, true);
                 if (!empty($res['meta']['name'])) {
                     $title = (string) $res['meta']['name'];
                     $year = (string) ($res['meta']['year'] ?? ($res['meta']['releaseInfo'] ?? ''));
@@ -2740,13 +2804,28 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $episode = isset($m[4]) ? (int)$m[4] : null;
         $resolvedType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
 
-        // Check configured upstream addons that declare 'meta' support
-        foreach ($configuredUpstreams as $upstream) {
+        // Race every upstream meta endpoint concurrently (serial cost 0.5-4s each)
+        $metaUrls = [];
+        foreach ($configuredUpstreams as $idx => $upstream) {
             $manifestUrl = trim((string)($upstream['url'] ?? ''));
             if ($manifestUrl === '') continue;
             $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-            $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/{$prefix}:{$val}.json";
-            $res = fd_http_json($metaUrl, [], 'GET', 4);
+            $metaUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/{$prefix}:{$val}.json";
+        }
+        $ampRes = fd_http_get_many_amp($metaUrls, ['timeout' => 4]);
+        $bodies = [];
+        if (!empty($ampRes['ok'])) {
+            foreach ($ampRes['results'] as $row) {
+                $bodies[] = (string) ($row['body'] ?? '');
+            }
+        } else {
+            foreach ($metaUrls as $u) {
+                $bodies[] = (string) @file_get_contents($u);
+            }
+        }
+        foreach ($bodies as $raw) {
+            if ($raw === '') continue;
+            $res = json_decode($raw, true);
             if (!empty($res['meta']['name'])) {
                 $title = (string) $res['meta']['name'];
                 $year = (string) ($res['meta']['year'] ?? ($res['meta']['releaseInfo'] ?? ''));

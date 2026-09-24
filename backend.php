@@ -6242,6 +6242,7 @@ function fd_search_files_parallel(array $queries): array
  */
 function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 40, ?array $preloadedPost = null): array
 {
+    static $postMemoryCache = [];
     $tStart = microtime(true);
     if ($season <= 0 || $episode <= 0) {
         return [];
@@ -6250,8 +6251,15 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     if ($preloadedPost !== null && !empty($preloadedPost['title'])) {
         $post = $preloadedPost;
     } elseif ($postId > 0) {
-        $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-        $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+        if (isset($postMemoryCache[$postId])) {
+            $post = $postMemoryCache[$postId];
+        } else {
+            $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+            $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            if (!empty($post)) {
+                $postMemoryCache[$postId] = $post;
+            }
+        }
     } else {
         $post = [];
     }
@@ -6290,10 +6298,11 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
                 if ($fileYear !== $targetYear) {
                     $yearDiff = abs($fileYear - $targetYear);
                     $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                    $cleanPostWords = array_values(array_filter(explode(' ', strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$keyword))), fn($w) => strlen($w) > 1));
+                    $cleanPostWords = array_values(array_filter(explode(' ', strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$keyword))), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan', 'a', 'an', 'no', 'di', 'ke', 'dari', 'yang', 's'], true)));
                     $allWordsMatch = !empty($cleanPostWords);
                     foreach ($cleanPostWords as $pw) {
-                        if (!str_contains($cleanFTitle, $pw)) {
+                        $pwStem = rtrim($pw, 's');
+                        if (!str_contains($cleanFTitle, $pw) && (strlen($pwStem) < 3 || !str_contains($cleanFTitle, $pwStem))) {
                             $allWordsMatch = false;
                             break;
                         }
@@ -6304,7 +6313,24 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
                 }
             }
 
-            // 2. Strict Franchise / Title Guard for short titles:
+            // 2. Content-word match: ensure all key title words (e.g. "spring" and "blade") exist in filename
+            $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
+            $contentWords = array_values(array_filter(explode(' ', strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$keyword))), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan', 'a', 'an', 'no', 'di', 'ke', 'dari', 'yang', 's'], true)));
+            if (count($contentWords) >= 2) {
+                $hasAllContent = true;
+                foreach ($contentWords as $cw) {
+                    $cwStem = rtrim($cw, 's');
+                    if (!str_contains($cleanFTitle, $cw) && (strlen($cwStem) < 3 || !str_contains($cleanFTitle, $cwStem))) {
+                        $hasAllContent = false;
+                        break;
+                    }
+                }
+                if (!$hasAllContent) {
+                    continue;
+                }
+            }
+
+            // 3. Strict Franchise / Title Guard for short titles:
             // Prevents "Glory" from matching unrelated titles like "You Are My Glory", "Gold Rush Our Race to Olympic Glory", etc.
             $cleanKw = strtolower(trim($keyword));
             if (strlen($cleanKw) >= 2) {
@@ -11990,18 +12016,17 @@ if ($isNuvioRoute) {
             // Legacy / direct file short code within post
             $fCode = $m[2];
             $filesToStream[] = ['short_code' => $fCode];
-        } elseif (str_starts_with($itemId, 'pm_post_') || str_starts_with($itemId, 'pm:post_') || str_starts_with($itemId, 'pm:post:')) {
-            // Whole post requested (e.g. movie post with multiple qualities or video files)
-            if (str_starts_with($itemId, 'pm_post_')) {
-                $postId = (int) substr($itemId, strlen('pm_post_'));
-            } elseif (str_starts_with($itemId, 'pm:post_')) {
-                $postId = (int) substr($itemId, strlen('pm:post_'));
-            } else {
-                $postId = (int) substr($itemId, strlen('pm:post:'));
-            }
+        } elseif (preg_match('/^(?:pm_post_|pm:post_|pm:post:)(\d+)(?::(\d+):(\d+))?$/i', $itemId, $pmMatches)) {
+            $postId = (int) $pmMatches[1];
+            $targetSeason = isset($pmMatches[2]) ? (int) $pmMatches[2] : null;
+            $targetEpisode = isset($pmMatches[3]) ? (int) $pmMatches[3] : null;
 
-            // Fast Path: Resolve movie streams from Manticore via post_id in 1 round trip
-            if ($itemType === 'movie') {
+            // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1)
+            if ($targetSeason !== null && $targetEpisode !== null) {
+                $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason, $targetEpisode, 60);
+            }
+            // Fast Path 2: Movie requested via post ID
+            elseif ($itemType === 'movie') {
                 $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie&limit=60";
                 $res = fd_http_json($mUrl, [], 'GET', 10);
                 if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
@@ -12293,14 +12318,36 @@ if ($isNuvioRoute) {
                 } else {
                     // For Movie: Fast path server-side native Manticore stream resolution in 1 round trip
                     $primaryMovieTitle = $searchedTitle !== '' ? $searchedTitle : $searchQuery;
+                    $cleanMovieTitle = fd_stream_keyword_from_post_title($primaryMovieTitle);
+                    if ($cleanMovieTitle === '') $cleanMovieTitle = $primaryMovieTitle;
                     $movieFastPathDone = false;
-                    if ($primaryMovieTitle !== '') {
+                    if ($cleanMovieTitle !== '') {
                         $apiBase = FD_WP_API_BASE;
-                        $mUrl = "{$apiBase}/stream-files?title=" . urlencode($primaryMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
+                        $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
                         $res = fd_http_json($mUrl, [], 'GET', 5);
                         if (isset($res['ok'])) {
-                            $movieFastPathDone = true;
                             if (!empty($res['items']) && is_array($res['items'])) {
+                                $movieFastPathDone = true;
+                                foreach ($res['items'] as $f) {
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCaption = (string) ($f['caption'] ?? '');
+                                    if (!fd_is_series_file($fTitle, $fCaption)) {
+                                        $filesToStream[] = $f;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If primary title returned 0 files and an AKA title exists, probe the AKA title via fast path
+                    if (empty($filesToStream) && $searchedAka !== '' && strcasecmp($searchedAka, $cleanMovieTitle) !== 0) {
+                        $cleanAkaTitle = fd_stream_keyword_from_post_title($searchedAka);
+                        if ($cleanAkaTitle !== '') {
+                            $apiBase = FD_WP_API_BASE;
+                            $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanAkaTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
+                            $res = fd_http_json($mUrl, [], 'GET', 5);
+                            if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+                                $movieFastPathDone = true;
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');
@@ -12380,10 +12427,15 @@ if ($isNuvioRoute) {
                     // Strict Movie Title & Year Guard: prevent cross-matching different titles
                     // (e.g. "Runner 2026" vs "The Runner 2026", "Late Runner 2026", "Blade Runner 2049")
                     if (!empty($filesToStream) && $searchedTitle !== '') {
-                        $cleanSearched = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $searchedTitle));
+                        $cleanBaseTitle = fd_stream_keyword_from_post_title($searchedTitle);
+                        if ($cleanBaseTitle === '') $cleanBaseTitle = $searchedTitle;
+                        $cleanSearched = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanBaseTitle));
                         $cleanSearched = trim(preg_replace('/\s+/', ' ', $cleanSearched));
                         $searchedLower = strtolower($cleanSearched);
                         $hasLeadingThe = str_starts_with($searchedLower, 'the ');
+
+                        $cleanAkaBase = $searchedAka !== '' ? fd_stream_keyword_from_post_title($searchedAka) : '';
+                        $akaLower = $cleanAkaBase !== '' ? strtolower(trim(preg_replace('/\s+/', ' ', preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanAkaBase)))) : '';
 
                         $filteredMovieFiles = [];
                         foreach ($filesToStream as $mf) {
@@ -12395,9 +12447,11 @@ if ($isNuvioRoute) {
                                 continue;
                             }
 
-                            // 1. Strict Year check if year is present in filename
+                            // 1. Year check: allow ±1 year tolerance, or ±2 years if all words match
                             if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                                if ($fym[1] !== $searchedYear) {
+                                $fileYear = (int) $fym[1];
+                                $targetYear = (int) $searchedYear;
+                                if (abs($fileYear - $targetYear) > 2) {
                                     continue;
                                 }
                             }
@@ -12405,34 +12459,49 @@ if ($isNuvioRoute) {
                             // 2. Normalize filename to extract the movie title portion before release tags/year
                             $cleanF = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
                             $cleanF = trim(preg_replace('/\s+/', ' ', $cleanF));
+
+                            // 3. Strict Sequel Guard: Do not match sequels (e.g. "Part II", "Part 2", "Chapter 2") when searching original title
+                            $isSequelSearched = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5)\b|chapter\s*\d+)\b/i', $searchedLower);
+                            $isSequelFile = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5)\b|chapter\s*\d+)\b/i', $cleanF);
+                            if (!$isSequelSearched && $isSequelFile) {
+                                continue;
+                            }
+
                             // Strip release tags (1080p, bluray, etc.)
                             $baseF = preg_replace('/\b(2160p|1080p|720p|480p|360p|4k|fhd|hd|sd|bluray|web-?dl|webrip|hdrip|hdtv|cam|hevc|x264|x265|aac.*|lubokvideo|yts|lulustream)\b.*/i', '', $cleanF);
                             // Strip year and anything following
-                            if ($searchedYear !== '') {
-                                $baseF = preg_replace('/\b' . $searchedYear . '\b.*/', '', $baseF);
-                            } else {
-                                $baseF = preg_replace('/\b(19\d\d|20\d\d)\b.*/', '', $baseF);
-                            }
+                            $baseF = preg_replace('/\b(19\d\d|20\d\d)\b.*/', '', $baseF);
                             $baseF = trim($baseF);
 
                             // Strip common movie edition suffixes
                             $baseF = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion)\b.*/i', '', $baseF);
                             $baseF = trim($baseF);
 
-                            // Strip leading release channels/groups (e.g. "prakytv the runner" -> "the runner")
-                            $baseF = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv)\s+/i', '', $baseF);
+                            // Strip leading release channels/groups (e.g. "prakytv the runner" -> "the runner", "studioghibli spirited away" -> "spirited away")
+                            $baseF = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu)\s+/i', '', $baseF);
 
-                            // If searchedTitle is "runner" and filename is "the runner", do NOT match (different movies)
+                            // Match either the searched title or the AKA title
+                            $matchesPrimary = ($baseF === $searchedLower || $baseF === "the {$searchedLower}");
                             if (!$hasLeadingThe && str_starts_with($baseF, 'the ')) {
-                                continue;
+                                $matchesPrimary = false;
                             }
-                            // If searchedTitle is "the runner" and filename is "runner", do NOT match (different movies)
                             if ($hasLeadingThe && !str_starts_with($baseF, 'the ') && $baseF === substr($searchedLower, 4)) {
-                                continue;
+                                $matchesPrimary = false;
                             }
 
-                            // Exclude titles with prefixes/suffixes (e.g. "late runner", "blade runner")
-                            if ($baseF !== $searchedLower && $baseF !== "the {$searchedLower}") {
+                            $matchesAka = false;
+                            if ($akaLower !== '') {
+                                $matchesAka = ($baseF === $akaLower || $baseF === "the {$akaLower}" || str_contains($cleanF, $akaLower));
+                            }
+
+                            if (!$matchesPrimary && !$matchesAka) {
+                                // Also allow matching if the full title is a clean exact prefix or token match
+                                if (str_starts_with($cleanF, $searchedLower . ' ') || $cleanF === $searchedLower) {
+                                    $matchesPrimary = true;
+                                }
+                            }
+
+                            if (!$matchesPrimary && !$matchesAka) {
                                 continue;
                             }
 

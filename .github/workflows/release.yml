@@ -6,13 +6,13 @@ name: Release Builder & Docker Publish
 # `v*` tag could publish a release that shadows /releases/latest.
 #
 # To cut a release: Actions -> "Release Builder & Docker Publish" -> Run
-# workflow, and supply the tag (e.g. v2.3.4). Leave the tag empty to build
+# workflow, and supply the tag (e.g. v2.4.7). Leave the tag empty to build
 # and publish the Docker image only, without creating a GitHub release.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v2.3.4). Leave empty to build the Docker image only."
+        description: "Release tag (e.g. v2.4.7). Leave empty to build the Docker image only."
         required: false
         default: ""
 
@@ -212,3 +212,51 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+      - name: Update next release tag in workflow
+        if: steps.vars.outputs.publish == 'true'
+        env:
+          RELEASE_TAG: ${{ env.TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          php -r '
+            $tag = getenv("RELEASE_TAG");
+            if (preg_match("/^v?(\d+)\.(\d+)\.(\d+)/", $tag, $m)) {
+                $major = $m[1];
+                $minor = $m[2];
+                $patch = (int)$m[3] + 1;
+                $next = "v{$major}.{$minor}.{$patch}";
+                $file = ".github/workflows/release.yml";
+                $content = file_get_contents($file);
+
+                $patternDesc = "/description:\s*\"Release tag \(e\.g\.\s*v[0-9]+\.[0-9]+\.[0-9]+.*?\)\.\s*Leave empty to build the Docker image only\.\"/";
+                $replaceDesc = "description: \"Release tag (e.g. {$next}). Leave empty to build the Docker image only.\"";
+
+                $patternDoc = "/# workflow, and supply the tag \(e\.g\.\s*v[0-9]+\.[0-9]+\.[0-9]+.*?\)\./";
+                $replaceDoc = "# workflow, and supply the tag (e.g. {$next}).";
+
+                $updated = preg_replace($patternDesc, $replaceDesc, $content);
+                $updated = preg_replace($patternDoc, $replaceDoc, $updated);
+
+                if ($updated && $updated !== $content) {
+                    file_put_contents($file, $updated);
+                    echo "Updated $file next tag example to $next\n";
+                }
+            }
+          '
+
+          WORKFLOW_FILE=".github/workflows/release.yml"
+          if ! git diff --quiet "$WORKFLOW_FILE"; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$WORKFLOW_FILE"
+
+            NEXT_SUGGESTION=$(grep -oP 'Release tag \(e\.g\. \K[^\)]+' "$WORKFLOW_FILE" || echo "next")
+            git commit -m "chore(release): update next release tag suggestion to $NEXT_SUGGESTION [skip ci]"
+
+            TARGET_BRANCH="${GITHUB_REF_NAME:-main}"
+            git pull --rebase origin "$TARGET_BRANCH" || true
+            git push origin "HEAD:$TARGET_BRANCH"
+          fi

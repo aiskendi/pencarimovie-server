@@ -2495,37 +2495,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $season = isset($m[2]) ? (int)$m[2] : null;
         $episode = isset($m[3]) ? (int)$m[3] : null;
 
-        // 1. Check Cinemeta cache first (24h TTL)
-        $cacheFile = fd_cache_path('cinemeta_' . md5($imdbId) . '.json');
-        if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
-            $cData = json_decode((string)@file_get_contents($cacheFile), true);
-            if (is_array($cData)) {
-                $title = (string) ($cData['name'] ?? '');
-                $year = (string) ($cData['year'] ?? '');
-            }
-        }
-
-        // 2. Fetch Cinemeta if not cached (fast ~180ms)
-        if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
-            $cinemetaType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
-            $cinemetaUrl = "https://v3-cinemeta.strem.io/meta/{$cinemetaType}/{$imdbId}.json";
-            $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 3);
-            if (!empty($cinemetaJson['meta']['name'])) {
-                $title = (string) $cinemetaJson['meta']['name'];
-                $relInfo = (string) ($cinemetaJson['meta']['releaseInfo'] ?? ($cinemetaJson['meta']['year'] ?? ''));
-                if (preg_match('/\b(19\d\d|20\d\d)\b/', $relInfo, $ym)) {
-                    $year = $ym[1];
-                } elseif (!empty($cinemetaJson['meta']['videos'][0]['released']) && preg_match('/\b(19\d\d|20\d\d)\b/', (string)$cinemetaJson['meta']['videos'][0]['released'], $ym)) {
-                    $year = $ym[1];
-                }
-                @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year]), LOCK_EX);
-            } else {
-                // Negative cache to prevent repeated cold misses
-                @file_put_contents($cacheFile, json_encode(['name' => '', 'year' => '']), LOCK_EX);
-            }
-        }
-
-        // 3. Check local catalog (Manticore media_ids_idx) for alternate title (AKA)
+        // 1. Check local catalog (Manticore media_ids_idx) first (fastest, ~1ms, zero external calls)
         $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
         if (empty($localImdb['title'])) {
             $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
@@ -2533,21 +2503,59 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
 
         $akaTitle = '';
         if (!empty($localImdb['title'])) {
-            if ($title === '') {
-                $title = (string) $localImdb['title'];
-                if ($year === '') {
-                    $year = (string) ($localImdb['year'] ?? '');
-                }
-            } elseif (strcasecmp((string) $localImdb['title'], $title) !== 0) {
-                $akaTitle = (string) $localImdb['title'];
-            }
+            $title = (string) $localImdb['title'];
+            $year = (string) ($localImdb['year'] ?? '');
+            $akaTitle = (string) ($localImdb['aka'] ?? '');
         }
 
-        if ($title !== '') {
-            // Auto-populate media_ids_idx for IMDb IDs so they are independently stored
-            $numericImdb = (int) preg_replace('/\D/', '', $imdbId);
-            $pseudoId = 9000000000 + ($numericImdb % 1000000000);
-            fd_media_ids_upsert($pseudoId, ['imdb' => $imdbId, 'tt' => $imdbId], $title, (int)$year, $imdbId, ($season !== null || $itemType === 'series') ? 'tvseries' : 'movie');
+        // 2. If missing from media_ids_idx, query configured upstream Stremio addons
+        if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
+            $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
+            if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
+                $cData = json_decode((string)@file_get_contents($cacheFile), true);
+                if (is_array($cData)) {
+                    $title = (string) ($cData['name'] ?? '');
+                    $year = (string) ($cData['year'] ?? '');
+                }
+            }
+
+            if ($title === '') {
+                $catSettings = fd_load_catalog_settings();
+                $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+                    ? (array) ($catSettings['upstream_manifests'] ?? [])
+                    : [];
+                $resolvedType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
+
+                foreach ($configuredUpstreams as $upstream) {
+                    $manifestUrl = trim((string)($upstream['url'] ?? ''));
+                    if ($manifestUrl === '') continue;
+                    $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+                    $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/{$resolvedType}/" . rawurlencode($imdbId) . ".json";
+                    $res = fd_http_json($metaUrl, [], 'GET', 3);
+                    if (!empty($res['meta']['name'])) {
+                        $title = (string) $res['meta']['name'];
+                        $relInfo = (string) ($res['meta']['releaseInfo'] ?? ($res['meta']['year'] ?? ''));
+                        if (preg_match('/\b(19\d\d|20\d\d)\b/', $relInfo, $ym)) {
+                            $year = $ym[1];
+                        } elseif (!empty($res['meta']['videos'][0]['released']) && preg_match('/\b(19\d\d|20\d\d)\b/', (string)$res['meta']['videos'][0]['released'], $ym)) {
+                            $year = $ym[1];
+                        }
+                        break;
+                    }
+                }
+
+                if ($title !== '') {
+                    @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year]), LOCK_EX);
+
+                    // Auto-populate media_ids_idx from upstream resolver so future requests are resolved locally
+                    $numericImdb = (int) preg_replace('/\D/', '', $imdbId);
+                    $pseudoId = 9000000000 + ($numericImdb % 1000000000);
+                    fd_media_ids_upsert($pseudoId, ['imdb' => $imdbId, 'tt' => $imdbId], $title, (int)$year, $imdbId, ($season !== null || $itemType === 'series') ? 'tvseries' : 'movie');
+                } else {
+                    // Negative cache to prevent repeated cold misses
+                    @file_put_contents($cacheFile, json_encode(['name' => '', 'year' => '']), LOCK_EX);
+                }
+            }
         }
 
         return [
@@ -2661,15 +2669,28 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         }
 
         if ($title === '') {
-            $kitsuUrl = "https://anime-kitsu.strem.fun/meta/anime/kitsu:{$kitsuId}.json";
-            $res = fd_http_json($kitsuUrl, [], 'GET', 5);
-            if (!empty($res['meta']['name'])) {
-                $title = (string) $res['meta']['name'];
-                $year = (string) ($res['meta']['year'] ?? ($res['meta']['releaseInfo'] ?? ''));
-                if (preg_match('/\b(19\d\d|20\d\d)\b/', $year, $ym)) {
-                    $year = $ym[1];
+            foreach ($configuredUpstreams as $upstream) {
+                $manifestUrl = trim((string)($upstream['url'] ?? ''));
+                if ($manifestUrl === '') continue;
+                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+                $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/anime/kitsu:{$kitsuId}.json";
+                $res = fd_http_json($metaUrl, [], 'GET', 3);
+                if (empty($res['meta']['name'])) {
+                    $metaUrl = rtrim($baseAddonUrl, '/') . "/meta/series/kitsu:{$kitsuId}.json";
+                    $res = fd_http_json($metaUrl, [], 'GET', 3);
                 }
-                $imdbId = (string) ($res['meta']['imdb_id'] ?? '');
+                if (!empty($res['meta']['name'])) {
+                    $title = (string) $res['meta']['name'];
+                    $year = (string) ($res['meta']['year'] ?? ($res['meta']['releaseInfo'] ?? ''));
+                    if (preg_match('/\b(19\d\d|20\d\d)\b/', $year, $ym)) {
+                        $year = $ym[1];
+                    }
+                    $imdbId = (string) ($res['meta']['imdb_id'] ?? '');
+                    break;
+                }
+            }
+
+            if ($title !== '') {
                 @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'imdb_id' => $imdbId]), LOCK_EX);
                 // Make media_ids_idx independent by populating on-the-fly from upstream
                 $mediaIdsToSave = ['kitsu' => $kitsuId];
@@ -3503,12 +3524,10 @@ function fd_get_item_subtitles(string $itemType, string $itemId): array
         'autoAdjustment' => false,
     ]));
 
-    $subEndpoints = [
-        "https://opensubtitles-v3.strem.io/subtitles/{$itemType}/" . urlencode($itemId) . ".json",
-    ];
+    $subEndpoints = [];
 
     $catSettings = fd_load_catalog_settings();
-    // Respect the master upstream switch — no upstream subtitle bridging when off.
+    // Respect the master upstream switch — query configured upstream addons for subtitles
     $configuredUpstreams = !empty($catSettings['upstream_enabled'])
         ? (array) ($catSettings['upstream_manifests'] ?? [])
         : [];
@@ -3606,21 +3625,11 @@ function fd_find_imdb_id_for_title(string $rawTitle): string
         return trim((string) @file_get_contents($cacheFile));
     }
 
-    // Try Cinemeta search (fast 2s timeout)
-    $searchQuery = urlencode($clean);
-    $url = "https://v3-cinemeta.strem.io/catalog/movie/top/search={$searchQuery}.json";
-    $json = fd_http_json($url, [], 'GET', 2);
     $imdbId = '';
-
-    if (!empty($json['metas'][0]['id']) && str_starts_with($json['metas'][0]['id'], 'tt')) {
-        $imdbId = (string) $json['metas'][0]['id'];
-    } else {
-        // Try series search (fast 2s timeout)
-        $urlSeries = "https://v3-cinemeta.strem.io/catalog/series/top/search={$searchQuery}.json";
-        $jsonSeries = fd_http_json($urlSeries, [], 'GET', 2);
-        if (!empty($jsonSeries['metas'][0]['id']) && str_starts_with($jsonSeries['metas'][0]['id'], 'tt')) {
-            $imdbId = (string) $jsonSeries['metas'][0]['id'];
-        }
+    // Look up via local Manticore media_ids_idx
+    $local = fd_lookup_local_catalog_by_prefix('imdb', $clean);
+    if (!empty($local['imdb_id'])) {
+        $imdbId = (string) $local['imdb_id'];
     }
 
     if ($imdbId !== '') {
@@ -11722,17 +11731,28 @@ if ($isNuvioRoute) {
                 }
             }
 
-            // Build candidate meta endpoints to query concurrently
-            $metaUrlsToQuery = [];
-
-            // Primary for IMDb IDs (tt...): Cinemeta is authoritative & fast (~180ms)
+            // 1. Check local media_ids_idx first before querying external upstreams
             if (preg_match('/^(tt\d{6,10})/i', $itemId, $tm)) {
                 $ttId = $tm[1];
-                $cineType = ($itemType === 'series') ? 'series' : 'movie';
-                $metaUrlsToQuery['cinemeta'] = "https://v3-cinemeta.strem.io/meta/{$cineType}/{$ttId}.json";
+                $local = fd_lookup_local_catalog_by_prefix('tt', $ttId);
+                if (empty($local['title'])) {
+                    $local = fd_lookup_local_catalog_by_prefix('imdb', $ttId);
+                }
+                if (!empty($local['title'])) {
+                    $localMeta = [
+                        'id'          => $ttId,
+                        'type'        => $itemType,
+                        'name'        => (string) $local['title'],
+                        'year'        => (string) ($local['year'] ?? ''),
+                        'releaseInfo' => (string) ($local['year'] ?? ''),
+                    ];
+                    @file_put_contents($metaCacheFile, json_encode(['meta' => $localMeta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    fd_stremio_json(['meta' => $localMeta], 200, 'max-age=3600, public');
+                }
             }
 
-            // Upstream bridged manifests
+            // 2. Query configured upstream bridged manifests
+            $metaUrlsToQuery = [];
             $catSettings = fd_load_catalog_settings();
             $configuredUpstreams = !empty($catSettings['upstream_enabled'])
                 ? (array) ($catSettings['upstream_manifests'] ?? [])
@@ -11744,11 +11764,6 @@ if ($isNuvioRoute) {
                 $metaUrlsToQuery['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$itemType}/" . rawurlencode($itemId) . ".json";
             }
 
-            // Anime Kitsu fallback
-            if (preg_match('/^kitsu:(\d+)/i', $itemId, $km)) {
-                $kId = $km[1];
-                $metaUrlsToQuery['kitsu'] = "https://anime-kitsu.strem.fun/meta/anime/kitsu:{$kId}.json";
-            }
 
             // Fetch meta endpoints concurrently via Amp
             $ampMetaRes = fd_http_get_many_amp($metaUrlsToQuery, ['timeout' => 4]);

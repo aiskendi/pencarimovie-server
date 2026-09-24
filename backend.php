@@ -2496,10 +2496,10 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $episode = isset($m[3]) ? (int)$m[3] : null;
 
         // 1. Check Cinemeta cache first (24h TTL)
-        $cacheFile = fd_storage_path('storage/cinemeta_' . md5($imdbId) . '.json');
+        $cacheFile = fd_cache_path('cinemeta_' . md5($imdbId) . '.json');
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
             $cData = json_decode((string)@file_get_contents($cacheFile), true);
-            if (is_array($cData) && !empty($cData['name'])) {
+            if (is_array($cData)) {
                 $title = (string) ($cData['name'] ?? '');
                 $year = (string) ($cData['year'] ?? '');
             }
@@ -2509,7 +2509,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
             $cinemetaType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
             $cinemetaUrl = "https://v3-cinemeta.strem.io/meta/{$cinemetaType}/{$imdbId}.json";
-            $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 4);
+            $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 3);
             if (!empty($cinemetaJson['meta']['name'])) {
                 $title = (string) $cinemetaJson['meta']['name'];
                 $relInfo = (string) ($cinemetaJson['meta']['releaseInfo'] ?? ($cinemetaJson['meta']['year'] ?? ''));
@@ -2519,6 +2519,9 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
                     $year = $ym[1];
                 }
                 @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year]), LOCK_EX);
+            } else {
+                // Negative cache to prevent repeated cold misses
+                @file_put_contents($cacheFile, json_encode(['name' => '', 'year' => '']), LOCK_EX);
             }
         }
 
@@ -6307,18 +6310,23 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     };
 
     // 1. Fast path: Server-side native Manticore stream resolution in 1 single round-trip
+    $fastPathDone = false;
     if ($keyword !== '') {
         $apiBase = FD_WP_API_BASE;
         $url = "{$apiBase}/stream-files?title=" . urlencode($keyword) . "&type=series&season={$season}&episode={$episode}&post_id={$postId}&limit={$maxFiles}";
-        $res = fd_http_json($url, [], 'GET', 10);
-        if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
-            $add($res['items']);
+        $res = fd_http_json($url, [], 'GET', 5);
+        if (isset($res['ok'])) {
+            $fastPathDone = true;
+            if (!empty($res['items']) && is_array($res['items'])) {
+                $add($res['items']);
+            }
         }
     }
     $exactCount = count($all);
 
-    // If fast-path found streams, return immediately (skipping redundant multi-query fallbacks)
-    if (count($all) > 0) {
+    // If fast-path communicated with Manticore (returning items or confirming 0 items exist),
+    // return immediately to avoid burning 4-5s on pointless fallback scans.
+    if ($fastPathDone || count($all) > 0) {
         $elapsed = round(microtime(true) - $tStart, 3);
         fd_log('stremio episode streams resolved', [
             'postId' => $postId,
@@ -11809,10 +11817,7 @@ if ($isNuvioRoute) {
             }
         }
 
-        // Pre-fetch subtitles for this item so they can be embedded directly in stream objects
-        // and served to external Stremio players supporting stream.subtitles
-        $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
-
+        $subtitlesForStream = [];
         $streams = [];
 
         $botIdStr = fd_get_bot_id();
@@ -12250,23 +12255,27 @@ if ($isNuvioRoute) {
                 } else {
                     // For Movie: Fast path server-side native Manticore stream resolution in 1 round trip
                     $primaryMovieTitle = $searchedTitle !== '' ? $searchedTitle : $searchQuery;
+                    $movieFastPathDone = false;
                     if ($primaryMovieTitle !== '') {
                         $apiBase = FD_WP_API_BASE;
                         $mUrl = "{$apiBase}/stream-files?title=" . urlencode($primaryMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
-                        $res = fd_http_json($mUrl, [], 'GET', 10);
-                        if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
-                            foreach ($res['items'] as $f) {
-                                $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                                $fCaption = (string) ($f['caption'] ?? '');
-                                if (!fd_is_series_file($fTitle, $fCaption)) {
-                                    $filesToStream[] = $f;
+                        $res = fd_http_json($mUrl, [], 'GET', 5);
+                        if (isset($res['ok'])) {
+                            $movieFastPathDone = true;
+                            if (!empty($res['items']) && is_array($res['items'])) {
+                                foreach ($res['items'] as $f) {
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCaption = (string) ($f['caption'] ?? '');
+                                    if (!fd_is_series_file($fTitle, $fCaption)) {
+                                        $filesToStream[] = $f;
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Fallback to query variants if fast path returned no files
-                    if (empty($filesToStream)) {
+                    // Fallback to query variants only if fast path failed / did not communicate
+                    if (!$movieFastPathDone && empty($filesToStream)) {
                         $queriesToTry = fd_build_search_query_variants($primaryMovieTitle, $searchedYear);
 
                         // Also try the AKA title. Catalog files may be named with
@@ -12605,9 +12614,9 @@ if ($isNuvioRoute) {
         $maxStreamFiles = ($maxTotal > 0) ? $maxTotal : 100;
         $filesToStream = array_slice($filesToStream, 0, $maxStreamFiles);
 
-        // Pre-resolve all streams before play or download using batch warmup
-        // Populates file_id_mt in memory and local resolve_cache for instant playback
+        // Pre-resolve all streams and fetch subtitles only when files exist
         if (!empty($filesToStream)) {
+            $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
             $filesToStream = fd_prewarm_streams_batch($filesToStream, $botIdStr);
         }
 

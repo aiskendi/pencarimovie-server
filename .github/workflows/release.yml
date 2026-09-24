@@ -19,7 +19,6 @@ on:
 permissions:
   contents: write
   packages: write
-  workflows: write
 
 jobs:
   build-and-release:
@@ -214,55 +213,46 @@ jobs:
           prerelease: false
           generate_release_notes: true
 
-      - name: Update next release tag in workflow
-        if: steps.vars.outputs.publish == 'true'
+      - name: Display Next Version and Release Summary
+        if: always()
         env:
-          RELEASE_TAG: ${{ env.TAG }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.TAG || 'latest' }}
+          PUBLISHED: ${{ steps.vars.outputs.publish || 'false' }}
         run: |
           set -euo pipefail
 
           php -r '
-            $tag = getenv("RELEASE_TAG");
+            $tag = getenv("TAG");
+            $published = getenv("PUBLISHED") === "true";
+
+            $next = "v1.0.0";
             if (preg_match("/^v?(\d+)\.(\d+)\.(\d+)/", $tag, $m)) {
                 $major = $m[1];
                 $minor = $m[2];
                 $patch = (int)$m[3] + 1;
                 $next = "v{$major}.{$minor}.{$patch}";
-                $file = ".github/workflows/release.yml";
-                $content = file_get_contents($file);
-
-                $patternDesc = "/description:\s*\"Release tag \(e\.g\.\s*v[0-9]+\.[0-9]+\.[0-9]+.*?\)\.\s*Leave empty to build the Docker image only\.\"/";
-                $replaceDesc = "description: \"Release tag (e.g. {$next}). Leave empty to build the Docker image only.\"";
-
-                $patternDoc = "/# workflow, and supply the tag \(e\.g\.\s*v[0-9]+\.[0-9]+\.[0-9]+.*?\)\./";
-                $replaceDoc = "# workflow, and supply the tag (e.g. {$next}).";
-
-                $updated = preg_replace($patternDesc, $replaceDesc, $content);
-                $updated = preg_replace($patternDoc, $replaceDoc, $updated);
-
-                if ($updated && $updated !== $content) {
-                    file_put_contents($file, $updated);
-                    echo "Updated $file next tag example to $next\n";
+            } else {
+                // Fetch highest git tag if current run was docker-only
+                $output = shell_exec("git tag -l \"v*\" --sort=-v:refname | head -n 1");
+                $latestTag = trim($output ?: "");
+                if (preg_match("/^v?(\d+)\.(\d+)\.(\d+)/", $latestTag, $m)) {
+                    $next = "v{$m[1]}.{$m[2]}." . ((int)$m[3] + 1);
                 }
             }
+
+            echo "::notice title=Next Recommended Release Tag::Next release version to use: " . $next . "\n";
+
+            $summary = "# 🚀 Release Build & Docker Publish Summary\n\n";
+            if ($published) {
+                $summary .= "- **Published Release Tag**: \`" . $tag . "\`\n";
+                $summary .= "- **Next Version To Use**: \`" . $next . "\` 🎉\n";
+                $summary .= "- **Docker Image**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":" . $tag . "\`\n\n";
+                $summary .= "> 💡 **Next time you run this workflow, supply \`" . $next . "\` in the tag input.**\n";
+            } else {
+                $summary .= "- **Docker Image**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":latest\`\n";
+                $summary .= "- **Next Version To Use (when cutting a release)**: \`" . $next . "\`\n\n";
+                $summary .= "> ℹ️ *No release tag was provided; built and published Docker image only.*\n";
+            }
+
+            file_put_contents(getenv("GITHUB_STEP_SUMMARY"), $summary, FILE_APPEND);
           '
-
-          WORKFLOW_FILE=".github/workflows/release.yml"
-          if ! git diff --quiet "$WORKFLOW_FILE"; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-
-            NEXT_SUGGESTION=$(grep -m1 -oP 'description: "Release tag \(e\.g\. \K[^.\)]+\.[^.\)]+\.[^.\)]+' "$WORKFLOW_FILE" || echo "next")
-
-            # Stage only the workflow file and discard other build artifacts
-            git add "$WORKFLOW_FILE"
-            git commit -m "chore(release): update next release tag suggestion to $NEXT_SUGGESTION [skip ci]"
-
-            # Stash untracked/unstaged build artifacts so git pull rebase works cleanly
-            git stash --include-untracked || true
-
-            TARGET_BRANCH="${GITHUB_REF_NAME:-main}"
-            git pull --rebase origin "$TARGET_BRANCH" || true
-            git push origin "HEAD:$TARGET_BRANCH"
-          fi

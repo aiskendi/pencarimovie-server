@@ -2296,32 +2296,32 @@ function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
         return $empty;
     }
 
-    // 1. Standalone local Manticore media_ids_idx lookup (fastest).
-    $hit = fd_manticore_lookup_by_id($prefix, $value);
-    if (!empty($hit['title'])) {
-        return $hit;
-    }
-
-    // 2. Fallback: Query remote WordPress /lookup-id (which checks server's media_ids_idx & postmeta).
-    if (defined('FD_WP_API_BASE')) {
-        $url = FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => $prefix, 'id' => $value]);
-        $res = fd_http_json($url, [], 'GET', 3);
-        if (!empty($res['title'])) {
-            $resolved = [
-                'title'      => (string) $res['title'],
-                'year'       => (string) ($res['year'] ?? ''),
-                'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
-                'media_type' => (string) ($res['media_type'] ?? 'movie'),
-            ];
-            // Cache locally into media_ids_idx if local Manticore is reachable
-            $postId = (int) ($res['post_id'] ?? 0);
-            if ($postId > 0) {
-                fd_media_ids_upsert($postId, [$prefix => $value], $resolved['title'], (int)$resolved['year'], $resolved['imdb_id'], $resolved['media_type']);
+    // Disk cache check to avoid repeat remote round-trips (24h positive, 2h negative)
+    $cacheKey = md5($prefix . ':' . $value);
+    $cacheFile = fd_cache_path('lookup_id_' . $cacheKey . '.json');
+    if (is_file($cacheFile)) {
+        $mtime = (int) filemtime($cacheFile);
+        $cachedRaw = @file_get_contents($cacheFile);
+        if ($cachedRaw) {
+            $cached = json_decode($cachedRaw, true);
+            if (is_array($cached)) {
+                $isHit = !empty($cached['title']);
+                $ttl = $isHit ? 86400 : 7200;
+                if ((time() - $mtime) < $ttl) {
+                    return $cached;
+                }
             }
-            return $resolved;
         }
     }
 
+    // Query remote WordPress /lookup-id (Manticore media_ids_idx & postmeta)
+    $hit = fd_manticore_lookup_by_id($prefix, $value);
+    if (!empty($hit['title'])) {
+        @file_put_contents($cacheFile, json_encode($hit, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        return $hit;
+    }
+
+    @file_put_contents($cacheFile, json_encode($empty, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
     return $empty;
 }
 
@@ -2348,7 +2348,7 @@ function fd_manticore_lookup_by_id(string $prefix, string $value): array
         FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => $prefix, 'id' => $value]),
         [],
         'GET',
-        5
+        3 // Fast 3s timeout
     );
     if (empty($res['title'])) {
         return $empty;
@@ -2395,6 +2395,38 @@ function fd_media_ids_upsert(int $postId, array $mediaIds, string $title, int $y
         return 0;
     }
 
+    // Non-blocking background write via Amp so stream responses are never delayed
+    $client = fd_get_amphp_client();
+    if ($client !== null && function_exists('Amp\\async')) {
+        \Amp\async(static function () use ($client, $postId, $clean, $title, $year, $imdbId, $mediaType): void {
+            try {
+                $url = FD_WP_API_BASE . '/media-ids';
+                $body = json_encode([
+                    'post_id'    => $postId,
+                    'media_ids'  => $clean,
+                    'title'      => $title,
+                    'year'       => $year,
+                    'imdb_id'    => $imdbId,
+                    'media_type' => $mediaType,
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                $request = new \Amp\Http\Client\Request($url, 'POST');
+                $request->setHeader('Content-Type', 'application/json');
+                $request->setHeader('Accept', 'application/json');
+                $request->setHeader('User-Agent', 'pencarimovie-server/' . FD_APP_VERSION);
+                $request->setHeader('X-App-Version', FD_APP_VERSION);
+                $secret = fd_get_api_secret();
+                if ($secret !== '') {
+                    $request->setHeader('X-API-Secret', $secret);
+                }
+                $request->setBody($body);
+                $cancellation = new \Amp\TimeoutCancellation(5);
+                $client->request($request, $cancellation);
+            } catch (\Throwable $e) {
+            }
+        });
+        return count($clean);
+    }
+
     $res = fd_http_json(
         FD_WP_API_BASE . '/media-ids',
         [
@@ -2406,7 +2438,7 @@ function fd_media_ids_upsert(int $postId, array $mediaIds, string $title, int $y
             'media_type' => $mediaType,
         ],
         'POST',
-        8
+        3
     );
 
     return !empty($res['ok']) ? (int) ($res['written'] ?? count($clean)) : 0;
@@ -2463,21 +2495,7 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $season = isset($m[2]) ? (int)$m[2] : null;
         $episode = isset($m[3]) ? (int)$m[3] : null;
 
-        // 1a. Standalone media_ids_idx lookup FIRST. The table is self-contained
-        // (title/year/imdb_id/media_type live on the row), so a seeded row lets
-        // us resolve titles that Cinemeta does not know (e.g. small Malaysian
-        // releases) WITHOUT any upstream addon. This mirrors the generic
-        // prefix:value lookup below, which previously bypassed bare `tt` IDs.
-        //
-        // The stored title may be an AKA (e.g. tt37594685 is "Libang Libu" in
-        // the catalog but "Restless and Anxious" in the metadata DB). We keep it
-        // as the primary title but ALSO resolve Cinemeta's name so the caller
-        // can retry with it when the primary yields no files.
-        $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
-        if (empty($localImdb['title'])) {
-            $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
-        }
-
+        // 1. Check Cinemeta cache first (24h TTL)
         $cacheFile = fd_storage_path('storage/cinemeta_' . md5($imdbId) . '.json');
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
             $cData = json_decode((string)@file_get_contents($cacheFile), true);
@@ -2487,10 +2505,11 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
         }
 
+        // 2. Fetch Cinemeta if not cached (fast ~180ms)
         if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
             $cinemetaType = ($season !== null || $itemType === 'series') ? 'series' : 'movie';
             $cinemetaUrl = "https://v3-cinemeta.strem.io/meta/{$cinemetaType}/{$imdbId}.json";
-            $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 5);
+            $cinemetaJson = fd_http_json($cinemetaUrl, [], 'GET', 4);
             if (!empty($cinemetaJson['meta']['name'])) {
                 $title = (string) $cinemetaJson['meta']['name'];
                 $relInfo = (string) ($cinemetaJson['meta']['releaseInfo'] ?? ($cinemetaJson['meta']['year'] ?? ''));
@@ -2503,9 +2522,12 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
         }
 
-        // Prefer the Cinemeta title (it matches the catalog filenames) and expose
-        // the media_ids_idx title as an AKA fallback. When only one is known, use
-        // it as the primary and leave the AKA empty.
+        // 3. Check local catalog (Manticore media_ids_idx) for alternate title (AKA)
+        $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
+        if (empty($localImdb['title'])) {
+            $localImdb = fd_lookup_local_catalog_by_prefix('imdb', $imdbId);
+        }
+
         $akaTitle = '';
         if (!empty($localImdb['title'])) {
             if ($title === '') {
@@ -3494,15 +3516,43 @@ function fd_get_item_subtitles(string $itemType, string $itemId): array
         $subEndpoints[] = rtrim($baseAddonUrl, '/') . "/subtitles/{$itemType}/" . urlencode($itemId) . ".json";
     }
 
-    foreach (array_unique($subEndpoints) as $upstreamSubUrl) {
-        $subRes = fd_http_json($upstreamSubUrl, [], 'GET', 5);
-        if (!empty($subRes['subtitles']) && is_array($subRes['subtitles'])) {
-            foreach ($subRes['subtitles'] as $sub) {
-                if (is_array($sub) && !empty($sub['url'])) {
-                    $sId = (string)($sub['id'] ?? $sub['url']);
-                    if (!isset($seenSubIds[$sId])) {
-                        $seenSubIds[$sId] = true;
-                        $subtitles[] = $sub;
+    // Parallelize subtitle fetching across all subtitle endpoints concurrently
+    $uniqueSubUrls = array_values(array_unique($subEndpoints));
+    $urlKeyMap = [];
+    foreach ($uniqueSubUrls as $idx => $u) {
+        $urlKeyMap['sub_' . $idx] = $u;
+    }
+
+    $ampSubResults = fd_http_get_many_amp($urlKeyMap, ['timeout' => 3]);
+    if ($ampSubResults['ok']) {
+        foreach ($ampSubResults['results'] as $row) {
+            $body = (string) ($row['body'] ?? '');
+            if ($body !== '') {
+                $subRes = json_decode($body, true);
+                if (is_array($subRes) && !empty($subRes['subtitles']) && is_array($subRes['subtitles'])) {
+                    foreach ($subRes['subtitles'] as $sub) {
+                        if (is_array($sub) && !empty($sub['url'])) {
+                            $sId = (string)($sub['id'] ?? $sub['url']);
+                            if (!isset($seenSubIds[$sId])) {
+                                $seenSubIds[$sId] = true;
+                                $subtitles[] = $sub;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        foreach ($uniqueSubUrls as $upstreamSubUrl) {
+            $subRes = fd_http_json($upstreamSubUrl, [], 'GET', 3);
+            if (!empty($subRes['subtitles']) && is_array($subRes['subtitles'])) {
+                foreach ($subRes['subtitles'] as $sub) {
+                    if (is_array($sub) && !empty($sub['url'])) {
+                        $sId = (string)($sub['id'] ?? $sub['url']);
+                        if (!isset($seenSubIds[$sId])) {
+                            $seenSubIds[$sId] = true;
+                            $subtitles[] = $sub;
+                        }
                     }
                 }
             }
@@ -7360,10 +7410,21 @@ function fd_get_default_catalog_options(): array
  */
 function fd_get_trending_keywords_map(): array
 {
-    static $cached = null;
-    if ($cached !== null) {
-        return $cached;
+    static $memoryCached = null;
+    if ($memoryCached !== null) {
+        return $memoryCached;
     }
+
+    $cacheFile = fd_cache_path('trending_keywords.json');
+    $ttl = 600; // 10 minutes
+
+    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+        $data = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($data) && !empty($data)) {
+            return $memoryCached = $data;
+        }
+    }
+
     $cached = [];
     try {
         $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
@@ -7378,9 +7439,20 @@ function fd_get_trending_keywords_map(): array
                 }
             }
         }
+        if (!empty($cached)) {
+            @file_put_contents($cacheFile, json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
     } catch (\Throwable $e) {
     }
-    return $cached;
+
+    if (empty($cached) && is_file($cacheFile)) {
+        $stale = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($stale) && !empty($stale)) {
+            return $memoryCached = $stale;
+        }
+    }
+
+    return $memoryCached = $cached;
 }
 
 /**
@@ -11613,44 +11685,54 @@ if ($isNuvioRoute) {
                 }
             }
 
-            // 1. Try upstream manifests first (only when the master upstream
-            //    switch is on — otherwise fall straight through to Cinemeta).
+            // Build candidate meta endpoints to query concurrently
+            $metaUrlsToQuery = [];
+
+            // Primary for IMDb IDs (tt...): Cinemeta is authoritative & fast (~180ms)
+            if (preg_match('/^(tt\d{6,10})/i', $itemId, $tm)) {
+                $ttId = $tm[1];
+                $cineType = ($itemType === 'series') ? 'series' : 'movie';
+                $metaUrlsToQuery['cinemeta'] = "https://v3-cinemeta.strem.io/meta/{$cineType}/{$ttId}.json";
+            }
+
+            // Upstream bridged manifests
             $catSettings = fd_load_catalog_settings();
             $configuredUpstreams = !empty($catSettings['upstream_enabled'])
                 ? (array) ($catSettings['upstream_manifests'] ?? [])
                 : [];
-            foreach ($configuredUpstreams as $upstream) {
+            foreach ($configuredUpstreams as $idx => $upstream) {
                 $mUrl = trim((string)($upstream['url'] ?? ''));
                 if ($mUrl === '') continue;
                 $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $mUrl);
-                $upMetaUrl = rtrim($baseAddonUrl, '/') . "/meta/{$itemType}/" . rawurlencode($itemId) . ".json";
-                $mRes = fd_http_json($upMetaUrl, [], 'GET', 6);
-                if (!empty($mRes['meta']) && is_array($mRes['meta']) && !empty($mRes['meta']['name'])) {
-                    @file_put_contents($metaCacheFile, json_encode($mRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                    fd_stremio_json($mRes, 200, 'max-age=3600, public');
-                }
+                $metaUrlsToQuery['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$itemType}/" . rawurlencode($itemId) . ".json";
             }
 
-            // 2. Fallback to Cinemeta for IMDb IDs (tt...)
-            if (preg_match('/^(tt\d{6,10})/i', $itemId, $tm)) {
-                $ttId = $tm[1];
-                $cineType = ($itemType === 'series') ? 'series' : 'movie';
-                $cineUrl = "https://v3-cinemeta.strem.io/meta/{$cineType}/{$ttId}.json";
-                $cRes = fd_http_json($cineUrl, [], 'GET', 6);
-                if (!empty($cRes['meta']) && is_array($cRes['meta'])) {
-                    @file_put_contents($metaCacheFile, json_encode($cRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                    fd_stremio_json($cRes, 200, 'max-age=3600, public');
-                }
-            }
-
-            // 3. Fallback to Kitsu for Anime (kitsu:...)
+            // Anime Kitsu fallback
             if (preg_match('/^kitsu:(\d+)/i', $itemId, $km)) {
                 $kId = $km[1];
-                $kitsuUrl = "https://anime-kitsu.strem.fun/meta/anime/kitsu:{$kId}.json";
-                $kRes = fd_http_json($kitsuUrl, [], 'GET', 6);
-                if (!empty($kRes['meta']) && is_array($kRes['meta'])) {
-                    @file_put_contents($metaCacheFile, json_encode($kRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                    fd_stremio_json($kRes, 200, 'max-age=3600, public');
+                $metaUrlsToQuery['kitsu'] = "https://anime-kitsu.strem.fun/meta/anime/kitsu:{$kId}.json";
+            }
+
+            // Fetch meta endpoints concurrently via Amp
+            $ampMetaRes = fd_http_get_many_amp($metaUrlsToQuery, ['timeout' => 4]);
+            if ($ampMetaRes['ok']) {
+                foreach ($ampMetaRes['results'] as $row) {
+                    $raw = (string) ($row['body'] ?? '');
+                    if ($raw !== '') {
+                        $mRes = json_decode($raw, true);
+                        if (is_array($mRes) && !empty($mRes['meta']) && is_array($mRes['meta']) && !empty($mRes['meta']['name'])) {
+                            @file_put_contents($metaCacheFile, json_encode($mRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                            fd_stremio_json($mRes, 200, 'max-age=3600, public');
+                        }
+                    }
+                }
+            } else {
+                foreach ($metaUrlsToQuery as $targetUrl) {
+                    $mRes = fd_http_json($targetUrl, [], 'GET', 4);
+                    if (!empty($mRes['meta']) && is_array($mRes['meta']) && !empty($mRes['meta']['name'])) {
+                        @file_put_contents($metaCacheFile, json_encode($mRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                        fd_stremio_json($mRes, 200, 'max-age=3600, public');
+                    }
                 }
             }
         }
@@ -12764,16 +12846,39 @@ if ($isNuvioRoute) {
         $configuredUpstreams = !empty($catSettings['upstream_enabled'])
             ? (array) ($catSettings['upstream_manifests'] ?? [])
             : [];
-        foreach ($configuredUpstreams as $upstream) {
+        $upstreamUrls = [];
+        foreach ($configuredUpstreams as $idx => $upstream) {
             $manifestUrl = trim((string)($upstream['url'] ?? ''));
             if ($manifestUrl === '') continue;
             $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-            $upstreamStreamUrl = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
-            $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 6);
-            if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
-                foreach ($uRes['streams'] as $uStream) {
-                    if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
-                        $streams[] = $uStream;
+            $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
+        }
+
+        if (!empty($upstreamUrls)) {
+            $ampUpstreamResults = fd_http_get_many_amp($upstreamUrls, ['timeout' => 4]);
+            if ($ampUpstreamResults['ok']) {
+                foreach ($ampUpstreamResults['results'] as $row) {
+                    $body = (string) ($row['body'] ?? '');
+                    if ($body !== '') {
+                        $uRes = json_decode($body, true);
+                        if (is_array($uRes) && !empty($uRes['streams']) && is_array($uRes['streams'])) {
+                            foreach ($uRes['streams'] as $uStream) {
+                                if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                    $streams[] = $uStream;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                foreach ($upstreamUrls as $upstreamStreamUrl) {
+                    $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
+                    if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
+                        foreach ($uRes['streams'] as $uStream) {
+                            if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                $streams[] = $uStream;
+                            }
+                        }
                     }
                 }
             }

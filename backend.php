@@ -11744,35 +11744,17 @@ if ($isNuvioRoute) {
         // ── Meta Bridge: If not a local pm_ ID, proxy from upstream manifests or Cinemeta ──
         if (!str_starts_with($itemId, 'pm_') && !str_starts_with($itemId, 'pm:')) {
             // Check meta disk cache (1 hour TTL)
-            $metaCacheFile = fd_storage_path('storage/up_meta_' . md5($itemType . '_' . $itemId) . '.json');
+            $metaCacheFile = fd_cache_path('up_meta_' . md5($itemType . '_' . $itemId) . '.json');
             if (is_file($metaCacheFile) && (time() - (int)filemtime($metaCacheFile)) < 3600) {
                 $cachedMeta = json_decode((string)@file_get_contents($metaCacheFile), true);
-                if (is_array($cachedMeta) && isset($cachedMeta['meta'])) {
-                    fd_stremio_json($cachedMeta, 200, 'max-age=3600, public');
+                if (is_array($cachedMeta) && !empty($cachedMeta['meta']['name'])) {
+                    if ($itemType !== 'series' || !empty($cachedMeta['meta']['videos'])) {
+                        fd_stremio_json($cachedMeta, 200, 'max-age=3600, public');
+                    }
                 }
             }
 
-            // 1. Check local media_ids_idx first before querying external upstreams
-            if (preg_match('/^(tt\d{6,10})/i', $itemId, $tm)) {
-                $ttId = $tm[1];
-                $local = fd_lookup_local_catalog_by_prefix('tt', $ttId);
-                if (empty($local['title'])) {
-                    $local = fd_lookup_local_catalog_by_prefix('imdb', $ttId);
-                }
-                if (!empty($local['title'])) {
-                    $localMeta = [
-                        'id'          => $ttId,
-                        'type'        => $itemType,
-                        'name'        => (string) $local['title'],
-                        'year'        => (string) ($local['year'] ?? ''),
-                        'releaseInfo' => (string) ($local['year'] ?? ''),
-                    ];
-                    @file_put_contents($metaCacheFile, json_encode(['meta' => $localMeta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                    fd_stremio_json(['meta' => $localMeta], 200, 'max-age=3600, public');
-                }
-            }
-
-            // 2. Query configured upstream bridged manifests (fallback to AIOMetadata for background resolution)
+            // 1. Query upstream resolver manifests (AIOMetadata / Cinemeta) to get complete metadata (posters, banners, descriptions, and full series videos array)
             $metaUrlsToQuery = [];
             $configuredUpstreams = fd_get_upstream_resolver_manifests();
             foreach ($configuredUpstreams as $idx => $upstream) {
@@ -11781,7 +11763,6 @@ if ($isNuvioRoute) {
                 $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $mUrl);
                 $metaUrlsToQuery['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/meta/{$itemType}/" . rawurlencode($itemId) . ".json";
             }
-
 
             // Fetch meta endpoints concurrently via Amp
             $ampMetaRes = fd_http_get_many_amp($metaUrlsToQuery, ['timeout' => 4]);
@@ -11804,6 +11785,30 @@ if ($isNuvioRoute) {
                         fd_stremio_json($mRes, 200, 'max-age=3600, public');
                     }
                 }
+            }
+
+            // 2. Fallback to local media_ids_idx if upstream manifests returned no result
+            $prefix = 'tt';
+            $val = $itemId;
+            if (preg_match('/^([a-zA-Z0-9_-]+):([^:]+)/', $itemId, $pm)) {
+                $prefix = strtolower($pm[1]);
+                $val = $pm[2];
+            }
+            $local = fd_lookup_local_catalog_by_prefix($prefix, $val);
+            if (empty($local['title']) && ($prefix === 'tt' || $prefix === 'imdb')) {
+                $local = fd_lookup_local_catalog_by_prefix($prefix === 'tt' ? 'imdb' : 'tt', $val);
+            }
+            if (!empty($local['title'])) {
+                $localMeta = [
+                    'id'          => $itemId,
+                    'type'        => $itemType,
+                    'name'        => (string) $local['title'],
+                    'year'        => (string) ($local['year'] ?? ''),
+                    'releaseInfo' => (string) ($local['year'] ?? ''),
+                    'posterShape' => 'poster',
+                ];
+                @file_put_contents($metaCacheFile, json_encode(['meta' => $localMeta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                fd_stremio_json(['meta' => $localMeta], 200, 'max-age=3600, public');
             }
         }
 

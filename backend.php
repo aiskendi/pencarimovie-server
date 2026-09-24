@@ -6488,8 +6488,18 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         $add($exactFiles);
     }
 
-    // 3. Fallback keyword probe (13 queries in parallel) only when still 0 files
-    if (count($all) === 0 && $keyword !== '') {
+    // 3. Fallback keyword probe (13 queries in parallel).
+    //
+    // This MUST run whenever the result set is still thin — not only when it is
+    // exactly 0. The post-files probe above (step 2) pages by file_size DESC, so
+    // a series with many releases fills its page with the LARGEST files and the
+    // later/smaller episodes (e.g. E27/E28) never appear. The exact-token probe
+    // below queries "keyword EP27" directly, which Manticore matches without the
+    // size-sorted page, so it recovers those starved episodes. Gating it on
+    // `=== 0` meant a single step-2 hit blocked it entirely, which is why some
+    // episodes returned 1 stream while others returned 12.
+    $thinThreshold = max(3, (int) ceil($maxFiles / 4));
+    if (count($all) < $thinThreshold && $keyword !== '') {
         // Build the individual episode tokens. Different uploaders name the same
         // episode differently (S01E01, E01, EP01, EP1, E1), so we query each
         // shape separately as well as in one OR-group.
@@ -12613,8 +12623,9 @@ if ($isNuvioRoute) {
             }
         }
 
-        // Ensure movie streams NEVER contain series files
-        if ($itemType === 'movie' || ($targetSeason === null && $targetEpisode === null && !str_contains($itemId, ':'))) {
+        // Ensure movie streams NEVER contain series files (skip for direct file IDs and 'other' catalog items)
+        $isDirectFile = str_starts_with($itemId, 'pm_file_') || str_starts_with($itemId, 'pm:file_') || str_starts_with($itemId, 'pm:file:');
+        if (!$isDirectFile && $itemType !== 'other' && ($itemType === 'movie' || ($targetSeason === null && $targetEpisode === null && !str_contains($itemId, ':')))) {
             $filesToStream = array_values(array_filter($filesToStream, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
         }
 
@@ -14447,7 +14458,14 @@ if (str_starts_with($path, '/api/')) {
             'year',
             'sort',
             'bot_id',
-            'country'
+            'country',
+            // Episode targeting for post_files. Without these the theme's
+            // ajax_stream_post_files() never appends "S01E27" to the search
+            // term, so searchresults() returns the size-sorted page and the
+            // later/smaller episodes (e.g. E26-E28) are starved — the stream
+            // list then shows only the biggest files.
+            'season',
+            'episode'
         ];
         $queryParams = ['action' => $streamAction];
         foreach ($allowedStreamParams as $paramKey) {

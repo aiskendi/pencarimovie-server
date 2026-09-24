@@ -6210,15 +6210,17 @@ function fd_search_files_parallel(array $queries): array
 function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 40, ?array $preloadedPost = null): array
 {
     $tStart = microtime(true);
-    if ($postId <= 0 || $season <= 0 || $episode <= 0) {
+    if ($season <= 0 || $episode <= 0) {
         return [];
     }
 
     if ($preloadedPost !== null && !empty($preloadedPost['title'])) {
         $post = $preloadedPost;
-    } else {
+    } elseif ($postId > 0) {
         $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
         $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+    } else {
+        $post = [];
     }
 
     $fullTitle = (string) ($post['title'] ?? '');
@@ -6315,8 +6317,23 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     }
     $exactCount = count($all);
 
-    // 2. Fallback probe post files for exact SxxExx MATCH (1 page, 50 items) if fast path didn't fill
-    if (count($all) < 15 && $postId > 0) {
+    // If fast-path found streams, return immediately (skipping redundant multi-query fallbacks)
+    if (count($all) > 0) {
+        $elapsed = round(microtime(true) - $tStart, 3);
+        fd_log('stremio episode streams resolved', [
+            'postId' => $postId,
+            'title' => $fullTitle,
+            'season' => $season,
+            'episode' => $episode,
+            'exactCount' => $exactCount,
+            'totalCount' => count($all),
+            'duration_seconds' => $elapsed,
+        ]);
+        return $all;
+    }
+
+    // 2. Fallback probe post files for exact SxxExx MATCH (1 page, 50 items) only when fast path returned 0 files
+    if ($postId > 0) {
         $exactFiles = fd_fetch_post_files_paged($postId, [
             'page_size' => 50,
             'max_files' => $maxFiles,
@@ -6328,8 +6345,8 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         $add($exactFiles);
     }
 
-    // 3. Fast keyword probe to discover external/Telegram channel releases (MalaySub, Fanszz, DramaOST, etc.)
-    if (count($all) < $maxFiles && $keyword !== '') {
+    // 3. Fallback keyword probe (13 queries in parallel) only when still 0 files
+    if (count($all) === 0 && $keyword !== '') {
         // Build the individual episode tokens. Different uploaders name the same
         // episode differently (S01E01, E01, EP01, EP1, E1), so we query each
         // shape separately as well as in one OR-group.
@@ -6401,8 +6418,8 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         }
     }
 
-    // 3. Fallback scan of post files only if we still have very few files
-    if (count($all) < 10) {
+    // 4. Fallback scan of post files only if still 0 files
+    if (count($all) === 0 && $postId > 0) {
         $pagedFiles = fd_fetch_post_files_paged($postId, [
             'page_size' => 150,
             'max_files' => 150,
@@ -11939,159 +11956,177 @@ if ($isNuvioRoute) {
             } else {
                 $postId = (int) substr($itemId, strlen('pm:post:'));
             }
-            $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-            $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-            $postTitle = $post['title'] ?? '';
 
-            $postFiles = fd_fetch_post_files_paged($postId, [
-                'page_size' => 50,
-                'max_files' => 80,
-            ]);
-
-            // For movie streams, strictly filter files to match post title and year
-            if ($itemType === 'movie' || (!empty($postTitle) && !preg_match('/tvseries|series|season|episode|drama/i', $postTitle))) {
-                $postYear = null;
-                if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                    $postYear = $ym[1];
+            // Fast Path: Resolve movie streams from Manticore via post_id in 1 round trip
+            if ($itemType === 'movie') {
+                $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie&limit=60";
+                $res = fd_http_json($mUrl, [], 'GET', 10);
+                if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+                    foreach ($res['items'] as $f) {
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCaption = (string) ($f['caption'] ?? '');
+                        if (!fd_is_series_file($fTitle, $fCaption)) {
+                            $filesToStream[] = $f;
+                        }
+                    }
                 }
+            }
 
-                $cleanTitle = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($postTitle));
-                $cleanTitle = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanTitle);
-                if ($postYear) {
-                    $cleanTitle = preg_replace('/\b' . $postYear . '\b/', '', $cleanTitle);
-                }
-                $cleanTitle = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTitle));
-                $cleanTitle = trim(preg_replace('/\s+/', ' ', $cleanTitle));
-                $postWords = array_values(array_filter(explode(' ', strtolower($cleanTitle)), fn($w) => strlen($w) > 1 && !in_array($w, ['dan', 'and', 'the'], true)));
+            if (empty($filesToStream)) {
+                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+                $postTitle = $post['title'] ?? '';
 
-                $matchedFiles = [];
-                foreach ($postFiles as $pf) {
-                    if (empty($pf['short_code'])) continue;
-                    $fTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
+                $postFiles = fd_fetch_post_files_paged($postId, [
+                    'page_size' => 50,
+                    'max_files' => 80,
+                ]);
 
-                    // Exclude series episodes from movie streams
-                    if (fd_is_series_file($fTitle, (string) ($pf['caption'] ?? ''))) {
-                        continue;
+                // For movie streams, strictly filter files to match post title and year
+                if ($itemType === 'movie' || (!empty($postTitle) && !preg_match('/tvseries|series|season|episode|drama/i', $postTitle))) {
+                    $postYear = null;
+                    if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+                        $postYear = $ym[1];
                     }
 
-                    // Strict year match if both post and file specify a year
-                    if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                        if ($fym[1] !== $postYear) {
+                    $cleanTitle = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($postTitle));
+                    $cleanTitle = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanTitle);
+                    if ($postYear) {
+                        $cleanTitle = preg_replace('/\b' . $postYear . '\b/', '', $cleanTitle);
+                    }
+                    $cleanTitle = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTitle));
+                    $cleanTitle = trim(preg_replace('/\s+/', ' ', $cleanTitle));
+                    $postWords = array_values(array_filter(explode(' ', strtolower($cleanTitle)), fn($w) => strlen($w) > 1 && !in_array($w, ['dan', 'and', 'the'], true)));
+
+                    $matchedFiles = [];
+                    foreach ($postFiles as $pf) {
+                        if (empty($pf['short_code'])) continue;
+                        $fTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
+
+                        // Exclude series episodes from movie streams
+                        if (fd_is_series_file($fTitle, (string) ($pf['caption'] ?? ''))) {
                             continue;
                         }
-                    }
 
-                    // Strict title word match (supports stem/plural variants e.g. selina vs selinas vs selina's)
-                    $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                    $cleanFTitleCompact = str_replace(' ', '', $cleanFTitle);
-                    $wordsMatch = true;
-                    foreach ($postWords as $pw) {
-                        $pwStem = rtrim($pw, 's');
-                        $hasMatch = str_contains($cleanFTitle, $pw)
-                            || (strlen($pwStem) >= 4 && str_contains($cleanFTitle, $pwStem))
-                            || str_contains($cleanFTitleCompact, $pw);
-                        if (!$hasMatch) {
-                            $wordsMatch = false;
-                            break;
+                        // Strict year match if both post and file specify a year
+                        if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
+                            if ($fym[1] !== $postYear) {
+                                continue;
+                            }
                         }
-                    }
-                    if (!$wordsMatch) {
-                        continue;
-                    }
 
-                    // Exclude sequels / franchise parts unless this file is a split chunk (e.g. part001/005, .001)
-                    if (!preg_match('/\b(part\s*\d+|part\s*[ivx]+|\d+)\b/i', $cleanTitle)) {
-                        $isSplitPart = preg_match('/[._\s-]part[._\s-]*0*\d{1,4}/i', $fTitle) || preg_match('/\.(?:mp4|mkv)\.0*\d{1,4}$/i', $fTitle);
-                        if (!$isSplitPart && preg_match('/\b(part\s*\d+|part\s*[ivx]+)\b/i', $fTitle)) {
+                        // Strict title word match (supports stem/plural variants e.g. selina vs selinas vs selina's)
+                        $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
+                        $cleanFTitleCompact = str_replace(' ', '', $cleanFTitle);
+                        $wordsMatch = true;
+                        foreach ($postWords as $pw) {
+                            $pwStem = rtrim($pw, 's');
+                            $hasMatch = str_contains($cleanFTitle, $pw)
+                                || (strlen($pwStem) >= 4 && str_contains($cleanFTitle, $pwStem))
+                                || str_contains($cleanFTitleCompact, $pw);
+                            if (!$hasMatch) {
+                                $wordsMatch = false;
+                                break;
+                            }
+                        }
+                        if (!$wordsMatch) {
                             continue;
                         }
+
+                        // Exclude sequels / franchise parts unless this file is a split chunk (e.g. part001/005, .001)
+                        if (!preg_match('/\b(part\s*\d+|part\s*[ivx]+|\d+)\b/i', $cleanTitle)) {
+                            $isSplitPart = preg_match('/[._\s-]part[._\s-]*0*\d{1,4}/i', $fTitle) || preg_match('/\.(?:mp4|mkv)\.0*\d{1,4}$/i', $fTitle);
+                            if (!$isSplitPart && preg_match('/\b(part\s*\d+|part\s*[ivx]+)\b/i', $fTitle)) {
+                                continue;
+                            }
+                        }
+
+                        $matchedFiles[] = $pf;
                     }
 
-                    $matchedFiles[] = $pf;
-                }
-
-                // If matched files found, use them. Otherwise fall back to the
-                // post's own files — but ONLY when the post has no year, or when
-                // no file carries a year at all. If the post HAS a year and the
-                // attached files all carry a DIFFERENT year, the post is
-                // mis-tagged (e.g. "The Lovers 2026" with only 2017 files
-                // attached); dumping them would show the wrong movie. In that
-                // case we keep the list empty and let the search_files
-                // supplement below try to find the correct-year releases.
-                $seenCodes = [];
-                if (!empty($matchedFiles)) {
-                    $postFilesToUse = $matchedFiles;
-                } elseif ($postYear === null) {
-                    // No year on the post: keep the previous behaviour.
-                    $postFilesToUse = array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
-                } else {
-                    // Post has a year. Keep only files that either carry the
-                    // matching year or carry no year at all (unlabelled files
-                    // are assumed to belong to the post).
-                    $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postYear) {
-                        $t = (string) ($f['title'] ?? '');
-                        if (fd_is_series_file($t, (string) ($f['caption'] ?? ''))) {
-                            return false;
-                        }
-                        if (preg_match('/\b(19\d\d|20\d\d)\b/', $t, $ym)) {
-                            return $ym[1] === $postYear;
-                        }
-                        return true;
-                    }));
-                }
-                foreach ($postFilesToUse as $pf) {
-                    if (!empty($pf['short_code']) && !isset($seenCodes[$pf['short_code']])) {
-                        $seenCodes[$pf['short_code']] = true;
-                        $filesToStream[] = $pf;
+                    // If matched files found, use them. Otherwise fall back to the
+                    // post's own files — but ONLY when the post has no year, or when
+                    // no file carries a year at all. If the post HAS a year and the
+                    // attached files all carry a DIFFERENT year, the post is
+                    // mis-tagged (e.g. "The Lovers 2026" with only 2017 files
+                    // attached); dumping them would show the wrong movie. In that
+                    // case we keep the list empty and let the search_files
+                    // supplement below try to find the correct-year releases.
+                    $seenCodes = [];
+                    if (!empty($matchedFiles)) {
+                        $postFilesToUse = $matchedFiles;
+                    } elseif ($postYear === null) {
+                        // No year on the post: keep the previous behaviour.
+                        $postFilesToUse = array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
+                    } else {
+                        // Post has a year. Keep only files that either carry the
+                        // matching year or carry no year at all (unlabelled files
+                        // are assumed to belong to the post).
+                        $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postYear) {
+                            $t = (string) ($f['title'] ?? '');
+                            if (fd_is_series_file($t, (string) ($f['caption'] ?? ''))) {
+                                return false;
+                            }
+                            if (preg_match('/\b(19\d\d|20\d\d)\b/', $t, $ym)) {
+                                return $ym[1] === $postYear;
+                            }
+                            return true;
+                        }));
                     }
-                }
+                    foreach ($postFilesToUse as $pf) {
+                        if (!empty($pf['short_code']) && !isset($seenCodes[$pf['short_code']])) {
+                            $seenCodes[$pf['short_code']] = true;
+                            $filesToStream[] = $pf;
+                        }
+                    }
 
-                // Also supplement with search_files variants (e.g. "selina s gold" vs "selinas gold" or "gol & gincu" vs "gol dan gincu")
-                // to make sure all available formats and release variants in Manticore are found!
-                if (!empty($cleanTitle)) {
-                    $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
-                    foreach ($searchVariants as $sv) {
-                        $sf = fd_fetch_stream_ajax('search_files', ['search' => $sv, 'limit' => 30]);
-                        if (is_array($sf) && !empty($sf['files'])) {
-                            foreach ($sf['files'] as $f) {
-                                if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
-                                $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                    // Also supplement with search_files variants (e.g. "selina s gold" vs "selinas gold" or "gol & gincu" vs "gol dan gincu")
+                    // to make sure all available formats and release variants in Manticore are found!
+                    if (!empty($cleanTitle)) {
+                        $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
+                        foreach ($searchVariants as $sv) {
+                            $sf = fd_fetch_stream_ajax('search_files', ['search' => $sv, 'limit' => 30]);
+                            if (is_array($sf) && !empty($sf['files'])) {
+                                foreach ($sf['files'] as $f) {
+                                    if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
 
-                                if (fd_is_series_file($fTitle, (string) ($f['caption'] ?? ''))) {
-                                    continue;
-                                }
-
-                                if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                                    if ($fym[1] !== $postYear) {
+                                    if (fd_is_series_file($fTitle, (string) ($f['caption'] ?? ''))) {
                                         continue;
                                     }
-                                }
 
-                                $cleanF = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                                $cleanFCompact = str_replace(' ', '', $cleanF);
-                                $allWords = true;
-                                foreach ($postWords as $pw) {
-                                    $pwStem = rtrim($pw, 's');
-                                    $hasMatch = str_contains($cleanF, $pw)
-                                        || (strlen($pwStem) >= 4 && str_contains($cleanF, $pwStem))
-                                        || str_contains($cleanFCompact, $pw);
-                                    if (!$hasMatch) {
-                                        $allWords = false;
-                                        break;
+                                    if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
+                                        if ($fym[1] !== $postYear) {
+                                            continue;
+                                        }
                                     }
-                                }
-                                if ($allWords) {
-                                    $seenCodes[$f['short_code']] = true;
-                                    $filesToStream[] = $f;
+
+                                    $cleanF = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
+                                    $cleanFCompact = str_replace(' ', '', $cleanF);
+                                    $allWords = true;
+                                    foreach ($postWords as $pw) {
+                                        $pwStem = rtrim($pw, 's');
+                                        $hasMatch = str_contains($cleanF, $pw)
+                                            || (strlen($pwStem) >= 4 && str_contains($cleanF, $pwStem))
+                                            || str_contains($cleanFCompact, $pw);
+                                        if (!$hasMatch) {
+                                            $allWords = false;
+                                            break;
+                                        }
+                                    }
+                                    if ($allWords) {
+                                        $seenCodes[$f['short_code']] = true;
+                                        $filesToStream[] = $f;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                foreach ($postFiles as $pf) {
-                    if (!empty($pf['short_code'])) {
-                        $filesToStream[] = $pf;
+                } else {
+                    foreach ($postFiles as $pf) {
+                        if (!empty($pf['short_code'])) {
+                            $filesToStream[] = $pf;
+                        }
                     }
                 }
             }
@@ -12128,34 +12163,66 @@ if ($isNuvioRoute) {
                 if ($targetSeason !== null && $targetEpisode !== null) {
                     $imdbEpisodeFilter = fd_episode_stream_filter($targetSeason, $targetEpisode);
 
-                    // 1. Exact Series Post Match: Try matching the title with year first (e.g. "Glory 2025")
-                    // This targets the exact post in 1 query instead of looping over 5 unrelated posts!
-                    $queriesToSearch = fd_build_search_query_variants($searchedTitle !== '' ? $searchedTitle : $searchQuery, $searchedYear);
-
-                    // Also try the AKA title (see the movie branch below).
-                    if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
-                        foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
-                            if (!in_array($akaQuery, $queriesToSearch, true)) {
-                                $queriesToSearch[] = $akaQuery;
-                            }
-                        }
+                    // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
+                    if ($searchedTitle !== '') {
+                        $filesToStream = fd_fetch_episode_stream_files(0, $targetSeason, $targetEpisode, 60, [
+                            'title' => $searchedTitle,
+                            'year' => $searchedYear,
+                        ]);
                     }
 
-                    $matchedPostId = null;
-                    $matchedPostData = null;
-                    foreach ($queriesToSearch as $sq) {
-                        $sp = fd_fetch_stream_ajax('search', ['search' => $sq, 'limit' => 5]);
-                        if (!is_array($sp) || empty($sp)) {
-                            continue;
+                    // Fallback to searching WordPress series posts only if fast path found 0 files
+                    if (empty($filesToStream)) {
+                        // Exact Series Post Match: Try matching the title with year first (e.g. "Glory 2025")
+                        // This targets the exact post in 1 query instead of looping over 5 unrelated posts!
+                        $queriesToSearch = fd_build_search_query_variants($searchedTitle !== '' ? $searchedTitle : $searchQuery, $searchedYear);
+
+                        // Also try the AKA title (see the movie branch below).
+                        if ($searchedAka !== '' && strcasecmp($searchedAka, $searchedTitle) !== 0) {
+                            foreach (fd_build_search_query_variants($searchedAka, $searchedYear) as $akaQuery) {
+                                if (!in_array($akaQuery, $queriesToSearch, true)) {
+                                    $queriesToSearch[] = $akaQuery;
+                                }
+                            }
                         }
 
-                        // Pass 1: exact year match
-                        if ($searchedYear !== '') {
-                            foreach ($sp as $p) {
-                                $pTitle = (string) ($p['title'] ?? '');
-                                $pId = $p['id'] ?? 0;
-                                if (!$pId) continue;
-                                if (preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] === $searchedYear) {
+                        $matchedPostId = null;
+                        $matchedPostData = null;
+                        foreach ($queriesToSearch as $sq) {
+                            $sp = fd_fetch_stream_ajax('search', ['search' => $sq, 'limit' => 5]);
+                            if (!is_array($sp) || empty($sp)) {
+                                continue;
+                            }
+
+                            // Pass 1: exact year match
+                            if ($searchedYear !== '') {
+                                foreach ($sp as $p) {
+                                    $pTitle = (string) ($p['title'] ?? '');
+                                    $pId = $p['id'] ?? 0;
+                                    if (!$pId) continue;
+                                    if (preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] === $searchedYear) {
+                                        $matchedPostId = (int) $pId;
+                                        $matchedPostData = $p;
+                                        break 2;
+                                    }
+                                }
+                            }
+
+                            // If no exact year match yet and we searched with year, try raw title query next
+                            if ($matchedPostId === null && $sq === "{$searchedTitle} {$searchedYear}") {
+                                continue;
+                            }
+
+                            // Pass 2: best candidate from search results
+                            if ($matchedPostId === null) {
+                                foreach ($sp as $p) {
+                                    $pTitle = (string) ($p['title'] ?? '');
+                                    $pId = $p['id'] ?? 0;
+                                    if (!$pId) continue;
+                                    // If searchedYear is known, avoid picking a post from a completely different year
+                                    if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] !== $searchedYear) {
+                                        continue;
+                                    }
                                     $matchedPostId = (int) $pId;
                                     $matchedPostData = $p;
                                     break 2;
@@ -12163,40 +12230,19 @@ if ($isNuvioRoute) {
                             }
                         }
 
-                        // If no exact year match yet and we searched with year, try raw title query next
-                        if ($matchedPostId === null && $sq === "{$searchedTitle} {$searchedYear}") {
-                            continue;
+                        if ($matchedPostId !== null) {
+                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 60, $matchedPostData);
                         }
 
-                        // Pass 2: best candidate from search results
-                        if ($matchedPostId === null) {
-                            foreach ($sp as $p) {
-                                $pTitle = (string) ($p['title'] ?? '');
-                                $pId = $p['id'] ?? 0;
-                                if (!$pId) continue;
-                                // If searchedYear is known, avoid picking a post from a completely different year
-                                if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $pTitle, $ym) && $ym[1] !== $searchedYear) {
-                                    continue;
-                                }
-                                $matchedPostId = (int) $pId;
-                                $matchedPostData = $p;
-                                break 2;
-                            }
-                        }
-                    }
-
-                    if ($matchedPostId !== null) {
-                        $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 60, $matchedPostData);
-                    }
-
-                    // Fallback: If no post matched or post returned 0 files, probe search_files directly
-                    if (count($filesToStream) === 0) {
-                        $epQuery = sprintf('%s S%02dE%02d', $searchQuery, $targetSeason, $targetEpisode);
-                        $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
-                        if (is_array($sf) && !empty($sf['files'])) {
-                            foreach ($sf['files'] as $f) {
-                                if ($imdbEpisodeFilter($f)) {
-                                    $filesToStream[] = $f;
+                        // Fallback: If no post matched or post returned 0 files, probe search_files directly
+                        if (count($filesToStream) === 0) {
+                            $epQuery = sprintf('%s S%02dE%02d', $searchQuery, $targetSeason, $targetEpisode);
+                            $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
+                            if (is_array($sf) && !empty($sf['files'])) {
+                                foreach ($sf['files'] as $f) {
+                                    if ($imdbEpisodeFilter($f)) {
+                                        $filesToStream[] = $f;
+                                    }
                                 }
                             }
                         }

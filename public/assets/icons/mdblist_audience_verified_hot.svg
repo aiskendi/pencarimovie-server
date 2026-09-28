@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-label="Verified Hot">
+  <circle cx="40" cy="40" r="38" fill="#f7f7f7"/>
+  <path d="M18 31h44v31H18z" fill="#ef3f30"/>
+  <path d="M18 31h44l-7-10H25z" fill="#f5c34a"/>
+  <path d="M25 21h30" stroke="#fff" stroke-linecap="round" stroke-width="4"/>
+  <path d="M29 31v31M40 31v31M51 31v31" stroke="#fff" stroke-opacity=".8" stroke-width="4"/>
+  <path d="m25 46 9 9 20-21" fill="none" stroke="#00912d" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+</svg>

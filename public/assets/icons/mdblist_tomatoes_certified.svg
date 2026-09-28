@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-label="Certified Fresh">
+  <circle cx="40" cy="40" r="38" fill="#f7f7f7"/>
+  <path d="M17 31c-4 11 1 29 20 32 18 3 29-10 26-27-2-12-12-18-25-16-10-8-18 1-21 11Z" fill="#fa320a"/>
+  <path d="M39 20c4-8 12-12 20-9-3 3-6 6-6 11-6-3-10-2-14-2Z" fill="#00912d"/>
+  <path d="m29 40 7 7 16-17" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M11 66h58" stroke="#3dad55" stroke-linecap="round" stroke-width="5"/>
+</svg>

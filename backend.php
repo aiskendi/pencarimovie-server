@@ -5866,8 +5866,8 @@ function fd_is_series_file(string $title, string $caption = ''): bool
         }
     }
 
-    // 1. Explicit SxxExx or Sxx.Exx / SxxEPxx / SxxEpxx / SxxE01-E14
-    if (preg_match('/(?:^|[^a-z0-9])S\d{1,2}\s*[ ._-]*E(?:P|PS|PISODE)?\s*[ ._-]*\d{1,4}(?:[^a-z0-9]|$)/i', $text)) {
+    // 1. Explicit SxxExx or Sxx.Exx / SxxEPxx / SxxEpxx / SxxE01-E14 / S02E12E13
+    if (preg_match('/(?:^|[^a-z0-9])S\d{1,2}\s*[ ._-]*(?:E(?:P|PS|PISODE)?\s*[ ._-]*\d{1,4})+/i', $text)) {
         return true;
     }
     // 2. Explicit 1x05 / 01x12
@@ -5894,6 +5894,241 @@ function fd_is_series_file(string $title, string $caption = ''): bool
     }
     // 6. Isolated S01, S02 (e.g. Title.S01.1080p, Show S1 Complete)
     if (preg_match('/(?:^|[^a-z0-9])S(\d{1,2})(?=[ ._\[\(-]+(?:2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|web|bluray|hdtv|complete|batch|ongoing|x264|x265|hevc)|$)/i', $text)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Strict Movie Title & Year Matcher:
+ * Ensures only files matching the actual movie title and year are accepted,
+ * preventing cross-matching unrelated movies (e.g. "Just You & Me with Charlie Laine"
+ * when searching "You with Me 2017", or "Blade Runner 2049" when searching "Runner 2026").
+ */
+function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, string $searchedYear = '', string $searchedAka = '', string $fileCaption = ''): bool
+{
+    if (fd_is_series_file($fileTitle, $fileCaption)) {
+        return false;
+    }
+
+    $searchedTitle = trim($searchedTitle);
+    if ($searchedTitle === '') {
+        return true;
+    }
+
+    // 1. Strict Year check if year is known
+    $searchedYear = trim($searchedYear);
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    if ($searchedYear !== '' && $hasFileYear) {
+        $fileYear = (int) $fym[1];
+        $targetYear = (int) $searchedYear;
+        if (abs($fileYear - $targetYear) > 1) {
+            return false;
+        }
+    }
+
+    // 2. Prepare normalized target title variants
+    $cleanTarget = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedTitle));
+    $cleanTarget = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanTarget);
+    if ($searchedYear !== '') {
+        $cleanTarget = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanTarget);
+    }
+    $cleanTarget = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTarget));
+    $cleanTarget = trim(preg_replace('/\s+/', ' ', $cleanTarget));
+    $targetLower = strtolower($cleanTarget);
+    if ($targetLower === '') {
+        $targetLower = strtolower(trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $searchedTitle)));
+    }
+    $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
+
+    // Prepare AKA target if provided
+    $akaLower = '';
+    $akaNoThe = '';
+    if ($searchedAka !== '') {
+        $cleanAka = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedAka));
+        $cleanAka = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanAka);
+        if ($searchedYear !== '') {
+            $cleanAka = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanAka);
+        }
+        $cleanAka = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanAka));
+        $cleanAka = trim(preg_replace('/\s+/', ' ', $cleanAka));
+        $akaLower = strtolower($cleanAka);
+        $akaNoThe = trim(preg_replace('/^the\s+/i', '', $akaLower));
+    }
+
+    // 3. Clean filename to extract the movie title portion before release tags and year
+    $fClean = fd_clean_media_title($fileTitle);
+    // Strip leading release channels/groups/tags
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi)\s+/i', '', $fClean);
+    $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
+    $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
+
+    // 4. Strip split-part indicators (e.g. part001, part 1 of chunks, .001) before title extraction
+    $fWithoutSplit = preg_replace('/[._\s-]part[._\s-]*0*\d{1,4}/i', '', $fCleanNorm);
+    $fWithoutSplit = preg_replace('/\.(?:mp4|mkv|avi|mov|ts|flv|wmv)\.0*\d{1,4}$/i', '', $fWithoutSplit);
+
+    // 5. Strip release tags and everything following
+    $baseF = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|ts|tc|r5|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $fWithoutSplit);
+    // Strip year and anything following
+    $baseF = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseF);
+    // Strip common movie edition and language/subtitle suffixes
+    $baseF = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion|sub\s*malay|malay\s*sub|eng\s*sub|sub\s*eng|indosub|sub\s*indo|subtitle|dubbed|multi\s*audio|clean\s*audio|hc|hardsub)\b.*/i', '', $baseF);
+    // Strip video container extensions if remaining
+    $baseF = preg_replace('/\b(?:mp4|mkv|avi|mov|ts|flv|wmv)\b/i', '', $baseF);
+    $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
+
+    // Strip leading country code or uploader handle prefix if immediately followed by target title (e.g. "PH.You.With.Me..." or "imnirvan.You.with.me...")
+    if ($targetNoThe !== '') {
+        $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in|[a-z0-9_]{3,15})\s+(?=' . preg_quote($targetNoThe, '/') . ')/i', '', $baseF);
+        if ($akaNoThe !== '') {
+            $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in|[a-z0-9_]{3,15})\s+(?=' . preg_quote($akaNoThe, '/') . ')/i', '', $baseF);
+        }
+    }
+    $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
+    $baseFNoThe = trim(preg_replace('/^the\s+/i', '', $baseF));
+
+    // 6. Strict Sequel Guard: Do not match sequels (e.g. "Avatar 2", "Chapter 2", "Part II") when search query is original title
+    $isSequelSearched = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5|6|7|8|9)\b|chapter\s*\d+)\b/i', $targetLower);
+    $isSequelFile = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5|6|7|8|9)\b|chapter\s*\d+)\b/i', $baseF);
+    if (!$isSequelSearched && $isSequelFile) {
+        return false;
+    }
+
+    // 7. Direct comparison between base filename title and target
+    if ($baseF !== '') {
+        if ($baseF === $targetLower || $baseFNoThe === $targetNoThe || $baseF === "the {$targetLower}") {
+            return true;
+        }
+        if ($akaLower !== '' && ($baseF === $akaLower || $baseFNoThe === $akaNoThe || $baseF === "the {$akaLower}")) {
+            return true;
+        }
+    }
+
+    // 8. Check with ampersand / dan / and / possessive variants
+    $targetVariants = [
+        str_replace(' and ', ' dan ', $targetLower),
+        str_replace(' dan ', ' and ', $targetLower),
+        str_replace(' and ', ' ', $targetLower),
+        str_replace(' dan ', ' ', $targetLower),
+        rtrim($targetLower, 's'),
+    ];
+    if (in_array($baseF, $targetVariants, true) || in_array($baseFNoThe, $targetVariants, true)) {
+        return true;
+    }
+
+    // 9. When year matches, allow exact word sequence match if all words match and extraneous words are minimal
+    if ($hasFileYear && $searchedYear !== '') {
+        $targetWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'and', 'dan', 'of', 'in', 'on', 'at'], true)));
+        if (!empty($targetWords)) {
+            $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
+            // Check if baseF contains all target words in proper proximity with no large alien title prefixes
+            $allWordsFound = true;
+            foreach ($targetWords as $tw) {
+                if (!in_array($tw, $fWords, true) && !str_contains($baseF, $tw)) {
+                    $allWordsFound = false;
+                    break;
+                }
+            }
+            if ($allWordsFound && count($fWords) <= count($targetWords) + 2) {
+                // Check that it doesn't start with unrelated prefix words like "just ..."
+                $firstTargetWord = $targetWords[0];
+                if (isset($fWords[0]) && ($fWords[0] === $firstTargetWord || $fWords[0] === 'the')) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Strict Series Episode Title & Season/Episode Matcher:
+ * Ensures only files matching the actual series title, season, and episode are accepted,
+ * preventing cross-matching unrelated series with overlapping keywords (e.g. "You Are My Glory"
+ * vs "Glory", or "Song of Glory" vs "The Glory").
+ */
+function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = ''): bool
+{
+    // 1. Must match target season and episode
+    $parsed = fd_classify_season_episode($fileTitle, $season, $episode, $fileCaption);
+    if (!fd_file_matches_episode($parsed, $season, $episode)) {
+        return false;
+    }
+
+    $seriesTitle = trim($seriesTitle);
+    if ($seriesTitle === '') {
+        return true;
+    }
+
+    // 2. Strict Year check if year is specified on the series and present on the file
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    if ($seriesYear !== '' && $hasFileYear) {
+        $fileYear = (int) $fym[1];
+        $targetYear = (int) $seriesYear;
+        if (abs($fileYear - $targetYear) > 1) {
+            return false;
+        }
+    }
+
+    // 3. Normalize series title
+    $cleanSeries = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($seriesTitle));
+    $cleanSeries = preg_replace('/\b(?:tvseries|series|season|musim|drama|episode|bahagian)\b.*/i', '', $cleanSeries);
+    if ($seriesYear !== '') {
+        $cleanSeries = preg_replace('/\b' . preg_quote($seriesYear, '/') . '\b/', ' ', $cleanSeries);
+    }
+    $cleanSeries = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanSeries));
+    $cleanSeries = trim(preg_replace('/\s+/', ' ', $cleanSeries));
+    $targetLower = strtolower($cleanSeries);
+    if ($targetLower === '') {
+        $targetLower = strtolower(trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $seriesTitle)));
+    }
+    $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
+
+    // 4. Extract series title portion from filename before episode/season markers and quality tags
+    $fClean = fd_clean_media_title($fileTitle);
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid)\s+/i', '', $fClean);
+    $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
+    $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
+
+    // Strip season/episode markers and everything after
+    $baseF = preg_replace('/(?:s\d{1,2}\s*[ ._-]*e(?:p|ps|pisode)?\s*\d{1,4}|(?<![a-z0-9])e(?:p|ps|pisode)?\s*\d{1,4}|\b\d{1,2}x\d{1,4}\b|season\s*\d+|musim\s*\d+|bahagian\s*\d+|part\s*\d+).*/i', '', $fCleanNorm);
+    // Strip release tags
+    $baseF = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|ts|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $baseF);
+    // Strip year
+    $baseF = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseF);
+    $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
+    $baseFNoThe = trim(preg_replace('/^the\s+/i', '', $baseF));
+
+    // 5. Check leading "The " compatibility
+    $hasLeadingThe = str_starts_with($targetLower, 'the ');
+    $fileHasLeadingThe = str_starts_with($baseF, 'the ');
+    if (!$hasLeadingThe && $fileHasLeadingThe) {
+        if ($seriesYear !== '' && preg_match('/\b(2022|2023|2024|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fileTitle)) {
+            return false;
+        }
+    }
+
+    // 6. Compare base filename title with target series title
+    if ($baseF !== '') {
+        if ($baseF === $targetLower || ($hasLeadingThe && $baseFNoThe === $targetNoThe) || (!$hasLeadingThe && !$fileHasLeadingThe && $baseF === $targetLower)) {
+            return true;
+        }
+        if (!$hasLeadingThe && $fileHasLeadingThe && $baseFNoThe === $targetNoThe && $seriesYear === '') {
+            return true;
+        }
+    }
+
+    // 7. Check with ampersand / and / dan / possessive variants
+    $targetVariants = [
+        str_replace(' and ', ' dan ', $targetLower),
+        str_replace(' dan ', ' and ', $targetLower),
+        str_replace(' and ', ' ', $targetLower),
+        str_replace(' dan ', ' ', $targetLower),
+        rtrim($targetLower, 's'),
+    ];
+    if (in_array($baseF, $targetVariants, true) || in_array($baseFNoThe, $targetVariants, true)) {
         return true;
     }
 
@@ -6353,7 +6588,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, $postYear, $keyword, $fullTitle): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, $postYear, $keyword, $fullTitle, $season, $episode): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -6368,75 +6603,12 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
 
             $fTitle = (string) ($file['title'] ?? '');
 
-            // 1. Strict Year Guard: If file specifies a 4-digit year that contradicts post year, skip!
-            // E.g. Post is Glory 2025, but file has 2022 -> reject. Post is The Glory 2022, file has 2025 -> reject.
-            // Exception: Allow +/-1 year tolerance if the entire title keywords match (e.g. series released Jan 2026 where uploaders labeled E01/E02 as 2025).
-            if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                $fileYear = (int) $fym[1];
-                $targetYear = (int) $postYear;
-                if ($fileYear !== $targetYear) {
-                    $yearDiff = abs($fileYear - $targetYear);
-                    $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                    $cleanPostWords = array_values(array_filter(explode(' ', strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$keyword))), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan', 'a', 'an', 'no', 'di', 'ke', 'dari', 'yang', 's'], true)));
-                    $allWordsMatch = !empty($cleanPostWords);
-                    foreach ($cleanPostWords as $pw) {
-                        $pwStem = rtrim($pw, 's');
-                        if (!str_contains($cleanFTitle, $pw) && (strlen($pwStem) < 3 || !str_contains($cleanFTitle, $pwStem))) {
-                            $allWordsMatch = false;
-                            break;
-                        }
-                    }
-                    if ($yearDiff > 1 || !$allWordsMatch) {
-                        continue;
-                    }
-                }
-            }
-
-            // 2. Content-word match: ensure all key title words (e.g. "spring" and "blade") exist in filename
-            $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-            $contentWords = array_values(array_filter(explode(' ', strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$keyword))), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan', 'a', 'an', 'no', 'di', 'ke', 'dari', 'yang', 's'], true)));
-            if (count($contentWords) >= 2) {
-                $hasAllContent = true;
-                foreach ($contentWords as $cw) {
-                    $cwStem = rtrim($cw, 's');
-                    if (!str_contains($cleanFTitle, $cw) && (strlen($cwStem) < 3 || !str_contains($cleanFTitle, $cwStem))) {
-                        $hasAllContent = false;
-                        break;
-                    }
-                }
-                if (!$hasAllContent) {
-                    continue;
-                }
-            }
-
-            // 3. Strict Franchise / Title Guard for short titles:
-            // Prevents "Glory" from matching unrelated titles like "You Are My Glory", "Gold Rush Our Race to Olympic Glory", etc.
-            $cleanKw = strtolower(trim($keyword));
-            if (strlen($cleanKw) >= 2) {
-                $normFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                $normFTitle = preg_replace('/\b(on9|stream|rilisanfilm|dailymaci|kdramashubs|wetv|pahe|galaxy|fanszz|dramaost|mkvdrama|dusklight|primefix|moviesmod|vegamovies|mkvcinemas|nodrakorid)\b/', ' ', $normFTitle);
-                $normFTitle = trim(preg_replace('/\s+/', ' ', $normFTitle));
-
-                if ($cleanKw === 'glory') {
-                    if (preg_match('/\b(?:my|olympic|special forces|cage of|song of|road to|power and the|greater|for the|tunes of|morning|race for|mad dog and)\s+glory\b/i', $normFTitle)) {
-                        continue;
-                    }
-                    // Differentiate Glory 2025 (Chinese series) from The Glory 2022 (Korean Netflix series)
-                    if ($postYear === '2025') {
-                        if (preg_match('/\b(2022|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fTitle) && !str_contains($fTitle, '2025')) {
-                            continue;
-                        }
-                    } elseif ($postYear === '2022') {
-                        if (preg_match('/\b(2025|wetv|dusklight|layarkeren)\b/i', $fTitle) && !str_contains($fTitle, '2022')) {
-                            continue;
-                        }
-                    }
-                }
-                if (!str_starts_with(strtolower($fullTitle), 'the ') && str_starts_with($normFTitle, 'the ') && $postYear !== null) {
-                    if (preg_match('/\b(2022|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fTitle) && !str_contains($fTitle, (string)$postYear)) {
-                        continue;
-                    }
-                }
+            // Strict Series Episode Title & Year Guard:
+            // Ensure the file title accurately matches the target series name, season, and episode.
+            $fCaption = (string) ($file['caption'] ?? '');
+            $seriesTitleToMatch = $fullTitle !== '' ? $fullTitle : (string) $keyword;
+            if (!fd_series_file_matches_title($fTitle, $seriesTitleToMatch, $season, $episode, (string) ($postYear ?? ''), $fCaption)) {
+                continue;
             }
 
             $seen[$code] = true;
@@ -12116,13 +12288,24 @@ if ($isNuvioRoute) {
             }
             // Fast Path 2: Movie requested via post ID
             elseif ($itemType === 'movie') {
+                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+                $postTitle = $post['title'] ?? '';
+                $postYear = '';
+                if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+                    $postYear = $ym[1];
+                }
+                $searchedTitle = $postTitle;
+                $searchedYear = $postYear;
+
                 $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie&limit=60";
                 $res = fd_http_json($mUrl, [], 'GET', 10);
                 if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
                     foreach ($res['items'] as $f) {
                         $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                         $fCaption = (string) ($f['caption'] ?? '');
-                        if (!fd_is_series_file($fTitle, $fCaption)) {
+                        // Strict title and year check to prevent unrelated files from leaking into movie streams
+                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
                             $filesToStream[] = $f;
                         }
                     }
@@ -12130,9 +12313,11 @@ if ($isNuvioRoute) {
             }
 
             if (empty($filesToStream)) {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-                $postTitle = $post['title'] ?? '';
+                if (empty($postData)) {
+                    $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                    $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+                    $postTitle = $post['title'] ?? '';
+                }
 
                 $postFiles = fd_fetch_post_files_paged($postId, [
                     'page_size' => 50,
@@ -12153,81 +12338,28 @@ if ($isNuvioRoute) {
                     }
                     $cleanTitle = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTitle));
                     $cleanTitle = trim(preg_replace('/\s+/', ' ', $cleanTitle));
-                    $postWords = array_values(array_filter(explode(' ', strtolower($cleanTitle)), fn($w) => strlen($w) > 1 && !in_array($w, ['dan', 'and', 'the'], true)));
 
                     $matchedFiles = [];
                     foreach ($postFiles as $pf) {
                         if (empty($pf['short_code'])) continue;
                         $fTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
+                        $fCap = (string) ($pf['caption'] ?? '');
 
-                        // Exclude series episodes from movie streams
-                        if (fd_is_series_file($fTitle, (string) ($pf['caption'] ?? ''))) {
-                            continue;
+                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
+                            $matchedFiles[] = $pf;
                         }
-
-                        // Strict year match if both post and file specify a year
-                        if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                            if ($fym[1] !== $postYear) {
-                                continue;
-                            }
-                        }
-
-                        // Strict title word match (supports stem/plural variants e.g. selina vs selinas vs selina's)
-                        $cleanFTitle = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                        $cleanFTitleCompact = str_replace(' ', '', $cleanFTitle);
-                        $wordsMatch = true;
-                        foreach ($postWords as $pw) {
-                            $pwStem = rtrim($pw, 's');
-                            $hasMatch = str_contains($cleanFTitle, $pw)
-                                || (strlen($pwStem) >= 4 && str_contains($cleanFTitle, $pwStem))
-                                || str_contains($cleanFTitleCompact, $pw);
-                            if (!$hasMatch) {
-                                $wordsMatch = false;
-                                break;
-                            }
-                        }
-                        if (!$wordsMatch) {
-                            continue;
-                        }
-
-                        // Exclude sequels / franchise parts unless this file is a split chunk (e.g. part001/005, .001)
-                        if (!preg_match('/\b(part\s*\d+|part\s*[ivx]+|\d+)\b/i', $cleanTitle)) {
-                            $isSplitPart = preg_match('/[._\s-]part[._\s-]*0*\d{1,4}/i', $fTitle) || preg_match('/\.(?:mp4|mkv)\.0*\d{1,4}$/i', $fTitle);
-                            if (!$isSplitPart && preg_match('/\b(part\s*\d+|part\s*[ivx]+)\b/i', $fTitle)) {
-                                continue;
-                            }
-                        }
-
-                        $matchedFiles[] = $pf;
                     }
 
-                    // If matched files found, use them. Otherwise fall back to the
-                    // post's own files — but ONLY when the post has no year, or when
-                    // no file carries a year at all. If the post HAS a year and the
-                    // attached files all carry a DIFFERENT year, the post is
-                    // mis-tagged (e.g. "The Lovers 2026" with only 2017 files
-                    // attached); dumping them would show the wrong movie. In that
-                    // case we keep the list empty and let the search_files
-                    // supplement below try to find the correct-year releases.
                     $seenCodes = [];
                     if (!empty($matchedFiles)) {
                         $postFilesToUse = $matchedFiles;
                     } elseif ($postYear === null) {
-                        // No year on the post: keep the previous behaviour.
                         $postFilesToUse = array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
                     } else {
-                        // Post has a year. Keep only files that either carry the
-                        // matching year or carry no year at all (unlabelled files
-                        // are assumed to belong to the post).
-                        $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postYear) {
+                        $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postTitle, $postYear) {
                             $t = (string) ($f['title'] ?? '');
-                            if (fd_is_series_file($t, (string) ($f['caption'] ?? ''))) {
-                                return false;
-                            }
-                            if (preg_match('/\b(19\d\d|20\d\d)\b/', $t, $ym)) {
-                                return $ym[1] === $postYear;
-                            }
-                            return true;
+                            $c = (string) ($f['caption'] ?? '');
+                            return fd_movie_file_matches_title($t, $postTitle, $postYear, '', $c);
                         }));
                     }
                     foreach ($postFilesToUse as $pf) {
@@ -12237,8 +12369,7 @@ if ($isNuvioRoute) {
                         }
                     }
 
-                    // Also supplement with search_files variants (e.g. "selina s gold" vs "selinas gold" or "gol & gincu" vs "gol dan gincu")
-                    // to make sure all available formats and release variants in Manticore are found!
+                    // Supplement with search_files variants using strict movie file matching
                     if (!empty($cleanTitle)) {
                         $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
                         foreach ($searchVariants as $sv) {
@@ -12247,31 +12378,9 @@ if ($isNuvioRoute) {
                                 foreach ($sf['files'] as $f) {
                                     if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCap = (string) ($f['caption'] ?? '');
 
-                                    if (fd_is_series_file($fTitle, (string) ($f['caption'] ?? ''))) {
-                                        continue;
-                                    }
-
-                                    if ($postYear !== null && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                                        if ($fym[1] !== $postYear) {
-                                            continue;
-                                        }
-                                    }
-
-                                    $cleanF = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                                    $cleanFCompact = str_replace(' ', '', $cleanF);
-                                    $allWords = true;
-                                    foreach ($postWords as $pw) {
-                                        $pwStem = rtrim($pw, 's');
-                                        $hasMatch = str_contains($cleanF, $pw)
-                                            || (strlen($pwStem) >= 4 && str_contains($cleanF, $pwStem))
-                                            || str_contains($cleanFCompact, $pw);
-                                        if (!$hasMatch) {
-                                            $allWords = false;
-                                            break;
-                                        }
-                                    }
-                                    if ($allWords) {
+                                    if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
                                         $seenCodes[$f['short_code']] = true;
                                         $filesToStream[] = $f;
                                     }
@@ -12514,103 +12623,19 @@ if ($isNuvioRoute) {
                     }
 
                     // Strict Movie Title & Year Guard: prevent cross-matching different titles
-                    // (e.g. "Runner 2026" vs "The Runner 2026", "Late Runner 2026", "Blade Runner 2049")
+                    // (e.g. "Runner 2026" vs "The Runner 2026", "Late Runner 2026", "Blade Runner 2049",
+                    // or "You with Me 2017" vs "Just You & Me with Charlie Laine")
                     if (!empty($filesToStream) && $searchedTitle !== '') {
-                        $cleanBaseTitle = fd_stream_keyword_from_post_title($searchedTitle);
-                        if ($cleanBaseTitle === '') $cleanBaseTitle = $searchedTitle;
-                        $cleanSearched = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanBaseTitle));
-                        $cleanSearched = trim(preg_replace('/\s+/', ' ', $cleanSearched));
-                        $searchedLower = strtolower($cleanSearched);
-                        $hasLeadingThe = str_starts_with($searchedLower, 'the ');
-
-                        $cleanAkaBase = $searchedAka !== '' ? fd_stream_keyword_from_post_title($searchedAka) : '';
-                        $akaLower = $cleanAkaBase !== '' ? strtolower(trim(preg_replace('/\s+/', ' ', preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanAkaBase)))) : '';
-
                         $filteredMovieFiles = [];
                         foreach ($filesToStream as $mf) {
-                            $fTitle = $mf['title'] ?? '';
-                            $fCaption = $mf['caption'] ?? '';
+                            $fTitle = (string) ($mf['title'] ?? '');
+                            $fCaption = (string) ($mf['caption'] ?? '');
 
-                            // Never allow series files in movie streams
-                            if (fd_is_series_file($fTitle, $fCaption)) {
-                                continue;
+                            if (fd_movie_file_matches_title($fTitle, $searchedTitle, $searchedYear, $searchedAka, $fCaption)) {
+                                $filteredMovieFiles[] = $mf;
                             }
-
-                            // 1. Year check: allow ±1 year tolerance, or ±2 years if all words match
-                            if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $fTitle, $fym)) {
-                                $fileYear = (int) $fym[1];
-                                $targetYear = (int) $searchedYear;
-                                if (abs($fileYear - $targetYear) > 2) {
-                                    continue;
-                                }
-                            }
-
-                            // 2. Normalize filename to extract the movie title portion before release tags/year
-                            $cleanF = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fTitle));
-                            $cleanF = trim(preg_replace('/\s+/', ' ', $cleanF));
-
-                            // 3. Strict Sequel Guard: Do not match sequels (e.g. "Part II", "Part 2", "Chapter 2") when searching original title
-                            $isSequelSearched = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5)\b|chapter\s*\d+)\b/i', $searchedLower);
-                            $isSequelFile = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5)\b|chapter\s*\d+)\b/i', $cleanF);
-                            if (!$isSequelSearched && $isSequelFile) {
-                                continue;
-                            }
-
-                            // Strip release tags (1080p, bluray, etc.)
-                            $baseF = preg_replace('/\b(2160p|1080p|720p|480p|360p|4k|fhd|hd|sd|bluray|web-?dl|webrip|hdrip|hdtv|cam|hevc|x264|x265|aac.*|lubokvideo|yts|lulustream)\b.*/i', '', $cleanF);
-                            // Strip year and anything following
-                            $baseF = preg_replace('/\b(19\d\d|20\d\d)\b.*/', '', $baseF);
-                            $baseF = trim($baseF);
-
-                            // Strip common movie edition suffixes
-                            $baseF = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion)\b.*/i', '', $baseF);
-                            $baseF = trim($baseF);
-
-                            // Strip leading release channels/groups (e.g. "prakytv the runner" -> "the runner", "studioghibli spirited away" -> "spirited away")
-                            $baseF = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu)\s+/i', '', $baseF);
-
-                            // Match either the searched title or the AKA title
-                            $matchesPrimary = ($baseF === $searchedLower || $baseF === "the {$searchedLower}");
-                            if (!$hasLeadingThe && str_starts_with($baseF, 'the ')) {
-                                $matchesPrimary = false;
-                            }
-                            if ($hasLeadingThe && !str_starts_with($baseF, 'the ') && $baseF === substr($searchedLower, 4)) {
-                                $matchesPrimary = false;
-                            }
-
-                            $matchesAka = false;
-                            if ($akaLower !== '') {
-                                $matchesAka = ($baseF === $akaLower || $baseF === "the {$akaLower}" || str_contains($cleanF, $akaLower));
-                            }
-
-                            if (!$matchesPrimary && !$matchesAka) {
-                                // Also allow matching if the full title is a clean exact prefix or token match
-                                if (str_starts_with($cleanF, $searchedLower . ' ') || $cleanF === $searchedLower) {
-                                    $matchesPrimary = true;
-                                }
-                            }
-
-                            if (!$matchesPrimary && !$matchesAka) {
-                                continue;
-                            }
-
-                            $filteredMovieFiles[] = $mf;
                         }
 
-                        // If the strict guard found exact matches, use them.
-                        //
-                        // Otherwise: when a year is known, the guard rejected
-                        // every candidate because none matched that year — the
-                        // post is mis-tagged (e.g. "The Lovers 2026" whose only
-                        // indexed files are "The Lovers 2017"). Falling back to
-                        // the unfiltered list here would re-introduce exactly
-                        // the wrong-year files the guard just rejected, so we
-                        // keep the list empty and show "No Streams Found"
-                        // instead of the wrong movie.
-                        //
-                        // Only when NO year is known do we fall back to the
-                        // unfiltered list (minus series files), preserving the
-                        // previous behaviour for year-less titles.
                         if (!empty($filteredMovieFiles)) {
                             $filesToStream = $filteredMovieFiles;
                         } elseif ($searchedYear === '') {
@@ -15114,6 +15139,14 @@ if ($full && str_starts_with($full, realpath($publicDir)) && is_file($full)) {
         'json' => 'application/json; charset=utf-8',
         'svg' => 'image/svg+xml; charset=utf-8',
         'ico' => 'image/x-icon',
+        'png' => 'image/png',
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'webp' => 'image/webp',
+        'woff' => 'font/woff',
+        'woff2' => 'font/woff2',
+        'ttf' => 'font/ttf',
+        'wasm' => 'application/wasm',
     ];
     header('Content-Type: ' . ($types[$ext] ?? 'application/octet-stream'));
     header('Cache-Control: no-store');

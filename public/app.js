@@ -86,6 +86,9 @@ class PencariMovieApp {
   // ══════════════════════════════════════════════════════════════
 
   async init() {
+    window.showSettingsGate = (opts) => this.showSettingsGate(opts);
+    window.openAddonModal = () => this.openAddonModal?.();
+    this._hideLoadingScreen();
     this.detectTelegram();
     this.bindGlobalEvents();
 
@@ -309,7 +312,7 @@ class PencariMovieApp {
     }
 
     // ── Settings gate ──
-    this.$('#connectBtn').addEventListener('click', () => {
+    this.$('#connectBtn')?.addEventListener('click', () => {
       this.saveSettings().catch((err) => {
         const el = this.$('#settingsStatus');
         if (el) el.textContent = 'Error: ' + err.message;
@@ -319,19 +322,20 @@ class PencariMovieApp {
     const afterLogout = () => {
       this.clearSession().then(() => {
         this._clearCachedSession();
-        this.$('#botTokenInput').value = '';
+        const bti = this.$('#botTokenInput');
+        if (bti) bti.value = '';
         this.showSettingsGate();
       });
     };
 
-    this.$('#logoutBtn').addEventListener('click', afterLogout);
-    this.$('#settingsDisconnectBtn').addEventListener('click', afterLogout);
+    this.$('#logoutBtn')?.addEventListener('click', afterLogout);
+    this.$('#settingsDisconnectBtn')?.addEventListener('click', afterLogout);
 
-    this.$('#settingsClose').addEventListener('click', () => {
+    this.$('#settingsClose')?.addEventListener('click', () => {
       this.closeSettingsGate();
     });
 
-    this.$('#settingsBtn').addEventListener('click', () => {
+    this.$('#settingsBtn')?.addEventListener('click', () => {
       this.showSettingsGate();
     });
 
@@ -1281,6 +1285,7 @@ class PencariMovieApp {
       }
     };
     this.openAddonModal = openAddonModal;
+    window.openAddonModal = openAddonModal;
 
     if (addonBtn) {
       addonBtn.addEventListener('click', openAddonModal);
@@ -1291,6 +1296,22 @@ class PencariMovieApp {
       settingsOpenAddonBtn.addEventListener('click', () => {
         this.closeSettingsGate();
         openAddonModal();
+      });
+    }
+
+    const settingsSwitchToAddonBtn = this.$('#settingsSwitchToAddonBtn');
+    if (settingsSwitchToAddonBtn) {
+      settingsSwitchToAddonBtn.addEventListener('click', () => {
+        this.closeSettingsGate();
+        openAddonModal();
+      });
+    }
+
+    const addonSwitchToSettingsBtn = this.$('#addonSwitchToSettingsBtn');
+    if (addonSwitchToSettingsBtn) {
+      addonSwitchToSettingsBtn.addEventListener('click', () => {
+        closeAddonModal();
+        this.showSettingsGate({ forceToken: false });
       });
     }
 
@@ -1515,34 +1536,34 @@ class PencariMovieApp {
     this.bindTunnelControls();
 
     // Allow Enter key on token input
-    this.$('#botTokenInput').addEventListener('keydown', (e) => {
+    this.$('#botTokenInput')?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
-        this.$('#connectBtn').click();
+        this.$('#connectBtn')?.click();
       }
     });
 
     // ── Nav ──
-    this.$('#streamSearchBtn').addEventListener('click', () => this.openSearch());
-    this.$('#streamHamburger').addEventListener('click', () => this.openMobileNav());
+    this.$('#streamSearchBtn')?.addEventListener('click', () => this.openSearch());
+    this.$('#streamHamburger')?.addEventListener('click', () => this.openMobileNav());
 
     // ── Search overlay ──
-    this.$('#searchOverlayBack').addEventListener('click', () => this.closeSearch());
-    this.$('#searchInput').addEventListener('input', (e) => {
+    this.$('#searchOverlayBack')?.addEventListener('click', () => this.closeSearch());
+    this.$('#searchInput')?.addEventListener('input', (e) => {
       clearTimeout(this.searchTimeout);
       const query = e.target.value.trim();
       if (query.length < 2) {
-        this.$('#searchResults').classList.add('hidden');
-        this.$('#searchEmpty').classList.add('hidden');
-        this.$('#searchSuggestions').classList.remove('hidden');
+        this.$('#searchResults')?.classList.add('hidden');
+        this.$('#searchEmpty')?.classList.add('hidden');
+        this.$('#searchSuggestions')?.classList.remove('hidden');
         return;
       }
       this.searchTimeout = setTimeout(() => this.doSearch(query), 400);
     });
 
     // ── Modal ──
-    this.$('#modalBackdrop').addEventListener('click', () => this.closeModal());
-    this.$('#modalClose').addEventListener('click', () => this.closeModal());
+    this.$('#modalBackdrop')?.addEventListener('click', () => this.closeModal());
+    this.$('#modalClose')?.addEventListener('click', () => this.closeModal());
 
     // ── Hero CTA (scroll fallback for non-JS navigation) ──
     const heroCta = this.$('#heroCta');
@@ -1553,14 +1574,14 @@ class PencariMovieApp {
     }
 
     // ── File Detail ──
-    this.$('#fileDetailBack').addEventListener('click', () => this.closeFileDetail());
-    this.$('#fileDetailBackdrop').addEventListener('click', () => this.closeFileDetail());
-    this.$('#fileDetailStreamBtn').addEventListener('click', () => {
-      const url = this.$('#fileDetailStreamBtn').getAttribute('data-url');
+    this.$('#fileDetailBack')?.addEventListener('click', () => this.closeFileDetail());
+    this.$('#fileDetailBackdrop')?.addEventListener('click', () => this.closeFileDetail());
+    this.$('#fileDetailStreamBtn')?.addEventListener('click', () => {
+      const url = this.$('#fileDetailStreamBtn')?.getAttribute('data-url');
       if (url) window.open(url, '_blank');
     });
-    this.$('#fileDetailDownloadBtn').addEventListener('click', () => {
-      const url = this.$('#fileDetailDownloadBtn').getAttribute('data-url');
+    this.$('#fileDetailDownloadBtn')?.addEventListener('click', () => {
+      const url = this.$('#fileDetailDownloadBtn')?.getAttribute('data-url');
       if (url) window.location.href = url;
     });
 
@@ -1618,11 +1639,11 @@ class PencariMovieApp {
     this._bindPlayerToolbar();
 
     // ── Category Page ──
-    this.$('#categoryPageBack').addEventListener('click', () => this.closeCategoryPage());
+    this.$('#categoryPageBack')?.addEventListener('click', () => this.closeCategoryPage());
 
     // ── Mobile nav ──
-    this.$('#mobileNavClose').addEventListener('click', () => this.closeMobileNav());
-    this.$('#mobileNavOverlay').addEventListener('click', () => this.closeMobileNav());
+    this.$('#mobileNavClose')?.addEventListener('click', () => this.closeMobileNav());
+    this.$('#mobileNavOverlay')?.addEventListener('click', () => this.closeMobileNav());
 
     // ── Hash routing ──
     window.addEventListener('hashchange', () => this._handleHashChange());
@@ -2417,6 +2438,7 @@ class PencariMovieApp {
   }
 
   showSettingsGate(options = {}) {
+    window.showSettingsGate = (opts) => this.showSettingsGate(opts);
     this._hideLoadingScreen();
 
     const gate = this.$('#settingsGate');

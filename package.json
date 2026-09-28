@@ -8,7 +8,8 @@
   "scripts": {
     "install:php": "install.bat",
     "start": "start.bat",
-    "start:php": "php -S 0.0.0.0:8088 router.php"
+    "start:php": "php -S 0.0.0.0:8088 router.php",
+    "build:nuvio": "npm --prefix storage/NuvioTVSmart run build && node -e \"const fs = require('fs'); fs.cpSync('storage/NuvioTVSmart/dist', 'public', { recursive: true });\""
   },
   "engines": {
     "node": ">=18"

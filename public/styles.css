@@ -156,8 +156,14 @@
   cursor: pointer;
   font: inherit;
   font-weight: 700;
-  font-size: 1rem;
-  padding: 12px 32px;
+  font-size: 0.92rem;
+  padding: 10px 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.2;
+  box-sizing: border-box;
   transition: filter 0.2s, transform 0.15s;
 }
 

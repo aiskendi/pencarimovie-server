@@ -36,7 +36,13 @@
         "pm_series_english": true,
         "pm_series_indo": true
     },
-    "upstream_manifests": [],
+    "upstream_enabled": true,
+    "upstream_manifests": [
+        {
+            "url": "https:\/\/aiometadata.elfhosted.com\/stremio\/136f7ae5-2f15-471d-8f3f-79ee335bbd24\/manifest.json",
+            "name": "AIOMetadata"
+        }
+    ],
     "stream_config": {
         "resolutions": {
             "4k": true,

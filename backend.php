@@ -6587,9 +6587,16 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         if (isset($postMemoryCache[$postId])) {
             $post = $postMemoryCache[$postId];
         } else {
-            $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-            $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-            if (!empty($post)) {
+            // Query media_ids_idx by post_id
+            $localMeta = fd_lookup_local_catalog_by_prefix('post', (string) $postId);
+            if (empty($localMeta['title'])) {
+                $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
+            }
+            $post = [
+                'title' => (string) ($localMeta['title'] ?? ''),
+                'year'  => (string) ($localMeta['year'] ?? ''),
+            ];
+            if (!empty($post['title'])) {
                 $postMemoryCache[$postId] = $post;
             }
         }
@@ -12310,12 +12317,16 @@ if ($isNuvioRoute) {
             }
             // Fast Path 2: Movie requested via post ID
             elseif ($itemType === 'movie') {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-                $postTitle = $post['title'] ?? '';
+                $postTitle = '';
                 $postYear = '';
-                if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                    $postYear = $ym[1];
+                // Query media_ids_idx by post_id
+                $localMeta = fd_lookup_local_catalog_by_prefix('post', (string) $postId);
+                if (empty($localMeta['title'])) {
+                    $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
+                }
+                if (!empty($localMeta['title'])) {
+                    $postTitle = (string) $localMeta['title'];
+                    $postYear = (string) ($localMeta['year'] ?? '');
                 }
                 $searchedTitle = $postTitle;
                 $searchedYear = $postYear;
@@ -12339,12 +12350,6 @@ if ($isNuvioRoute) {
             }
 
             if (!$moviePostFastPathDone && empty($filesToStream)) {
-                if (empty($postData)) {
-                    $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-                    $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-                    $postTitle = $post['title'] ?? '';
-                }
-
                 $postFiles = fd_fetch_post_files_paged($postId, [
                     'page_size' => 50,
                     'max_files' => 80,

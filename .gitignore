@@ -81,6 +81,9 @@ storage/eclipse*
 storage/wesper/
 storage/stremio-web/
 storage/ffmpeg-*
+storage/NuvioTVSmart/
+test_runner_all.py
+check_sponsor_settings.py
 test_tt_stream.json
 clean-posts-*.php
 clean-posts-*.sh

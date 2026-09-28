@@ -5978,15 +5978,12 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     $baseF = preg_replace('/\b(?:mp4|mkv|avi|mov|ts|flv|wmv)\b/i', '', $baseF);
     $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
 
-    // Strip leading country code or uploader handle prefix if immediately followed by target title (e.g. "PH.You.With.Me..." or "imnirvan.You.with.me...")
-    if ($targetNoThe !== '') {
-        $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in|[a-z0-9_]{3,15})\s+(?=' . preg_quote($targetNoThe, '/') . ')/i', '', $baseF);
-        if ($akaNoThe !== '') {
-            $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in|[a-z0-9_]{3,15})\s+(?=' . preg_quote($akaNoThe, '/') . ')/i', '', $baseF);
-        }
+    // Strip leading country code prefix (only 2-4 letter country codes, never "the")
+    $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in)\s+(?=' . preg_quote($targetLower, '/') . ')/i', '', $baseF);
+    if ($akaLower !== '') {
+        $baseF = preg_replace('/^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in)\s+(?=' . preg_quote($akaLower, '/') . ')/i', '', $baseF);
     }
     $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
-    $baseFNoThe = trim(preg_replace('/^the\s+/i', '', $baseF));
 
     // 6. Strict Sequel Guard: Do not match sequels (e.g. "Avatar 2", "Chapter 2", "Part II") when search query is original title
     $isSequelSearched = (bool) preg_match('/\b(?:part\s*(?:ii|iii|iv|v|\d+)|\b(?:2|3|4|5|6|7|8|9)\b|chapter\s*\d+)\b/i', $targetLower);
@@ -5995,12 +5992,12 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         return false;
     }
 
-    // 7. Direct comparison between base filename title and target
+    // 7. Direct comparison between base filename title and target (strict: "The Runner" != "Runner")
     if ($baseF !== '') {
-        if ($baseF === $targetLower || $baseFNoThe === $targetNoThe || $baseF === "the {$targetLower}") {
+        if ($baseF === $targetLower) {
             return true;
         }
-        if ($akaLower !== '' && ($baseF === $akaLower || $baseFNoThe === $akaNoThe || $baseF === "the {$akaLower}")) {
+        if ($akaLower !== '' && $baseF === $akaLower) {
             return true;
         }
     }
@@ -6013,29 +6010,17 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         str_replace(' dan ', ' ', $targetLower),
         rtrim($targetLower, 's'),
     ];
-    if (in_array($baseF, $targetVariants, true) || in_array($baseFNoThe, $targetVariants, true)) {
+    if (in_array($baseF, $targetVariants, true)) {
         return true;
     }
 
-    // 9. When year matches, allow exact word sequence match if all words match and extraneous words are minimal
+    // 9. Multi-word title exact word sequence match (only for 2+ word titles)
     if ($hasFileYear && $searchedYear !== '') {
-        $targetWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => strlen($w) > 1 && !in_array($w, ['the', 'and', 'dan', 'of', 'in', 'on', 'at'], true)));
-        if (!empty($targetWords)) {
+        $targetWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => strlen($w) > 1));
+        if (count($targetWords) >= 2) {
             $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
-            // Check if baseF contains all target words in proper proximity with no large alien title prefixes
-            $allWordsFound = true;
-            foreach ($targetWords as $tw) {
-                if (!in_array($tw, $fWords, true) && !str_contains($baseF, $tw)) {
-                    $allWordsFound = false;
-                    break;
-                }
-            }
-            if ($allWordsFound && count($fWords) <= count($targetWords) + 2) {
-                // Check that it doesn't start with unrelated prefix words like "just ..."
-                $firstTargetWord = $targetWords[0];
-                if (isset($fWords[0]) && ($fWords[0] === $firstTargetWord || $fWords[0] === 'the')) {
-                    return true;
-                }
+            if ($fWords === $targetWords) {
+                return true;
             }
         }
     }
@@ -12529,7 +12514,7 @@ if ($isNuvioRoute) {
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');
-                                    if (!fd_is_series_file($fTitle, $fCaption)) {
+                                    if (fd_movie_file_matches_title($fTitle, $primaryMovieTitle, $searchedYear, $searchedAka, $fCaption)) {
                                         $filesToStream[] = $f;
                                     }
                                 }
@@ -12549,7 +12534,7 @@ if ($isNuvioRoute) {
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');
-                                    if (!fd_is_series_file($fTitle, $fCaption)) {
+                                    if (fd_movie_file_matches_title($fTitle, $primaryMovieTitle, $searchedYear, $searchedAka, $fCaption)) {
                                         $filesToStream[] = $f;
                                     }
                                 }

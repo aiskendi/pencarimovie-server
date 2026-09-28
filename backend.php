@@ -2324,54 +2324,7 @@ function fd_lookup_local_catalog_by_prefix(string $prefix, string $value): array
         }
     }
 
-    // Query remote WordPress /lookup-id (Manticore media_ids_idx & postmeta)
-    $hit = fd_manticore_lookup_by_id($prefix, $value);
-    if (!empty($hit['title'])) {
-        @file_put_contents($cacheFile, json_encode($hit, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-        $memoryCache[$memKey] = $hit;
-        return $hit;
-    }
-
-    @file_put_contents($cacheFile, json_encode($empty, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-    $memoryCache[$memKey] = $empty;
     return $empty;
-}
-
-/**
- * Look up a stored external ID via the WordPress `media_ids_idx` API.
- *
- * The Manticore connection lives on the WordPress host, so the local backend
- * never talks to Manticore directly — it goes through the plugin's
- * `/lookup-id` route. This works on every runtime (no mysqli extension needed)
- * and keeps a single writer/reader for the table.
- *
- * @return array{title:string,year:string,imdb_id:string,media_type:string}
- */
-function fd_manticore_lookup_by_id(string $prefix, string $value): array
-{
-    $empty = ['title' => '', 'year' => '', 'imdb_id' => '', 'media_type' => ''];
-    $prefix = strtolower(trim($prefix));
-    $value = trim($value);
-    if ($prefix === '' || $value === '' || !defined('FD_WP_API_BASE')) {
-        return $empty;
-    }
-
-    $res = fd_http_json(
-        FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => $prefix, 'id' => $value]),
-        [],
-        'GET',
-        3 // Fast 3s timeout
-    );
-    if (empty($res['title'])) {
-        return $empty;
-    }
-
-    return [
-        'title'      => (string) $res['title'],
-        'year'       => !empty($res['year']) ? (string) $res['year'] : '',
-        'imdb_id'    => (string) ($res['imdb_id'] ?? ''),
-        'media_type' => (string) ($res['media_type'] ?? ''),
-    ];
 }
 
 /**
@@ -2532,10 +2485,8 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         $season = isset($m[2]) ? (int)$m[2] : null;
         $episode = isset($m[3]) ? (int)$m[3] : null;
 
-        // 1. Local disk cache FIRST. The WordPress /lookup-id round-trip costs
-        //    2.5-8s (WP bootstrap + TLS on the VPS) while this file read is ~1ms.
-        //    Checking it before the network call is what makes a repeat stream
-        //    request fast; previously the network call always ran first.
+        // 1. Local disk cache FIRST. Checking it before any upstream network call
+        //    is what makes repeat requests instant (~1ms).
         $cacheFile = fd_cache_path('ext_meta_' . md5($imdbId) . '.json');
         $akaTitle = '';
         if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 86400) {
@@ -2547,19 +2498,6 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
             }
         }
 
-        // 2. Check local catalog (Manticore media_ids_idx) via WordPress.
-        //    The `tt` and `imdb` prefixes are the SAME row in media_ids_idx, so only
-        //    one lookup is needed — the second was a guaranteed duplicate round-trip
-        //    (measured 1.4-9.5s each on a cold cache) that doubled the miss latency.
-        if ($title === '') {
-            $localImdb = fd_lookup_local_catalog_by_prefix('tt', $imdbId);
-            if (!empty($localImdb['title'])) {
-                $title = (string) $localImdb['title'];
-                $year = (string) ($localImdb['year'] ?? '');
-                $akaTitle = (string) ($localImdb['aka'] ?? '');
-                @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'aka' => $akaTitle]), LOCK_EX);
-            }
-        }
 
         // 3. If still missing, query configured upstream Stremio addons
         if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
@@ -6156,10 +6094,10 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
 
 function fd_fetch_stream_ajax(string $action, array $params = []): array
 {
-    $streamAction = 'stream_' . $action;
-    $wpUrl = defined('FD_WP_AJAX_URL') ? FD_WP_AJAX_URL : 'https://pencarimovie.com/wp-admin/admin-ajax.php';
+    $route = str_replace('_', '-', $action);
+    $apiBase = defined('FD_WP_API_BASE') ? FD_WP_API_BASE : 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
+    $wpUrl = rtrim($apiBase, '/') . '/' . $route;
     $queryParams = $params;
-    $queryParams['action'] = $streamAction;
     if ($action === 'trending') {
         unset($queryParams['bot_id']);
     } elseif (empty($queryParams['bot_id'])) {
@@ -6177,11 +6115,11 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
     }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
-    // Direct cURL fetch
+    // Direct fetch
     try {
         $body = fd_http_get_contents($fullWpUrl, [
             'method' => 'GET',
-            'headers' => ['X-Requested-With: XMLHttpRequest'],
+            'headers' => ['Accept: application/json'],
             'timeout' => 12,
         ]);
         if (is_string($body) && $body !== '') {
@@ -6189,13 +6127,16 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
             if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
                 return (array) ($decoded['data'] ?? []);
             }
+            if (is_array($decoded) && isset($decoded['ok']) && $decoded['ok']) {
+                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
+            }
             if (is_array($decoded)) {
-                return $decoded;
+                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
             }
         }
         return [];
     } catch (\Throwable $e) {
-        fd_log('stremio wp ajax fetch failed', ['action' => $streamAction, 'error' => $e->getMessage()]);
+        fd_log('stremio wp rest fetch failed', ['action' => $action, 'error' => $e->getMessage()]);
         return [];
     }
 }
@@ -6394,11 +6335,12 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
 
 function fd_stream_keyword_from_post_title(string $title): string
 {
-    $keyword = trim((string) preg_replace('/[\x00-\x1F]+/u', ' ', $title));
+    $keyword = fd_clean_html_entities($title);
+    $keyword = trim((string) preg_replace('/[\x00-\x1F]+/u', ' ', $keyword));
     $keyword = trim((string) preg_replace('/\s*[•·]\s*.+$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\s*\(\d{4}\)\s*$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\s+\d{4}\s*$/u', '', $keyword));
-    $keyword = trim((string) preg_replace('/\b(?:tvseries|tv\s*series)\b/iu', '', $keyword));
+    $keyword = trim((string) preg_replace('/\b(?:tvseries|tv\s*series|movie)\b/iu', '', $keyword));
     return trim((string) preg_replace('/\s+/', ' ', $keyword));
 }
 
@@ -6484,7 +6426,7 @@ function fd_search_files_parallel(array $queries): array
         return $out;
     }
 
-    $wpUrl = defined('FD_WP_AJAX_URL') ? FD_WP_AJAX_URL : 'https://pencarimovie.com/wp-admin/admin-ajax.php';
+    $apiBase = defined('FD_WP_API_BASE') ? FD_WP_API_BASE : 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
     $activeBotId = fd_get_bot_id();
     $country = '';
     $detected = fd_detect_country();
@@ -6499,7 +6441,6 @@ function fd_search_files_parallel(array $queries): array
             'search' => $q,
             'limit' => 50,
             'offset' => 0,
-            'action' => 'stream_search_files',
         ];
         if ($activeBotId !== '') {
             $params['bot_id'] = $activeBotId;
@@ -6507,7 +6448,7 @@ function fd_search_files_parallel(array $queries): array
         if ($country !== '') {
             $params['country'] = $country;
         }
-        $url = $wpUrl . '?' . http_build_query($params);
+        $url = rtrim($apiBase, '/') . '/search-files?' . http_build_query($params);
 
         $futures[$q] = \Amp\async(static function () use ($client, $url): array {
             try {
@@ -6647,9 +6588,12 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     // If Manticore confirms 0 items match, we immediately return instead of triggering
     // slow multi-query fallbacks across WordPress posts.
     $fastPathDone = false;
-    if ($keyword !== '') {
+    $idParam = trim((string) ($preloadedPost['id'] ?? ($preloadedPost['external_id'] ?? ($preloadedPost['imdb_id'] ?? ($postId > 0 ? "post:{$postId}" : '')))));
+    if ($keyword !== '' || $idParam !== '') {
         $apiBase = FD_WP_API_BASE;
-        $url = "{$apiBase}/stream-files?title=" . urlencode($keyword) . "&type=series&season={$season}&episode={$episode}&post_id={$postId}&limit={$maxFiles}";
+        $url = "{$apiBase}/stream-files?type=series&season={$season}&episode={$episode}&limit={$maxFiles}"
+            . ($keyword !== '' ? '&title=' . urlencode($keyword) : '')
+            . ($idParam !== '' ? "&id=" . urlencode($idParam) : '');
         $res = fd_http_json($url, [], 'GET', 5);
         if (isset($res['ok'])) {
             $fastPathDone = true;
@@ -6676,18 +6620,6 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         return $all;
     }
 
-    // 2. Fallback probe post files for exact SxxExx MATCH (1 page, 50 items) only when fast path returned 0 files
-    if ($postId > 0) {
-        $exactFiles = fd_fetch_post_files_paged($postId, [
-            'page_size' => 50,
-            'max_files' => $maxFiles,
-            'season' => $season,
-            'episode' => $episode,
-            'filter' => $filter,
-            'max_pages' => 1,
-        ]);
-        $add($exactFiles);
-    }
 
     // 3. Fallback keyword probe (13 queries in parallel).
     //
@@ -11355,18 +11287,18 @@ if ($isNuvioRoute) {
                     }
 
                     $cacheKey = md5($forwardUrl);
-                    $cacheFile = fd_storage_path('storage/up_cat_' . $cacheKey . '.json');
-                    if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 600) {
+                    $cacheFile = fd_cache_path('up_cat_' . $cacheKey . '.json');
+                    if (is_file($cacheFile) && (time() - (int)filemtime($cacheFile)) < 3600) {
                         $cachedData = json_decode((string)@file_get_contents($cacheFile), true);
                         if (is_array($cachedData) && isset($cachedData['metas'])) {
-                            fd_stremio_json($cachedData, 200, 'max-age=600, public');
+                            fd_stremio_json($cachedData, 200, 'max-age=3600, public');
                         }
                     }
 
                     $upRes = fd_http_json($forwardUrl, [], 'GET', 8);
                     if (is_array($upRes) && isset($upRes['metas'])) {
                         @file_put_contents($cacheFile, json_encode($upRes, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
-                        fd_stremio_json($upRes, 200, 'max-age=600, public');
+                        fd_stremio_json($upRes, 200, 'max-age=3600, public');
                     }
                 }
             }
@@ -11860,16 +11792,11 @@ if ($isNuvioRoute) {
             $cats = (array) ($post['categories'] ?? []);
             $tags = (array) ($post['tags'] ?? []);
 
-            // Probe S01, S02, ... so later-season ranker boost cannot hide S1.
-            $files = $itemType === 'series'
-                ? fd_fetch_series_episode_files($postId)
-                : fd_fetch_post_files_paged($postId, [
-                    'page_size' => 50,
-                    'max_files' => 80,
-                ]);
-
             $isSeries = ($itemType === 'series') || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
             $resolvedType = ($itemType === 'series' || $isSeries) ? 'series' : 'movie';
+
+            // Only series metadata requires episode files to construct the videos array
+            $files = ($resolvedType === 'series') ? fd_fetch_series_episode_files($postId) : [];
 
             fd_log('stremio meta post resolved', [
                 'postId' => $postId,
@@ -12311,28 +12238,18 @@ if ($isNuvioRoute) {
             $targetSeason = isset($pmMatches[2]) ? (int) $pmMatches[2] : null;
             $targetEpisode = isset($pmMatches[3]) ? (int) $pmMatches[3] : null;
 
-            // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1)
-            if ($targetSeason !== null && $targetEpisode !== null) {
-                $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason, $targetEpisode, 60);
+            // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1 or series root pm:post:9000020144)
+            if ($itemType === 'series' || ($targetSeason !== null && $targetEpisode !== null)) {
+                $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 60);
             }
             // Fast Path 2: Movie requested via post ID
             elseif ($itemType === 'movie') {
-                $postTitle = '';
-                $postYear = '';
-                // Query media_ids_idx by post_id
-                $localMeta = fd_lookup_local_catalog_by_prefix('post', (string) $postId);
-                if (empty($localMeta['title'])) {
-                    $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
-                }
-                if (!empty($localMeta['title'])) {
-                    $postTitle = (string) $localMeta['title'];
-                    $postYear = (string) ($localMeta['year'] ?? '');
-                }
+                $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=60";
+                $res = fd_http_json($mUrl, [], 'GET', 15);
+                $postTitle = (string) ($res['resolved_title'] ?? '');
+                $postYear = (string) ($res['resolved_year'] ?? '');
                 $searchedTitle = $postTitle;
                 $searchedYear = $postYear;
-
-                $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie" . ($postTitle !== '' ? '&title=' . urlencode($postTitle) : '') . ($postYear !== '' ? '&year=' . urlencode($postYear) : '') . "&limit=60";
-                $res = fd_http_json($mUrl, [], 'GET', 15);
                 $moviePostFastPathDone = false;
                 if (isset($res['ok'])) {
                     $moviePostFastPathDone = true;
@@ -12341,7 +12258,7 @@ if ($isNuvioRoute) {
                             $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                             $fCaption = (string) ($f['caption'] ?? '');
                             // Strict title and year check to prevent unrelated files from leaking into movie streams
-                            if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
+                            if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
                                 $filesToStream[] = $f;
                             }
                         }
@@ -12349,80 +12266,25 @@ if ($isNuvioRoute) {
                 }
             }
 
-            if (!$moviePostFastPathDone && empty($filesToStream)) {
-                $postFiles = fd_fetch_post_files_paged($postId, [
-                    'page_size' => 50,
-                    'max_files' => 80,
-                ]);
+            if (!$moviePostFastPathDone && empty($filesToStream) && !empty($postTitle)) {
+                $seenCodes = [];
+                $postYear = null;
+                if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+                    $postYear = $ym[1];
+                }
+                $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
+                foreach ($searchVariants as $sv) {
+                    $sf = fd_fetch_stream_ajax('search_files', ['search' => $sv, 'limit' => 30]);
+                    if (is_array($sf) && !empty($sf['files'])) {
+                        foreach ($sf['files'] as $f) {
+                            if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
+                            $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                            $fCap = (string) ($f['caption'] ?? '');
 
-                // For movie streams, strictly filter files to match post title and year
-                if ($itemType === 'movie' || (!empty($postTitle) && !preg_match('/tvseries|series|season|episode|drama/i', $postTitle))) {
-                    $postYear = null;
-                    if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                        $postYear = $ym[1];
-                    }
-
-                    $cleanTitle = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($postTitle));
-                    $cleanTitle = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanTitle);
-                    if ($postYear) {
-                        $cleanTitle = preg_replace('/\b' . $postYear . '\b/', '', $cleanTitle);
-                    }
-                    $cleanTitle = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTitle));
-                    $cleanTitle = trim(preg_replace('/\s+/', ' ', $cleanTitle));
-
-                    $matchedFiles = [];
-                    foreach ($postFiles as $pf) {
-                        if (empty($pf['short_code'])) continue;
-                        $fTitle = fd_clean_html_entities((string) ($pf['title'] ?? ''));
-                        $fCap = (string) ($pf['caption'] ?? '');
-
-                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
-                            $matchedFiles[] = $pf;
-                        }
-                    }
-
-                    $seenCodes = [];
-                    if (!empty($matchedFiles)) {
-                        $postFilesToUse = $matchedFiles;
-                    } elseif ($postYear === null) {
-                        $postFilesToUse = array_values(array_filter($postFiles, fn($f) => !fd_is_series_file((string)($f['title'] ?? ''), (string)($f['caption'] ?? ''))));
-                    } else {
-                        $postFilesToUse = array_values(array_filter($postFiles, function ($f) use ($postTitle, $postYear) {
-                            $t = (string) ($f['title'] ?? '');
-                            $c = (string) ($f['caption'] ?? '');
-                            return fd_movie_file_matches_title($t, $postTitle, $postYear, '', $c);
-                        }));
-                    }
-                    foreach ($postFilesToUse as $pf) {
-                        if (!empty($pf['short_code']) && !isset($seenCodes[$pf['short_code']])) {
-                            $seenCodes[$pf['short_code']] = true;
-                            $filesToStream[] = $pf;
-                        }
-                    }
-
-                    // Supplement with search_files variants using strict movie file matching
-                    if (!empty($cleanTitle)) {
-                        $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
-                        foreach ($searchVariants as $sv) {
-                            $sf = fd_fetch_stream_ajax('search_files', ['search' => $sv, 'limit' => 30]);
-                            if (is_array($sf) && !empty($sf['files'])) {
-                                foreach ($sf['files'] as $f) {
-                                    if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
-                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                                    $fCap = (string) ($f['caption'] ?? '');
-
-                                    if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
-                                        $seenCodes[$f['short_code']] = true;
-                                        $filesToStream[] = $f;
-                                    }
-                                }
+                            if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCap)) {
+                                $seenCodes[$f['short_code']] = true;
+                                $filesToStream[] = $f;
                             }
-                        }
-                    }
-                } else {
-                    foreach ($postFiles as $pf) {
-                        if (!empty($pf['short_code'])) {
-                            $filesToStream[] = $pf;
                         }
                     }
                 }
@@ -12461,10 +12323,11 @@ if ($isNuvioRoute) {
                     $imdbEpisodeFilter = fd_episode_stream_filter($targetSeason, $targetEpisode);
 
                     // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
-                    if ($searchedTitle !== '') {
+                    if ($searchedTitle !== '' || $itemId !== '') {
                         $filesToStream = fd_fetch_episode_stream_files(0, $targetSeason, $targetEpisode, 60, [
                             'title' => $searchedTitle,
                             'year' => $searchedYear,
+                            'id' => $itemId,
                         ]);
                     }
 
@@ -12552,9 +12415,12 @@ if ($isNuvioRoute) {
                     $cleanMovieTitle = fd_stream_keyword_from_post_title($primaryMovieTitle);
                     if ($cleanMovieTitle === '') $cleanMovieTitle = $primaryMovieTitle;
                     $movieFastPathDone = false;
-                    if ($cleanMovieTitle !== '') {
+                    if ($cleanMovieTitle !== '' || $itemId !== '') {
                         $apiBase = FD_WP_API_BASE;
-                        $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
+                        $mUrl = "{$apiBase}/stream-files?type=movie&limit=40"
+                            . ($cleanMovieTitle !== '' ? "&title=" . urlencode($cleanMovieTitle) : '')
+                            . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
+                            . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
                         $res = fd_http_json($mUrl, [], 'GET', 5);
                         if (isset($res['ok'])) {
                             $movieFastPathDone = true;
@@ -14499,12 +14365,9 @@ if (str_starts_with($path, '/api/')) {
             fd_json(['ok' => 0, 'message' => 'action parameter is required.'], 400);
         }
 
-        // Map short action names to stream_* WordPress AJAX actions
-        // e.g., "trending" → "stream_trending", "search_files" → "stream_search_files"
-        $streamAction = 'stream_' . $action;
-
-        // Build the WordPress admin-ajax.php URL, strictly forwarding allowed parameters
-        $wpUrl = defined('FD_WP_AJAX_URL') ? FD_WP_AJAX_URL : 'https://pencarimovie.com/wp-admin/admin-ajax.php';
+        $route = str_replace('_', '-', $action);
+        $apiBase = defined('FD_WP_API_BASE') ? FD_WP_API_BASE : 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
+        $wpUrl = rtrim($apiBase, '/') . '/' . $route;
 
         $allowedStreamParams = [
             'category',
@@ -14520,15 +14383,10 @@ if (str_starts_with($path, '/api/')) {
             'sort',
             'bot_id',
             'country',
-            // Episode targeting for post_files. Without these the theme's
-            // ajax_stream_post_files() never appends "S01E27" to the search
-            // term, so searchresults() returns the size-sorted page and the
-            // later/smaller episodes (e.g. E26-E28) are starved — the stream
-            // list then shows only the biggest files.
             'season',
             'episode'
         ];
-        $queryParams = ['action' => $streamAction];
+        $queryParams = [];
         foreach ($allowedStreamParams as $paramKey) {
             if (isset($_GET[$paramKey]) && is_scalar($_GET[$paramKey])) {
                 $queryParams[$paramKey] = trim((string) $_GET[$paramKey]);

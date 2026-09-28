@@ -6033,6 +6033,18 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
  * Ensures only files matching the actual series title, season, and episode are accepted,
  * preventing cross-matching unrelated series with overlapping keywords (e.g. "You Are My Glory"
  * vs "Glory", or "Song of Glory" vs "The Glory").
+ *
+ * CRITICAL ARCHITECTURE NOTE:
+ * Releases in the database follow TWO distinct naming conventions:
+ * 1. Standard Western format: [Title] [Year] [SxxExx / EPxx] [Quality]
+ *    e.g. "The.Rebel.Princess.2021.EP1.mp4", "Breaking.Bad.S01E01.1080p.mkv"
+ * 2. Asian Drama / Telegram format: [Group/Channel] [Exx] [Title] [Year/Tags]
+ *    e.g. "CDL.E01.The.Rebel.Princess.mp4", "YDF.E01.The.Rebel.Princess.2021.mp4",
+ *         "Nodrakor.The.Rebel.Princess.kdf.EP38.mp4", "CH.E01.The.Rebel.Princess.Fanszz.mp4"
+ *
+ * DO NOT strip episode markers blindly from the start of the string without extracting
+ * the post-episode title portion ($afterEp), or Asian drama files will be truncated to
+ * just their release group prefix (e.g. "cdl") and discarded.
  */
 function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = ''): bool
 {
@@ -6071,50 +6083,72 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     }
     $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
 
-    // 4. Extract series title portion from filename before episode/season markers and quality tags
-    $fClean = fd_clean_media_title($fileTitle);
-    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid)\s+/i', '', $fClean);
+    // 4. Extract series title portion from filename
+    $fClean = preg_replace('/\.(mp4|mkv|avi|mov|ts|flv|webm)$/i', '', $fileTitle);
+    $fClean = fd_clean_media_title($fClean);
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
     $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
 
-    // Strip season/episode markers and everything after
+    $qualityPattern = '/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|ts|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe|fanszz|malaysub|sub|engsub|indosub|kdf)\b.*/i';
+    $epPattern = '/(?:s\d{1,2}\s*[ ._-]*e(?:p|ps|pisode)?\s*\d{1,4}|(?<![a-z0-9])e(?:p|ps|pisode)?\s*\d{1,4}|\b\d{1,2}x\d{1,4}\b|season\s*\d+|musim\s*\d+|bahagian\s*\d+|part\s*\d+)/i';
+
+    // Pattern A (Standard Western): Title BEFORE episode marker (e.g. "The.Rebel.Princess.2021.EP1.mp4")
     $baseF = preg_replace('/(?:s\d{1,2}\s*[ ._-]*e(?:p|ps|pisode)?\s*\d{1,4}|(?<![a-z0-9])e(?:p|ps|pisode)?\s*\d{1,4}|\b\d{1,2}x\d{1,4}\b|season\s*\d+|musim\s*\d+|bahagian\s*\d+|part\s*\d+).*/i', '', $fCleanNorm);
-    // Strip release tags
-    $baseF = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|ts|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $baseF);
-    // Strip year
+    $baseF = preg_replace($qualityPattern, '', $baseF);
     $baseF = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseF);
     $baseF = trim(preg_replace('/\s+/', ' ', $baseF));
     $baseFNoThe = trim(preg_replace('/^the\s+/i', '', $baseF));
 
+    // Pattern B (Asian Drama / Channel prefix): Title AFTER episode marker (e.g. "CDL.E01.The.Rebel.Princess.2021.mp4", "YDF.E01.The.Rebel.Princess.mp4")
+    // When episode tag is at the beginning, the actual show title follows the episode number.
+    $afterEp = '';
+    if (preg_match($epPattern, $fCleanNorm, $epMatches, PREG_OFFSET_CAPTURE)) {
+        $epOffset = $epMatches[0][1] + strlen($epMatches[0][0]);
+        $afterStr = substr($fCleanNorm, $epOffset);
+        $afterStr = preg_replace($qualityPattern, '', $afterStr);
+        $afterStr = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $afterStr);
+        $afterEp = trim(preg_replace('/\s+/', ' ', $afterStr));
+    }
+    $afterEpNoThe = trim(preg_replace('/^the\s+/i', '', $afterEp));
+
     // 5. Check leading "The " compatibility
     $hasLeadingThe = str_starts_with($targetLower, 'the ');
-    $fileHasLeadingThe = str_starts_with($baseF, 'the ');
+    $fileHasLeadingThe = str_starts_with($baseF, 'the ') || str_starts_with($afterEp, 'the ');
     if (!$hasLeadingThe && $fileHasLeadingThe) {
         if ($seriesYear !== '' && preg_match('/\b(2022|2023|2024|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fileTitle)) {
             return false;
         }
     }
 
-    // 6. Compare base filename title with target series title
-    if ($baseF !== '') {
-        if ($baseF === $targetLower || ($hasLeadingThe && $baseFNoThe === $targetNoThe) || (!$hasLeadingThe && !$fileHasLeadingThe && $baseF === $targetLower)) {
-            return true;
-        }
-        if (!$hasLeadingThe && $fileHasLeadingThe && $baseFNoThe === $targetNoThe && $seriesYear === '') {
-            return true;
-        }
-    }
-
-    // 7. Check with ampersand / and / dan / possessive variants
+    // 6. Compare extracted title candidates with target series title
+    $candidates = array_filter([$baseF, $baseFNoThe, $afterEp, $afterEpNoThe], fn($c) => $c !== '');
     $targetVariants = [
+        $targetLower,
+        $targetNoThe,
         str_replace(' and ', ' dan ', $targetLower),
         str_replace(' dan ', ' and ', $targetLower),
         str_replace(' and ', ' ', $targetLower),
         str_replace(' dan ', ' ', $targetLower),
         rtrim($targetLower, 's'),
     ];
-    if (in_array($baseF, $targetVariants, true) || in_array($baseFNoThe, $targetVariants, true)) {
-        return true;
+
+    foreach ($candidates as $c) {
+        if (in_array($c, $targetVariants, true)) {
+            return true;
+        }
+        if (str_starts_with($c, $targetLower . ' ') || ($targetNoThe !== '' && str_starts_with($c, $targetNoThe . ' '))) {
+            return true;
+        }
+    }
+
+    // 7. Multi-word exact phrase matching (safe for phrases with 2+ content words like "rebel princess")
+    $stopWords = ['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan'];
+    $contentWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => !in_array($w, $stopWords, true)));
+    if (count($contentWords) >= 2) {
+        if (preg_match('/\b' . preg_quote($targetLower, '/') . '\b/i', $fCleanNorm) || ($targetNoThe !== '' && preg_match('/\b' . preg_quote($targetNoThe, '/') . '\b/i', $fCleanNorm))) {
+            return true;
+        }
     }
 
     return false;
@@ -6601,7 +6635,10 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         }
     };
 
-    // 1. Fast path: Server-side native Manticore stream resolution in 1 single round-trip
+    // 1. Fast path: Server-side native Manticore stream resolution in 1 single round-trip (~0.3s)
+    // NOTE: $fastPathDone MUST be set whenever Manticore responds (isset($res['ok'])).
+    // If Manticore confirms 0 items match, we immediately return instead of triggering
+    // slow multi-query fallbacks across WordPress posts.
     $fastPathDone = false;
     if ($keyword !== '') {
         $apiBase = FD_WP_API_BASE;
@@ -12285,19 +12322,23 @@ if ($isNuvioRoute) {
 
                 $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie&limit=60";
                 $res = fd_http_json($mUrl, [], 'GET', 10);
-                if (!empty($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
-                    foreach ($res['items'] as $f) {
-                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                        $fCaption = (string) ($f['caption'] ?? '');
-                        // Strict title and year check to prevent unrelated files from leaking into movie streams
-                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
-                            $filesToStream[] = $f;
+                $moviePostFastPathDone = false;
+                if (isset($res['ok'])) {
+                    $moviePostFastPathDone = true;
+                    if (!empty($res['items']) && is_array($res['items'])) {
+                        foreach ($res['items'] as $f) {
+                            $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                            $fCaption = (string) ($f['caption'] ?? '');
+                            // Strict title and year check to prevent unrelated files from leaking into movie streams
+                            if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
+                                $filesToStream[] = $f;
+                            }
                         }
                     }
                 }
             }
 
-            if (empty($filesToStream)) {
+            if (!$moviePostFastPathDone && empty($filesToStream)) {
                 if (empty($postData)) {
                     $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
                     $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
@@ -12499,7 +12540,9 @@ if ($isNuvioRoute) {
                         }
                     }
                 } else {
-                    // For Movie: Fast path server-side native Manticore stream resolution in 1 round trip
+                    // For Movie: Fast path server-side native Manticore stream resolution in 1 round trip (~0.3s)
+                    // NOTE: $movieFastPathDone is set whenever Manticore returns a valid response.
+                    // This prevents slow sequential fallback search loops (which take 7-10s) when Manticore confirms 0 items exist.
                     $primaryMovieTitle = $searchedTitle !== '' ? $searchedTitle : $searchQuery;
                     $cleanMovieTitle = fd_stream_keyword_from_post_title($primaryMovieTitle);
                     if ($cleanMovieTitle === '') $cleanMovieTitle = $primaryMovieTitle;
@@ -12509,8 +12552,8 @@ if ($isNuvioRoute) {
                         $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanMovieTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
                         $res = fd_http_json($mUrl, [], 'GET', 5);
                         if (isset($res['ok'])) {
+                            $movieFastPathDone = true;
                             if (!empty($res['items']) && is_array($res['items'])) {
-                                $movieFastPathDone = true;
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                                     $fCaption = (string) ($f['caption'] ?? '');

@@ -12320,8 +12320,8 @@ if ($isNuvioRoute) {
                 $searchedTitle = $postTitle;
                 $searchedYear = $postYear;
 
-                $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie&limit=60";
-                $res = fd_http_json($mUrl, [], 'GET', 10);
+                $mUrl = FD_WP_API_BASE . "/stream-files?post_id={$postId}&type=movie" . ($postTitle !== '' ? '&title=' . urlencode($postTitle) : '') . ($postYear !== '' ? '&year=' . urlencode($postYear) : '') . "&limit=60";
+                $res = fd_http_json($mUrl, [], 'GET', 15);
                 $moviePostFastPathDone = false;
                 if (isset($res['ok'])) {
                     $moviePostFastPathDone = true;
@@ -13183,11 +13183,14 @@ if ($isNuvioRoute) {
             ? (array) ($catSettings['upstream_manifests'] ?? [])
             : [];
         $upstreamUrls = [];
-        foreach ($configuredUpstreams as $idx => $upstream) {
-            $manifestUrl = trim((string)($upstream['url'] ?? ''));
-            if ($manifestUrl === '') continue;
-            $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-            $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
+        $isLocalPmId = str_starts_with($itemId, 'pm:') || str_starts_with($itemId, 'pm_');
+        if (!$isLocalPmId) {
+            foreach ($configuredUpstreams as $idx => $upstream) {
+                $manifestUrl = trim((string)($upstream['url'] ?? ''));
+                if ($manifestUrl === '') continue;
+                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+                $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
+            }
         }
 
         if (!empty($upstreamUrls)) {

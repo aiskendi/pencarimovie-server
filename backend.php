@@ -11775,11 +11775,13 @@ if ($isNuvioRoute) {
                 $postId = (int) substr($itemId, strlen('pm:post:'));
             }
 
-            $metaPostCache = fd_cache_path('meta_cache_' . md5('post_' . $postId . '_' . $itemType) . '.json');
+            $metaPostCache = fd_cache_path('meta_cache_' . md5('post_' . $postId) . '.json');
             if (is_file($metaPostCache) && (time() - (int)filemtime($metaPostCache)) < 1800) {
                 $cachedMeta = json_decode((string)@file_get_contents($metaPostCache), true);
-                if (is_array($cachedMeta) && isset($cachedMeta['meta'])) {
-                    fd_stremio_json($cachedMeta, 200, 'max-age=1800, public');
+                if (is_array($cachedMeta) && isset($cachedMeta['meta']) && !empty($cachedMeta['meta']['name']) && ($cachedMeta['meta']['name'] !== 'PencariMovie Media') && ($cachedMeta['meta']['name'] !== 'Untitled')) {
+                    if (($cachedMeta['meta']['type'] ?? '') !== 'series' || !empty($cachedMeta['meta']['videos'])) {
+                        fd_stremio_json($cachedMeta, 200, 'max-age=1800, public');
+                    }
                 }
             }
 
@@ -11977,7 +11979,7 @@ if ($isNuvioRoute) {
                 'genres' => $meta['genres'] ?? [],
             ]);
 
-            if (!empty($metaPostCache) && !empty($meta['name'])) {
+            if (!empty($metaPostCache) && !empty($meta['name']) && $title !== 'PencariMovie Media' && $cleanPostTitle !== 'Untitled' && (!empty($excerpt) || !empty($videos))) {
                 @file_put_contents($metaPostCache, json_encode(['meta' => $meta], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
             }
 

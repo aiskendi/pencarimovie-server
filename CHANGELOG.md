@@ -2,6 +2,26 @@
 
 All notable changes to the PencariMovie Server / Downloader project will be documented in this file.
 
+## [2.3.3] - 2026-09-29
+
+### Added
+
+- **Nuvio TV Smart Player & Web UI Enhancements**:
+  - Subtitle rail selection with mouse and touch interaction in the player subtitle modal.
+  - Fullscreen auto-rotation, smooth mouse seeking, and auto-progression to next episode.
+  - Auto-retry and recovery mechanism for playback stalls and network startup glitches.
+  - Unified Sources and Episodes panels with responsive glass-card styling and no title truncation on large screens.
+  - Fixed "Continue Watching" series history stack preserving clean back navigation without popstate corruption.
+- **Sub-Second Stream Resolution & Manticore `media_ids_idx` Fast-Path**:
+  - Direct `media_ids_idx` metadata lookups for instant stream card generation.
+  - Direct PM stream resolution bypasses slow upstream requests and forwards post metadata directly.
+  - Strict title matching distinguishing "Title" from "The Title", with full AKA alias search support.
+- **Master Upstream Catalog Toggle (`upstream_enabled`)**:
+  - One-switch control in Catalog Configuration to toggle upstream addons (e.g. AIOMetadata) without wiping custom URLs.
+  - Prevents dashboard hangs by filtering out non-local `up_*` catalogs from web category rows.
+- **Same-Origin Stream Cookie Auth**:
+  - Cookie credentials automatically forwarded on same-origin requests for seamless remote and Cloudflare Tunnel playback.
+
 ## [2.1.8] - 2026-09-18
 
 ### Added

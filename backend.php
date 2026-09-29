@@ -358,6 +358,7 @@ function fd_json(array $data, int $status = 200): never
         header('Access-Control-Allow-Origin: *');
         header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret');
+        header('Access-Control-Allow-Private-Network: true');
         if ($status >= 400) {
             header('Connection: close');
         }
@@ -13152,12 +13153,17 @@ if (str_starts_with($path, '/api/')) {
         header('Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS');
         header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret, Range');
         header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
+        header('Access-Control-Allow-Private-Network: true');
         header('X-Content-Type-Options: nosniff');
         header('X-Frame-Options: SAMEORIGIN');
         header('Referrer-Policy: strict-origin-when-cross-origin');
     }
 
     if ($method === 'OPTIONS') {
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS');
+        header('Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Secret, Range');
+        header('Access-Control-Allow-Private-Network: true');
         http_response_code(204);
         exit;
     }

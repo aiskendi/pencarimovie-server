@@ -13,7 +13,6 @@ class PencariMovieApp {
     // ── Config ──
     this.localApiBase = window.location.origin;
     this.wpApiBase = 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
-    this.wpAjaxUrl = 'https://pencarimovie.com/wp-admin/admin-ajax.php';
     this.siteName = 'PencariMovie';
 
     // ── State ──
@@ -4120,10 +4119,10 @@ class PencariMovieApp {
       effectiveParams.country = this.country;
     }
 
-    // 1. Direct browser call to WordPress admin-ajax (no local device DNS/cURL dependency)
+    // 1. Direct browser call to WordPress REST API (no local device DNS/cURL dependency)
     try {
-      const directUrl = new URL(this.wpAjaxUrl || 'https://pencarimovie.com/wp-admin/admin-ajax.php');
-      directUrl.searchParams.set('action', `stream_${action}`);
+      const route = action.replace(/_/g, '-');
+      const directUrl = new URL(`${this.wpApiBase || 'https://pencarimovie.com/wp-json/pencarimovie-server/v1'}/${route}`);
       Object.entries(effectiveParams).forEach(([key, value]) => {
         if (value !== undefined && value !== null && value !== '') {
           directUrl.searchParams.set(key, value);
@@ -4135,7 +4134,7 @@ class PencariMovieApp {
       try {
         const resp = await fetch(directUrl.toString(), {
           headers: {
-            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
             'X-App-Version': this.version || '2.0.0'
           },
           signal: ctrl.signal

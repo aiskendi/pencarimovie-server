@@ -1,5 +1,8 @@
 <!doctype html>
-<html lang="en" class="no-flex-gap no-css-grid no-css-math no-backdrop-filter no-aspect-ratio">
+<html
+  lang="en"
+  class="no-flex-gap no-css-grid no-css-math no-backdrop-filter no-aspect-ratio"
+>
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
@@ -22,9 +25,11 @@
     <script>
       (function configureTizenLaunch() {
         var root = typeof globalThis !== "undefined" ? globalThis : window;
-        var search = String((window.location && window.location.search) || "").toLowerCase();
+        var search = String(
+          (window.location && window.location.search) || "",
+        ).toLowerCase();
         var userAgent = String(
-          (window.navigator && window.navigator.userAgent) || ""
+          (window.navigator && window.navigator.userAgent) || "",
         ).toLowerCase();
         var webapis = root.webapis || {};
         var isTizenLaunch = Boolean(
@@ -35,7 +40,7 @@
           webapis.avPlay ||
           webapis.productinfo ||
           search.indexOf("wrapper=tizen") !== -1 ||
-          userAgent.indexOf("tizen") !== -1
+          userAgent.indexOf("tizen") !== -1,
         );
 
         if (!isTizenLaunch) {
@@ -51,7 +56,7 @@
         }
         viewport.setAttribute(
           "content",
-          "width=1920, height=1080, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+          "width=1920, height=1080, initial-scale=1.0, maximum-scale=1.0, user-scalable=no",
         );
       })();
     </script>
@@ -395,7 +400,6 @@
             </button>
           </div>
 
-
           <!-- Change Password Box -->
           <div class="settings-gate__addon-box" style="margin-top: 14px">
             <span>🔑 Change Password</span>
@@ -650,7 +654,10 @@
                   </button>
                 </span>
               </div>
-              <div class="addon-catalog-list" id="addonCatalogSpecialList"></div>
+              <div
+                class="addon-catalog-list"
+                id="addonCatalogSpecialList"
+              ></div>
             </div>
 
             <div class="addon-catalog-section" id="addonCatalogCountrySection">
@@ -729,7 +736,15 @@
                 margin-bottom: 8px;
               "
             ></div>
-            <div style="display: flex; gap: 6px; align-items: center; width: 100%; box-sizing: border-box;">
+            <div
+              style="
+                display: flex;
+                gap: 6px;
+                align-items: center;
+                width: 100%;
+                box-sizing: border-box;
+              "
+            >
               <input
                 type="text"
                 id="upstreamAddonInput"
@@ -801,12 +816,26 @@
               >Active</span
             >
           </div>
-          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              align-items: center;
+              width: 100%;
+              box-sizing: border-box;
+            "
+          >
             <input
               type="text"
               id="addonTokenInput"
               class="settings-gate__input"
-              style="font-family: monospace; font-size: 0.82rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              style="
+                font-family: monospace;
+                font-size: 0.82rem;
+                flex: 1 1 0%;
+                min-width: 0;
+                box-sizing: border-box;
+              "
               readonly
               value=""
             />
@@ -879,12 +908,27 @@
               >Remote</span
             >
           </div>
-          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              align-items: center;
+              width: 100%;
+              box-sizing: border-box;
+            "
+          >
             <input
               type="text"
               id="addonManifestLanInput"
               class="settings-gate__input"
-              style="color: #00d26a; font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              style="
+                color: #00d26a;
+                font-family: monospace;
+                font-size: 0.88rem;
+                flex: 1 1 0%;
+                min-width: 0;
+                box-sizing: border-box;
+              "
               readonly
               value=""
             />
@@ -938,12 +982,27 @@
               >Local</span
             >
           </div>
-          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              align-items: center;
+              width: 100%;
+              box-sizing: border-box;
+            "
+          >
             <input
               type="text"
               id="addonManifestInput"
               class="settings-gate__input"
-              style="color: #bbb; font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              style="
+                color: #bbb;
+                font-family: monospace;
+                font-size: 0.88rem;
+                flex: 1 1 0%;
+                min-width: 0;
+                box-sizing: border-box;
+              "
               readonly
               value=""
             />
@@ -996,12 +1055,27 @@
               >Public</span
             >
           </div>
-          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              align-items: center;
+              width: 100%;
+              box-sizing: border-box;
+            "
+          >
             <input
               type="text"
               id="addonManifestTunnelInput"
               class="settings-gate__input"
-              style="color: #ff8a5b; font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              style="
+                color: #ff8a5b;
+                font-family: monospace;
+                font-size: 0.88rem;
+                flex: 1 1 0%;
+                min-width: 0;
+                box-sizing: border-box;
+              "
               readonly
               value=""
             />
@@ -1048,7 +1122,7 @@
         </div>
 
         <!-- Eclipse Music Addon Field -->
-        <div class="settings-gate__field" style="margin-top: 16px;">
+        <div class="settings-gate__field" style="margin-top: 16px">
           <div
             style="
               display: flex;
@@ -1081,7 +1155,14 @@
               type="text"
               id="addonManifestEclipseInput"
               class="settings-gate__input"
-              style="color: #fb7185; font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              style="
+                color: #fb7185;
+                font-family: monospace;
+                font-size: 0.88rem;
+                flex: 1 1 0%;
+                min-width: 0;
+                box-sizing: border-box;
+              "
               readonly
               value=""
             />
@@ -1103,8 +1184,10 @@
               📋 Copy
             </button>
           </div>
-          <p style="font-size: 0.76rem; color: #a1a1aa; margin-top: 6px;">
-            In Eclipse Music: <strong>Settings ➔ Connections ➔ Add Connection ➔ Addon</strong> and paste this URL.
+          <p style="font-size: 0.76rem; color: #a1a1aa; margin-top: 6px">
+            In Eclipse Music:
+            <strong>Settings ➔ Connections ➔ Add Connection ➔ Addon</strong> and
+            paste this URL.
           </p>
         </div>
 
@@ -1257,19 +1340,23 @@
     </div>
 
     <!-- ─── Core JS and Nuvio Shell ───────────────────────────── -->
-    <script src="boot-guard.js"></script>
+    <script src="boot-guard.js?v=20260930pm05"></script>
     <script
       defer
       src="core-js.bundle.js"
-      onerror="window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)"
+      onerror="
+        window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)
+      "
     ></script>
     <script defer src="nuvio.env.js"></script>
     <script defer src="assets/libs/qrcode-generator.js"></script>
     <script
       defer
-      src="app.bundle.js?v=20260930pm01"
-      onerror="window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)"
+      src="app.bundle.js?v=20260930pm05"
+      onerror="
+        window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)
+      "
     ></script>
-    <script defer src="app.js?v=20260930pm01"></script>
+    <script defer src="app.js?v=20260930pm05"></script>
   </body>
 </html>

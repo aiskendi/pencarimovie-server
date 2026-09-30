@@ -10793,10 +10793,12 @@ if ($isNuvioRoute) {
                 'name' => 'Popular',
                 'genres' => $allGenreOptions,
                 'extra' => [
+                    ['name' => 'search', 'isRequired' => false],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
             ],
             [
                 'type' => 'movie',
@@ -10821,6 +10823,21 @@ if ($isNuvioRoute) {
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
+                'extraRequired' => ['search'],
+            ],
+            [
+                'type' => 'other',
+                'id' => 'top',
+                'name' => 'Telegram Files',
+                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
+                'extra' => [
+                    ['name' => 'search', 'isRequired' => false],
+                    ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
+                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
+                    ['name' => 'skip', 'isRequired' => false],
+                ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
             ],
             [
                 'type' => 'other',
@@ -10845,6 +10862,8 @@ if ($isNuvioRoute) {
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
+                'extraRequired' => ['search'],
             ],
             [
                 'type' => 'movie',
@@ -10960,14 +10979,16 @@ if ($isNuvioRoute) {
             // Series Catalogs
             [
                 'type' => 'series',
-                'id' => 'pm_series_top',
+                'id' => 'top',
                 'name' => 'Popular',
                 'genres' => $allGenreOptions,
                 'extra' => [
+                    ['name' => 'search', 'isRequired' => false],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
             ],
             [
                 'type' => 'series',
@@ -10992,6 +11013,8 @@ if ($isNuvioRoute) {
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
+                'extraSupported' => ['search', 'genre', 'year', 'skip'],
+                'extraRequired' => ['search'],
             ],
             [
                 'type' => 'series',
@@ -11344,7 +11367,7 @@ if ($isNuvioRoute) {
                 foreach ($pairs as $p) {
                     $kv = explode('=', $p, 2);
                     if (count($kv) === 2) {
-                        $extra[$kv[0]] = $kv[1];
+                        $extra[$kv[0]] = urldecode(rawurldecode($kv[1]));
                     }
                 }
             }
@@ -11355,7 +11378,10 @@ if ($isNuvioRoute) {
         if (isset($_GET['year'])) $extra['year'] = (string)$_GET['year'];
         if (isset($_GET['skip'])) $extra['skip'] = (int)$_GET['skip'];
 
-        $searchQuery = $extra['search'] ?? '';
+        $searchQuery = trim(urldecode(rawurldecode((string) ($extra['search'] ?? ''))));
+        if (str_contains($searchQuery, '%20')) {
+            $searchQuery = trim(rawurldecode($searchQuery));
+        }
         $genre = $extra['genre'] ?? '';
         $year = $extra['year'] ?? '';
 
@@ -11446,9 +11472,12 @@ if ($isNuvioRoute) {
                 }
             }
 
-            // 2. Search direct Telegram files (included in separate pm_search_files catalog)
-            if ($catalogId === 'pm_search_files') {
-                $metas = []; // Reset metas to ensure direct Telegram files only
+            // 2. Search direct Telegram files (included across all search catalogs)
+            $shouldSearchFiles = ($catalogId === 'pm_search_files' || $catalogId === 'top' || str_starts_with($catalogId, 'pm_search_') || $catalogType === 'other');
+            if ($shouldSearchFiles) {
+                if ($catalogId === 'pm_search_files') {
+                    $metas = []; // Reset metas to ensure direct Telegram files only
+                }
                 $searchFiles = fd_fetch_stream_ajax('search_files', [
                     'search' => $searchQuery,
                     'limit' => 50,
@@ -11462,6 +11491,14 @@ if ($isNuvioRoute) {
                         $fTitle = fd_clean_html_entities((string) ($file['title'] ?? 'Telegram File'));
                         $fThumb = $file['thumbnail_url'] ?? '';
                         $fSize = (int) ($file['file_size'] ?? 0);
+
+                        $isEp = preg_match('/\b(e\d+|ep\d+|episod\b|episode\b|s\d+e\d+|part\d+)\b/i', $fTitle);
+                        if ($catalogType === 'movie' && $isEp && $catalogId !== 'pm_search_files') {
+                            continue;
+                        }
+                        if ($catalogType === 'series' && !$isEp && $catalogId !== 'pm_search_files') {
+                            continue;
+                        }
 
                         // Extract resolution & format tags
                         $pills = [];
@@ -11491,7 +11528,7 @@ if ($isNuvioRoute) {
 
                         $metas[] = [
                             'id' => 'pm_file_' . $fCode,
-                            'type' => 'other',
+                            'type' => $catalogType,
                             'name' => $fTitle,
                             'poster' => $fThumb,
                             'posterShape' => 'poster',
@@ -11501,13 +11538,13 @@ if ($isNuvioRoute) {
                     }
                 }
             }
-        } elseif ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest' || str_starts_with($catalogId, 'pm_topkw_')) {
+        } elseif ($catalogType === 'other' || $catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest' || str_starts_with($catalogId, 'pm_topkw_')) {
             // ── Telegram Files Catalogs (Year Files / Top Keywords) ──
             $searchFiles = [];
             // When a quality or year filter is active, fetch extra candidate files to filter down
             $fileFetchLimit = ($genre !== '' || $year !== '') ? 100 : 50;
 
-            if ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest') {
+            if ($catalogId === 'pm_files_year' || $catalogId === 'pm_files_latest' || $catalogId === 'top' || $catalogId === 'pm_search_files') {
                 // Fetch newest files from tg_file_new (or search by year if selected)
                 $latestSearchTerm = ($year !== '') ? $year : '__latest__';
                 $searchFiles = fd_fetch_stream_ajax('search_files', [
@@ -11776,7 +11813,7 @@ if ($isNuvioRoute) {
 
             $meta = [
                 'id' => $itemId,
-                'type' => 'other',
+                'type' => $itemType !== '' ? $itemType : 'other',
                 'name' => $cleanTitle,
                 'poster' => $thumb,
                 'posterShape' => 'poster',
@@ -14478,7 +14515,7 @@ if (str_starts_with($path, '/api/')) {
                 throw new \RuntimeException('fd_http_get_contents failed');
             }
         } catch (\Throwable $e) {
-            fd_log('proxy-stream failed', ['action' => $streamAction, 'error' => $e->getMessage()]);
+            fd_log('proxy-stream failed', ['action' => $action, 'error' => $e->getMessage()]);
             fd_json(['ok' => 0, 'message' => 'Failed to fetch data from PencariMovie.'], 502);
         }
 

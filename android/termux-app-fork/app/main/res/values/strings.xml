@@ -5,6 +5,12 @@
     <string name="start_server">Start Server</string>
     <string name="stop_server">Stop Server</string>
     <string name="open_browser">Open Browser</string>
+    <string name="open_web">Open Web</string>
+    <string name="addon_setup">Addon Setup</string>
+    <string name="server_settings">Settings</string>
+    <string name="cloudflare_tunnel">Cloudflare Tunnel</string>
+    <string name="tunnel_off">Tunnel: Off</string>
+    <string name="tunnel_starting">Tunnel: Connecting…</string>
     <string name="status_idle">Status: Idle</string>
     <string name="status_running">Status: Running</string>
     <string name="status_error">Status: Error</string>
@@ -12,6 +18,9 @@
     <string name="status_stopping">Status: Stopping...</string>
     <string name="auto_start_on_boot">Auto start on boot</string>
     <string name="battery_saver_mode">Battery Saver (Smart WakeLock)</string>
+    <string name="copied_to_clipboard">Copied to clipboard</string>
+    <string name="open_in_browser">Open in Browser</string>
+    <string name="reload">Reload</string>
     <string name="update_download">Download Update</string>
     <string name="update_available">Update available: v%1$s (installed v%2$s)</string>
     <string name="update_downloading">Downloading…</string>

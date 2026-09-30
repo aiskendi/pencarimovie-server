@@ -1,106 +1,96 @@
 package com.pencarimovie.downloader
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import android.view.View
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.switchmaterial.SwitchMaterial
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
+        private const val TAG = "MainActivity"
         private const val KEY_BACKGROUND_GUIDE_SHOWN = "background_guide_shown"
     }
 
     private var serverService: ServerService? = null
     private var isBound = false
 
-    private lateinit var btnStartStop: MaterialButton
-    private lateinit var btnOpenBrowser: MaterialButton
-    private lateinit var btnBackgroundGuide: MaterialButton
-    private lateinit var switchAutoStart: com.google.android.material.switchmaterial.SwitchMaterial
-    private lateinit var switchBatterySaver: com.google.android.material.switchmaterial.SwitchMaterial
+    private lateinit var viewStatusDot: View
     private lateinit var tvStatus: TextView
-    private lateinit var tvLog: TextView
+    private lateinit var progressBarStatus: ProgressBar
+    private lateinit var tvStatusLan: TextView
+    private lateinit var tvStatusTunnel: TextView
+
+    private lateinit var btnStartStop: MaterialButton
+    private lateinit var btnOpenWeb: MaterialButton
+    private lateinit var btnAddon: MaterialButton
+    private lateinit var btnSettings: MaterialButton
+
+    private lateinit var switchTunnel: SwitchMaterial
+    private lateinit var tvTunnelStatus: TextView
+
+    private lateinit var switchAutoStart: SwitchMaterial
+    private lateinit var switchBatterySaver: SwitchMaterial
+    private lateinit var btnBackgroundGuide: MaterialButton
+
     private lateinit var updateBanner: LinearLayout
     private lateinit var tvUpdateText: TextView
     private lateinit var btnUpdateDownload: MaterialButton
-    private lateinit var updateProgress: android.widget.ProgressBar
+    private lateinit var updateProgress: ProgressBar
 
     private var currentState: ServerState = ServerState.Idle
     private var serverPort: Int = 8088
     private var lanIp: String? = null
+    private var currentTunnelUrl: String? = null
 
-    /** Tracks the state observer registration, so we can remove it on disconnect. */
     private var stateObserver: ((ServerState) -> Unit)? = null
-
-    /** Tracks the last appended log line to skip consecutive duplicates. */
-    private var lastLogLine: String? = null
-
-    /** True while an update APK is downloading, to block duplicate taps. */
     private var isDownloadingUpdate = false
+    private var tunnelPollJob: Job? = null
+    private var isTunnelToggleInProgress = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             serverService = (service as? ServerService.LocalBinder)?.getService()
-            // Remove any previous observer to prevent accumulation on re-bind
             val svc = serverService
             stateObserver?.let { svc?.state?.removeObserver(it) }
-            // Register fresh observer
             stateObserver = { state ->
                 runOnUiThread { onStateChanged(state) }
             }
             svc?.state?.observe(stateObserver!!)
-
-            // Set up runtime log callback — receives ALL server process output
-            // independently of server state. Structured JSON logs from
-            // FrankenPHP/Caddy (internal diagnostics) are filtered out here.
-            // Also skip lines that duplicate app-generated status messages
-            // (Starting, Running, etc.) — these are no longer emitted by state
-            // handlers, but the process may still output similar lines.
-            svc?.onServerLogLine = { line ->
-                runOnUiThread {
-                    if (line.isNotBlank() &&
-                        // Show structured JSON logs from FrankenPHP *only* if they
-                        // contain user-relevant content (e.g., download requests).
-                        // Pure internal diagnostics (tls, admin, heartbeat) are
-                        // filtered out.
-                        (!line.trimStart().startsWith("{") || line.contains("PencariMovie Server") || line.contains("PencariMovie Downloader")) &&
-                        // Skip lines that duplicate app-generated status messages
-                        // still emitted by updateUiForState() (Error, Stopping).
-                        !line.startsWith("Stopping server") &&
-                        !line.startsWith("Error:") &&
-                        // Skip lines generated by the app itself
-                        !line.startsWith("Server start requested") &&
-                        !line.startsWith("Server stop requested") &&
-                        !line.startsWith("Bootstrap installed")) {
-                        // Skip consecutive duplicates (e.g., repeated heartbeat)
-                        if (line == lastLogLine) return@runOnUiThread
-                        lastLogLine = line
-                        appendLog(line)
-                    }
-                }
-            }
 
             // Sync battery saver state with the service
             val prefs = getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
@@ -108,7 +98,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            serverService?.onServerLogLine = null
             stateObserver?.let { serverService?.state?.removeObserver(it) }
             stateObserver = null
             serverService = null
@@ -120,13 +109,24 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        viewStatusDot = findViewById(R.id.viewStatusDot)
+        tvStatus = findViewById(R.id.tvStatus)
+        progressBarStatus = findViewById(R.id.progressBarStatus)
+        tvStatusLan = findViewById(R.id.tvStatusLan)
+        tvStatusTunnel = findViewById(R.id.tvStatusTunnel)
+
         btnStartStop = findViewById(R.id.btnStartStop)
-        btnOpenBrowser = findViewById(R.id.btnOpenBrowser)
-        btnBackgroundGuide = findViewById(R.id.btnBackgroundGuide)
+        btnOpenWeb = findViewById(R.id.btnOpenWeb)
+        btnAddon = findViewById(R.id.btnAddon)
+        btnSettings = findViewById(R.id.btnSettings)
+
+        switchTunnel = findViewById(R.id.switchTunnel)
+        tvTunnelStatus = findViewById(R.id.tvTunnelStatus)
+
         switchAutoStart = findViewById(R.id.switchAutoStart)
         switchBatterySaver = findViewById(R.id.switchBatterySaver)
-        tvStatus = findViewById(R.id.tvStatus)
-        tvLog = findViewById(R.id.tvLog)
+        btnBackgroundGuide = findViewById(R.id.btnBackgroundGuide)
+
         updateBanner = findViewById(R.id.updateBanner)
         tvUpdateText = findViewById(R.id.tvUpdateText)
         btnUpdateDownload = findViewById(R.id.btnUpdateDownload)
@@ -151,23 +151,18 @@ class MainActivity : AppCompatActivity() {
         setupListeners()
         updateUiForState(ServerState.Idle)
 
-        // Non-blocking update check — never delays startup, never blocks the UI.
         checkForAppUpdate()
 
         // Disable Start button until bootstrap check completes
         btnStartStop.isEnabled = false
 
-        // Check and extract bootstrap on first launch (matches TermuxActivity.java pattern)
+        // Check and extract bootstrap on first launch
         val prefixDir = File(TermuxInstaller.PREFIX_DIR_PATH)
         val isFirstLaunch = !prefixDir.isDirectory || (prefixDir.list()?.isEmpty() == true)
 
         TermuxInstaller.setupBootstrapIfNeeded(this, Runnable {
             runOnUiThread {
-                if (isFirstLaunch) {
-                    appendLog("Bootstrap installed successfully")
-                }
                 btnStartStop.isEnabled = true
-                // Show battery optimization dialog once on first install (only if not already exempt)
                 if (isFirstLaunch) {
                     checkAndPromptBatteryOptimization()
                 }
@@ -180,8 +175,17 @@ class MainActivity : AppCompatActivity() {
         bindService()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (currentState is ServerState.Running) {
+            fetchTunnelStatus()
+            startTunnelPolling()
+        }
+    }
+
     override fun onStop() {
         super.onStop()
+        stopTunnelPolling()
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false
@@ -207,30 +211,190 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        btnOpenBrowser.setOnClickListener {
-            val port = (currentState as? ServerState.Running)?.port
-                ?: (serverService?.state?.value as? ServerState.Running)?.port
-                ?: serverPort
-            val host = "127.0.0.1"
-            val url = "http://$host:$port"
+        btnOpenWeb.setOnClickListener {
+            WebActivity.start(this, "http://localhost:$serverPort/", getString(R.string.app_name))
+        }
+
+        btnAddon.setOnClickListener {
+            WebActivity.start(this, "http://localhost:$serverPort/#addon", getString(R.string.addon_setup))
+        }
+
+        btnSettings.setOnClickListener {
+            WebActivity.start(this, "http://localhost:$serverPort/#settings", getString(R.string.server_settings))
+        }
+
+        tvStatusLan.setOnClickListener {
+            val lanUrl = lanIp?.let { ip -> "http://$ip:$serverPort" }
+            if (!lanUrl.isNullOrEmpty()) {
+                copyToClipboard(lanUrl, "LAN URL copied to clipboard")
+            }
+        }
+
+        tvStatusTunnel.setOnClickListener {
+            val tunnel = currentTunnelUrl
+            if (!tunnel.isNullOrEmpty()) {
+                copyToClipboard(tunnel, "Tunnel URL copied to clipboard")
+            }
+        }
+
+        switchTunnel.setOnClickListener {
+            val isChecked = switchTunnel.isChecked
+            toggleTunnel(isChecked)
+        }
+    }
+
+    private fun copyToClipboard(text: String, message: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = ClipData.newPlainText("PencariMovie Server URL", text)
+        clipboard?.setPrimaryClip(clip)
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun toggleTunnel(enable: Boolean) {
+        if (currentState !is ServerState.Running) return
+        isTunnelToggleInProgress = true
+        switchTunnel.isEnabled = false
+        tvTunnelStatus.text = if (enable) getString(R.string.tunnel_starting) else "Disconnecting tunnel…"
+
+        // Fast poll loop while connecting
+        val fastPollJob = if (enable) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                while (isActive && isTunnelToggleInProgress) {
+                    delay(2000)
+                    fetchTunnelStatusInternal()
+                }
+            }
+        } else null
+
+        lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                startActivity(intent)
+                val endpoint = if (enable) "enable" else "disable"
+                val url = URL("http://127.0.0.1:$serverPort/api/tunnel/$endpoint")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 10_000
+                    readTimeout = 180_000 // Cloudflared download & setup can take up to 90s
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Accept", "application/json")
+                }
+                val payload = if (enable) "{\"tunnel_token\":\"\"}" else "{}"
+                conn.outputStream.use { it.write(payload.toByteArray()) }
+
+                val responseCode = conn.responseCode
+                val stream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
+                val responseBody = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                conn.disconnect()
+
+                var parsedError: String? = null
+                if (responseBody.isNotEmpty()) {
+                    try {
+                        val json = JSONObject(responseBody)
+                        if (json.optInt("ok", 1) == 0) {
+                            parsedError = json.optString("message", "Failed to start tunnel")
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                withContext(Dispatchers.Main) {
+                    fastPollJob?.cancel()
+                    isTunnelToggleInProgress = false
+                    if (parsedError != null) {
+                        tvTunnelStatus.text = parsedError
+                        switchTunnel.isChecked = false
+                        switchTunnel.isEnabled = true
+                    } else {
+                        fetchTunnelStatus()
+                    }
+                }
             } catch (e: Exception) {
-                Toast.makeText(this, "No browser found to open $url", Toast.LENGTH_SHORT).show()
+                Log.w(TAG, "Failed to toggle tunnel: ${e.message}")
+                withContext(Dispatchers.Main) {
+                    fastPollJob?.cancel()
+                    isTunnelToggleInProgress = false
+                    tvTunnelStatus.text = "Tunnel error: ${e.message}"
+                    switchTunnel.isEnabled = true
+                    fetchTunnelStatus()
+                }
             }
         }
     }
 
-    /**
-     * Check the rolling `apk-latest` release for a newer APK and, if found,
-     * reveal the update banner.
-     *
-     * Runs on [lifecycleScope] so it is cancelled automatically if the activity
-     * is destroyed. Any failure (offline, rate-limited, malformed JSON) is
-     * swallowed by [UpdateChecker] and simply leaves the banner hidden — an
-     * update check must never interfere with starting the server.
-     */
+    private fun startTunnelPolling() {
+        stopTunnelPolling()
+        tunnelPollJob = lifecycleScope.launch(Dispatchers.IO) {
+            while (isActive && currentState is ServerState.Running) {
+                fetchTunnelStatusInternal()
+                delay(6000)
+            }
+        }
+    }
+
+    private fun stopTunnelPolling() {
+        tunnelPollJob?.cancel()
+        tunnelPollJob = null
+    }
+
+    private fun fetchTunnelStatus() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            fetchTunnelStatusInternal()
+        }
+    }
+
+    private suspend fun fetchTunnelStatusInternal() {
+        if (currentState !is ServerState.Running) return
+        try {
+            val url = URL("http://127.0.0.1:$serverPort/api/tunnel/status")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 3000
+            conn.readTimeout = 4000
+
+            if (conn.responseCode == 200) {
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(body)
+                val enabled = json.optBoolean("enabled", false)
+                val running = json.optBoolean("running", false)
+                val publicUrl = json.optString("public_url", "").ifEmpty {
+                    json.optString("public_domain_url", "").ifEmpty {
+                        json.optString("tunnel_url", "")
+                    }
+                }
+
+                val isTunnelActive = enabled || running || publicUrl.isNotEmpty()
+
+                withContext(Dispatchers.Main) {
+                    if (!isTunnelToggleInProgress) {
+                        switchTunnel.isChecked = isTunnelActive
+                        switchTunnel.isEnabled = (currentState is ServerState.Running)
+                    }
+
+                    if (isTunnelActive && publicUrl.isNotEmpty()) {
+                        currentTunnelUrl = publicUrl
+                        tvTunnelStatus.text = "Connected: $publicUrl"
+                        tvStatusTunnel.text = "Tunnel: $publicUrl (Tap to copy)"
+                        tvStatusTunnel.visibility = View.VISIBLE
+                    } else if (isTunnelActive) {
+                        currentTunnelUrl = null
+                        tvTunnelStatus.text = getString(R.string.tunnel_starting)
+                        tvStatusTunnel.visibility = View.GONE
+                    } else {
+                        currentTunnelUrl = null
+                        tvTunnelStatus.text = getString(R.string.tunnel_off)
+                        tvStatusTunnel.visibility = View.GONE
+                    }
+                }
+            }
+            conn.disconnect()
+        } catch (_: Exception) {
+            withContext(Dispatchers.Main) {
+                if (!isTunnelToggleInProgress) {
+                    switchTunnel.isEnabled = (currentState is ServerState.Running)
+                }
+            }
+        }
+    }
+
     private fun checkForAppUpdate() {
         lifecycleScope.launch {
             val info = UpdateChecker.checkForUpdate(BuildConfig.VERSION_CODE) ?: return@launch
@@ -246,21 +410,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Download the update APK and hand it to the system package installer.
-     *
-     * Android always shows its own confirmation dialog before installing, so
-     * this is never silent. If the download or hash check fails, fall back to
-     * opening the release page so the user can install manually.
-     */
     private fun downloadAndInstallUpdate(info: UpdateChecker.UpdateInfo) {
-        // Guard against a second tap while a download is already running.
         if (isDownloadingUpdate) return
         isDownloadingUpdate = true
         btnUpdateDownload.isEnabled = false
 
-        // Show the progress bar immediately so the tap has visible feedback
-        // before the first byte arrives.
         updateProgress.visibility = View.VISIBLE
         updateProgress.isIndeterminate = true
         updateProgress.progress = 0
@@ -272,8 +426,6 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         if (total > 0) {
                             val pct = (done * 100 / total).toInt()
-                            // Switch from spinner to determinate once we know
-                            // the total size.
                             updateProgress.isIndeterminate = false
                             updateProgress.progress = pct
                             btnUpdateDownload.text =
@@ -295,7 +447,6 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
 
-                // Download done — hand off to the installer.
                 updateProgress.isIndeterminate = true
                 btnUpdateDownload.text = getString(R.string.update_installing)
 
@@ -320,7 +471,7 @@ class MainActivity : AppCompatActivity() {
     private fun openReleasePage() {
         try {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(UpdateChecker.RELEASE_PAGE_URL)))
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             Toast.makeText(this, UpdateChecker.RELEASE_PAGE_URL, Toast.LENGTH_LONG).show()
         }
     }
@@ -340,65 +491,107 @@ class MainActivity : AppCompatActivity() {
     private fun updateUiForState(state: ServerState) {
         when (state) {
             is ServerState.Idle -> {
-                btnStartStop.text = "Start Server"
+                stopTunnelPolling()
+                btnStartStop.text = getString(R.string.start_server)
                 btnStartStop.isEnabled = true
-                btnOpenBrowser.isEnabled = false
-                tvStatus.text = "Status: Idle"
+                btnOpenWeb.isEnabled = false
+                btnAddon.isEnabled = false
+                btnSettings.isEnabled = false
+                switchTunnel.isEnabled = false
+                switchTunnel.isChecked = false
+                tvTunnelStatus.text = getString(R.string.tunnel_off)
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_text_dim))
+                tvStatus.text = getString(R.string.status_idle)
                 tvStatus.setTextColor(getColor(R.color.glass_text_dim))
-                // Clear accumulated log on stop, so old sessions don't pile up
-                tvLog.text = ""
+                progressBarStatus.visibility = View.GONE
+                tvStatusLan.visibility = View.GONE
+                tvStatusTunnel.visibility = View.GONE
             }
             is ServerState.Starting -> {
                 btnStartStop.text = "Starting..."
                 btnStartStop.isEnabled = false
-                btnOpenBrowser.isEnabled = false
-                tvStatus.text = "Status: Starting..."
+                btnOpenWeb.isEnabled = false
+                btnAddon.isEnabled = false
+                btnSettings.isEnabled = false
+                switchTunnel.isEnabled = false
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_warn))
+                tvStatus.text = getString(R.string.status_starting)
                 tvStatus.setTextColor(getColor(R.color.glass_warn))
-                // Do NOT appendLog here — the process output (delivered via
-                // onServerLogLine) will contain server startup messages. The
-                // status bar above already shows "Starting..." visually.
+                progressBarStatus.visibility = View.VISIBLE
+                tvStatusLan.visibility = View.GONE
+                tvStatusTunnel.visibility = View.GONE
             }
             is ServerState.SetupProgress -> {
                 btnStartStop.text = "Starting..."
                 btnStartStop.isEnabled = false
-                btnOpenBrowser.isEnabled = false
-                tvStatus.text = "Status: Setting up..."
+                btnOpenWeb.isEnabled = false
+                btnAddon.isEnabled = false
+                btnSettings.isEnabled = false
+                switchTunnel.isEnabled = false
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_warn))
+                tvStatus.text = "Status: Setting up...\n${state.message}"
                 tvStatus.setTextColor(getColor(R.color.glass_warn))
-                // Log output is delivered via onServerLogLine (set in
-                // serviceConnection), which runs independently of state.
-                // state.message is only used for the status text above.
+                progressBarStatus.visibility = View.VISIBLE
+                tvStatusLan.visibility = View.GONE
+                tvStatusTunnel.visibility = View.GONE
             }
             is ServerState.Running -> {
-                btnStartStop.text = "Stop Server"
+                btnStartStop.text = getString(R.string.stop_server)
                 btnStartStop.isEnabled = true
-                btnOpenBrowser.isEnabled = true
-                val ipInfo = if (state.lanIp != null) "LAN: http://${state.lanIp}:${state.port}" else ""
-                tvStatus.text = "Status: Running (port ${state.port})\n$ipInfo"
+                btnOpenWeb.isEnabled = true
+                btnAddon.isEnabled = true
+                btnSettings.isEnabled = true
+                switchTunnel.isEnabled = true
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_ok))
+                tvStatus.text = "Status: Running (port ${state.port})"
                 tvStatus.setTextColor(getColor(R.color.glass_ok))
-                // Do NOT appendLog here — the process output (delivered via
-                // onServerLogLine) will contain "Server running on port..." and
-                // "LAN access:..." messages. The status bar above already shows
-                // the running state with IP info.
+                progressBarStatus.visibility = View.GONE
+
+                if (!state.lanIp.isNullOrEmpty()) {
+                    tvStatusLan.text = "LAN: http://${state.lanIp}:${state.port} (Tap to copy)"
+                    tvStatusLan.visibility = View.VISIBLE
+                } else {
+                    tvStatusLan.visibility = View.GONE
+                }
+
+                startTunnelPolling()
             }
             is ServerState.Error -> {
-                btnStartStop.text = "Start Server"
+                stopTunnelPolling()
+                btnStartStop.text = getString(R.string.start_server)
                 btnStartStop.isEnabled = true
-                btnOpenBrowser.isEnabled = false
-                tvStatus.text = "Status: Error"
+                btnOpenWeb.isEnabled = false
+                btnAddon.isEnabled = false
+                btnSettings.isEnabled = false
+                switchTunnel.isEnabled = false
+                switchTunnel.isChecked = false
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_error))
+                tvStatus.text = "Status: Error\n${state.message}"
                 tvStatus.setTextColor(getColor(R.color.glass_error))
-                // Keep appendLog for Error — the error message may not appear
-                // in process output (e.g., exceptions from native runner).
-                appendLog("Error: ${state.message}")
+                progressBarStatus.visibility = View.GONE
+                tvStatusLan.visibility = View.GONE
+                tvStatusTunnel.visibility = View.GONE
             }
             is ServerState.Stopping -> {
-                btnStartStop.text = "Stopping..."
+                stopTunnelPolling()
+                btnStartStop.text = getString(R.string.status_stopping)
                 btnStartStop.isEnabled = false
-                btnOpenBrowser.isEnabled = false
-                tvStatus.text = "Status: Stopping..."
+                btnOpenWeb.isEnabled = false
+                btnAddon.isEnabled = false
+                btnSettings.isEnabled = false
+                switchTunnel.isEnabled = false
+
+                viewStatusDot.backgroundTintList = ColorStateList.valueOf(getColor(R.color.glass_error))
+                tvStatus.text = getString(R.string.status_stopping)
                 tvStatus.setTextColor(getColor(R.color.glass_error))
-                // Keep appendLog for Stopping — the process won't output
-                // "Stopping server..." since it's being killed externally.
-                appendLog("Stopping server...")
+                progressBarStatus.visibility = View.VISIBLE
+                tvStatusLan.visibility = View.GONE
+                tvStatusTunnel.visibility = View.GONE
             }
         }
     }
@@ -437,26 +630,13 @@ class MainActivity : AppCompatActivity() {
     private fun startServer() {
         val intent = ServerService.startIntent(this)
         ContextCompat.startForegroundService(this, intent)
-        appendLog("Server start requested")
     }
 
     private fun stopServer() {
         val intent = ServerService.stopIntent(this)
         startService(intent)
-        appendLog("Server stop requested")
     }
 
-    /**
-     * Check if battery optimization is enabled and prompt the user to disable it.
-     *
-     * On most Android 6+ devices, battery optimization can prevent foreground
-     * services from running reliably. OEMs like Xiaomi, Samsung, Huawei, and
-     * OnePlus have especially aggressive background killing. This prompt guides
-     * the user to the system settings to whitelist the app.
-     *
-     * Only shows once (checks [Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS]
-     * directly rather than using a shared preference flag).
-     */
     private fun openAppSettings() {
         try {
             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
@@ -479,13 +659,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Shows the background-activity / battery-exemption guide.
-     *
-     * The dialog is ALWAYS cancelable so the user is never locked out on any
-     * Android version or OEM. When battery optimization is active, an extra
-     * "Start Anyway" button lets the user proceed without changing settings.
-     */
     private fun checkAndPromptBatteryOptimization(forcePrompt: Boolean = false) {
         val prefs = getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
         if (!forcePrompt) {
@@ -527,18 +700,5 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Close", null)
             .show()
-    }
-
-    private fun appendLog(message: String) {
-        tvLog.append("$message\n")
-        // Auto-scroll to bottom — defer after layout pass to avoid NPE
-        // when layout is null (called from onCreate before first layout pass)
-        tvLog.post {
-            val layout = tvLog.layout ?: return@post
-            val scrollAmount = layout.getLineTop(tvLog.lineCount) - tvLog.height
-            if (scrollAmount > 0) {
-                tvLog.scrollTo(0, scrollAmount)
-            }
-        }
     }
 }

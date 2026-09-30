@@ -8129,8 +8129,17 @@ function fd_tunnel_write_pid(int $pid): void
     @file_put_contents(fd_tunnel_pid_path(), (string) $pid, LOCK_EX);
 }
 
-function fd_tunnel_pid_alive(int $pid): bool
+function fd_tunnel_pid_alive(int $pid, int $metricsPort = 0): bool
 {
+    if ($pid <= 1 && $metricsPort <= 0) {
+        return false;
+    }
+    if ($metricsPort > 0) {
+        $resp = @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1);
+        if ($resp !== '' && stripos($resp, '"status":200') !== false) {
+            return true;
+        }
+    }
     if ($pid <= 1) {
         return false;
     }
@@ -8818,17 +8827,26 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
             }
         }
 
+        // If PHP is ALREADY running inside PRoot (e.g. FrankenPHP started by NativeRunner),
+        // we must NOT wrap cloudflared with proot again (nested proot fails ptrace).
+        $tracerStatus = (string) @file_get_contents('/proc/self/status');
+        $isInsideProot = getenv('PROOT_TMP_DIR') !== false ||
+            getenv('PROOT_LOADER_PATH') !== false ||
+            preg_match('/TracerPid:\s*([1-9]\d*)/', $tracerStatus);
+
         $prootBin = '';
-        foreach (['/data/data/com.pencarimovie.downloader/files/usr/bin/proot', '/data/data/com.termux/files/usr/bin/proot'] as $pb) {
-            if (is_file($pb) && is_executable($pb)) {
-                $prootBin = $pb;
-                break;
+        if (!$isInsideProot) {
+            foreach (['/data/data/com.pencarimovie.downloader/files/usr/bin/proot', '/data/data/com.termux/files/usr/bin/proot'] as $pb) {
+                if (is_file($pb) && is_executable($pb)) {
+                    $prootBin = $pb;
+                    break;
+                }
             }
-        }
-        if ($prootBin === '') {
-            $whichProot = trim((string) @shell_exec('command -v proot 2>/dev/null'));
-            if ($whichProot !== '' && is_file($whichProot)) {
-                $prootBin = $whichProot;
+            if ($prootBin === '') {
+                $whichProot = trim((string) @shell_exec('command -v proot 2>/dev/null'));
+                if ($whichProot !== '' && is_file($whichProot)) {
+                    $prootBin = $whichProot;
+                }
             }
         }
 
@@ -9046,14 +9064,18 @@ function fd_get_tunnel_status(): array
 {
     $state = fd_load_tunnel_state();
     $pid = fd_tunnel_read_pid();
-    $alive = $pid > 1 && fd_tunnel_pid_alive($pid);
+    $metricsPort = (int) ($state['metrics_port'] ?? 0);
+    $alive = ($pid > 1 && fd_tunnel_pid_alive($pid, $metricsPort)) ||
+        ($metricsPort > 0 && stripos((string) @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1), '"status":200') !== false);
 
     // Watchdog: if the state says enabled but cloudflared died, revive it.
     if (!$alive && !empty($state['enabled'])) {
         fd_tunnel_auto_restart();
         $state = fd_load_tunnel_state();
         $pid = fd_tunnel_read_pid();
-        $alive = $pid > 1 && fd_tunnel_pid_alive($pid);
+        $metricsPort = (int) ($state['metrics_port'] ?? 0);
+        $alive = ($pid > 1 && fd_tunnel_pid_alive($pid, $metricsPort)) ||
+            ($metricsPort > 0 && stripos((string) @fd_tunnel_local_http_get('http://127.0.0.1:' . $metricsPort . '/ready', 1), '"status":200') !== false);
     }
 
     $tunnelToken = trim((string) ($state['tunnel_token'] ?? ''));

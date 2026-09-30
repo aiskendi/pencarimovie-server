@@ -200,7 +200,30 @@ class NativeRunner(
         var started = tryStartFrankenphp(lanIp)
 
         if (!started) {
+            // Check if FrankenPHP binary or release files were damaged/truncated
+            val frankenphpFile = File("$appDir/bin/frankenphp")
+            val backendFile = File("$appDir/backend.php")
+            val isCorrupted = !frankenphpFile.isFile || frankenphpFile.length() < 1_000_000L || !backendFile.isFile || backendFile.length() < 1024L
+
+            if (isCorrupted) {
+                emitProgress("[setup] Release files missing or corrupted. Cleaning and re-downloading...")
+                Log.w(TAG, "FrankenPHP files corrupted (frankenphp size=${frankenphpFile.length()}, backend size=${backendFile.length()}). Forcing clean re-download...")
+                try { File("$appDir/$RELEASE_TAG_FILE").delete() } catch (_: Exception) {}
+                val reinstalled = installOrUpdate(force = true)
+                if (reinstalled || isAppInstalled()) {
+                    emitProgress("[server] Retrying FrankenPHP startup...")
+                    started = tryStartFrankenphp(lanIp)
+                }
+            }
+        }
+
+        if (!started) {
             if (isProotRunnable()) {
+                // Check once more if binary exists
+                val frankenphpFile = File("$appDir/bin/frankenphp")
+                if (!frankenphpFile.isFile || frankenphpFile.length() < 1_000_000L) {
+                    throw RuntimeException("FrankenPHP binary corrupted or missing (${frankenphpFile.length()} bytes). Please restart server to re-download.")
+                }
                 // proot works — the failure is FrankenPHP's own. Do not mask it.
                 Log.e(TAG, "FrankenPHP failed to start but proot is runnable — not falling back")
                 throw RuntimeException(
@@ -222,9 +245,16 @@ class NativeRunner(
     }
 
     private fun isAppInstalled(): Boolean {
-        return File(appDir).isDirectory && (
-            File("$appDir/backend.php").isFile || File("$appDir/bin/frankenphp").isFile
-        )
+        val app = File(appDir)
+        val backend = File("$appDir/backend.php")
+        val frankenphp = File("$appDir/bin/frankenphp")
+        val valid = app.isDirectory && backend.isFile && backend.length() > 1024L &&
+                frankenphp.isFile && frankenphp.length() > 1_000_000L
+        if (!valid && app.isDirectory) {
+            // Files are missing or corrupted — invalidate release tag
+            try { File("$appDir/$RELEASE_TAG_FILE").delete() } catch (_: Exception) {}
+        }
+        return valid
     }
 
     private fun releaseTarget(): String {
@@ -347,12 +377,13 @@ class NativeRunner(
     private fun downloadFileNative(urlStr: String, destFile: File): Boolean {
         var currentUrl = urlStr
         var redirects = 5
+        val partFile = File(destFile.parentFile, "${destFile.name}.part")
         while (redirects-- > 0) {
             try {
                 val conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
                     instanceFollowRedirects = false
                     connectTimeout = 30_000
-                    readTimeout = 120_000
+                    readTimeout = 180_000
                     setRequestProperty("User-Agent", "pencarimovie-downloader")
                 }
                 val code = conn.responseCode
@@ -368,16 +399,42 @@ class NativeRunner(
                     conn.disconnect()
                     return false
                 }
+                val expectedLength = conn.contentLengthLong
                 destFile.parentFile?.mkdirs()
+                if (partFile.exists()) partFile.delete()
+
+                var totalRead = 0L
                 conn.inputStream.use { input ->
-                    destFile.outputStream().use { output ->
-                        input.copyTo(output)
+                    partFile.outputStream().use { output ->
+                        val buffer = ByteArray(65536)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            totalRead += read
+                        }
+                        output.flush()
                     }
                 }
                 conn.disconnect()
-                return destFile.isFile && destFile.length() > 0
+
+                // Integrity checks
+                if (expectedLength > 0 && totalRead != expectedLength) {
+                    Log.w(TAG, "Download interrupted: received $totalRead of $expectedLength bytes")
+                    partFile.delete()
+                    return false
+                }
+                if (partFile.length() < 100_000L) {
+                    Log.w(TAG, "Downloaded file suspiciously small (${partFile.length()} bytes)")
+                    partFile.delete()
+                    return false
+                }
+
+                if (destFile.exists()) destFile.delete()
+                val success = partFile.renameTo(destFile)
+                return success && destFile.isFile && destFile.length() > 0
             } catch (e: Exception) {
                 Log.w(TAG, "downloadFileNative error: ${e.message}")
+                if (partFile.exists()) partFile.delete()
                 return false
             }
         }
@@ -388,12 +445,12 @@ class NativeRunner(
      * Same start-time OTA as the one-file installers.
      * Returns true if files were installed or updated.
      */
-    private suspend fun installOrUpdate(): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun installOrUpdate(force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         val target = releaseTarget()
         emitProgress("[setup] Checking GitHub for updates...")
         val latest = fetchLatestTag()
         val current = readCurrentTag()
-        val hadApp = isAppInstalled()
+        val hadApp = !force && isAppInstalled()
 
         if (latest.isNullOrEmpty()) {
             if (hadApp) {
@@ -456,33 +513,59 @@ class NativeRunner(
             Log.w(TAG, "Native downloads failed, falling back to wget...")
             val downloadScript = """
                 mkdir -p '$tmp'
-                if ! wget --no-check-certificate -O '$tmp/pencarimovie.tar.gz' '$url' 2>&1; then
+                rm -f '$tmp/pencarimovie.tar.gz.part'
+                if ! wget --no-check-certificate -O '$tmp/pencarimovie.tar.gz.part' '$url' 2>&1; then
                     echo "[setup] Primary wget failed, trying fallback: $fallbackUrl"
-                    wget --no-check-certificate -O '$tmp/pencarimovie.tar.gz' '$fallbackUrl' 2>&1
+                    wget --no-check-certificate -O '$tmp/pencarimovie.tar.gz.part' '$fallbackUrl' 2>&1
+                fi
+                if [ -f '$tmp/pencarimovie.tar.gz.part' ] && [ $(stat -c%s '$tmp/pencarimovie.tar.gz.part' 2>/dev/null || stat -f%z '$tmp/pencarimovie.tar.gz.part' 2>/dev/null || echo 0) -gt 100000 ]; then
+                    mv -f '$tmp/pencarimovie.tar.gz.part' '$tmp/pencarimovie.tar.gz'
+                else
+                    rm -f '$tmp/pencarimovie.tar.gz.part'
+                    exit 1
                 fi
             """.trimIndent()
-            downloaded = runShell(downloadScript) && tarFile.isFile && tarFile.length() > 0
+            downloaded = runShell(downloadScript) && tarFile.isFile && tarFile.length() > 100_000L
         }
 
-        if (!downloaded) {
-            Log.e(TAG, "Failed to download $url or fallback $fallbackUrl")
+        if (!downloaded || !tarFile.isFile || tarFile.length() < 100_000L) {
+            Log.e(TAG, "Failed to download valid tarball from $url or fallback $fallbackUrl")
+            tarFile.delete()
             return false
         }
 
-        // 2. Extract and install
+        // 2. Extract and install with archive integrity guard & post-extract validation
         val script = """
             set -e
             TMP='$tmp'
             APP_DIR='$appDir'
             TAG='$tag'
+            TAR_FILE="${'$'}TMP/pencarimovie.tar.gz"
+
+            echo "[setup] Validating archive integrity..."
+            if ! tar -tzf "${'$'}TAR_FILE" >/dev/null 2>&1; then
+                echo "[setup] Error: tarball is corrupted or truncated. Removing broken file."
+                rm -f "${'$'}TAR_FILE"
+                exit 1
+            fi
+
+            rm -rf "${'$'}TMP/extract"
             mkdir -p "${'$'}TMP/extract" "${'$'}APP_DIR"
             echo "[setup] Extracting..."
-            tar -xzf "${'$'}TMP/pencarimovie.tar.gz" -C "${'$'}TMP/extract"
+            tar -xzf "${'$'}TAR_FILE" -C "${'$'}TMP/extract"
             SRC="${'$'}TMP/extract"
             if [ ! -f "${'$'}SRC/backend.php" ] && [ ! -f "${'$'}SRC/start.sh" ]; then
               FOUND=${'$'}(find "${'$'}SRC" -maxdepth 2 -type f \( -name backend.php -o -name start.sh \) 2>/dev/null | head -1 || true)
               [ -n "${'$'}FOUND" ] && SRC=${'$'}(dirname "${'$'}FOUND")
             fi
+
+            # Check that extracted source is valid
+            if [ ! -f "${'$'}SRC/backend.php" ] && [ ! -f "${'$'}SRC/bin/frankenphp" ]; then
+                echo "[setup] Error: extracted archive has no backend.php or bin/frankenphp"
+                rm -rf "${'$'}TMP"
+                exit 1
+            fi
+
             echo "[setup] Installing (keeping storage/)..."
             for item in "${'$'}SRC"/*; do
               [ -e "${'$'}item" ] || continue
@@ -504,6 +587,16 @@ class NativeRunner(
               [ -f "${'$'}f" ] || continue
               tr -d '\r' < "${'$'}f" > "${'$'}f.tmp" && mv "${'$'}f.tmp" "${'$'}f"
             done
+
+            # Set execution permissions on binaries
+            chmod 755 "${'$'}APP_DIR/bin"/* 2>/dev/null || true
+
+            # Post-extract verification
+            if [ ! -f "${'$'}APP_DIR/backend.php" ]; then
+                echo "[setup] Error: installation incomplete (backend.php missing)"
+                exit 1
+            fi
+
             printf '%s\n' "${'$'}TAG" > "${'$'}APP_DIR/$RELEASE_TAG_FILE"
             rm -rf "${'$'}TMP"
             echo "[setup] Done (${'$'}TAG)."
@@ -710,18 +803,7 @@ opcache.enable_cli = 0
 
         // FrankenPHP under proot cannot exec Termux ifconfig. Persist the
         // Kotlin-detected LAN IP so backend.php can return it to the Nuvio card.
-        val lanIpFile = File("$appDirPath/storage/lan_ip.txt")
-        try {
-            File("$appDirPath/storage").mkdirs()
-            if (usableLanIp.isNotEmpty()) {
-                lanIpFile.writeText(usableLanIp)
-                Log.i(TAG, "Wrote LAN_IP $usableLanIp to ${lanIpFile.path}")
-            } else if (lanIpFile.exists()) {
-                lanIpFile.delete()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to write lan_ip.txt: ${e.message}")
-        }
+        persistLanIp(usableLanIp)
 
         // Build the proot command matching the setup script with PHPRC fix.
         // PHPRC must point to bin/ so FrankenPHP loads bin/php.ini (which was
@@ -764,7 +846,7 @@ opcache.enable_cli = 0
         // own defaults, and pinning them here capped concurrency and memory below
         // what the device can handle.
         val shellCommand = buildString {
-            append("export PATH=\"$appDirPath/bin:$prefixDir/bin:\$PATH\" && ")
+            append("export PATH=\"$appDirPath/bin:$appDirPath/storage/bin:$prefixDir/bin:\$PATH\" && ")
             append("export PHP_BINDIR=\"$appDirPath/bin\" && ")
             append("export PHPRC=\"$appDirPath/bin\" && ")
             append("export PREFIX=\"$prefixDir\" && ")
@@ -781,8 +863,11 @@ opcache.enable_cli = 0
             append("-b \"$appDirPath:$appDirPath\" ")
             append("-b \"$tmpDir:/tmp\" ")
             append("-b \"$tmpDir/resolv.conf:/etc/resolv.conf\" ")
+            if (File("/system/etc/security/cacerts").isDirectory) {
+                append("-b \"/system/etc/security/cacerts:/system/etc/security/cacerts\" ")
+            }
             append("/system/bin/sh -c '")
-            append("export PATH=\"$appDirPath/bin:$prefixDir/bin:\$PATH\"; ")
+            append("export PATH=\"$appDirPath/bin:$appDirPath/storage/bin:$prefixDir/bin:\$PATH\"; ")
             append("export PHP_BINDIR=\"$appDirPath/bin\"; ")
             append("export PHPRC=\"$appDirPath/bin\"; ")
             append("export PREFIX=\"$prefixDir\"; ")
@@ -1134,5 +1219,26 @@ opcache.enable_cli = 0
         try { Thread.sleep(500) } catch (_: InterruptedException) {}
 
         Log.i(TAG, "Server stopped")
+    }
+
+    /**
+     * Persists the detected LAN IP so backend.php and other tools can access it.
+     * Can be called dynamically when the network changes (e.g. Wi-Fi connects or Hotspot turns on).
+     */
+    fun persistLanIp(lanIp: String?) {
+        val usableLanIp = lanIp?.trim().orEmpty()
+        val lanIpFile = File("$appDir/storage/lan_ip.txt")
+        try {
+            File("$appDir/storage").mkdirs()
+            if (usableLanIp.isNotEmpty()) {
+                lanIpFile.writeText(usableLanIp)
+                Log.i(TAG, "Wrote LAN_IP $usableLanIp to ${lanIpFile.path}")
+            } else if (lanIpFile.exists()) {
+                lanIpFile.delete()
+                Log.i(TAG, "Cleared LAN_IP from ${lanIpFile.path}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to write lan_ip.txt: ${e.message}")
+        }
     }
 }

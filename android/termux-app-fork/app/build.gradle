@@ -82,14 +82,14 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true
-            shrinkResources false // Reproducible builds
+            minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
             signingConfig signingConfigs.release
         }
 
         debug {
-            signingConfig signingConfigs.debug
+            debuggable true
+            signingConfig signingConfigs.release
         }
     }
 

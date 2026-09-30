@@ -7,9 +7,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
-import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -57,6 +62,8 @@ class ServerService : Service() {
 
     /** Handler for dispatching state changes to the main thread. */
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     /** NativeRunner configured for bootstrap prefix paths (standalone APK). */
     private val nativeRunner = NativeRunner().also { runner ->
@@ -164,6 +171,7 @@ class ServerService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterNetworkCallback()
         // Ensure clean stop — nativeRunner.stop() is idempotent
         nativeRunner.stop()
         scope.cancel()
@@ -243,6 +251,7 @@ class ServerService : Service() {
                     if (isBatterySaverEnabled) {
                         releaseWakeLock()
                     }
+                    registerNetworkCallback()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start server", e)
@@ -255,6 +264,7 @@ class ServerService : Service() {
     }
 
     private fun stopServer() {
+        unregisterNetworkCallback()
         // Run stop on background thread — nativeRunner.stop() now waits for
         // pkill + port release which would block the main thread.
         _state.value = ServerState.Stopping
@@ -597,6 +607,74 @@ class ServerService : Service() {
         }
 
         return null
+    }
+
+    /**
+     * Registers a network callback to dynamically detect when Wi-Fi or Hotspot is turned on/off
+     * while the server is running, updating LAN IP without requiring a server restart.
+     */
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            if (networkCallback != null) return
+
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    checkAndUpdateLanIp()
+                }
+                override fun onLost(network: Network) {
+                    checkAndUpdateLanIp()
+                }
+                override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                    checkAndUpdateLanIp()
+                }
+                override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                    checkAndUpdateLanIp()
+                }
+            }
+            networkCallback = callback
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                cm.registerDefaultNetworkCallback(callback)
+            } else {
+                val request = NetworkRequest.Builder().build()
+                cm.registerNetworkCallback(request, callback)
+            }
+            Log.d(TAG, "Dynamic NetworkCallback registered successfully")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to register NetworkCallback: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.unregisterNetworkCallback(it)
+                Log.d(TAG, "Dynamic NetworkCallback unregistered")
+            }
+        } catch (_: Exception) {}
+        networkCallback = null
+    }
+
+    private fun checkAndUpdateLanIp() {
+        scope.launch {
+            // Small debounce to let link properties settle
+            delay(500)
+            val current = _state.value
+            if (current !is ServerState.Running) return@launch
+            val newIp = detectLanIp()
+            if (newIp != current.lanIp) {
+                Log.i(TAG, "Dynamic LAN IP changed: ${current.lanIp} -> $newIp")
+                nativeRunner.persistLanIp(newIp)
+                mainHandler.post {
+                    val updated = _state.value
+                    if (updated is ServerState.Running) {
+                        _state.value = updated.copy(lanIp = newIp)
+                        updateNotification("Running on port ${updated.port}", true)
+                    }
+                }
+            }
+        }
     }
 }
 

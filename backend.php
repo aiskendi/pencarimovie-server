@@ -7959,6 +7959,10 @@ function fd_load_catalog_settings(): array
         }
     }
 
+    if (!is_file($path)) {
+        @fd_save_catalog_settings($defaults);
+    }
+
     return $defaults;
 }
 

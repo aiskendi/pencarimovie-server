@@ -88,12 +88,12 @@ class PencariMovieApp {
   async init() {
     window.showSettingsGate = (opts) => this.showSettingsGate(opts);
     window.openAddonModal = () => this.openAddonModal?.();
-    this._hideLoadingScreen();
     this.detectTelegram();
     this.bindGlobalEvents();
 
     // ── Auth gate — must pass before anything else loads ──
     if (!(await this.checkAuth())) {
+      this._hideLoadingScreen();
       return; // Auth gate is showing; stop init until the user logs in
     }
 
@@ -102,6 +102,8 @@ class PencariMovieApp {
 
   async continueInit() {
     this.loadLanIp();
+    // Pre-load and initialize catalog configuration settings
+    this.loadCatalogSettings?.();
 
     // ── Instant Modal Opening if requested by hash (zero waiting) ──
     const initHash = window.location.hash;
@@ -1285,6 +1287,9 @@ class PencariMovieApp {
       }
     };
     this.openAddonModal = openAddonModal;
+    this.loadCatalogSettings = loadCatalogSettings;
+    // Load catalog settings and server country during initial setup
+    loadCatalogSettings();
     window.openAddonModal = openAddonModal;
 
     if (addonBtn) {
@@ -2275,8 +2280,7 @@ class PencariMovieApp {
         // UI forever (observed: an endless "Provisioning guest bot..." spinner).
         this._provisionPollCount = (this._provisionPollCount || 0) + 1;
         this.provisionError = 'Provisioning guest bot...';
-        const loadText = document.querySelector('.loading-screen__text');
-        if (loadText) loadText.textContent = 'Provisioning guest bot...';
+        this._showLoadingScreen('Provisioning guest bot...');
 
         if (this._provisionPollCount > 20) {
           // ~50s of polling with no session — stop and surface the gate.
@@ -2297,8 +2301,7 @@ class PencariMovieApp {
         }, 2500);
       } else if (data && data.ok === 1) {
         // No session found and not currently provisioning — attempt 1-click automatic guest bot provisioning on the fly
-        const loadText = document.querySelector('.loading-screen__text');
-        if (loadText) loadText.textContent = 'Provisioning guest bot...';
+        this._showLoadingScreen('Provisioning guest bot...');
 
         // Pre-flight clock check: a skewed clock makes every MTProto handshake
         // fail with a confusing "message ID too new/old" error. Detect it now
@@ -3327,6 +3330,18 @@ class PencariMovieApp {
   showLoading(show) {
     const el = this.$('#streamLoading');
     if (el) el.classList.toggle('hidden', !show);
+  }
+
+  /** Show the full-page loading screen shown during session check / guest bot provisioning */
+  _showLoadingScreen(text = 'Provisioning guest bot...') {
+    const el = this.$('#loadingScreen');
+    if (el) {
+      el.classList.remove('hidden');
+      el.setAttribute('aria-hidden', 'false');
+      el.style.display = '';
+      const textEl = el.querySelector('.loading-screen__text');
+      if (textEl) textEl.textContent = text;
+    }
   }
 
   /** Hide the full-page loading screen shown during session check */

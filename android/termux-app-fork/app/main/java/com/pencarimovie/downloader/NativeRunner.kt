@@ -1230,13 +1230,8 @@ opcache.enable_cli = 0
         val lanIpFile = File("$appDir/storage/lan_ip.txt")
         try {
             File("$appDir/storage").mkdirs()
-            if (usableLanIp.isNotEmpty()) {
-                lanIpFile.writeText(usableLanIp)
-                Log.i(TAG, "Wrote LAN_IP $usableLanIp to ${lanIpFile.path}")
-            } else if (lanIpFile.exists()) {
-                lanIpFile.delete()
-                Log.i(TAG, "Cleared LAN_IP from ${lanIpFile.path}")
-            }
+            lanIpFile.writeText(usableLanIp)
+            Log.i(TAG, "Persisted LAN IP '$usableLanIp' to ${lanIpFile.path}")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to write lan_ip.txt: ${e.message}")
         }

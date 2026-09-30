@@ -7020,21 +7020,24 @@ function fd_is_android_runtime(): bool
 
 function fd_cached_lan_ip(): string
 {
-    $env = trim((string) fd_env('LAN_IP', ''));
-    if (fd_is_usable_lan_ipv4($env)) {
-        return $env;
-    }
     try {
         $path = fd_storage_path('storage/lan_ip.txt');
         if (is_file($path)) {
             $cached = trim((string) @file_get_contents($path));
-            if (fd_is_usable_lan_ipv4($cached)) {
-                return $cached;
+            if ($cached !== '') {
+                return fd_is_usable_lan_ipv4($cached) ? $cached : '';
             }
+            return '';
         }
     } catch (Throwable $e) {
         return '';
     }
+
+    $env = trim((string) fd_env('LAN_IP', ''));
+    if (fd_is_usable_lan_ipv4($env)) {
+        return $env;
+    }
+
     return '';
 }
 

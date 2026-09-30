@@ -1193,7 +1193,7 @@ class PencariMovieApp {
       }
 
       if (manifestLanInput) {
-        manifestLanInput.value = lanUrl || (this.lanIp ? `http://${this.lanIp}${portSuffix}${tokenPrefix}/manifest.json` : '');
+        manifestLanInput.value = lanUrl || '';
       }
 
       if (manifestTunnelInput) {
@@ -1738,10 +1738,13 @@ class PencariMovieApp {
       if (port > 0 && port < 65536) {
         this.listenPort = port;
       }
-      if (lanIp && lanIp !== '127.0.0.1') {
-        this.lanIp = lanIp;
+      this.lanIp = (lanIp && lanIp !== '127.0.0.1') ? lanIp : '';
+      if (this.lanIp) {
+        localStorage.setItem('pm.lan_ip', this.lanIp);
+      } else {
+        localStorage.removeItem('pm.lan_ip');
       }
-      this._updateAddonModalUrls();
+      this._updateAddonModalUrls?.();
     } catch (e) {
       // Non-fatal — never tied to bot session.
     }

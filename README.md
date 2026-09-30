@@ -21,7 +21,7 @@
 **PencariMovie Server** is a lightweight, standalone streaming engine that connects directly to Telegram's MTProto protocol. It converts media into direct, high-speed HTTP streams with instant seek support for **Stremio**, **Nuvio**, **Eclipse Music**, or the built-in dark web player.
 
 - **Zero account setup**: Runs out of the box without requiring personal Telegram logins, phone numbers, or bot tokens.
-- **Sub-second stream resolution**: Manticore indexing and fast-path metadata resolution for instant stream links.
+- **Sub-second stream resolution**: Fast-path metadata indexing for instant stream links.
 - **Local & private**: Resolves and streams directly over your local machine or LAN without third-party debrid accounts.
 - **Cross-platform**: Available as a native Windows tray app, Linux CLI, Android APK (TV/Phone), Termux script, and multi-arch Docker image.
 
@@ -228,7 +228,7 @@ _(Works across Windows, macOS, Linux, and Termux)._
 ## ✨ Features
 
 - **🔌 100% Plug & Play**: Instant streaming without creating bot tokens, entering phone numbers, or configuring API keys.
-- **⚡ Sub-Second Resolution**: Instant stream cards powered by direct `media_ids_idx` Manticore lookups.
+- **⚡ Sub-Second Resolution**: Instant stream cards powered by optimized direct metadata resolution.
 - **📺 Stremio & Nuvio Ready**: Built-in addon provider with catalog bridging and direct seekable `.mp4` stream resolution.
 - **🎵 Lossless Eclipse Music Streaming**: Transcodes high-res ALAC music tracks into lossless FLAC on the fly for Android, iOS, and Web.
 - **🎛️ Master Upstream Toggle**: Enable or disable all bridged upstream catalogs (e.g. AIOMetadata) with a single switch without wiping your custom manifests.

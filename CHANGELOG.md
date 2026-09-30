@@ -12,8 +12,8 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
   - Auto-retry and recovery mechanism for playback stalls and network startup glitches.
   - Unified Sources and Episodes panels with responsive glass-card styling and no title truncation on large screens.
   - Fixed "Continue Watching" series history stack preserving clean back navigation without popstate corruption.
-- **Sub-Second Stream Resolution & Manticore `media_ids_idx` Fast-Path**:
-  - Direct `media_ids_idx` metadata lookups for instant stream card generation.
+- **Sub-Second Stream Resolution & Fast-Path Metadata Indexing**:
+  - Direct metadata lookups for instant stream card generation.
   - Direct PM stream resolution bypasses slow upstream requests and forwards post metadata directly.
   - Strict title matching distinguishing "Title" from "The Title", with full AKA alias search support.
 - **Master Upstream Catalog Toggle (`upstream_enabled`)**:

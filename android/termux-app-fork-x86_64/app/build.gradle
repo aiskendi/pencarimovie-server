@@ -34,8 +34,8 @@ android {
         // Falls back to the checked-in values for local builds.
         def versionNameOverride = project.findProperty("versionNameOverride")
         def versionCodeOverride = project.findProperty("versionCodeOverride")
-        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 20
-        versionName versionNameOverride != null ? versionNameOverride.toString() : "2.0.0"
+        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 22
+        versionName versionNameOverride != null ? versionNameOverride.toString() : "2.0.2"
 
         validateVersionName(versionName)
 

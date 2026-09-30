@@ -38,8 +38,8 @@ android {
         //   ./gradlew :app:assembleRelease -PversionNameOverride=2.0.1 -PversionCodeOverride=21
         def versionNameOverride = project.findProperty("versionNameOverride")
         def versionCodeOverride = project.findProperty("versionCodeOverride")
-        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 21
-        versionName versionNameOverride != null ? versionNameOverride.toString() : "2.0.0"
+        versionCode versionCodeOverride != null ? versionCodeOverride.toString().toInteger() : 22
+        versionName versionNameOverride != null ? versionNameOverride.toString() : "2.0.2"
 
         validateVersionName(versionName)
 

@@ -397,7 +397,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkForAppUpdate() {
         lifecycleScope.launch {
-            val info = UpdateChecker.checkForUpdate(BuildConfig.VERSION_CODE) ?: return@launch
+            val info = UpdateChecker.checkForUpdate(BuildConfig.VERSION_CODE, BuildConfig.VERSION_NAME) ?: return@launch
 
             tvUpdateText.text = getString(
                 R.string.update_available,

@@ -13,13 +13,6 @@ name: Android APK
 # release-key.jks for release), so no signing secrets are required.
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - "android/termux-app-fork/**"
-      - ".github/workflows/android-apk.yml"
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version_name:
@@ -82,16 +75,6 @@ jobs:
           # Relative to the job's working-directory (android/termux-app-fork).
           GRADLE=app/build.gradle
 
-          # versionCode is a plain incrementing integer, bumped by hand in
-          # app/build.gradle before each release. CI only reads it — it must be
-          # higher than the installed build or Android rejects the update as a
-          # downgrade.
-          CODE=$(grep -oP 'versionCode .*: \K[0-9]+' "$GRADLE" | head -n 1)
-          if ! [[ "$CODE" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::Could not read a positive versionCode from $GRADLE (got '$CODE')"
-            exit 1
-          fi
-
           # versionName: manual input > git tag > the value in app/build.gradle.
           if [ -n "${{ github.event.inputs.version_name }}" ]; then
             NAME="${{ github.event.inputs.version_name }}"
@@ -110,6 +93,21 @@ jobs:
           if ! [[ "$NAME" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::versionName '$NAME' is not valid semver"
             exit 1
+          fi
+
+          # Baseline versionCode from app/build.gradle
+          CODE=$(grep -oP 'versionCode .*: \K[0-9]+' "$GRADLE" | head -n 1)
+          if ! [[ "$CODE" =~ ^[1-9][0-9]*$ ]]; then
+            CODE=1
+          fi
+
+          # Automatically compute a monotonic versionCode from semver (e.g. 2.0.2 -> 20002)
+          # so releasing a new version always has a higher versionCode than previous installs
+          if [[ "$NAME" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            SEMVER_CODE=$(( BASH_REMATCH[1] * 10000 + BASH_REMATCH[2] * 100 + BASH_REMATCH[3] ))
+            if [ "$SEMVER_CODE" -gt "$CODE" ]; then
+              CODE="$SEMVER_CODE"
+            fi
           fi
 
           echo "name=$NAME" >> "$GITHUB_OUTPUT"

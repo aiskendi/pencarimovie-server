@@ -67,21 +67,24 @@ object UpdateChecker {
      * [currentVersionCode]. Returns null when up to date, offline, or on any
      * parse/network error — a failed check must never block the UI.
      */
-    suspend fun checkForUpdate(currentVersionCode: Int): UpdateInfo? =
+    suspend fun checkForUpdate(currentVersionCode: Int, currentVersionName: String = BuildConfig.VERSION_NAME): UpdateInfo? =
         withContext(Dispatchers.IO) {
             try {
                 val json = fetchVersionJson() ?: return@withContext null
                 val info = parse(json) ?: return@withContext null
 
-                if (info.versionCode > currentVersionCode) {
+                val isNewer = info.versionCode > currentVersionCode ||
+                    (info.versionCode >= currentVersionCode && isSemverNewer(info.versionName, currentVersionName))
+
+                if (isNewer) {
                     Log.i(
                         TAG,
                         "Update available: ${info.versionName} (${info.versionCode}) " +
-                            "> installed ($currentVersionCode)"
+                            "> installed ($currentVersionName, code $currentVersionCode)"
                     )
                     info
                 } else {
-                    Log.i(TAG, "Up to date (installed $currentVersionCode, remote ${info.versionCode})")
+                    Log.i(TAG, "Up to date (installed $currentVersionName / code $currentVersionCode, remote ${info.versionName} / code ${info.versionCode})")
                     null
                 }
             } catch (e: Exception) {
@@ -89,6 +92,23 @@ object UpdateChecker {
                 null
             }
         }
+
+    private fun isSemverNewer(remoteVersion: String, currentVersion: String): Boolean {
+        try {
+            val remoteClean = remoteVersion.trim().removePrefix("v").substringBefore("-").substringBefore("+")
+            val currentClean = currentVersion.trim().removePrefix("v").substringBefore("-").substringBefore("+")
+            val remoteParts = remoteClean.split('.').map { it.toIntOrNull() ?: 0 }
+            val currentParts = currentClean.split('.').map { it.toIntOrNull() ?: 0 }
+            val maxLen = maxOf(remoteParts.size, currentParts.size)
+            for (i in 0 until maxLen) {
+                val r = remoteParts.getOrElse(i) { 0 }
+                val c = currentParts.getOrElse(i) { 0 }
+                if (r > c) return true
+                if (r < c) return false
+            }
+        } catch (_: Exception) {}
+        return false
+    }
 
     private fun fetchVersionJson(): String? {
         // Cache-buster: the apk-latest asset is replaced in place, and the CDN

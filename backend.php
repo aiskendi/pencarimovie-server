@@ -6513,7 +6513,7 @@ function fd_search_files_parallel(array $queries): array
  * SxxExx MATCH misses E01-style names; search_files backfills those.
  * Never dump mixed/unfiltered post files onto an episode page.
  */
-function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 40, ?array $preloadedPost = null): array
+function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, int $maxFiles = 250, ?array $preloadedPost = null): array
 {
     static $postMemoryCache = [];
     $tStart = microtime(true);
@@ -12318,11 +12318,11 @@ if ($isNuvioRoute) {
 
             // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1 or series root pm:post:9000020144)
             if ($itemType === 'series' || ($targetSeason !== null && $targetEpisode !== null)) {
-                $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 60);
+                $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250);
             }
             // Fast Path 2: Movie requested via post ID
             elseif ($itemType === 'movie') {
-                $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=60";
+                $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150";
                 $res = fd_http_json($mUrl, [], 'GET', 15);
                 $postTitle = (string) ($res['resolved_title'] ?? '');
                 $postYear = (string) ($res['resolved_year'] ?? '');
@@ -12402,7 +12402,7 @@ if ($isNuvioRoute) {
 
                     // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
                     if ($searchedTitle !== '' || $itemId !== '') {
-                        $filesToStream = fd_fetch_episode_stream_files(0, $targetSeason, $targetEpisode, 60, [
+                        $filesToStream = fd_fetch_episode_stream_files(0, $targetSeason, $targetEpisode, 250, [
                             'title' => $searchedTitle,
                             'year' => $searchedYear,
                             'id' => $itemId,
@@ -12469,7 +12469,7 @@ if ($isNuvioRoute) {
                         }
 
                         if ($matchedPostId !== null) {
-                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 60, $matchedPostData);
+                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 250, $matchedPostData);
                         }
 
                         // Fallback: If no post matched or post returned 0 files, probe search_files directly
@@ -12495,7 +12495,7 @@ if ($isNuvioRoute) {
                     $movieFastPathDone = false;
                     if ($cleanMovieTitle !== '' || $itemId !== '') {
                         $apiBase = FD_WP_API_BASE;
-                        $mUrl = "{$apiBase}/stream-files?type=movie&limit=40"
+                        $mUrl = "{$apiBase}/stream-files?type=movie&limit=150"
                             . ($cleanMovieTitle !== '' ? "&title=" . urlencode($cleanMovieTitle) : '')
                             . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
                             . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
@@ -12519,7 +12519,7 @@ if ($isNuvioRoute) {
                         $cleanAkaTitle = fd_stream_keyword_from_post_title($searchedAka);
                         if ($cleanAkaTitle !== '') {
                             $apiBase = FD_WP_API_BASE;
-                            $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanAkaTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=40";
+                            $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanAkaTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=150";
                             $res = fd_http_json($mUrl, [], 'GET', 5);
                             if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
                                 $movieFastPathDone = true;

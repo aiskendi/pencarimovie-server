@@ -5685,7 +5685,12 @@ function fd_classify_season_episode(string $title, int $seasonNum = 0, int $epis
 
     // 4. Season / Musim / Part / Cour / Vol keywords
     if ($season === 0) {
-        if (preg_match('/(?:^|[^a-z0-9])(?:season|musim)\s*[ ._-]*0*(\d{1,2})(?:[^a-z0-9]|$)/i', $title, $m)) {
+        // Ordinal season (e.g. 5th Season.01, 2nd Season Ep 3) MUST precede "Season 01" check
+        if (preg_match('/(?:^|[^a-z0-9])0*(\d{1,2})(?:st|nd|rd|th)\s*[ ._-]*(?:season|musim)(?:[^a-z0-9]|$)/i', $title, $m)) {
+            $season = (int) $m[1];
+        } elseif (preg_match('/(?:^|[^a-z0-9])(?:season|musim)\s*[ ._-]*0*(\d{1,2})(?:[^a-z0-9]|$)/i', $title, $m)) {
+            $season = (int) $m[1];
+        } elseif (preg_match('/(?:^|[^a-z0-9])0*(\d{1,2})\s*[ ._-]*(?:season|musim)(?:[^a-z0-9]|$)/i', $title, $m)) {
             $season = (int) $m[1];
         } elseif (preg_match('/(?:^|[^a-z0-9])(?:PART|VOL|VOLUME|COUR)\s*[ ._-]*0*(\d{1,2})(?=[ ._-]+(?:EP|E|\d))/i', $title, $m)) {
             $season = (int) $m[1];

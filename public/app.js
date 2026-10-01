@@ -4244,7 +4244,8 @@ class PencariMovieApp {
               'pm_series_indo': { slug: 'indonesian', name: 'Indonesian Series' }
             };
 
-            let info = catMap[id];
+            const baseId = id.replace(/_(year|genre|latest|\d{4}|older)$/, '');
+            let info = catMap[baseId] || catMap[id];
             let isTopKw = false;
             let topKwQuery = '';
 
@@ -4258,18 +4259,19 @@ class PencariMovieApp {
                 topKwQuery = '__latest__';
                 info = { slug: 'new_files', name: cat.name || 'New' };
               } else {
-                info = { slug: id.replace(/^pm_(movies|series)_/, ''), name: cat.name || id };
+                info = { slug: baseId.replace(/^pm_(movies|series)_/, ''), name: (cat.type && (cat.type.includes('Movies') || cat.type.includes('Series'))) ? cat.type : (cat.name || id) };
               }
             }
 
-            const key = `${info.slug}-${cat.type || ''}`;
+            const mediaType = (cat.type && cat.type.includes('Series')) ? 'series' : (cat.type && cat.type.includes('Movies')) ? 'movie' : cat.type;
+            const key = `${info.slug}-${mediaType || ''}`;
             if (!seenSlugs.has(key)) {
               seenSlugs.add(key);
               derivedCategories.push({
-                name: cat.name || info.name,
+                name: info.name || cat.name,
                 slug: info.slug,
-                media_type: cat.type,
-                catalog_id: id,
+                media_type: mediaType,
+                catalog_id: baseId,
                 is_topkw: isTopKw,
                 search_query: topKwQuery
               });
@@ -4996,9 +4998,16 @@ class PencariMovieApp {
 
       let html = '';
 
-      // Files section (group split parts into unified items)
+      const extractYear = (str) => {
+        const m = (str || '').match(/\b(19\d{2}|20\d{2})\b/);
+        return m ? parseInt(m[1], 10) : 0;
+      };
+
+      // Files section (group split parts and sort by year descending)
       const rawFiles = filesResult?.files || [];
       const files = this.groupSplitParts(rawFiles);
+      files.sort((a, b) => extractYear(b.title) - extractYear(a.title));
+
       if (files.length > 0) {
         html += `
           <div class="stream-search-section">
@@ -5013,8 +5022,14 @@ class PencariMovieApp {
         `;
       }
 
-      // Posts section
+      // Posts section (sort by year descending)
       const posts = Array.isArray(postsResult) ? postsResult : (postsResult?.data || []);
+      posts.sort((a, b) => {
+        const yB = extractYear(b.title) || extractYear(b.date);
+        const yA = extractYear(a.title) || extractYear(a.date);
+        return yB - yA;
+      });
+
       if (posts.length > 0) {
         html += `
           <div class="stream-search-section">

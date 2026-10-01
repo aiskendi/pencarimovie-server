@@ -7701,17 +7701,17 @@ function fd_is_topkeyword_valid(string $keyword): bool
 function fd_get_default_catalog_options(): array
 {
     $options = [
-        // Special catalogs: Popular, Search, Telegram Files enabled by default
+        // Special catalogs: Popular, New, Search, Telegram Files
         'top' => ['type' => 'movie', 'group' => 'special', 'name' => 'Popular (Movies)', 'default' => true],
-        'year' => ['type' => 'movie', 'group' => 'special', 'name' => 'New (Movies)', 'default' => false],
+        'year' => ['type' => 'movie', 'group' => 'special', 'name' => 'New (Movies)', 'default' => true],
         'pm_search_movie' => ['type' => 'movie', 'group' => 'special', 'name' => 'Search Movies', 'default' => true],
         'pm_series_top' => ['type' => 'series', 'group' => 'special', 'name' => 'Popular (Series)', 'default' => true],
-        'pm_series_year' => ['type' => 'series', 'group' => 'special', 'name' => 'New (Series)', 'default' => false],
+        'pm_series_year' => ['type' => 'series', 'group' => 'special', 'name' => 'New (Series)', 'default' => true],
         'pm_search_series' => ['type' => 'series', 'group' => 'special', 'name' => 'Search Series', 'default' => true],
         'pm_files_year' => ['type' => 'other', 'group' => 'special', 'name' => 'New (Telegram Files)', 'default' => true],
         'pm_search_files' => ['type' => 'other', 'group' => 'special', 'name' => 'Telegram Files (Search)', 'default' => true],
         'pm_trending_keywords' => ['type' => 'other', 'group' => 'special', 'name' => 'Trending Keywords (Files)', 'default' => true],
-        // Movies country/category (default disabled)
+        // Movies country catalogs: Movies > Country > Year with Genre
         'pm_movies_malay' => ['type' => 'movie', 'group' => 'country', 'name' => 'Malaysia (Movie)', 'default' => false],
         'pm_movies_indo' => ['type' => 'movie', 'group' => 'country', 'name' => 'Indonesia (Movie)', 'default' => false],
         'pm_movies_korean' => ['type' => 'movie', 'group' => 'country', 'name' => 'Korea (Movie)', 'default' => false],
@@ -7722,7 +7722,7 @@ function fd_get_default_catalog_options(): array
         'pm_movies_bollywood' => ['type' => 'movie', 'group' => 'country', 'name' => 'Bollywood (Movie)', 'default' => false],
         'pm_movies_philippines' => ['type' => 'movie', 'group' => 'country', 'name' => 'Philippines (Movie)', 'default' => false],
         'pm_movies_english' => ['type' => 'movie', 'group' => 'country', 'name' => 'English (Movie)', 'default' => false],
-        // Series country/category (default disabled)
+        // Series country catalogs: Series > Country > Year with Genre
         'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => false],
         'pm_series_anime' => ['type' => 'series', 'group' => 'country', 'name' => 'Anime (Series)', 'default' => false],
         'pm_series_japan' => ['type' => 'series', 'group' => 'country', 'name' => 'J-Drama (Series)', 'default' => false],
@@ -10805,16 +10805,77 @@ if ($isNuvioRoute) {
         ];
 
         // Release Years for Stremio / Nuvio Discover filter dropdown
+        // Release Years for Stremio / Nuvio Discover filter dropdown (descending to 1980)
         $currentYear = (int) date('Y');
         $allYearOptions = [];
-        for ($y = $currentYear; $y >= 2000; $y--) {
+        for ($y = $currentYear; $y >= 1980; $y--) {
             $allYearOptions[] = (string) $y;
         }
 
-        // Catalog order is the Nuvio/Stremio home-row order.
-        // Latest Releases is first so it appears at the top of each type.
+        // Detect user country to prioritize home country catalog at top of list
+        $detectedCountry = fd_detect_country();
+        $userCountryCode = strtolower((string) ($detectedCountry['country_code'] ?? ''));
+
+        // Country catalogs for Movies (Movies > Country > Year)
+        // Country catalogs for Movies: Movies > Country > Year with Genre
+        $movieCountryCatalogs = [
+            'pm_movies_malay' => 'Malaysia',
+            'pm_movies_indo' => 'Indonesia',
+            'pm_movies_korean' => 'Korea',
+            'pm_movies_japan' => 'Japan',
+            'pm_movies_anime' => 'Anime',
+            'pm_movies_chinese' => 'China / HK',
+            'pm_movies_thai' => 'Thailand',
+            'pm_movies_bollywood' => 'Bollywood',
+            'pm_movies_philippines' => 'Philippines',
+            'pm_movies_english' => 'English',
+        ];
+        $cMapMovie = [
+            'my' => 'pm_movies_malay',
+            'id' => 'pm_movies_indo',
+            'kr' => 'pm_movies_korean',
+            'jp' => 'pm_movies_japan',
+            'cn' => 'pm_movies_chinese',
+            'hk' => 'pm_movies_chinese',
+            'th' => 'pm_movies_thai',
+            'in' => 'pm_movies_bollywood',
+            'ph' => 'pm_movies_philippines',
+        ];
+        if (isset($cMapMovie[$userCountryCode], $movieCountryCatalogs[$cMapMovie[$userCountryCode]])) {
+            $pKey = $cMapMovie[$userCountryCode];
+            $movieCountryCatalogs = [$pKey => $movieCountryCatalogs[$pKey]] + $movieCountryCatalogs;
+        }
+
+        // Country catalogs for Series: Series > Country > Year with Genre
+        $seriesCountryCatalogs = [
+            'pm_series_malay' => 'Malaysia',
+            'pm_series_indo' => 'Indonesia',
+            'pm_series_kdrama' => 'K-Drama',
+            'pm_series_anime' => 'Anime',
+            'pm_series_japan' => 'J-Drama',
+            'pm_series_cdrama' => 'C-Drama',
+            'pm_series_thai' => 'Thailand',
+            'pm_series_philippines' => 'Philippines',
+            'pm_series_english' => 'English',
+        ];
+        $cMapSeries = [
+            'my' => 'pm_series_malay',
+            'id' => 'pm_series_indo',
+            'kr' => 'pm_series_kdrama',
+            'jp' => 'pm_series_japan',
+            'cn' => 'pm_series_cdrama',
+            'hk' => 'pm_series_cdrama',
+            'th' => 'pm_series_thai',
+            'ph' => 'pm_series_philippines',
+        ];
+        if (isset($cMapSeries[$userCountryCode], $seriesCountryCatalogs[$cMapSeries[$userCountryCode]])) {
+            $pKey = $cMapSeries[$userCountryCode];
+            $seriesCountryCatalogs = [$pKey => $seriesCountryCatalogs[$pKey]] + $seriesCountryCatalogs;
+        }
+
+        $filterOptionsCombined = array_merge($allYearOptions, $allGenreOptions);
         $manifestCatalogs = [
-            // Movies Catalogs
+            // ── 1. Movies Catalogs ──
             [
                 'type' => 'movie',
                 'id' => 'top',
@@ -10854,295 +10915,118 @@ if ($isNuvioRoute) {
                 'extraSupported' => ['search', 'genre', 'year', 'skip'],
                 'extraRequired' => ['search'],
             ],
-            [
-                'type' => 'other',
-                'id' => 'top',
-                'name' => 'Telegram Files',
-                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
-                'extra' => [
-                    ['name' => 'search', 'isRequired' => false],
-                    ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-                'extraSupported' => ['search', 'genre', 'year', 'skip'],
-            ],
-            [
-                'type' => 'other',
-                'id' => 'pm_files_year',
-                'name' => 'New',
-                'genres' => $allYearOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-                'extraSupported' => ['genre', 'skip'],
-                'extraRequired' => ['genre'],
-            ],
-            [
-                'type' => 'other',
-                'id' => 'pm_search_files',
-                'name' => 'Telegram Files',
-                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
-                'extra' => [
-                    ['name' => 'search', 'isRequired' => true],
-                    ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-                'extraSupported' => ['search', 'genre', 'year', 'skip'],
-                'extraRequired' => ['search'],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_malay',
-                'name' => 'Malaysia',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_indo',
-                'name' => 'Indonesia',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_korean',
-                'name' => 'Korea',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_japan',
-                'name' => 'Japan',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_anime',
-                'name' => 'Anime',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_chinese',
-                'name' => 'China / HK',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_thai',
-                'name' => 'Thailand',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_bollywood',
-                'name' => 'Bollywood',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_philippines',
-                'name' => 'Philippines',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'movie',
-                'id' => 'pm_movies_english',
-                'name' => 'English',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
+        ];
 
-            // Series Catalogs
-            [
-                'type' => 'series',
-                'id' => 'top',
-                'name' => 'Popular',
-                'genres' => $allGenreOptions,
+        // Movies Country Catalogs (Movies > Country > Year with Genre)
+        foreach ($movieCountryCatalogs as $catId => $catName) {
+            $manifestCatalogs[] = [
+                'type' => 'movie',
+                'id' => $catId,
+                'name' => $catName,
+                'genres' => $filterOptionsCombined,
                 'extra' => [
-                    ['name' => 'search', 'isRequired' => false],
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
-                'extraSupported' => ['search', 'genre', 'year', 'skip'],
+                'extraSupported' => ['genre', 'year', 'skip'],
+            ];
+        }
+
+        // ── 2. Series Catalogs ──
+        $manifestCatalogs[] = [
+            'type' => 'series',
+            'id' => 'top',
+            'name' => 'Popular',
+            'genres' => $allGenreOptions,
+            'extra' => [
+                ['name' => 'search', 'isRequired' => false],
+                ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
+                ['name' => 'skip', 'isRequired' => false],
             ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_year',
-                'name' => 'New',
-                'genres' => $allYearOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-                'extraSupported' => ['genre', 'skip'],
-                'extraRequired' => ['genre'],
+            'extraSupported' => ['search', 'genre', 'year', 'skip'],
+        ];
+        $manifestCatalogs[] = [
+            'type' => 'series',
+            'id' => 'pm_series_year',
+            'name' => 'New',
+            'genres' => $allYearOptions,
+            'extra' => [
+                ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
+                ['name' => 'skip', 'isRequired' => false],
             ],
-            [
+            'extraSupported' => ['genre', 'skip'],
+            'extraRequired' => ['genre'],
+        ];
+        $manifestCatalogs[] = [
+            'type' => 'series',
+            'id' => 'pm_search_series',
+            'name' => 'Search Series',
+            'genres' => $allGenreOptions,
+            'extra' => [
+                ['name' => 'search', 'isRequired' => true],
+                ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
+                ['name' => 'skip', 'isRequired' => false],
+            ],
+            'extraSupported' => ['search', 'genre', 'year', 'skip'],
+            'extraRequired' => ['search'],
+        ];
+
+        // Series Country Catalogs (Series > Country > Year with Genre)
+        foreach ($seriesCountryCatalogs as $catId => $catName) {
+            $manifestCatalogs[] = [
                 'type' => 'series',
-                'id' => 'pm_search_series',
-                'name' => 'Search Series',
-                'genres' => $allGenreOptions,
+                'id' => $catId,
+                'name' => $catName,
+                'genres' => $filterOptionsCombined,
                 'extra' => [
-                    ['name' => 'search', 'isRequired' => true],
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
+                    ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
                     ['name' => 'skip', 'isRequired' => false],
                 ],
-                'extraSupported' => ['search', 'genre', 'year', 'skip'],
-                'extraRequired' => ['search'],
+                'extraSupported' => ['genre', 'year', 'skip'],
+            ];
+        }
+
+        // ── 3. Other Catalogs (Telegram Files) ──
+        $manifestCatalogs[] = [
+            'type' => 'other',
+            'id' => 'top',
+            'name' => 'Telegram Files',
+            'genres' => $allYearOptions,
+            'extra' => [
+                ['name' => 'search', 'isRequired' => false],
+                ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
+                ['name' => 'skip', 'isRequired' => false],
             ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_kdrama',
-                'name' => 'K-Drama',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
+            'extraSupported' => ['search', 'genre', 'skip'],
+        ];
+        $manifestCatalogs[] = [
+            'type' => 'other',
+            'id' => 'pm_files_year',
+            'name' => 'New',
+            'genres' => $allYearOptions,
+            'extra' => [
+                ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
+                ['name' => 'skip', 'isRequired' => false],
             ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_anime',
-                'name' => 'Anime',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
+            'extraSupported' => ['genre', 'skip'],
+            'extraRequired' => ['genre'],
+        ];
+        $manifestCatalogs[] = [
+            'type' => 'other',
+            'id' => 'pm_search_files',
+            'name' => 'Telegram Files',
+            'genres' => $allYearOptions,
+            'extra' => [
+                ['name' => 'search', 'isRequired' => true],
+                ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
+                ['name' => 'skip', 'isRequired' => false],
             ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_japan',
-                'name' => 'J-Drama',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_malay',
-                'name' => 'Malaysia',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_cdrama',
-                'name' => 'C-Drama',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_thai',
-                'name' => 'Thailand',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_philippines',
-                'name' => 'Philippines',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_english',
-                'name' => 'English',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
-            [
-                'type' => 'series',
-                'id' => 'pm_series_indo',
-                'name' => 'Indonesia',
-                'genres' => $allGenreOptions,
-                'extra' => [
-                    ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
-                    ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
-                    ['name' => 'skip', 'isRequired' => false],
-                ],
-            ],
+            'extraSupported' => ['search', 'genre', 'skip'],
+            'extraRequired' => ['search'],
         ];
 
         // Add top keyword catalogs to $manifestCatalogs if trending keywords are available
@@ -11187,10 +11071,15 @@ if ($isNuvioRoute) {
                     }
                 }
 
-                // Check if media type (movie or series or other) is enabled
+                // Check if media type is enabled
                 if (!empty($enabledTypes[$cType])) {
-                    // Check if specific catalog is enabled (defaulting to true if not set)
-                    if (!isset($enabledCatalogMap[$cId]) || !empty($enabledCatalogMap[$cId])) {
+                    $checkId = $cId;
+                    if ($cType === 'series' && $cId === 'top') {
+                        $checkId = 'pm_series_top';
+                    } elseif ($cType === 'other' && $cId === 'top') {
+                        $checkId = 'pm_files_year';
+                    }
+                    if (!isset($enabledCatalogMap[$checkId]) || !empty($enabledCatalogMap[$checkId])) {
                         $filteredCatalogs[] = $cat;
                     }
                 }
@@ -11301,12 +11190,12 @@ if ($isNuvioRoute) {
         ];
         $resources[] = [
             'name' => 'stream',
-            'types' => ['movie', 'series', 'other'],
+            'types' => $activeTypes,
             'idPrefixes' => ['pm_', 'pm:', 'tt', 'tmdb:', 'kitsu:', 'kitsu', 'mal:', 'anilist:', 'tvdb:'],
         ];
         $resources[] = [
             'name' => 'subtitles',
-            'types' => ['movie', 'series'],
+            'types' => $activeTypes,
             'idPrefixes' => ['pm_', 'pm:', 'tt', 'tmdb:', 'kitsu:', 'kitsu', 'mal:', 'anilist:', 'tvdb:'],
         ];
 
@@ -11322,7 +11211,7 @@ if ($isNuvioRoute) {
             'logo' => $logoUrl,
             'background' => $logoUrl,
             'resources' => $resources,
-            'types' => ['movie', 'series', 'other'],
+            'types' => $activeTypes,
             'idPrefixes' => ['pm_', 'pm:', 'tt', 'tmdb:', 'kitsu:', 'kitsu', 'mal:', 'anilist:', 'tvdb:'],
             'catalogs' => $filteredCatalogs,
             'behaviorHints' => [
@@ -11338,8 +11227,8 @@ if ($isNuvioRoute) {
 
     // ── Nuvio Catalog: /catalog/:type/:id[/:extra].json ──
     if (preg_match('#^/catalog/([^/]+)/([^/]+?)(?:/(.*))?\.json$#', $addonPath, $matches)) {
-        $catalogType = $matches[1];
-        $catalogId = $matches[2];
+        $catalogType = urldecode($matches[1]);
+        $catalogId = urldecode($matches[2]);
         $extraStr = $matches[3] ?? '';
 
         // Bridge: Check if this is an upstream bridged catalog (prefixed with up_{index}_)
@@ -11413,14 +11302,14 @@ if ($isNuvioRoute) {
         $genre = $extra['genre'] ?? '';
         $year = $extra['year'] ?? '';
 
-        // If catalog is a Year catalog (like Cinemeta's year catalog) where 'genre' is a 4-digit year,
-        // map it to $year and default to the current year (2026) when not specified.
-        $isYearCatalog = ($catalogId === 'year' || $catalogId === 'pm_series_year' || $catalogId === 'pm_files_year');
-        if ($isYearCatalog) {
-            if ($year === '' && preg_match('/^\d{4}$/', $genre)) {
+        // Extract year from catalogId if catalog is a year sub-catalog (e.g. pm_movies_malay_2024)
+        if ($year === '') {
+            if (preg_match('/_(\d{4})$/', $catalogId, $ym)) {
+                $year = $ym[1];
+            } elseif (preg_match('/^\d{4}$/', $genre)) {
                 $year = $genre;
                 $genre = '';
-            } elseif ($year === '') {
+            } elseif ($catalogId === 'year' || $catalogId === 'pm_series_year' || $catalogId === 'pm_files_year') {
                 $year = (string) date('Y');
             }
         }
@@ -11438,7 +11327,7 @@ if ($isNuvioRoute) {
                 }
             }
         } else {
-            $catCacheKey = md5('search_' . $catalogType . '_' . strtolower(trim($searchQuery)) . '_' . $skip);
+            $catCacheKey = md5('search_' . $catalogType . '_' . strtolower(trim($searchQuery)) . '_' . $year . '_' . $skip);
             $catCacheFile = fd_cache_path('cat_cache_' . $catCacheKey . '.json');
             if (is_file($catCacheFile) && (time() - (int)filemtime($catCacheFile)) < 300) {
                 $cachedCat = json_decode((string)@file_get_contents($catCacheFile), true);
@@ -11496,6 +11385,9 @@ if ($isNuvioRoute) {
                     if ($releaseYear !== '') {
                         $metaItem['releaseInfo'] = $releaseYear;
                     }
+                    if ($year !== '' && $releaseYear !== '' && $releaseYear !== $year) {
+                        continue;
+                    }
                     $metas[] = $metaItem;
                 }
             }
@@ -11549,12 +11441,14 @@ if ($isNuvioRoute) {
                             continue;
                         }
 
+                        $fReleaseYear = fd_extract_release_year($fTitle);
+
                         // Apply year filter if selected (e.g. 2026)
-                        if ($year !== '' && !str_contains($fTitle, $year)) {
+                        if ($year !== '' && !str_contains($fTitle, $year) && ($fReleaseYear === '' || $fReleaseYear !== $year)) {
                             continue;
                         }
 
-                        $metas[] = [
+                        $fileMetaItem = [
                             'id' => 'pm_file_' . $fCode,
                             'type' => $catalogType,
                             'name' => $fTitle,
@@ -11563,6 +11457,10 @@ if ($isNuvioRoute) {
                             'description' => "⚡ Direct Telegram File · {$pillLine}\n\n{$fTitle}",
                             'genres' => $genres,
                         ];
+                        if ($fReleaseYear !== '') {
+                            $fileMetaItem['releaseInfo'] = $fReleaseYear;
+                        }
+                        $metas[] = $fileMetaItem;
                     }
                 }
             }
@@ -11660,9 +11558,9 @@ if ($isNuvioRoute) {
                 'limit' => $fetchLimit,
                 'offset' => $skip,
             ];
-            if ($catalogType === 'movie' || $catalogType === 'series') {
-                $params['media_type'] = $catalogType;
-            }
+            $baseCatId = preg_replace('/_(year|genre|latest|\d{4}|older)$/', '', $catalogId);
+            $isSeriesCatalog = (str_contains(strtolower($catalogType), 'series') || str_contains($baseCatId, '_series_'));
+            $params['media_type'] = $isSeriesCatalog ? 'series' : 'movie';
 
             $catalogCategoryMap = [
                 'pm_movies_malay' => 'malay',
@@ -11690,7 +11588,7 @@ if ($isNuvioRoute) {
 
             if ($catalogId === 'top' || $catalogId === 'pm_series_top') {
                 // Popular releases - derived from top search keywords filtered by user country
-                $params['category'] = 'popular';
+                $params['category'] = ($year !== '') ? '' : 'popular';
                 $detectedCountry = fd_detect_country();
                 if (!empty($detectedCountry['country_code'])) {
                     $params['country'] = $detectedCountry['country_code'];
@@ -11698,6 +11596,8 @@ if ($isNuvioRoute) {
             } elseif ($catalogId === 'year' || $catalogId === 'pm_movies_latest' || $catalogId === 'pm_series_year' || $catalogId === 'pm_series_latest') {
                 // Latest releases - no country filter; genre extra still applies.
                 $params['category'] = '';
+            } elseif (isset($catalogCategoryMap[$baseCatId])) {
+                $params['category'] = $catalogCategoryMap[$baseCatId];
             } elseif (isset($catalogCategoryMap[$catalogId])) {
                 $params['category'] = $catalogCategoryMap[$catalogId];
             } elseif (str_starts_with($catalogId, 'pm_cat_')) {
@@ -11706,11 +11606,30 @@ if ($isNuvioRoute) {
                 $params['category'] = $catSlug;
             }
 
-            if ($genre !== '') {
-                $params['genre'] = $genre;
-            }
-            if ($year !== '') {
-                $params['year'] = $year;
+            if (str_ends_with($catalogId, '_year')) {
+                if ($year !== '') {
+                    $params['year'] = $year;
+                } elseif ($genre !== '') {
+                    $params['year'] = $genre;
+                }
+            } elseif (str_ends_with($catalogId, '_genre')) {
+                if ($genre !== '') {
+                    $params['genre'] = $genre;
+                }
+                if ($year !== '') {
+                    $params['year'] = $year;
+                }
+            } else {
+                if ($genre !== '') {
+                    if (preg_match('/^\d{4}$/', $genre)) {
+                        $params['year'] = $genre;
+                    } else {
+                        $params['genre'] = $genre;
+                    }
+                }
+                if ($year !== '') {
+                    $params['year'] = $year;
+                }
             }
 
             $posts = fd_fetch_stream_ajax('posts', $params);
@@ -11743,6 +11662,16 @@ if ($isNuvioRoute) {
                     $metas[] = $metaItem;
                 }
             }
+        }
+
+        if (!empty($metas)) {
+            // Sort discovery items by release year descending so the newest releases appear first
+            usort($metas, function ($a, $b) {
+                $yA = (int) ($a['releaseInfo'] ?? 0);
+                $yB = (int) ($b['releaseInfo'] ?? 0);
+                if ($yA === $yB) return 0;
+                return ($yA > $yB) ? -1 : 1;
+            });
         }
 
         if (!empty($catCacheFile) && !empty($metas)) {
@@ -11887,7 +11816,7 @@ if ($isNuvioRoute) {
             $cats = (array) ($post['categories'] ?? []);
             $tags = (array) ($post['tags'] ?? []);
 
-            $isSeries = ($itemType === 'series') || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
+            $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series')) || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
             $resolvedType = ($itemType === 'series' || $isSeries) ? 'series' : 'movie';
 
             // Only series metadata requires episode files to construct the videos array
@@ -12333,12 +12262,13 @@ if ($isNuvioRoute) {
             $targetSeason = isset($pmMatches[2]) ? (int) $pmMatches[2] : null;
             $targetEpisode = isset($pmMatches[3]) ? (int) $pmMatches[3] : null;
 
+            $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series') || ($targetSeason !== null && $targetEpisode !== null));
             // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1 or series root pm:post:9000020144)
-            if ($itemType === 'series' || ($targetSeason !== null && $targetEpisode !== null)) {
+            if ($isSeries) {
                 $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250);
             }
             // Fast Path 2: Movie requested via post ID
-            elseif ($itemType === 'movie') {
+            else {
                 $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150";
                 $res = fd_http_json($mUrl, [], 'GET', 15);
                 $postTitle = (string) ($res['resolved_title'] ?? '');

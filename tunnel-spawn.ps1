@@ -41,7 +41,7 @@ foreach ($path in @($LogFile, $errLog)) {
     }
 }
 
-$env:TUNNEL_TRANSPORT_PROTOCOL = 'http2'
+$env:TUNNEL_TRANSPORT_PROTOCOL = if ($env:TUNNEL_TRANSPORT_PROTOCOL) { $env:TUNNEL_TRANSPORT_PROTOCOL } else { 'auto' }
 
 $argList = @(
     'tunnel',
@@ -49,6 +49,8 @@ $argList = @(
     '--config', $Config,
     '--logfile', $LogFile,
     '--metrics', $Metrics,
+    '--edge-ip-version', 'auto',
+    '--grace-period', '15s',
     '--no-autoupdate',
     '--retries', '99'
 )

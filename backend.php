@@ -8698,7 +8698,14 @@ function fd_tunnel_write_dummy_config(string $localUrl = 'http://127.0.0.1:8088'
 {
     $path = fd_tunnel_config_path();
     $body = "ingress:\n"
-        . "  - service: " . $localUrl . "\n";
+        . "  - service: " . $localUrl . "\n"
+        . "    originRequest:\n"
+        . "      connectTimeout: 10s\n"
+        . "      tcpKeepAlive: 30s\n"
+        . "      keepAliveTimeout: 90s\n"
+        . "      keepAliveConnections: 100\n"
+        . "      noTLSVerify: true\n"
+        . "      http2Origin: false\n";
     @file_put_contents($path, $body);
     return $path;
 }
@@ -8728,6 +8735,7 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
             $cmdLine = escapeshellarg($binReal)
                 . ' tunnel --logfile ' . escapeshellarg($logReal)
                 . ' --metrics ' . escapeshellarg($metrics)
+                . ' --edge-ip-version auto --grace-period 15s'
                 . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken));
         } else {
             $cmdLine = escapeshellarg($binReal)
@@ -8735,6 +8743,7 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
                 . ' --config ' . escapeshellarg($configReal)
                 . ' --logfile ' . escapeshellarg($logReal)
                 . ' --metrics ' . escapeshellarg($metrics)
+                . ' --edge-ip-version auto --grace-period 15s'
                 . ' --no-autoupdate --retries 99';
         }
 
@@ -8744,12 +8753,12 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
             2 => ['pipe', 'w'],
         ];
 
-        // Minimal safe environment with TUNNEL_TRANSPORT_PROTOCOL=http2 and system root
+        // Minimal safe environment with auto QUIC/HTTP2 transport protocol and system root
         $env = [
             'SystemRoot' => (string) (fd_env('SystemRoot') ?: 'C:\\Windows'),
             'WINDIR' => (string) (fd_env('WINDIR') ?: 'C:\\Windows'),
             'PATH' => (string) (fd_env('PATH') ?: 'C:\\Windows\\System32;C:\\Windows'),
-            'TUNNEL_TRANSPORT_PROTOCOL' => 'http2',
+            'TUNNEL_TRANSPORT_PROTOCOL' => (string) (fd_env('TUNNEL_TRANSPORT_PROTOCOL') ?: 'auto'),
             'USERPROFILE' => (string) (fd_env('USERPROFILE') ?: 'C:\\Users\\ewangtlex'),
             'LOCALAPPDATA' => (string) (fd_env('LOCALAPPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Local'),
             'APPDATA' => (string) (fd_env('APPDATA') ?: 'C:\\Users\\ewangtlex\\AppData\\Roaming'),
@@ -8869,25 +8878,26 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
                 $sslEnv = 'SSL_CERT_FILE=' . escapeshellarg($caCertPath) . ' SSL_CERT_DIR=' . escapeshellarg(dirname($caCertPath)) . ' ';
             }
 
+            $transportProto = (string) (fd_env('TUNNEL_TRANSPORT_PROTOCOL') ?: 'auto');
             if ($isNamedTunnel) {
-                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
+                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=' . escapeshellarg($transportProto) . ' ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
                     . $prootBinds . ' '
                     . escapeshellarg($bin)
                     . ' tunnel --logfile ' . escapeshellarg($logFile)
                     . ' --metrics ' . escapeshellarg($metrics)
-                    . ' --edge-ip-version 4'
+                    . ' --edge-ip-version 4 --grace-period 15s'
                     . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken))
                     . ' >> ' . escapeshellarg($errLog)
                     . ' 2>&1 & echo $!';
             } else {
-                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
+                $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=' . escapeshellarg($transportProto) . ' ' . $sslEnv . $detachPrefix . escapeshellarg($prootBin) . ' --link2symlink -0 '
                     . $prootBinds . ' '
                     . escapeshellarg($bin)
                     . ' tunnel --url ' . escapeshellarg($localUrl)
                     . ' --config ' . escapeshellarg($config)
                     . ' --logfile ' . escapeshellarg($logFile)
                     . ' --metrics ' . escapeshellarg($metrics)
-                    . ' --edge-ip-version 4'
+                    . ' --edge-ip-version 4 --grace-period 15s'
                     . ' --no-autoupdate --retries 99'
                     . ' >> ' . escapeshellarg($errLog)
                     . ' 2>&1 & echo $!';
@@ -8905,21 +8915,22 @@ function fd_tunnel_spawn(string $bin, string $localUrl, int $metricsPort = 20241
         $sslEnv = 'SSL_CERT_FILE=' . escapeshellarg($caCertPath) . ' SSL_CERT_DIR=' . escapeshellarg(dirname($caCertPath)) . ' ';
     }
 
+    $transportProto = (string) (fd_env('TUNNEL_TRANSPORT_PROTOCOL') ?: 'auto');
     if ($isNamedTunnel) {
-        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
+        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=' . escapeshellarg($transportProto) . ' ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
             . ' tunnel --logfile ' . escapeshellarg($logFile)
             . ' --metrics ' . escapeshellarg($metrics)
-            . ' --edge-ip-version 4'
+            . ' --edge-ip-version auto --grace-period 15s'
             . ' --no-autoupdate --retries 99 run --token ' . escapeshellarg(trim($tunnelToken))
             . ' >> ' . escapeshellarg($errLog)
             . ' 2>&1 & echo $!';
     } else {
-        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=http2 ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
+        $cmd = 'TUNNEL_TRANSPORT_PROTOCOL=' . escapeshellarg($transportProto) . ' ' . $sslEnv . $detachPrefix . escapeshellarg($bin)
             . ' tunnel --url ' . escapeshellarg($localUrl)
             . ' --config ' . escapeshellarg($config)
             . ' --logfile ' . escapeshellarg($logFile)
             . ' --metrics ' . escapeshellarg($metrics)
-            . ' --edge-ip-version 4'
+            . ' --edge-ip-version auto --grace-period 15s'
             . ' --no-autoupdate --retries 99'
             . ' >> ' . escapeshellarg($errLog)
             . ' 2>&1 & echo $!';

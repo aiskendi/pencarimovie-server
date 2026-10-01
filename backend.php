@@ -5660,7 +5660,12 @@ function fd_classify_season_episode(string $title, int $seasonNum = 0, int $epis
         $episodeEnd = (int) $m[3];
     }
     // 1b. Single SxxExx or Sxx.Exx / SxxEPxx / SxxEpxx in title
-    elseif (preg_match('/(?:^|[^a-z0-9])S(\d{1,2})\s*[ ._-]*E(?:P|PS|PISODE)?\s*[ ._-]*(\d{1,4})(?:[^a-z0-9]|$)/i', $title, $m)) {
+    elseif (preg_match('/(?:^|[^a-z0-9])S(\d{1,2})\s*[ ._-]*E(?:P|PS|PISODE)?\s*[ ._-]*0*(\d{1,4})(?=[^0-9]|$)/i', $title, $m)) {
+        $season = (int) $m[1];
+        $episode = (int) $m[2];
+    }
+    // 1c. Explicit Sxx.xx (e.g. S1.01, S01.02)
+    elseif (preg_match('/(?:^|[^a-z0-9])S(\d{1,2})\.0*(\d{1,4})(?=[^0-9]|$)/i', $title, $m)) {
         $season = (int) $m[1];
         $episode = (int) $m[2];
     }
@@ -5703,7 +5708,7 @@ function fd_classify_season_episode(string $title, int $seasonNum = 0, int $epis
 
     // 6. Check explicit EP / Episode / Bahagian tokens in title (e.g. EP27, Episode 05)
     if ($episode === 0) {
-        if (preg_match('/(?:^|[^a-z0-9])(?:EP|EPS|EPISODE|EPISOD|BAHAGIAN|BABAK)\s*[ ._-]*0*(\d{1,4})(?:[^a-z0-9]|$)/i', $title, $m)) {
+        if (preg_match('/(?:^|[^a-z0-9])(?:EP|EPS|EPISODE|EPISOD|BAHAGIAN|BABAK)\s*[ ._-]*0*(\d{1,4})(?=[^0-9]|$)/i', $title, $m)) {
             $n = (int) $m[1];
             if ($n > 0 && ($n < 1900 || $n > 2100)) {
                 $episode = $n;
@@ -5739,7 +5744,7 @@ function fd_classify_season_episode(string $title, int $seasonNum = 0, int $epis
         // Negative lookbehind (?<![0-9]) prevents matching numbers that are part
         // of audio codecs like "DD5.1.x264" (the "1" in "5.1" must not be treated
         // as an episode number).
-        if (preg_match('/(?<![0-9])[ ._\[\(-](\d{1,3})[ ._\]\)-]+(?:2160p|1080p|720p|480p|360p|4k|uhd|fhd|hd|sd|web|bluray|hdtv|malaysub|end|final|x264|x265|hevc|aac)/i', $cleanWithoutYears, $m)) {
+        if (preg_match('/(?<![0-9])[ ._\[\(-](\d{1,3})[ ._\]\)-]+(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|web|bluray|hdtv|malaysub|end|final|x264|x265|hevc|aac|anitv|ani|tv|raw|[a-z0-9_-]+|\d{3,4}x\d{3,4})/i', $cleanWithoutYears, $m)) {
             $n = (int) $m[1];
             if ($n > 0 && ($n < 1900 || $n > 2100)) {
                 $episode = $n;
@@ -6085,6 +6090,13 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     if (count($contentWords) >= 2) {
         if (preg_match('/\b' . preg_quote($targetLower, '/') . '\b/i', $fCleanNorm) || ($targetNoThe !== '' && preg_match('/\b' . preg_quote($targetNoThe, '/') . '\b/i', $fCleanNorm))) {
             return true;
+        }
+        // If target has 3+ content words (e.g. "super fishing grander musashi"), also check core tail 2-word phrase ("grander musashi")
+        if (count($contentWords) >= 3) {
+            $tail2 = implode(' ', array_slice($contentWords, -2));
+            if (preg_match('/\b' . preg_quote($tail2, '/') . '\b/i', $fCleanNorm)) {
+                return true;
+            }
         }
     }
 

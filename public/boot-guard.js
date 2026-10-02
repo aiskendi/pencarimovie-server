@@ -5,35 +5,6 @@
     window.globalThis = window;
   }
 
-  // Diagnostic search console logger
-  if (typeof window.fetch === "function" && !window.__pmFetchLoggingInstalled) {
-    window.__pmFetchLoggingInstalled = true;
-    var _origFetch = window.fetch;
-    window.fetch = function (input, init) {
-      var url = typeof input === "string" ? input : (input && input.url ? input.url : "");
-      var isInteresting = url.indexOf("search") !== -1 || url.indexOf("/catalog/") !== -1 || url.indexOf("proxy-stream") !== -1;
-      if (isInteresting) {
-        console.log("%c[PencariMovie Request] " + url, "color: #ff6b35; font-weight: bold;", init || {});
-      }
-      return _origFetch.apply(this, arguments).then(function (response) {
-        if (isInteresting) {
-          try {
-            var clone = response.clone();
-            clone.json().then(function (data) {
-              var count = Array.isArray(data?.metas) ? data.metas.length : (data?.data?.files ? data.data.files.length : (Array.isArray(data?.data) ? data.data.length : (data?.files ? data.files.length : 0)));
-              console.log(
-                "%c[PencariMovie Response (" + response.status + ")] " + url + " (" + count + " items)",
-                "color: #28a745; font-weight: bold;",
-                data
-              );
-            }).catch(function () {});
-          } catch (e) {}
-        }
-        return response;
-      });
-    };
-  }
-
   if (window.NuvioBootGuard) {
     return;
   }

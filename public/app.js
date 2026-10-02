@@ -1283,6 +1283,7 @@ class PencariMovieApp {
         this.loadTunnelStatus().finally(() => {
           updateAddonModalUrls();
         });
+        this._syncOverlayFreeze();
       }
     };
     this.openAddonModal = openAddonModal;
@@ -1326,6 +1327,7 @@ class PencariMovieApp {
         if (window.location.hash === '#configure' || window.location.hash === '#addon') {
           history.replaceState(null, '', window.location.pathname);
         }
+        this._syncOverlayFreeze();
       }
     };
     this.closeAddonModal = closeAddonModal;
@@ -1671,7 +1673,15 @@ class PencariMovieApp {
         else if (this.isFileDetailOpen()) this.closeFileDetail();
         else if (this._isCategoryPageOpen) this.closeCategoryPage();
         else if (this.isMobileNavOpen) this.closeMobileNav();
+        // Remote Back / Escape must still be able to dismiss the overlays now
+        // that the background focus engine (nuvio-modal-open) is frozen.
         else if (
+          this.$('#addonModal') &&
+          !this.$('#addonModal').classList.contains('hidden')
+        ) {
+          this.closeAddonModal();
+        } else if (
+          this.$('#settingsGate') &&
           !this.$('#settingsGate').classList.contains('hidden') &&
           this.hasSession
         ) {
@@ -2442,6 +2452,23 @@ class PencariMovieApp {
     }
   }
 
+  // The overlays (#settingsGate / #addonModal / #authGate) must freeze the Nuvio
+  // shell behind them. `nuvio-modal-open` is the focus engine's existing modal
+  // gate (js/ui/navigation/focusEngine.js) — it makes key handling and pointer
+  // focus bail out before they touch the background screen; `inert` on the app
+  // root blocks clicks and tab focus. Recompute from the DOM so every open/close
+  // path (including the settings <-> addon switches) stays in sync.
+  _syncOverlayFreeze() {
+    const visible = ['#settingsGate', '#addonModal', '#authGate'].some((sel) => {
+      const el = this.$(sel);
+      return Boolean(el) && !el.classList.contains('hidden');
+    });
+    document.body.classList.toggle('nuvio-modal-open', visible);
+    const app = this.$('#app') || this.$('#streamApp');
+    if (app) app.toggleAttribute('inert', visible);
+    return visible;
+  }
+
   showSettingsGate(options = {}) {
     window.showSettingsGate = (opts) => this.showSettingsGate(opts);
     this._hideLoadingScreen();
@@ -2538,6 +2565,8 @@ class PencariMovieApp {
 
     // Stop hero rotation while settings are open
     this._stopHeroRotation();
+
+    this._syncOverlayFreeze();
   }
 
   hideSettingsGate() {
@@ -2567,6 +2596,8 @@ class PencariMovieApp {
     if (connectedSection) connectedSection.classList.add('hidden');
     if (closeBtn) closeBtn.style.display = '';
     if (statusEl) statusEl.textContent = '';
+
+    this._syncOverlayFreeze();
   }
 
   closeSettingsGate() {
@@ -3996,6 +4027,7 @@ class PencariMovieApp {
     gate.classList.remove('hidden');
     gate.setAttribute('aria-hidden', 'false');
     this._hideLoadingScreen?.();
+    this._syncOverlayFreeze();
     const input = this.$('#authPasswordInput');
     if (input) input.focus();
   }
@@ -4005,6 +4037,7 @@ class PencariMovieApp {
     if (!gate) return;
     gate.classList.add('hidden');
     gate.setAttribute('aria-hidden', 'true');
+    this._syncOverlayFreeze();
   }
 
   async submitAuthPassword() {

@@ -1042,6 +1042,17 @@
   color: #fff;
 }
 
+/* The Home screen renders every row of every catalog in one go, and the resulting
+   main-thread work (measured: 13-31s of long-task time before this rule) is what
+   swallows scroll input on a first load. Let the engine skip layout/paint for rows
+   that are off screen — engines that don't know these properties ignore them.
+   The Home skeleton itself is rendered by the shell (renderHomeLoadingState), not
+   here. */
+.home-screen-shell .home-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 320px;
+}
+
 .loading-screen__spinner {
   width: 44px;
   height: 44px;

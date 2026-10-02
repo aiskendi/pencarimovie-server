@@ -10,7 +10,7 @@
     <meta name="theme-color" content="#141414" />
     <title>PencariMovie — Stream & Download</title>
     <link rel="stylesheet" href="stream-theme.css" />
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20261002pm16" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -60,7 +60,7 @@
     <!-- ─── Loading Screen (shown during session check) ───────── -->
     <div id="loadingScreen" class="loading-screen" aria-hidden="false">
       <div class="loading-screen__spinner"></div>
-      <p class="loading-screen__text">Connecting...</p>
+      <p class="loading-screen__text"></p>
     </div>
     <script>
       (function () {
@@ -768,6 +768,335 @@
             ></div>
           </div>
 
+          <!-- ─── Streams Configuration Section (AIOStreams style) ─── -->
+          <div
+            class="addon-catalog-section"
+            style="
+              margin-top: 14px;
+              border-top: 1px dashed rgba(255, 255, 255, 0.1);
+              padding-top: 12px;
+            "
+          >
+            <div
+              class="addon-catalog-section__label"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <span>📺 Streams Configuration (AIOStreams Filter Engine):</span>
+            </div>
+            <p
+              style="
+                font-size: 0.74rem;
+                color: #aaa;
+                margin: 4px 0 8px 0;
+                line-height: 1.35;
+              "
+            >
+              Filter, rank, and limit video streams delivered to Nuvio/Stremio
+              (Resolutions, Qualities, Codecs, HDR, File Sizes & Keywords).
+            </p>
+
+            <!-- Resolutions -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px">
+                Resolutions:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes4k" checked />
+                  <span>✨ 4K / UHD (2160p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes1080p" checked />
+                  <span>🧿 1080p (FHD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes720p" checked />
+                  <span>💿 720p (HD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResSd" checked />
+                  <span>📁 SD (480p / 360p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResUnknown" checked />
+                  <span>❓ Unknown</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Source Qualities -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px">
+                Source Qualities:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualRemux" checked />
+                  <span>🏆 BluRay REMUX</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualBluray" checked />
+                  <span>💿 BluRay</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebdl" checked />
+                  <span>🌐 WEB-DL</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebrip" checked />
+                  <span>⚡ WEBRip</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualHdtv" checked />
+                  <span>📺 HDTV</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualCam" checked />
+                  <span>🎥 CAM / Telesync</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeCam" />
+                  <span style="color: #ff5e57">🚫 Block All CAM</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeUnplayable" checked />
+                  <span style="color: #ff5e57">🚫 Exclude Unplayable</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Video Encodes & Visual Tags -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: #bbb; margin-bottom: 4px">
+                Encodes & Formats:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncHevc" checked />
+                  <span>🎞️ HEVC (H.265)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAvc" checked />
+                  <span>🎞️ AVC (H.264)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAv1" checked />
+                  <span>🎞️ AV1</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisHdr" checked />
+                  <span>🌈 HDR / HDR10+</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisDv" checked />
+                  <span>👓 Dolby Vision</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Priority & Stream Limits -->
+            <div
+              style="
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                align-items: center;
+                margin-bottom: 8px;
+              "
+            >
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamPreferredRes"
+                  style="font-size: 0.76rem; color: #ccc"
+                  >Priority:</label
+                >
+                <select
+                  id="streamPreferredRes"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                >
+                  <option value="auto">Auto (Highest First)</option>
+                  <option value="4k">4K (2160p)</option>
+                  <option value="1080p">1080p (FHD)</option>
+                  <option value="720p">720p (HD)</option>
+                  <option value="sd">SD (480p/360p)</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxPerRes"
+                  style="font-size: 0.76rem; color: #ccc"
+                  >Max / Resolution:</label
+                >
+                <select
+                  id="streamMaxPerRes"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                >
+                  <option value="0">All Available</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxTotal"
+                  style="font-size: 0.76rem; color: #ccc"
+                  >Max Total:</label
+                >
+                <select
+                  id="streamMaxTotal"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                >
+                  <option value="0">Default (100)</option>
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="30">30</option>
+                  <option value="50">50</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMinSizeMb"
+                  style="font-size: 0.76rem; color: #ccc"
+                  >Min Size:</label
+                >
+                <input
+                  type="number"
+                  id="streamMinSizeMb"
+                  min="0"
+                  max="10000"
+                  placeholder="MB"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: 68px;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                />
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxSizeGb"
+                  style="font-size: 0.76rem; color: #ccc"
+                  >Max Size:</label
+                >
+                <input
+                  type="number"
+                  id="streamMaxSizeGb"
+                  min="0"
+                  max="100"
+                  placeholder="GB"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: 68px;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                />
+              </div>
+            </div>
+
+            <!-- Keyword Filters -->
+            <div
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-top: 6px;
+              "
+            >
+              <div style="display: flex; gap: 6px; align-items: center">
+                <label
+                  for="streamExcludedKeywords"
+                  style="font-size: 0.74rem; color: #ff7675; min-width: 105px"
+                  >Exclude Keywords:</label
+                >
+                <input
+                  type="text"
+                  id="streamExcludedKeywords"
+                  placeholder="e.g. cam, sample, trailer, dub"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 8px;
+                    font-size: 0.74rem;
+                    flex: 1;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                />
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center">
+                <label
+                  for="streamRequiredKeywords"
+                  style="font-size: 0.74rem; color: #55efc4; min-width: 105px"
+                  >Require Keywords:</label
+                >
+                <input
+                  type="text"
+                  id="streamRequiredKeywords"
+                  placeholder="e.g. malaysub, 10bit (optional)"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 8px;
+                    font-size: 0.74rem;
+                    flex: 1;
+                    background: rgba(0, 0, 0, 0.4);
+                    border: 1px solid rgba(255, 255, 255, 0.15);
+                    border-radius: 4px;
+                    color: #fff;
+                  "
+                />
+              </div>
+            </div>
+          </div>
+
           <div class="addon-catalog-save-row">
             <button
               type="button"
@@ -1265,11 +1594,30 @@
     ></script>
     <script defer src="nuvio.env.js"></script>
     <script defer src="assets/libs/qrcode-generator.js"></script>
-    <script
-      defer
-      src="app.bundle.js?v=20261002pm05"
-      onerror="window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)"
-    ></script>
-    <script defer src="app.js?v=20261002pm06"></script>
+    <!-- The Nuvio shell bundle boots the whole home screen behind whatever is on
+         screen: /manifest.json, one request per catalog (local AND upstream) and
+         ~1.9s of main-thread long tasks. A deep link straight onto an overlay
+         (#addon / #configure / #settings) has no home screen to show, so the shell
+         is loaded the moment the overlay closes — see _syncOverlayFreeze() in app.js. -->
+    <script>
+      (function () {
+        var hash = String((window.location && window.location.hash) || "").toLowerCase();
+        var overlayBoot = hash === "#addon" || hash === "#configure" || hash === "#settings";
+        window.__pmLoadShellBundle = function () {
+          if (window.__pmShellBundleLoaded) return;
+          window.__pmShellBundleLoaded = true;
+          var s = document.createElement("script");
+          s.src = "app.bundle.js?v=20261002pm16";
+          s.onerror = function () {
+            window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(s.src);
+          };
+          document.head.appendChild(s);
+        };
+        if (!overlayBoot) {
+          window.__pmLoadShellBundle();
+        }
+      })();
+    </script>
+    <script defer src="app.js?v=20261002pm16"></script>
   </body>
 </html>

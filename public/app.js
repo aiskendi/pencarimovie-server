@@ -244,11 +244,15 @@ class PencariMovieApp {
       } else if (hash === '#settings') {
         // Instant show settings card without waiting for initial catalog/media data
         this.showSettingsGate({ forceToken: !this.botId });
-        this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
+        // Do not boot the home screen behind the overlay: the manifest + catalog
+        // rows + trending fetches block the main thread for ~2s (measured: 1.9s of
+        // long tasks, worst 657ms) and the overlay feels stuck. _syncOverlayFreeze()
+        // runs the deferred load the moment the overlay closes.
+        if (this._syncOverlayFreeze()) this._pendingInitialDataLoad = true;
       } else if (hash === '#configure' || hash === '#addon') {
         // Instant show addon / configure modal immediately
         this.openAddonModal?.();
-        this.loadInitialData().catch((err) => console.warn('Background init data load failed:', err));
+        if (this._syncOverlayFreeze()) this._pendingInitialDataLoad = true;
       } else if (hash.startsWith('#file/')) {
         const shortCode = hash.replace('#file/', '');
         // Load main page data in background so it's rendered when user goes back
@@ -2466,6 +2470,22 @@ class PencariMovieApp {
     document.body.classList.toggle('nuvio-modal-open', visible);
     const app = this.$('#app') || this.$('#streamApp');
     if (app) app.toggleAttribute('inert', visible);
+    // Boot order matters: hideSettingsGate() runs before the hash branches open an
+    // overlay, so "nothing visible yet" must not count as "overlay dismissed".
+    // The shell bundle is only released once an overlay has actually been shown.
+    if (visible) this._overlayWasVisible = true;
+    // A deep link onto an overlay (#addon / #settings / #configure) defers the
+    // home-screen load; this is the single place every overlay close routes
+    // through, so the deferred load starts exactly when the screen is free.
+    if (!visible && this._pendingInitialDataLoad) {
+      this._pendingInitialDataLoad = false;
+      this.loadInitialData().catch((err) => console.warn('Deferred init data load failed:', err));
+    }
+    if (!visible && this._overlayWasVisible) {
+      // An overlay deep link skipped the Nuvio shell on purpose (see
+      // __pmLoadShellBundle in index.html) — boot it now that the screen is free.
+      window.__pmLoadShellBundle?.();
+    }
     return visible;
   }
 
@@ -2570,7 +2590,9 @@ class PencariMovieApp {
   }
 
   hideSettingsGate() {
-    // Must hide the loading screen first — it has z-index 10000 (above everything)
+    // Must hide the loading screen first — it has z-index 10000 (above everything).
+    // The Home skeleton that follows is the shell's own (renderHomeLoadingState),
+    // rendered inside the Home scroller rather than as an overlay here.
     this._hideLoadingScreen();
 
     const gate = this.$('#settingsGate');

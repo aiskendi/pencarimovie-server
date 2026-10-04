@@ -2911,31 +2911,62 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         ]);
     }
 
-    $ampRace = fd_http_get_many_amp($raceUrls, ['headers' => $headers, 'timeout' => 12]);
-    if ($ampRace['ok']) {
-        foreach ($ampRace['results'] as $bId => $row) {
-            $httpCode = (int) ($row['http'] ?? 0);
-            $raw = (string) ($row['body'] ?? '');
-            $botStatuses[$bId] = ['http' => $httpCode, 'err' => $row['error'] ?? null];
-
-            if ($httpCode >= 200 && $httpCode < 300 && $raw !== '') {
-                $json = json_decode($raw, true);
-                if (is_array($json)) {
-                    if (!empty($json['file_id_mt']) || !empty($json['file_id'])) {
-                        $winner = $json;
-                        $winnerBotId = (string) $bId;
-                        break; // First winning resolution wins.
+    $client = fd_get_amphp_client();
+    $ampAvailable = ($client !== null && function_exists('Amp\\async') && class_exists('Amp\\Future'));
+    if ($ampAvailable) {
+        $cancellation = new \Amp\TimeoutCancellation(12);
+        $futures = [];
+        foreach ($raceUrls as $bId => $url) {
+            $futures[$bId] = \Amp\async(static function () use ($client, $url, $headers, $cancellation): array {
+                try {
+                    $request = new \Amp\Http\Client\Request($url, 'GET');
+                    foreach ($headers as $h) {
+                        $parts = explode(':', $h, 2);
+                        if (count($parts) === 2) {
+                            $request->setHeader(trim($parts[0]), trim($parts[1]));
+                        }
                     }
-                    $lastErrorResult = $json;
+                    $response = $client->request($request, $cancellation);
+                    $status = $response->getStatus();
+                    $body = $response->getBody()->buffer($cancellation);
+                    return ['body' => is_string($body) ? $body : '', 'http' => $status, 'error' => null];
+                } catch (\Throwable $e) {
+                    return ['body' => '', 'http' => 0, 'error' => $e->getMessage()];
                 }
-            } elseif ($raw !== '') {
-                $json = json_decode($raw, true);
-                if (is_array($json)) {
-                    $lastErrorResult = $json;
+            });
+        }
+
+        try {
+            // iterate() yields futures in order of completion as soon as each completes
+            foreach (\Amp\Future::iterate($futures) as $bId => $future) {
+                $row = $future->await();
+                $httpCode = (int) ($row['http'] ?? 0);
+                $raw = (string) ($row['body'] ?? '');
+                $botStatuses[$bId] = ['http' => $httpCode, 'err' => $row['error'] ?? null];
+
+                if ($httpCode >= 200 && $httpCode < 300 && $raw !== '') {
+                    $json = json_decode($raw, true);
+                    if (is_array($json)) {
+                        if (!empty($json['file_id_mt']) || !empty($json['file_id'])) {
+                            $winner = $json;
+                            $winnerBotId = (string) $bId;
+                            break; // First winning resolution wins immediately!
+                        }
+                        $lastErrorResult = $json;
+                    }
+                } elseif ($raw !== '') {
+                    $json = json_decode($raw, true);
+                    if (is_array($json)) {
+                        $lastErrorResult = $json;
+                    }
                 }
             }
+        } catch (\Throwable $e) {
+            // Amp loop exception, fallback will be used if winner is null
         }
-    } else {
+    }
+
+    if ($winner === null && !$ampAvailable) {
         // Fallback: curl_multi (Amp unavailable).
         $mh = curl_multi_init();
         $handles = [];
@@ -3238,7 +3269,84 @@ function fd_http_fire_and_forget(string $url, array $payload = [], string $metho
     }
 }
 
-function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = ''): array
+/**
+ * Spawns a background detached CLI process or async request to resolve missing
+ * short_codes into storage/cache/resolve_cache_*.json without blocking.
+ */
+function fd_spawn_warmup_resolve(array $shortCodes, string $botId = '', string $context = ''): bool
+{
+    $shortCodes = array_values(array_unique(array_filter(array_map('trim', $shortCodes))));
+    if (empty($shortCodes)) {
+        return false;
+    }
+
+    if ($botId === '') {
+        $picked = fd_pick_pool_bot();
+        $botId = !empty($picked['bot_id']) ? (string) $picked['bot_id'] : fd_get_bot_id();
+    }
+
+    // Filter out codes that are already cached
+    $missing = [];
+    foreach ($shortCodes as $sc) {
+        if (fd_resolve_shortcode_cached($sc, $botId) === null) {
+            $missing[] = $sc;
+        }
+    }
+
+    if (empty($missing)) {
+        return true;
+    }
+
+    $chunk = array_slice($missing, 0, 40);
+    $root = fd_get_app_root();
+
+    // Determine PHP CLI binary
+    $phpBin = PHP_BINARY;
+    if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+        $prefix = (string) fd_env('PREFIX', '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+            if (is_file($candidate)) {
+                $phpBin = $candidate;
+            } elseif (is_file($root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp'))) {
+                $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp') . ' php-cli';
+            }
+        }
+    }
+
+    $backendScript = $root . DIRECTORY_SEPARATOR . 'backend.php';
+    if (!is_file($backendScript)) {
+        $backendScript = __DIR__ . DIRECTORY_SEPARATOR . 'backend.php';
+    }
+
+    $codesArg = implode(',', $chunk);
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $backendScript . '"'
+        . ' warmup'
+        . ' "' . addslashes($codesArg) . '"'
+        . ' "' . addslashes($botId) . '"'
+        . ' "' . addslashes($context) . '"';
+
+    fd_log('spawning background warmup resolve', [
+        'context' => $context !== '' ? $context : 'batch',
+        'count' => count($chunk),
+        'bot_id' => $botId,
+        'sample_codes' => array_slice($chunk, 0, 3),
+    ]);
+
+    if (fd_is_windows()) {
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+    } else {
+        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    }
+
+    return true;
+}
+
+function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = '', string $context = ''): array
 {
     $shortCodes = array_values(array_unique(array_filter(array_map('trim', $shortCodes))));
     if (empty($shortCodes)) {
@@ -3267,15 +3375,8 @@ function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = ''): arr
         return $results;
     }
 
-    // Trigger non-blocking fire-and-forget warmup on WordPress in chunks of 40
-    $chunks = array_chunk($missingCodes, 40);
-    foreach ($chunks as $chunk) {
-        $url = FD_WP_API_BASE . '/resolve-files';
-        fd_http_fire_and_forget($url, [
-            'short_codes' => implode(',', $chunk),
-            'bot_id' => $botId,
-        ], 'POST');
-    }
+    // Trigger non-blocking detached background warmup to resolve and persist into disk cache
+    fd_spawn_warmup_resolve($missingCodes, $botId, $context);
 
     return $results;
 }
@@ -3294,7 +3395,7 @@ function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = ''): arr
  * @param int    $chunkSize  Codes per batch request (WordPress caps at ~40)
  * @return array{ok:int,bot_id:string,total:int,resolved:int,failed:int,results:array,failed_codes:array}
  */
-function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chunkSize = 40): array
+function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chunkSize = 40, string $context = ''): array
 {
     $shortCodes = array_values(array_unique(array_filter(array_map('trim', $shortCodes))));
     if (empty($shortCodes)) {
@@ -3445,6 +3546,7 @@ function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chu
     }
 
     fd_log('warmup resolve batch completed', [
+        'context' => $context !== '' ? $context : 'batch',
         'bot_id' => $botId,
         'total' => count($shortCodes),
         'resolved' => count($results),
@@ -3470,7 +3572,7 @@ function fd_warmup_resolve_batch(array $shortCodes, string $botId = '', int $chu
  * @param string $botId Destination bot ID
  * @return array Enriched files array with cached file_id_mt populated where already warm
  */
-function fd_prewarm_streams_batch(array $files, string $botId = ''): array
+function fd_prewarm_streams_batch(array $files, string $botId = '', string $context = ''): array
 {
     if (empty($files)) {
         return [];
@@ -3488,8 +3590,8 @@ function fd_prewarm_streams_batch(array $files, string $botId = ''): array
         return $files;
     }
 
-    // Hit-and-forget: checks local cache for instant hits, fires async background warmup for misses
-    $resolvedMap = fd_resolve_shortcodes_batch($shortCodes, $botId);
+    // Non-blocking: checks local cache for instant hits, spawns detached background warmup for misses
+    $resolvedMap = fd_resolve_shortcodes_batch($shortCodes, $botId, $context);
 
     // Merge resolved data into the file list if already in cache
     foreach ($files as &$f) {
@@ -12763,7 +12865,7 @@ if ($isNuvioRoute) {
         // Pre-resolve all streams and fetch subtitles only when files exist
         if (!empty($filesToStream)) {
             $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
-            $filesToStream = fd_prewarm_streams_batch($filesToStream, $botIdStr);
+            $filesToStream = fd_prewarm_streams_batch($filesToStream, $botIdStr, $itemId);
         }
 
         foreach ($filesToStream as $fItem) {
@@ -12948,7 +13050,7 @@ if ($isNuvioRoute) {
             }
             if ($itemType === 'series') {
                 $groupTokens = ['pencarimovie'];
-                $fullText = strtolower($fTitle . ' ' . $fCaption);
+                $fullText = strtolower($fTitle . ' ' . $fCaption . ' ' . $cleanFTitle);
 
                 // 1. Release source / group / encoder
                 $groups = [
@@ -12987,19 +13089,91 @@ if ($isNuvioRoute) {
                     'melia',
                     'mk',
                     'flx',
-                    'mkvcinemas'
+                    'mkvcinemas',
+                    'anipakku',
+                    'kitaujisub',
+                    'tuturunime',
+                    'sokudo',
+                    'dkb',
+                    'primefix',
+                    'primef',
+                    'movies4u',
+                    'brabusanime',
+                    'anicade',
+                    'infinite',
+                    'toonworld4all',
+                    'msm',
+                    'orion',
+                    'toc',
+                    'cm',
+                    'drakorid',
+                    'jadeijo',
+                    'nunadrama',
+                    'iconflix',
+                    'old',
+                    'd_o',
+                    'awsub',
+                    'samehadaku',
+                    'oploverz',
+                    'moeisub',
+                    'subsplease',
+                    'judas',
+                    'erai-raws',
+                    'commie',
+                    'horriblesubs',
+                    'asw',
+                    'chotabheem',
+                    'youseisei',
+                    'neptune',
+                    'csmelayu',
+                    'skytorrents',
+                    'bilibili',
+                    'qman',
+                    'viki',
+                    'adrama'
                 ];
                 $matchedGroups = [];
                 foreach ($groups as $g) {
-                    if (preg_match('/(?:^|[._\-\s\[\(])' . preg_quote($g, '/') . '(?:[._\-\s\]\)]|$)/i', $fTitle . ' ' . $fCaption)) {
-                        $matchedGroups[] = $g;
+                    if (preg_match('/(?:^|[._\-\s\[\(\/])' . preg_quote($g, '/') . '(?:[._\-\s\]\)\/]|$)/i', $fullText)) {
+                        $matchedGroups[] = str_replace(['_', '&'], '-', $g);
                     }
                 }
-                if (!empty($matchedGroups)) {
-                    $groupTokens[] = implode('.', $matchedGroups);
+
+                // Prefix group [Group]
+                if (preg_match('/^\[([a-z0-9_-]{2,20})\]/i', $fTitle, $pm)) {
+                    $matchedGroups[] = strtolower($pm[1]);
                 }
 
-                // 2. Language / subtitle flavor
+                if (!empty($matchedGroups)) {
+                    $groupTokens[] = implode('.', array_unique($matchedGroups));
+                }
+
+                // 2. Platform / Streaming Provider
+                $plat = strtolower($mediaTags['platform'] ?? '');
+                if ($plat !== '') {
+                    $groupTokens[] = $plat;
+                } elseif (preg_match('/\b(nf|netflix)\b/i', $fullText)) {
+                    $groupTokens[] = 'nf';
+                } elseif (preg_match('/\b(amzn|primevideo|prime)\b/i', $fullText)) {
+                    $groupTokens[] = 'amzn';
+                } elseif (preg_match('/\b(dsnp|disney\+?)\b/i', $fullText)) {
+                    $groupTokens[] = 'dsnp';
+                } elseif (preg_match('/\b(atvp|apple\s*tv\+?)\b/i', $fullText)) {
+                    $groupTokens[] = 'atvp';
+                } elseif (preg_match('/\b(hmax|hbo\s*max)\b/i', $fullText)) {
+                    $groupTokens[] = 'hmax';
+                } elseif (preg_match('/\b(wetv)\b/i', $fullText)) {
+                    $groupTokens[] = 'wetv';
+                } elseif (preg_match('/\b(iqiyi)\b/i', $fullText)) {
+                    $groupTokens[] = 'iqiyi';
+                } elseif (preg_match('/\b(viki)\b/i', $fullText)) {
+                    $groupTokens[] = 'viki';
+                }
+
+                // 3. Language / Subtitle / Audio flavor
+                if (preg_match('/\b(dual[._\-\s]*audio|multi[._\-\s]*audio|dual)\b/i', $fullText)) {
+                    $groupTokens[] = 'dual';
+                }
                 if (preg_match('/\b(malaysub|malay\.?sub|sub\.?malay)\b/i', $fullText)) {
                     $groupTokens[] = 'malaysub';
                 } elseif (preg_match('/\b(indosub|indo\.?sub|sub\.?indo|indonesian)\b/i', $fullText)) {
@@ -13010,6 +13184,8 @@ if ($isNuvioRoute) {
                     $groupTokens[] = 'chinsub';
                 } elseif (preg_match('/\b(multisub|multi\.?sub)\b/i', $fullText)) {
                     $groupTokens[] = 'multisub';
+                } elseif (preg_match('/\b(latino|lat)\b/i', $fullText)) {
+                    $groupTokens[] = 'latino';
                 } elseif (preg_match('/\b(hardsub)\b/i', $fullText)) {
                     $groupTokens[] = 'hardsub';
                 } elseif (preg_match('/\b(softsub)\b/i', $fullText)) {
@@ -13018,36 +13194,44 @@ if ($isNuvioRoute) {
                     $groupTokens[] = 'raw';
                 }
 
-                // 3. Source / Medium
-                if (preg_match('/\b(bluray|blu-ray|bdrip|remux)\b/i', $fullText)) {
+                // 4. Source / Quality (normalize webdl & webrip -> web for reliable autoplay)
+                if (preg_match('/\b(remux)\b/i', $fullText)) {
+                    $groupTokens[] = 'remux';
+                } elseif (preg_match('/\b(bluray|blu-ray|bdrip)\b/i', $fullText)) {
                     $groupTokens[] = 'bluray';
-                } elseif (preg_match('/\b(web-?dl|webrip)\b/i', $fullText)) {
-                    $groupTokens[] = 'webdl';
+                } elseif (preg_match('/\b(web-?dl|webrip|web|\.we?\.mkv|\.w\.mkv)\b/i', $fullText)) {
+                    $groupTokens[] = 'web';
+                } elseif (preg_match('/\b(hdrip)\b/i', $fullText)) {
+                    $groupTokens[] = 'hdrip';
                 } elseif (preg_match('/\b(hdtv|tvrip|pdtv)\b/i', $fullText)) {
                     $groupTokens[] = 'hdtv';
+                } elseif ($mediaTags['source'] !== '') {
+                    $groupTokens[] = strtolower($mediaTags['source']);
                 }
 
-                // 4. Resolution / quality
+                // 5. Resolution / quality
                 if ($qualityTag !== '') {
                     $groupTokens[] = strtolower(str_replace(' ', '-', $qualityTag));
                 }
 
-                // 5. Codec
-                if (preg_match('/\b(hevc|x265|h265)\b/i', $fullText)) {
+                // 6. Visual Tags (10bit, HDR, DV)
+                if (!empty($mediaTags['visual'])) {
+                    foreach ($mediaTags['visual'] as $v) {
+                        $groupTokens[] = strtolower($v);
+                    }
+                } elseif (preg_match('/\b(10bit|10-bit|hi10p?)\b/i', $fullText)) {
+                    $groupTokens[] = '10bit';
+                }
+
+                // 7. Video Codec
+                if (preg_match('/\b(av1)\b/i', $fullText)) {
+                    $groupTokens[] = 'av1';
+                } elseif (preg_match('/\b(hevc|x265|h265)\b/i', $fullText)) {
                     $groupTokens[] = 'x265';
                 } elseif (preg_match('/\b(avc|x264|h264)\b/i', $fullText)) {
                     $groupTokens[] = 'x264';
-                }
-
-                // 6. Clean title signature fallback to group consistent title releases together
-                $sig = preg_replace('/\.(mp4|mkv|avi|ts|flv)$/i', '', $cleanFTitle);
-                $sig = preg_replace('/\b(?:19\d\d|20\d\d)\b/', '', $sig);
-                $sig = preg_replace('/(?:^|[^a-z0-9])(?:S\d{1,2})?[ ._-]*(?:EP|EPS|EPISODE|EPISOD|E|PART|VOL|BAHAGIAN)[ ._-]*\d{1,4}(?:[^a-z0-9]|$)/i', ' ', $sig);
-                $sig = preg_replace('/\b(akhir|final|end)\b/i', '', $sig);
-                $sig = preg_replace('/[^a-z0-9]+/i', '-', trim($sig));
-                $sig = strtolower(trim($sig, '-'));
-                if ($sig !== '') {
-                    $groupTokens[] = substr($sig, 0, 30);
+                } elseif ($mediaTags['codec'] !== '') {
+                    $groupTokens[] = strtolower($mediaTags['codec']);
                 }
 
                 $behaviorHints['bingeGroup'] = implode('-', array_unique($groupTokens));
@@ -14135,14 +14319,8 @@ if (str_starts_with($path, '/api/')) {
         // Batch resolution mode
         if ($rawCodes !== '') {
             $codesList = preg_split('/[\s,]+/', $rawCodes);
-            $batchResults = fd_resolve_shortcodes_batch($codesList, $botId);
-            fd_json([
-                'ok' => 1,
-                'bot_id' => $botId,
-                'total' => count($codesList),
-                'resolved' => count($batchResults),
-                'results' => $batchResults,
-            ]);
+            $batchResults = fd_warmup_resolve_batch($codesList, $botId);
+            fd_json($batchResults);
         }
 
         $shortCode = trim((string) ($_REQUEST['short_code'] ?? ''));
@@ -14489,7 +14667,7 @@ if (str_starts_with($path, '/api/')) {
                 $files = $decoded['data']['files'] ?? ($decoded['files'] ?? null);
                 if (is_array($files) && !empty($files)) {
                     $activeBotId = !empty($queryParams['bot_id']) ? (string)$queryParams['bot_id'] : fd_get_bot_id();
-                    $warmedFiles = fd_prewarm_streams_batch($files, $activeBotId);
+                    $warmedFiles = fd_prewarm_streams_batch($files, $activeBotId, (string) ($queryParams['action'] ?? 'search_files'));
                     if (isset($decoded['data']['files'])) {
                         $decoded['data']['files'] = $warmedFiles;
                     } elseif (isset($decoded['files'])) {
@@ -14519,7 +14697,7 @@ if (str_starts_with($path, '/api/')) {
             $encoded = fd_extract_download_payload_from_path($path);
         }
         $decodedPayload = $encoded !== '' ? fd_decode_download_payload($encoded) : [];
-        $fileId = trim((string) ($decodedPayload['file_id'] ?? ($_GET['file_id'] ?? $_POST['file_id'] ?? '')));
+        $fileId = trim((string) ($decodedPayload['file_id_mt'] ?? $decodedPayload['file_id'] ?? ($_GET['file_id_mt'] ?? $_GET['file_id'] ?? $_POST['file_id_mt'] ?? $_POST['file_id'] ?? '')));
         $shortCode = trim((string) ($decodedPayload['short_code'] ?? ($_GET['short_code'] ?? $_POST['short_code'] ?? $_GET['sc'] ?? '')));
         if ($shortCode === '' && $fileId === '' && $encoded !== '' && empty($decodedPayload)) {
             $shortCode = $encoded;
@@ -14615,8 +14793,14 @@ if (str_starts_with($path, '/api/')) {
         $error = null;
 
 
-        // If short_code is provided, concurrently resolve across all candidate bots simultaneously
-        if ($shortCode !== '') {
+        // If file_id is not already known and short_code is provided, resolve concurrently
+        if ($fileId === '' && $shortCode !== '') {
+            // Concurrently pre-ensure the IPC worker for the default bot while resolution is in-flight
+            $sessionPath = fd_get_bot_session_path($botId);
+            if ($sessionPath !== '' && (is_dir($sessionPath) || is_file($sessionPath))) {
+                fd_ensure_ipc_worker($sessionPath);
+            }
+
             $res = fd_resolve_shortcode_concurrent($shortCode, $candidateBots);
             $candidateFileId = trim((string) ($res['file_id_mt'] ?? $res['file_id'] ?? ''));
             $cBotId = !empty($res['bot_id']) ? (string) $res['bot_id'] : $botId;
@@ -14988,8 +15172,20 @@ if (str_starts_with($path, '/api/')) {
 
 // ─── Static file serving ────────────────────────────────────────────────────
 
-// If running under the CLI SAPI, do not attempt to serve static files
+// If running under the CLI SAPI, handle CLI background commands
 if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+    global $argv;
+    $cliAction = $argv[1] ?? ($_SERVER['argv'][1] ?? '');
+    if ($cliAction === 'warmup') {
+        $rawCodes = $argv[2] ?? ($_SERVER['argv'][2] ?? '');
+        $cliBotId = $argv[3] ?? ($_SERVER['argv'][3] ?? '');
+        $cliContext = $argv[4] ?? ($_SERVER['argv'][4] ?? '');
+        $codes = array_values(array_unique(array_filter(preg_split('/[\s,]+/', $rawCodes))));
+        if (!empty($codes)) {
+            fd_warmup_resolve_batch($codes, $cliBotId, 40, $cliContext);
+        }
+        exit(0);
+    }
     return true;
 }
 

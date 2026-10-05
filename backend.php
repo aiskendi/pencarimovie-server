@@ -15172,6 +15172,8 @@ if (str_starts_with($path, '/api/')) {
                     header('Access-Control-Allow-Methods: GET, HEAD, OPTIONS');
                     header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type');
                     header('Accept-Ranges: bytes');
+                    header('X-Accel-Buffering: no');
+                    header('Incremental: ?1');
                 }
                 fd_log('starting downloadToBrowser', [
                     'file_id' => $fileId,

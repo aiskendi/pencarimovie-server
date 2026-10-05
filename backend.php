@@ -5978,17 +5978,24 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
 
     // 1. Strict Year check if year is known
     $searchedYear = trim($searchedYear);
-    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    $hasFileYear = (bool) preg_match_all('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fymAll);
     if ($searchedYear !== '' && $hasFileYear) {
-        $fileYear = (int) $fym[1];
         $targetYear = (int) $searchedYear;
-        if (abs($fileYear - $targetYear) > 1) {
+        $matchedAnyYear = false;
+        foreach ($fymAll[1] as $yStr) {
+            if (abs((int) $yStr - $targetYear) <= 1) {
+                $matchedAnyYear = true;
+                break;
+            }
+        }
+        if (!$matchedAnyYear) {
             return false;
         }
     }
 
     // 2. Prepare normalized target title variants
     $cleanTarget = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedTitle));
+    $cleanTarget = preg_replace('/\s*&\s*/', ' and ', $cleanTarget);
     $cleanTarget = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanTarget);
     if ($searchedYear !== '') {
         $cleanTarget = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanTarget);
@@ -6006,6 +6013,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     $akaNoThe = '';
     if ($searchedAka !== '') {
         $cleanAka = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedAka));
+        $cleanAka = preg_replace('/\s*&\s*/', ' and ', $cleanAka);
         $cleanAka = preg_replace('/\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\d+(?:\.\d+)?\s*(?:gb|mb))\b/i', ' ', $cleanAka);
         if ($searchedYear !== '') {
             $cleanAka = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanAka);
@@ -6016,10 +6024,40 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         $akaNoThe = trim(preg_replace('/^the\s+/i', '', $akaLower));
     }
 
+    // 2b. Caption check: If caption contains clean release title and year, check it directly
+    if ($fileCaption !== '') {
+        $firstLine = trim(strtok($fileCaption, "\r\n"));
+        if (preg_match('/\.(?:mp4|mkv|avi|mov|ts|flv|wmv)\b/i', $firstLine) || preg_match('/\b(19\d\d|20\d\d)\b/', $firstLine)) {
+            $capClean = fd_clean_media_title($firstLine);
+            $capCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $capClean));
+            $capCleanNorm = trim(preg_replace('/\s+/', ' ', $capCleanNorm));
+            $capWithoutSplit = preg_replace('/[._\s-]part[._\s-]*0*\d{1,4}/i', '', $capCleanNorm);
+            $baseCap = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|predvd|predvdrip|ts|tc|r5|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $capWithoutSplit);
+            if ($searchedYear !== '') {
+                $baseCap = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b.*/', '', $baseCap);
+            } else {
+                $baseCap = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseCap);
+            }
+            $baseCap = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion|sub\s*malay|malay\s*sub|eng\s*sub|sub\s*eng|indosub|sub\s*indo|subtitle|dubbed|multi\s*audio|clean\s*audio|hc|hardsub)\b.*/i', '', $baseCap);
+            $baseCap = trim(preg_replace('/\s+/', ' ', $baseCap));
+            if ($baseCap !== '' && ($baseCap === $targetLower || ($akaLower !== '' && $baseCap === $akaLower))) {
+                if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $firstLine, $cym)) {
+                    if (abs((int)$cym[1] - (int)$searchedYear) <= 1) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+        }
+    }
+
     // 3. Clean filename to extract the movie title portion before release tags and year
     $fClean = fd_clean_media_title($fileTitle);
-    // Strip leading release channels/groups/tags
-    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi)\s+/i', '', $fClean);
+    // Strip leading @channel tags or [group] tags
+    $fClean = preg_replace('/^(?:@\w+[._\s]+|\[[^\]]+\][._\s]*|\([^\)]+\)[._\s]*)/i', '', $fClean);
+    // Strip leading release channels/groups/tags/domains
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|sklink(?:\s*office)?|movie\s*king|movie\s*world|film\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
     $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
 
@@ -6028,9 +6066,15 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     $fWithoutSplit = preg_replace('/\.(?:mp4|mkv|avi|mov|ts|flv|wmv)\.0*\d{1,4}$/i', '', $fWithoutSplit);
 
     // 5. Strip release tags and everything following
-    $baseF = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|ts|tc|r5|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $fWithoutSplit);
-    // Strip year and anything following
-    $baseF = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseF);
+    $baseF = preg_replace('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hd|sd|bluray|blu-ray|bdrip|brrip|web-?dl|webrip|hdrip|hdtv|cam|predvd|predvdrip|ts|tc|r5|dvdrip|remux|hevc|x264|x265|h264|h265|aac.*|lubokvideo|yts|lulustream|galaxyrg|pahe)\b.*/i', '', $fWithoutSplit);
+    // Strip release year and anything following (careful: do not strip if year is part of target title)
+    if ($searchedYear !== '') {
+        $baseF = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b.*/', '', $baseF);
+    }
+    // If baseF still contains a 4-digit year not in target title, strip it
+    if (!preg_match('/\b(19\d\d|20\d\d)\b/', $targetLower)) {
+        $baseF = preg_replace('/\b(?:19\d\d|20\d\d)\b.*/', '', $baseF);
+    }
     // Strip common movie edition and language/subtitle suffixes
     $baseF = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion|sub\s*malay|malay\s*sub|eng\s*sub|sub\s*eng|indosub|sub\s*indo|subtitle|dubbed|multi\s*audio|clean\s*audio|hc|hardsub)\b.*/i', '', $baseF);
     // Strip video container extensions if remaining
@@ -6059,6 +6103,23 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         if ($akaLower !== '' && $baseF === $akaLower) {
             return true;
         }
+
+        // Check if baseF ends with targetLower preceded by known uploader/channel/site words
+        // e.g. "sklink office baththa" ends with "baththa", prefix is "sklink office"
+        $targetsToCheck = [$targetLower];
+        if ($akaLower !== '') $targetsToCheck[] = $akaLower;
+        foreach ($targetsToCheck as $tgt) {
+            if (str_ends_with($baseF, ' ' . $tgt)) {
+                $prefix = trim(substr($baseF, 0, -strlen($tgt)));
+                // Prefix must be composed exclusively of uploader/group/channel/site words
+                if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd)\b\s*)+$/i', $prefix)) {
+                    // Strict protection: prefix must NOT contain articles or title adjectives
+                    if (!preg_match('/\b(?:the|a|an|blade|late|maze|avatar|chapter|part)\b/i', $prefix)) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     // 8. Check with ampersand / dan / and / possessive variants
@@ -6071,6 +6132,18 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     ];
     if (in_array($baseF, $targetVariants, true)) {
         return true;
+    }
+
+    // Also check target variants with uploader prefix
+    foreach ($targetVariants as $tv) {
+        if ($tv !== '' && str_ends_with($baseF, ' ' . $tv)) {
+            $prefix = trim(substr($baseF, 0, -strlen($tv)));
+            if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd)\b\s*)+$/i', $prefix)) {
+                if (!preg_match('/\b(?:the|a|an|blade|late|maze|avatar|chapter|part)\b/i', $prefix)) {
+                    return true;
+                }
+            }
+        }
     }
 
     // 9. Multi-word title exact word sequence match (only for 2+ word titles)
@@ -12389,16 +12462,29 @@ if ($isNuvioRoute) {
                 $searchedTitle = $postTitle;
                 $searchedYear = $postYear;
                 $moviePostFastPathDone = false;
-                if (isset($res['ok'])) {
+                if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
                     $moviePostFastPathDone = true;
-                    if (!empty($res['items']) && is_array($res['items'])) {
-                        foreach ($res['items'] as $f) {
-                            $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                            $fCaption = (string) ($f['caption'] ?? '');
-                            // Strict title and year check to prevent unrelated files from leaking into movie streams
-                            if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
-                                $filesToStream[] = $f;
-                            }
+                    foreach ($res['items'] as $f) {
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCaption = (string) ($f['caption'] ?? '');
+                        // Strict title and year check to prevent unrelated files from leaking into movie streams
+                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
+                            $filesToStream[] = $f;
+                        }
+                    }
+                }
+            }
+
+            // Fallback for Movie requested via post ID:
+            // If stream-files returned 0 items, probe post_files directly for this exact post ID
+            if (empty($filesToStream) && $postId > 0) {
+                $pfRes = fd_fetch_stream_ajax('post_files', ['post_id' => $postId, 'limit' => 100]);
+                if (is_array($pfRes) && !empty($pfRes['files'])) {
+                    foreach ($pfRes['files'] as $f) {
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCaption = (string) ($f['caption'] ?? '');
+                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', '', $fCaption)) {
+                            $filesToStream[] = $f;
                         }
                     }
                 }

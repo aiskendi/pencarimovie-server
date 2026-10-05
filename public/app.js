@@ -5985,6 +5985,12 @@ class PencariMovieApp {
         }
       }
       if (data && data.update_needed) {
+        // Defensive check: if minimum_version is present, only require update if current is strictly below minimum
+        if (data.minimum_version && data.current_version) {
+          if (!this._isVersionBelow(data.current_version, data.minimum_version)) {
+            return null;
+          }
+        }
         return data;
       }
       return null;
@@ -5992,6 +5998,21 @@ class PencariMovieApp {
       console.warn('Version check request failed:', e);
       return null;
     }
+  }
+
+  _isVersionBelow(current, minimum) {
+    if (!current || !minimum) return false;
+    const parse = (v) => String(v).replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+    const c = parse(current);
+    const m = parse(minimum);
+    const len = Math.max(c.length, m.length);
+    for (let i = 0; i < len; i++) {
+      const cPart = c[i] || 0;
+      const mPart = m[i] || 0;
+      if (cPart < mPart) return true;
+      if (cPart > mPart) return false;
+    }
+    return false;
   }
 
   renderSettingsVersion() {

@@ -165,7 +165,7 @@ define('FD_WP_API_BASE', 'https://pencarimovie.com/wp-json/pencarimovie-server/v
 // so the local SNI is a benign hostname.
 define('FD_WP_FALLBACK_HOST', 'telegra.my');
 define('FD_WP_API_BASE_FALLBACK', 'https://' . FD_WP_FALLBACK_HOST . '/wp-json/pencarimovie-server/v1');
-define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.2.7');
+define('FD_APP_VERSION', is_file(__DIR__ . '/.release-tag') ? ltrim(trim((string) file_get_contents(__DIR__ . '/.release-tag')), 'v') : '2.7.7');
 define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
@@ -5162,7 +5162,13 @@ function fd_check_version(): array
         if (is_file($cacheFile)) {
             $cached = @json_decode((string) @file_get_contents($cacheFile), true);
             if (is_array($cached) && !empty($cached['time']) && (time() - $cached['time'] < 3600)) {
-                $fd_version_state = $cached['data'] ?? [];
+                // If disk cache was saved for a different app version, invalidate it
+                if (!empty($cached['result']['current_version']) && $cached['result']['current_version'] !== $current) {
+                    @unlink($cacheFile);
+                    $fd_version_state = [];
+                } else {
+                    $fd_version_state = $cached['data'] ?? [];
+                }
             }
         }
     }
@@ -5173,7 +5179,9 @@ function fd_check_version(): array
         if (!empty($response['ok'])) {
             $minVersion = (string) ($response['min_version'] ?? '');
             $updateUrl = (string) ($response['update_url'] ?? '');
-            $updateNeeded = $minVersion !== '' && version_compare($current, $minVersion, '<');
+            $updateNeeded = ($minVersion !== '')
+                ? version_compare($current, $minVersion, '<')
+                : !empty($response['update_required']);
             $fd_version_state['min_version'] = $minVersion;
             $fd_version_state['update_url'] = $updateUrl;
             $fd_version_state['update_required'] = $updateNeeded;
@@ -5206,7 +5214,9 @@ function fd_check_version(): array
 
     $minVersion = (string) ($fd_version_state['min_version'] ?? '');
     $updateUrl = (string) ($fd_version_state['update_url'] ?? '');
-    $updateNeeded = !empty($fd_version_state['update_required']) || ($minVersion !== '' && version_compare($current, $minVersion, '<'));
+    $updateNeeded = ($minVersion !== '')
+        ? version_compare($current, $minVersion, '<')
+        : !empty($fd_version_state['update_required']);
 
     return [
         'ok' => true,
@@ -7778,6 +7788,7 @@ function fd_is_topkeyword_valid(string $keyword): bool
         'nsfw',
         'naked',
         'nude',
+        'melayu',
         'colmek',
         'sange',
         'tetek',

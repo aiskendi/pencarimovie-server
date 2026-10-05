@@ -1,8 +1,8 @@
 # 🎬 PencariMovie Server
 
 <p align="center">
-  <strong>High-speed self-hosted media stream resolver & downloader for Stremio, Nuvio, Eclipse Music, and web browsers.</strong><br>
-  100% Plug & Play • Zero Account Setup • No Telegram Login or Bot Token Required
+  <strong>Self-hosted Telegram MTProto media stream bridge & local file downloader for Stremio, Nuvio, Eclipse Music, and web clients.</strong><br>
+  Local Execution • Direct MTProto Transport • Zero Cloud Relay
 </p>
 
 <p align="center">
@@ -11,19 +11,20 @@
   <a href="#-stremio-nuvio--eclipse-music-setup">App Setup</a> •
   <a href="#-server-security--remote-token-auth">Security & Auth</a> •
   <a href="#-cli-commands-pms">CLI Usage</a> •
-  <a href="#-features">Features</a>
+  <a href="#-features">Features</a> •
+  <a href="#-legal-disclaimer--dmca-policy">Legal & DMCA</a>
 </p>
 
 ---
 
 ## 💡 What is PencariMovie Server?
 
-**PencariMovie Server** is a lightweight, standalone streaming engine that connects directly to Telegram's MTProto protocol. It converts media into direct, high-speed HTTP streams with instant seek support for **Stremio**, **Nuvio**, **Eclipse Music**, or the built-in dark web player.
+**PencariMovie Server** is a lightweight, self-hosted streaming utility and protocol bridge connecting client applications to Telegram's MTProto API. It converts user-authorized Telegram file references into local HTTP streams with range-request (`HTTP 206`) seek support for media players including **Stremio**, **Nuvio**, and web browsers.
 
-- **Zero account setup**: Runs out of the box without requiring personal Telegram logins, phone numbers, or bot tokens.
-- **Sub-second stream resolution**: Fast-path metadata indexing for instant stream links.
-- **Local & private**: Resolves and streams directly over your local machine or LAN without third-party debrid accounts.
-- **Cross-platform**: Available as a native Windows tray app, Linux CLI, Android APK (TV/Phone), Termux script, and multi-arch Docker image.
+- **Client-Side MTProto Bridge**: Directly streams authorized media to the user's local player using MadelineProto.
+- **No Remote File Hosting**: The server does not host, store, or re-transmit copyrighted files; streams originate from Telegram's network directly to the local client.
+- **Local & Private**: Runs on the user's own hardware (localhost / private LAN) without passing credentials or media bytes to external proxy servers.
+- **Cross-Platform**: Available as a native Windows tray application, Linux daemon, Android APK, Termux script, and Docker container.
 
 ---
 
@@ -180,7 +181,7 @@ DEBUG=0
 1. Open the **Eclipse Music** app (`https://eclipsemusic.app`) on your device.
 2. Go to **Settings** ➔ **Connections** ➔ **Add Connection** ➔ **Addon**.
 3. Enter your Eclipse manifest URL: `http://<YOUR-LAN-IP>:8088/eclipse/manifest.json` (or `http://127.0.0.1:8088/eclipse`).
-4. Search and stream from over 500,000+ tracks directly in lossless FLAC / MP3!
+4. Stream audio tracks with automatic lossless ALAC-to-FLAC transcoding on compatible devices.
 
 ---
 
@@ -227,22 +228,46 @@ _(Works across Windows, macOS, Linux, and Termux)._
 
 ## ✨ Features
 
-- **🔌 100% Plug & Play**: Instant streaming without creating bot tokens, entering phone numbers, or configuring API keys.
-- **⚡ Sub-Second Resolution**: Instant stream cards powered by optimized direct metadata resolution.
-- **📺 Stremio & Nuvio Ready**: Built-in addon provider with catalog bridging and direct seekable `.mp4` stream resolution.
-- **🎵 Lossless Eclipse Music Streaming**: Transcodes high-res ALAC music tracks into lossless FLAC on the fly for Android, iOS, and Web.
-- **🎛️ Master Upstream Toggle**: Enable or disable all bridged upstream catalogs (e.g. AIOMetadata) with a single switch without wiping your custom manifests.
-- **🎬 Netflix-Style Web Player**: Built-in dark UI with trending titles, categories, full search, and responsive mobile player.
-- **📡 Multi-Device LAN Sharing**: Share streams across devices on your home Wi-Fi (`http://<LAN-IP>:8088`).
-- **☁️ 1-Click Cloudflare Tunnel**: Free, instant HTTPS tunnel (`pms tunnel`) without opening router ports or registering domain names.
-- **🤖 Bot Pool Balancing**: Add multiple bot tokens in Settings to load-balance high-concurrency downloads and bypass rate limits.
-- **⚡ Background Service**: System tray integration on Windows; foreground service with wake lock on Android.
+- **🔌 Plug & Play Local Setup**: Runs directly on user machines with auto-configured local session handling.
+- **⚡ High-Throughput Streaming**: HTTP 206 range-request support for instant video and audio seeking.
+- **📺 Stremio & Nuvio Protocol Compatible**: Implements the Stremio Addon v3 protocol specification for media playback.
+- **🎵 Audio Transcoding Engine**: On-the-fly ALAC-to-FLAC transcoding for broad platform compatibility (Android/iOS/Web).
+- **🎛️ Custom Upstream Addon Bridging**: Easily integrate and toggle custom third-party metadata catalogs.
+- **💻 Local Web Player Interface**: Built-in responsive web dashboard for local file access and player playback.
+- **📡 Home Network LAN Access**: Access streams on connected TV and mobile devices via local Wi-Fi (`http://<LAN-IP>:8088`).
+- **☁️ Optional Secure Tunneling**: Connect remotely using Cloudflare Tunnel integration (`pms tunnel`).
+- **🤖 Bot Pool Rotation**: Configure multiple Bot API credentials to balance high-concurrency personal transfers.
+- **⚡ System Service Integration**: Windows system tray helper and Android background service support.
+
+---
+
+## ⚖️ Legal Disclaimer & DMCA Policy
+
+### Disclaimer
+
+**PencariMovie Server** is an open-source, non-commercial software tool designed for personal media management, protocol translation, and client-side streaming of user-accessible Telegram files.
+
+1. **No Content Hosting**: This software and its developers **do not host, store, cache, upload, or transmit any media files or copyrighted material**. All media transfers occur directly between the client user, the local software instance, and Telegram's infrastructure.
+2. **Third-Party Indexing & Catalogs**: Any metadata, filenames, or search results displayed through client addons or third-party catalog feeds are provided by external sources. The project maintainers do not own, control, or operate third-party Telegram channels or upload services.
+3. **User Responsibility**: Users of this software are solely responsible for ensuring that their use complies with local copyright laws, intellectual property regulations, and Telegram's Terms of Service. The developers explicitly disclaim any liability for copyright infringement, unauthorized access, or misuse of this software by third parties.
+
+### Notice & Takedown (DMCA / Copyright Inquiries)
+
+If you are a copyright owner, content producer, or legal representative wishing to report unauthorized references or request exclusion of specific titles from discovery endpoints:
+
+- Please submit a formal written notice detailing:
+  1. The copyrighted work claimed to have been infringed;
+  2. The specific identification or URL/query where the reference occurs;
+  3. Your contact information (name, organization, email, and phone number);
+  4. A statement affirming that you hold the copyright or are authorized to act on behalf of the copyright owner.
+- Send all DMCA and copyright inquiries to: **`dmca@pencarimovie.com`** (or submit an issue to the repository maintainer).
+- Notices are reviewed expeditiously, and qualifying metadata references or index entries will be promptly delisted and excluded.
 
 ---
 
 ## 🔒 Open Source & Privacy
 
-- **Open Source**: Licensed under GPL-3.0. Full source code is inspectable on GitHub.
+- **Open Source**: Licensed under GPL-3.0.
 - **Local Isolation**: Media requests, streams, and sessions are processed locally without third-party tracking or cloud relays.
 - **Secure Boundaries**: Admin actions (settings, bot pool, tunnel triggers) are restricted to local requests only and blocked across public tunnels.
 

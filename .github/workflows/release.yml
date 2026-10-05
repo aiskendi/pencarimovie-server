@@ -48,10 +48,13 @@ jobs:
             fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
-            # No tag: build and push the Docker image only, no GitHub release.
-            TAG="latest"
+            # No tag: resolve latest git tag so .release-tag has a valid semantic version
+            TAG="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+            if [ -z "$TAG" ]; then
+              TAG="v2.7.8"
+            fi
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "No tag supplied — building the Docker image only."
+            echo "No tag supplied — building Docker image with resolved tag: $TAG"
           fi
 
           echo "TAG=$TAG" >> "$GITHUB_ENV"

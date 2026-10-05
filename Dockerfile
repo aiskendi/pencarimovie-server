@@ -35,6 +35,7 @@ RUN set -e; \
     elif [ -f "/tmp/repo/backend.php" ] && [ -x "/tmp/repo/bin/frankenphp" ] && [ -d "/tmp/repo/vendor" ]; then \
         echo "Copying workspace files directly..."; \
         cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
+        if [ -f "/tmp/repo/.release-tag" ]; then cp /tmp/repo/.release-tag /tmp/extract/.release-tag; fi; \
         cp -r /tmp/repo/vendor /tmp/extract/; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
         mkdir -p /tmp/extract/bin; \
@@ -48,6 +49,7 @@ RUN set -e; \
         rm -f /tmp/server.tar.gz; \
         echo "Overlaying repository files..."; \
         cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
+        if [ -f "/tmp/repo/.release-tag" ]; then cp /tmp/repo/.release-tag /tmp/extract/.release-tag; fi; \
         if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
         if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \

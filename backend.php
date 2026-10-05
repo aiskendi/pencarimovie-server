@@ -15178,7 +15178,41 @@ if (str_starts_with($path, '/api/')) {
                     if ($newFileId !== '' && $newFileId !== $fileId && $downloadAttempt < $maxDownloadAttempts) {
                         $fileId = $newFileId;
                         $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
+                        if (!empty($reResolved['bot_id']) && (string) $reResolved['bot_id'] !== $botId) {
+                            $botId = (string) $reResolved['bot_id'];
+                            [$retryMadeline] = fd_boot_madeline(null, [], $botId);
+                            if ($retryMadeline) {
+                                $madeline = $retryMadeline;
+                                $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+                                $abortCallback = $isIpcClient ? null : $abortCallback;
+                            }
+                        }
                         continue;
+                    }
+
+                    // If same bot returned identical or empty file_id, try candidate bots in pool
+                    if (($newFileId === '' || $newFileId === $fileId) && $downloadAttempt < $maxDownloadAttempts) {
+                        $pool = fd_get_bot_pool();
+                        foreach ($pool as $pBot) {
+                            $altBotId = (string) ($pBot['bot_id'] ?? '');
+                            if ($altBotId !== '' && $altBotId !== $botId && fd_has_local_session($altBotId)) {
+                                fd_log('file reference expired, trying alternate bot from pool', ['short_code' => $shortCode, 'alt_bot_id' => $altBotId]);
+                                $altResolved = fd_resolve_shortcode($shortCode, $altBotId, true);
+                                $altFileId = trim((string) ($altResolved['file_id_mt'] ?? $altResolved['file_id'] ?? ''));
+                                if ($altFileId !== '') {
+                                    [$altMadeline] = fd_boot_madeline(null, [], $altBotId);
+                                    if ($altMadeline) {
+                                        $madeline = $altMadeline;
+                                        $botId = $altBotId;
+                                        $fileId = $altFileId;
+                                        $fileSize = (int) ($altResolved['file_size'] ?? $fileSize);
+                                        $isIpcClient = $madeline instanceof \danog\MadelineProto\Ipc\Client;
+                                        $abortCallback = $isIpcClient ? null : $abortCallback;
+                                        continue 2;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 

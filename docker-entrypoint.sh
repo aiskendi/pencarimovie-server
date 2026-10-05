@@ -55,6 +55,12 @@ fi
 mkdir -p /tmp/caddy/data /tmp/caddy/config /app/storage 2>/dev/null || true
 chmod 777 /app/storage 2>/dev/null || true
 
+# FrankenPHP 1.13.0+ compatibility: ensure entry.php handles os.Args[0] (frankenphp) being prepended to argv
+ENTRY="/app/vendor/danog/madelineproto/src/Ipc/Runner/entry.php"
+if [ -f "$ENTRY" ] && ! grep -q "str_ends_with(\$arguments\[0\]" "$ENTRY" 2>/dev/null; then
+    sed -i 's/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1);/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1); if (isset(\$arguments[0]) \&\& (\\str_ends_with(\$arguments[0], '\''.php'\'') || (isset(\$arguments[1]) \&\& \\in_array(\$arguments[1], ['\''madeline-ipc'\'', '\''madeline-worker'\''], true)))) { \\array_shift(\$arguments); }/g' "$ENTRY" 2>/dev/null || true
+fi
+
 # If custom arguments were passed (and not self or 'start'), execute them
 if [ $# -gt 0 ] && [ "$1" != "/usr/local/bin/docker-entrypoint.sh" ] && [ "$1" != "start" ]; then
     exec "$@"

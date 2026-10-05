@@ -548,7 +548,19 @@ diff --git a/src/Ipc/Runner/entry.php b/src/Ipc/Runner/entry.php
 index e7f2597..3fcfcbb 100644
 --- a/src/Ipc/Runner/entry.php
 +++ b/src/Ipc/Runner/entry.php
-@@ -115,3 +115,17 @@
+@@ -46,6 +46,11 @@
+         $arguments = [];
+         if (isset($GLOBALS['argv']) && !empty($GLOBALS['argv'])) {
+             $arguments = \array_slice($GLOBALS['argv'], 1);
++            // FrankenPHP 1.13.0+ prepends the binary itself (os.Args[0]) to argv, so $argv[0] is frankenphp
++            // and $argv[1] is the script path. If arguments still start with the script path, strip it.
++            if (isset($arguments[0]) && (\str_ends_with($arguments[0], '.php') || (isset($arguments[1]) && \in_array($arguments[1], ['madeline-ipc', 'madeline-worker'], true)))) {
++                \array_shift($arguments);
++            }
+         } elseif (isset($_GET['argv']) && !empty($_GET['argv'])) {
+             $arguments = $_GET['argv'];
+         }
+@@ -115,3 +120,17 @@
              $API->initSelfRestart();
              $session->storeIpcState(new IpcState($runnerId));
 +

@@ -53,6 +53,11 @@ RUN set -e; \
         if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
         if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
         if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \
+        if [ -f "/tmp/repo/bin/php" ]; then cp /tmp/repo/bin/php /tmp/extract/bin/php 2>/dev/null || true; fi; \
+        ENTRY="/tmp/extract/vendor/danog/madelineproto/src/Ipc/Runner/entry.php"; \
+        if [ -f "$ENTRY" ] && ! grep -q "str_ends_with(\$arguments\[0\]" "$ENTRY" 2>/dev/null; then \
+            sed -i 's/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1);/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1); if (isset(\$arguments[0]) \&\& (\\str_ends_with(\$arguments[0], '\''.php'\'') || (isset(\$arguments[1]) \&\& \\in_array(\$arguments[1], ['\''madeline-ipc'\'', '\''madeline-worker'\''], true)))) { \\array_shift(\$arguments); }/g' "$ENTRY" 2>/dev/null || true; \
+        fi; \
     fi; \
     cp -a /tmp/extract/. /app/; \
     rm -rf /tmp/extract /tmp/repo; \

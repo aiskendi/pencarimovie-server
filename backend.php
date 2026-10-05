@@ -4199,6 +4199,19 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         return false;
     }
 
+    // FrankenPHP 1.13.0+ compatibility: ensure entry.php handles os.Args[0] (frankenphp) being prepended to argv
+    $entryCode = @file_get_contents($entry);
+    if ($entryCode !== false && !str_contains($entryCode, 'str_ends_with($arguments[0]')) {
+        $patched = str_replace(
+            '$arguments = \array_slice($GLOBALS[\'argv\'], 1);',
+            '$arguments = \array_slice($GLOBALS[\'argv\'], 1);' . "\n" . '            if (isset($arguments[0]) && (\str_ends_with($arguments[0], \'.php\') || (isset($arguments[1]) && \in_array($arguments[1], [\'madeline-ipc\', \'madeline-worker\'], true)))) {' . "\n" . '                \array_shift($arguments);' . "\n" . '            }',
+            $entryCode
+        );
+        if ($patched !== $entryCode) {
+            @file_put_contents($entry, $patched);
+        }
+    }
+
     $startupId = random_int(100000000, 2000000000);
     $sessionDir = str_replace('/', DIRECTORY_SEPARATOR, $sessionDir);
 
@@ -12291,21 +12304,43 @@ if ($isNuvioRoute) {
         // Check 5-minute stream list cache (per itemId and baseUrl to differentiate tunnel vs local).
         // The auth state is part of the key so an unauthenticated request can never
         // be served a cached authenticated response (and vice versa).
+        $isRefresh = !empty($_GET['refresh']) || !empty($_GET['force']) || !empty($_GET['nocache']) ||
+            (isset($_SERVER['HTTP_CACHE_CONTROL']) && str_contains(strtolower($_SERVER['HTTP_CACHE_CONTROL']), 'no-cache')) ||
+            (isset($_SERVER['HTTP_PRAGMA']) && str_contains(strtolower($_SERVER['HTTP_PRAGMA']), 'no-cache'));
+
         $streamCacheKey = md5($itemId . ':' . $itemType . ':' . $baseUrl . ':' . (fd_is_authenticated() ? 'auth' : 'anon'));
         $streamCacheFile = fd_cache_path('stream_cache_' . $streamCacheKey . '.json');
-        if (is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
+        if (!$isRefresh && is_file($streamCacheFile) && (time() - (int)filemtime($streamCacheFile)) < 300) {
             $cachedJson = @file_get_contents($streamCacheFile);
             if ($cachedJson) {
                 $cachedData = json_decode($cachedJson, true);
-                if (is_array($cachedData) && isset($cachedData['streams'])) {
-                    fd_log('stremio stream served from cache', [
-                        'itemId' => $itemId,
-                        'streamCount' => count($cachedData['streams']),
-                        'duration_seconds' => round(microtime(true) - $streamStart, 4),
-                    ]);
-                    fd_stremio_json($cachedData, 200, 'max-age=300, public');
+                if (is_array($cachedData) && !empty($cachedData['streams']) && is_array($cachedData['streams'])) {
+                    // Check if cachedData has at least one real playable stream (has url or infoHash).
+                    // Never serve a cached "no stream found" or error/placeholder response.
+                    $hasPlayableInCache = false;
+                    foreach ($cachedData['streams'] as $cs) {
+                        if (is_array($cs) && (!empty($cs['url']) || !empty($cs['infoHash']))) {
+                            $hasPlayableInCache = true;
+                            break;
+                        }
+                    }
+                    if ($hasPlayableInCache) {
+                        fd_log('stremio stream served from cache', [
+                            'itemId' => $itemId,
+                            'streamCount' => count($cachedData['streams']),
+                            'duration_seconds' => round(microtime(true) - $streamStart, 4),
+                        ]);
+                        fd_stremio_json($cachedData, 200, 'max-age=300, public');
+                    } else {
+                        // Cached file has no playable streams (e.g. stale "No streams found" placeholder).
+                        // Purge it so a fresh lookup is executed immediately.
+                        @unlink($streamCacheFile);
+                    }
                 }
             }
+        } elseif ($isRefresh && is_file($streamCacheFile)) {
+            // Client explicitly requested refresh/revalidate: purge existing cache file
+            @unlink($streamCacheFile);
         }
 
         $subtitlesForStream = [];
@@ -13400,22 +13435,23 @@ if ($isNuvioRoute) {
             }
         }
 
-        // Add sponsored / ad stream link with externalUrl on top if configured and not empty
+        // Check if any real playable stream exists (has url or infoHash)
+        $hasPlayableStreams = false;
+        foreach ($streams as $s) {
+            if (is_array($s) && (!empty($s['url']) || !empty($s['infoHash']))) {
+                $hasPlayableStreams = true;
+                break;
+            }
+        }
+
+        // Sponsor / ad stream details from versionCheck
         $sponsorInfo = $versionCheck['sponsor'] ?? [];
         $adUrl = trim((string) ($sponsorInfo['url'] ?? ''));
         $adName = trim((string) ($sponsorInfo['name'] ?? ''));
         $adDesc = trim((string) ($sponsorInfo['description'] ?? ''));
 
-        if (!empty($streams)) {
-            if ($adUrl !== '') {
-                array_unshift($streams, [
-                    'name' => $adName,
-                    'description' => $adDesc,
-                    'externalUrl' => $adUrl,
-                ]);
-            }
-        } else {
-            // No streams found: check if files existed but were all hidden by user's stream filters
+        if (!$hasPlayableStreams) {
+            // No playable streams found: check if files existed but were all hidden by user's stream filters
             if (!empty($totalFilesBeforeFilter) && $totalFilesBeforeFilter > 0) {
                 $noStreamTitle = '⚠️ Streams Filtered Out';
                 $noStreamDesc = "🔍 {$totalFilesBeforeFilter} stream(s) found on PencariMovie, but hidden by your active filters (Resolution / Codec / Size / Keywords).\n👉 Tap to open settings & adjust filters.";
@@ -13432,12 +13468,28 @@ if ($isNuvioRoute) {
             ];
         }
 
-        // Save to stream cache for 5 minutes
-        if (!empty($streamCacheFile)) {
-            @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        // ALWAYS add the sponsored message on top if configured (regardless of whether streams were found or empty)
+        if ($adUrl !== '') {
+            array_unshift($streams, [
+                'name' => $adName !== '' ? $adName : 'PencariMovie',
+                'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
+                'externalUrl' => $adUrl,
+            ]);
         }
 
-        fd_stremio_json(['streams' => $streams]);
+        // Save to stream cache ONLY if real playable streams were found.
+        // NEVER cache "no stream found" so newly indexed files or resolved streams appear immediately.
+        if ($hasPlayableStreams && !empty($streamCacheFile)) {
+            @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            fd_stremio_json(['streams' => $streams], 200, 'max-age=300, public');
+        } else {
+            // If no playable streams, ensure any existing cache file is deleted
+            if (!empty($streamCacheFile) && is_file($streamCacheFile)) {
+                @unlink($streamCacheFile);
+            }
+            // Send no-cache headers so client/Stremio does not cache empty/no stream response
+            fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
+        }
     }
 
     // ── Nuvio Subtitles: /subtitles/:type/:id[/:extra].json ──
@@ -15306,11 +15358,17 @@ if (str_starts_with($path, '/api/')) {
 // If running under the CLI SAPI, handle CLI background commands
 if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
     global $argv;
-    $cliAction = $argv[1] ?? ($_SERVER['argv'][1] ?? '');
+    $cliArgs = $argv ?? ($_SERVER['argv'] ?? []);
+    // Under FrankenPHP 1.13.0+, os.Args[0] (frankenphp) is prepended to argv so $cliArgs[0] is frankenphp
+    // and $cliArgs[1] is the script path. Normalize by stripping the script path if present.
+    if (isset($cliArgs[1]) && str_ends_with($cliArgs[1], '.php')) {
+        $cliArgs = array_values(array_slice($cliArgs, 1));
+    }
+    $cliAction = $cliArgs[1] ?? '';
     if ($cliAction === 'warmup') {
-        $rawCodes = $argv[2] ?? ($_SERVER['argv'][2] ?? '');
-        $cliBotId = $argv[3] ?? ($_SERVER['argv'][3] ?? '');
-        $cliContext = $argv[4] ?? ($_SERVER['argv'][4] ?? '');
+        $rawCodes = $cliArgs[2] ?? '';
+        $cliBotId = $cliArgs[3] ?? '';
+        $cliContext = $cliArgs[4] ?? '';
         $codes = array_values(array_unique(array_filter(preg_split('/[\s,]+/', $rawCodes))));
         if (!empty($codes)) {
             fd_warmup_resolve_batch($codes, $cliBotId, 40, $cliContext);

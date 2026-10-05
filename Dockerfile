@@ -31,7 +31,14 @@ RUN set -e; \
     mkdir -p /tmp/extract; \
     if [ -f "$TAR_PATH" ]; then \
         echo "Extracting local release package: $TAR_PATH"; \
-        tar -xzf "$TAR_PATH" -C /tmp/extract; \
+        tar -xzf "$TAR_PATH" --strip-components=1 -C /tmp/extract 2>/dev/null || tar -xzf "$TAR_PATH" -C /tmp/extract; \
+        if [ ! -f /tmp/extract/bin/frankenphp ]; then \
+            SUBDIR=$(find /tmp/extract -mindepth 1 -maxdepth 1 -type d | head -n 1); \
+            if [ -n "$SUBDIR" ] && [ -f "$SUBDIR/bin/frankenphp" ]; then \
+                cp -a "$SUBDIR"/. /tmp/extract/; \
+                rm -rf "$SUBDIR"; \
+            fi; \
+        fi; \
     elif [ -f "/tmp/repo/backend.php" ] && [ -x "/tmp/repo/bin/frankenphp" ] && [ -d "/tmp/repo/vendor" ]; then \
         echo "Copying workspace files directly..."; \
         cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
@@ -47,17 +54,17 @@ RUN set -e; \
         curl -fsSL -o /tmp/server.tar.gz "https://github.com/aiskendi/pencarimovie-server/releases/latest/download/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
         tar -xzf /tmp/server.tar.gz --strip-components=1 -C /tmp/extract; \
         rm -f /tmp/server.tar.gz; \
-        echo "Overlaying repository files..."; \
-        cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
-        if [ -f "/tmp/repo/.release-tag" ]; then cp /tmp/repo/.release-tag /tmp/extract/.release-tag; fi; \
-        if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
-        if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
-        if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \
-        if [ -f "/tmp/repo/bin/php" ]; then cp /tmp/repo/bin/php /tmp/extract/bin/php 2>/dev/null || true; fi; \
-        ENTRY="/tmp/extract/vendor/danog/madelineproto/src/Ipc/Runner/entry.php"; \
-        if [ -f "$ENTRY" ] && ! grep -q "str_ends_with(\$arguments\[0\]" "$ENTRY" 2>/dev/null; then \
-            sed -i 's/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1);/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1); if (isset(\$arguments[0]) \&\& (\\str_ends_with(\$arguments[0], '\''.php'\'') || (isset(\$arguments[1]) \&\& \\in_array(\$arguments[1], ['\''madeline-ipc'\'', '\''madeline-worker'\''], true)))) { \\array_shift(\$arguments); }/g' "$ENTRY" 2>/dev/null || true; \
-        fi; \
+    fi; \
+    echo "Overlaying repository files..."; \
+    cp -r /tmp/repo/public /tmp/repo/backend.php /tmp/repo/index.php /tmp/repo/router.php /tmp/repo/Caddyfile /tmp/extract/ 2>/dev/null || true; \
+    if [ -f "/tmp/repo/.release-tag" ]; then cp /tmp/repo/.release-tag /tmp/extract/.release-tag; fi; \
+    if [ -d "/tmp/repo/vendor" ]; then cp -r /tmp/repo/vendor /tmp/extract/; fi; \
+    if [ -d "/tmp/repo/src" ]; then cp -r /tmp/repo/src /tmp/extract/; fi; \
+    if [ -f "/tmp/repo/bin/php.ini.unix" ]; then cp /tmp/repo/bin/php.ini.unix /tmp/extract/bin/php.ini 2>/dev/null || true; fi; \
+    if [ -f "/tmp/repo/bin/php" ]; then cp /tmp/repo/bin/php /tmp/extract/bin/php 2>/dev/null || true; fi; \
+    ENTRY="/tmp/extract/vendor/danog/madelineproto/src/Ipc/Runner/entry.php"; \
+    if [ -f "$ENTRY" ] && ! grep -q "str_ends_with(\$arguments\[0\]" "$ENTRY" 2>/dev/null; then \
+        sed -i 's/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1);/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1); if (isset(\$arguments[0]) \&\& (\\str_ends_with(\$arguments[0], '\''.php'\'') || (isset(\$arguments[1]) \&\& \\in_array(\$arguments[1], ['\''madeline-ipc'\'', '\''madeline-worker'\''], true)))) { \\array_shift(\$arguments); }/g' "$ENTRY" 2>/dev/null || true; \
     fi; \
     cp -a /tmp/extract/. /app/; \
     rm -rf /tmp/extract /tmp/repo; \

@@ -6231,7 +6231,7 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     // 4. Extract series title portion from filename
     $fClean = preg_replace('/\.(mp4|mkv|avi|mov|ts|flv|webm)$/i', '', $fileTitle);
     $fClean = fd_clean_media_title($fClean);
-    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor)\s+/i', '', $fClean);
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor|layarasia|old|oppa\.biz|drakor\s*id)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
     $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
 
@@ -6294,11 +6294,14 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         if (preg_match('/\b' . preg_quote($targetLower, '/') . '\b/i', $fCleanNorm) || ($targetNoThe !== '' && preg_match('/\b' . preg_quote($targetNoThe, '/') . '\b/i', $fCleanNorm))) {
             return true;
         }
-        // If target has 3+ content words (e.g. "super fishing grander musashi"), also check core tail 2-word phrase ("grander musashi")
+        // If target has 3+ content words (e.g. "super fishing grander musashi"), only check core tail 2-word phrase against candidates directly, NOT arbitrary substring
         if (count($contentWords) >= 3) {
             $tail2 = implode(' ', array_slice($contentWords, -2));
-            if (preg_match('/\b' . preg_quote($tail2, '/') . '\b/i', $fCleanNorm)) {
-                return true;
+            $tail2NoThe = trim(preg_replace('/^the\s+/i', '', $tail2));
+            foreach ($candidates as $c) {
+                if ($c === $tail2 || ($tail2NoThe !== '' && $c === $tail2NoThe)) {
+                    return true;
+                }
             }
         }
     }
@@ -6746,6 +6749,19 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             $localMeta = fd_lookup_local_catalog_by_prefix('post', (string) $postId);
             if (empty($localMeta['title'])) {
                 $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
+            }
+            if (empty($localMeta['title'])) {
+                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $postItem = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+                $postTitle = (string) ($postItem['title'] ?? ($postItem['post_title'] ?? ''));
+                $postYear = (string) ($postItem['year'] ?? '');
+                if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+                    $postYear = $ym[1];
+                }
+                $localMeta = [
+                    'title' => $postTitle,
+                    'year'  => $postYear,
+                ];
             }
             $post = [
                 'title' => (string) ($localMeta['title'] ?? ''),

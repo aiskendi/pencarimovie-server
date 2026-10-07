@@ -1491,8 +1491,14 @@ function fd_auth_record_success(string $ip): void
 function fd_auth_token_from_request(): string
 {
     $path = (string) parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH);
-    // Support clean /<token>/manifest.json or /<token>/stream/... (32-char hex token)
-    if (preg_match('#^/([0-9a-fA-F]{32})(?:/|$)#', $path, $m)) {
+    // Support clean /<token>/manifest.json or /<token>/stream/... (hex token).
+    // Accept any length >= 32: the generated token is bin2hex(random_bytes(16)) (32 chars),
+    // but an operator-supplied SERVER_TOKEN may be longer (a 34-char token was observed on
+    // Render). Hard-coding {32} made the WHOLE /<token>/... URL form 404 for such a token,
+    // even though ?token= / X-Auth-Token / the pm_auth cookie all still worked — so the addon
+    // installed from the dashboard could not load anything. Keep this in sync with
+    // fd_strip_token_prefix(), which must strip the same prefix after auth succeeds.
+    if (preg_match('#^/([0-9a-fA-F]{32,})(?:/|$)#', $path, $m)) {
         return strtolower($m[1]);
     }
     if (preg_match('#^/t/([A-Za-z0-9]+)(?:/|$)#', $path, $m)) {
@@ -1545,7 +1551,8 @@ function fd_require_auth(): void
  */
 function fd_strip_token_prefix(string $path): string
 {
-    if (preg_match('#^/[0-9a-fA-F]{32}(/.*)?$#', $path, $m)) {
+    // Must match the same token length rule as fd_auth_token_from_request().
+    if (preg_match('#^/[0-9a-fA-F]{32,}(/.*)?$#', $path, $m)) {
         return (!empty($m[1])) ? $m[1] : '/';
     }
     if (preg_match('#^/t/[A-Za-z0-9]+(/.*)?$#', $path, $m)) {

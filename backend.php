@@ -1855,8 +1855,15 @@ function fd_amphp_http_request(string $url, string $method, array $headers, stri
     }
 
     $tStart = microtime(true);
-    // Ensure a safe timeout of at least 10 seconds to accommodate TLS handshakes
-    $effectiveTimeout = max(10, $timeout);
+    // Explicitly configure Amp Request transfer & inactivity timeouts to match $effectiveTimeout.
+    // Amp defaults transferTimeout and inactivityTimeout to 10s internally; without these setters,
+    // any request taking longer than 10s (e.g. cold /stream-files or batch /resolve-files) gets cancelled
+    // by Amp's internal timer and retries, adding 10-15s unnecessary latency.
+    $effectiveTimeout = max(3, $timeout);
+    $request->setTransferTimeout((float) $effectiveTimeout);
+    $request->setInactivityTimeout((float) $effectiveTimeout);
+    $request->setTlsHandshakeTimeout((float) min(10, $effectiveTimeout));
+    $request->setTcpConnectTimeout((float) min(10, $effectiveTimeout));
     $cancellation = new \Amp\TimeoutCancellation($effectiveTimeout);
     $response = $client->request($request, $cancellation);
     $status = $response->getStatus();
@@ -1918,13 +1925,17 @@ function fd_http_get_many_amp(array $urls, array $options = []): array
     }
 
     $headers = (array) ($options['headers'] ?? []);
-    $timeout = max(10, (int) ($options['timeout'] ?? 12));
+    $timeout = max(1, (int) ($options['timeout'] ?? 12));
 
     $futures = [];
     foreach ($urls as $key => $url) {
         $futures[$key] = \Amp\async(static function () use ($client, $url, $headers, $timeout): array {
             try {
                 $request = new \Amp\Http\Client\Request($url, 'GET');
+                $request->setTransferTimeout((float) $timeout);
+                $request->setInactivityTimeout((float) $timeout);
+                $request->setTlsHandshakeTimeout((float) min(10, $timeout));
+                $request->setTcpConnectTimeout((float) min(10, $timeout));
                 foreach ($headers as $h) {
                     $parts = explode(':', $h, 2);
                     if (count($parts) === 2) {
@@ -13170,7 +13181,8 @@ if ($isNuvioRoute) {
         if (!empty($filesToStream)) {
             if ($subtitlesFuture !== null) {
                 try {
-                    $subtitlesForStream = $subtitlesFuture->await();
+                    $subCancellation = new \Amp\TimeoutCancellation(0.8);
+                    $subtitlesForStream = $subtitlesFuture->await($subCancellation);
                 } catch (\Throwable $e) {
                     $subtitlesForStream = [];
                 }
@@ -13568,19 +13580,24 @@ if ($isNuvioRoute) {
             $streams[] = $streamObj;
         }
 
-        // Merge streams from configured upstream addons (fetched concurrently via $upstreamFuture)
+        // Merge streams from configured upstream addons (fetched concurrently via $upstreamFuture).
+        // Non-blocking guard: When local PencariMovie streams already exist, cap upstream wait
+        // to at most 0.8s so user streams list displays immediately without waiting for slow external addons.
         if ($upstreamFuture !== null) {
             try {
-                $upstreamStreams = $upstreamFuture->await();
+                $waitTimeout = !empty($streams) ? 0.8 : 2.5;
+                $upCancellation = new \Amp\TimeoutCancellation($waitTimeout);
+                $upstreamStreams = $upstreamFuture->await($upCancellation);
                 foreach ($upstreamStreams as $uStream) {
                     $streams[] = $uStream;
                 }
             } catch (\Throwable $e) {
-                // Ignore upstream addon errors
+                // Upstream timed out or failed — never block stream list delivery
             }
-        } elseif (!empty($upstreamUrls)) {
+        } elseif (!empty($upstreamUrls) && empty($streams)) {
+            // Only probe upstream sequentially if Amp was unavailable AND no local streams were found
             foreach ($upstreamUrls as $upstreamStreamUrl) {
-                $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
+                $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 3);
                 if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
                     foreach ($uRes['streams'] as $uStream) {
                         if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {

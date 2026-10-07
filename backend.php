@@ -6750,19 +6750,9 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             if (empty($localMeta['title'])) {
                 $localMeta = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
             }
-            if (empty($localMeta['title'])) {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-                $postItem = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
-                $postTitle = (string) ($postItem['title'] ?? ($postItem['post_title'] ?? ''));
-                $postYear = (string) ($postItem['year'] ?? '');
-                if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                    $postYear = $ym[1];
-                }
-                $localMeta = [
-                    'title' => $postTitle,
-                    'year'  => $postYear,
-                ];
-            }
+            // Do not block on get_post here! stream-files?id=post:POST_ID resolves
+            // the title and files on the WordPress origin directly (~0.3s).
+            // We only call get_post as fallback if stream-files returns 0 items.
             $post = [
                 'title' => (string) ($localMeta['title'] ?? ''),
                 'year'  => (string) ($localMeta['year'] ?? ''),
@@ -6785,7 +6775,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, $postYear, $keyword, $fullTitle, $season, $episode): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -6827,6 +6817,20 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         $res = fd_http_json($url, [], 'GET', 5);
         if (isset($res['ok'])) {
             $fastPathDone = true;
+            if (empty($fullTitle) && !empty($res['resolved_title'])) {
+                $fullTitle = (string) $res['resolved_title'];
+                $keyword = fd_stream_keyword_from_post_title($fullTitle);
+                $resYear = (string) ($res['resolved_year'] ?? '');
+                if ($resYear !== '') {
+                    $postYear = $resYear;
+                } elseif ($postYear === null && preg_match('/\b(19\d\d|20\d\d)\b/', $fullTitle, $ym)) {
+                    $postYear = $ym[1];
+                }
+                $post = ['title' => $fullTitle, 'year' => (string) ($postYear ?? '')];
+                if ($postId > 0) {
+                    $postMemoryCache[$postId] = $post;
+                }
+            }
             if (!empty($res['items']) && is_array($res['items'])) {
                 $add($res['items']);
             }
@@ -6834,11 +6838,52 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     }
     $exactCount = count($all);
 
-    // If fast-path communicated with Manticore (returning items or confirming 0 items exist),
-    // return immediately to avoid burning 4-5s on pointless fallback scans.
-    if ($fastPathDone || count($all) > 0) {
+    // If fast-path returned items, return immediately.
+    if (count($all) > 0) {
         $elapsed = round(microtime(true) - $tStart, 3);
         fd_log('stremio episode streams resolved', [
+            'postId' => $postId,
+            'title' => $fullTitle,
+            'season' => $season,
+            'episode' => $episode,
+            'exactCount' => $exactCount,
+            'totalCount' => count($all),
+            'duration_seconds' => $elapsed,
+        ]);
+        return $all;
+    }
+
+    // Fallback: If stream-files returned 0 items and post title is still unknown for postId,
+    // fetch get_post as fallback so keyword fallback queries have the title to search.
+    $fetchedFallbackPost = false;
+    if (count($all) === 0 && empty($fullTitle) && $postId > 0) {
+        $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+        $postItem = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+        $postTitle = (string) ($postItem['title'] ?? ($postItem['post_title'] ?? ''));
+        $postYearStr = (string) ($postItem['year'] ?? '');
+        if ($postYearStr === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
+            $postYearStr = $ym[1];
+        }
+        $post = [
+            'title' => $postTitle,
+            'year'  => $postYearStr,
+        ];
+        if (!empty($post['title'])) {
+            $postMemoryCache[$postId] = $post;
+            $fullTitle = $post['title'];
+            $keyword = fd_stream_keyword_from_post_title($fullTitle);
+            if ($postYear === null && $postYearStr !== '') {
+                $postYear = $postYearStr;
+            }
+            $fetchedFallbackPost = true;
+        }
+    }
+
+    // If fast-path communicated with Manticore with a known title/keyword and confirmed 0 items exist,
+    // return immediately to avoid burning 4-5s on pointless fallback scans.
+    if ($fastPathDone && $keyword !== '' && !$fetchedFallbackPost) {
+        $elapsed = round(microtime(true) - $tStart, 3);
+        fd_log('stremio episode streams resolved (fast-path empty)', [
             'postId' => $postId,
             'title' => $fullTitle,
             'season' => $season,
@@ -12427,6 +12472,75 @@ if ($isNuvioRoute) {
             }
         }
 
+        // ── Concurrent Pipeline Fan-Out ──
+        // Subtitles and upstream addons do not depend on local media file resolution.
+        // Dispatch both asynchronously via Amp\async() so their I/O runs concurrently
+        // with the local stream file queries (~200ms+ saved).
+        fd_ensure_autoload();
+        $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
+
+        $subtitlesFuture = null;
+        if ($hasAmp && !str_starts_with($itemId, 'pm:post:') && !str_starts_with($itemId, 'pm_post_') && !str_starts_with($itemId, 'pm:file:') && !str_starts_with($itemId, 'pm_file_')) {
+            $subtitlesFuture = \Amp\async(static function () use ($itemType, $itemId): array {
+                try {
+                    return fd_get_item_subtitles($itemType, $itemId);
+                } catch (\Throwable $e) {
+                    return [];
+                }
+            });
+        }
+
+        $catSettings = fd_load_catalog_settings();
+        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
+            ? (array) ($catSettings['upstream_manifests'] ?? [])
+            : [];
+        $upstreamUrls = [];
+        $isLocalPmId = str_starts_with($itemId, 'pm:') || str_starts_with($itemId, 'pm_');
+        if (!$isLocalPmId && !empty($configuredUpstreams)) {
+            foreach ($configuredUpstreams as $idx => $upstream) {
+                $manifestUrl = trim((string)($upstream['url'] ?? ''));
+                if ($manifestUrl === '') continue;
+                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
+                $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
+            }
+        }
+
+        $upstreamFuture = ($hasAmp && !empty($upstreamUrls)) ? \Amp\async(static function () use ($upstreamUrls): array {
+            $streams = [];
+            try {
+                $ampUpstreamResults = fd_http_get_many_amp($upstreamUrls, ['timeout' => 4]);
+                if ($ampUpstreamResults['ok']) {
+                    foreach ($ampUpstreamResults['results'] as $row) {
+                        $body = (string) ($row['body'] ?? '');
+                        if ($body !== '') {
+                            $uRes = json_decode($body, true);
+                            if (is_array($uRes) && !empty($uRes['streams']) && is_array($uRes['streams'])) {
+                                foreach ($uRes['streams'] as $uStream) {
+                                    if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                        $streams[] = $uStream;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    foreach ($upstreamUrls as $upstreamStreamUrl) {
+                        $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
+                        if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
+                            foreach ($uRes['streams'] as $uStream) {
+                                if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                                    $streams[] = $uStream;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                // Ignore upstream network failures
+            }
+            return $streams;
+        }) : null;
+
         // Collect all target files to stream
         $filesToStream = [];
 
@@ -13012,7 +13126,15 @@ if ($isNuvioRoute) {
 
         // Pre-resolve all streams and fetch subtitles only when files exist
         if (!empty($filesToStream)) {
-            $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
+            if ($subtitlesFuture !== null) {
+                try {
+                    $subtitlesForStream = $subtitlesFuture->await();
+                } catch (\Throwable $e) {
+                    $subtitlesForStream = [];
+                }
+            } else {
+                $subtitlesForStream = fd_get_item_subtitles($itemType, $itemId);
+            }
             $filesToStream = fd_prewarm_streams_batch($filesToStream, $botIdStr, $itemId);
         }
 
@@ -13404,47 +13526,23 @@ if ($isNuvioRoute) {
             $streams[] = $streamObj;
         }
 
-        // Fetch & merge streams from configured upstream addons (only when the
-        // master upstream switch is on).
-        $catSettings = fd_load_catalog_settings();
-        $configuredUpstreams = !empty($catSettings['upstream_enabled'])
-            ? (array) ($catSettings['upstream_manifests'] ?? [])
-            : [];
-        $upstreamUrls = [];
-        $isLocalPmId = str_starts_with($itemId, 'pm:') || str_starts_with($itemId, 'pm_');
-        if (!$isLocalPmId) {
-            foreach ($configuredUpstreams as $idx => $upstream) {
-                $manifestUrl = trim((string)($upstream['url'] ?? ''));
-                if ($manifestUrl === '') continue;
-                $baseAddonUrl = preg_replace('#/manifest\.json(\?.*)?$#i', '', $manifestUrl);
-                $upstreamUrls['up_' . $idx] = rtrim($baseAddonUrl, '/') . "/stream/{$itemType}/" . urlencode($itemId) . ".json";
-            }
-        }
-
-        if (!empty($upstreamUrls)) {
-            $ampUpstreamResults = fd_http_get_many_amp($upstreamUrls, ['timeout' => 4]);
-            if ($ampUpstreamResults['ok']) {
-                foreach ($ampUpstreamResults['results'] as $row) {
-                    $body = (string) ($row['body'] ?? '');
-                    if ($body !== '') {
-                        $uRes = json_decode($body, true);
-                        if (is_array($uRes) && !empty($uRes['streams']) && is_array($uRes['streams'])) {
-                            foreach ($uRes['streams'] as $uStream) {
-                                if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
-                                    $streams[] = $uStream;
-                                }
-                            }
-                        }
-                    }
+        // Merge streams from configured upstream addons (fetched concurrently via $upstreamFuture)
+        if ($upstreamFuture !== null) {
+            try {
+                $upstreamStreams = $upstreamFuture->await();
+                foreach ($upstreamStreams as $uStream) {
+                    $streams[] = $uStream;
                 }
-            } else {
-                foreach ($upstreamUrls as $upstreamStreamUrl) {
-                    $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
-                    if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
-                        foreach ($uRes['streams'] as $uStream) {
-                            if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
-                                $streams[] = $uStream;
-                            }
+            } catch (\Throwable $e) {
+                // Ignore upstream addon errors
+            }
+        } elseif (!empty($upstreamUrls)) {
+            foreach ($upstreamUrls as $upstreamStreamUrl) {
+                $uRes = fd_http_json($upstreamStreamUrl, [], 'GET', 4);
+                if (!empty($uRes['streams']) && is_array($uRes['streams'])) {
+                    foreach ($uRes['streams'] as $uStream) {
+                        if (is_array($uStream) && (!empty($uStream['url']) || !empty($uStream['infoHash']) || !empty($uStream['externalUrl']))) {
+                            $streams[] = $uStream;
                         }
                     }
                 }

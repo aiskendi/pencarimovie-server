@@ -2498,6 +2498,17 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
         }
 
 
+        // 2. Query WordPress /lookup-id (Manticore media_ids_idx) before falling back to Cinemeta
+        if ($title === '') {
+            $wpLookup = fd_http_json(FD_WP_API_BASE . '/lookup-id?' . http_build_query(['prefix' => 'imdb', 'id' => $imdbId]), [], 'GET', 3);
+            if (!empty($wpLookup['title'])) {
+                $title = (string) $wpLookup['title'];
+                $year = (string) ($wpLookup['year'] ?? '');
+                $akaTitle = (string) ($wpLookup['aka'] ?? '');
+                @file_put_contents($cacheFile, json_encode(['name' => $title, 'year' => $year, 'aka' => $akaTitle], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            }
+        }
+
         // 3. If still missing, query configured upstream Stremio addons
         if ($title === '' || ($year === '' && ($season !== null || $itemType === 'series'))) {
             if ($title === '') {
@@ -6809,12 +6820,13 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     // slow multi-query fallbacks across WordPress posts.
     $fastPathDone = false;
     $idParam = trim((string) ($preloadedPost['id'] ?? ($preloadedPost['external_id'] ?? ($preloadedPost['imdb_id'] ?? ($postId > 0 ? "post:{$postId}" : '')))));
+    $idParam = preg_replace('/:\d+:\d+$/', '', $idParam);
     if ($keyword !== '' || $idParam !== '') {
         $apiBase = FD_WP_API_BASE;
         $url = "{$apiBase}/stream-files?type=series&season={$season}&episode={$episode}&limit={$maxFiles}"
             . ($keyword !== '' ? '&title=' . urlencode($keyword) : '')
             . ($idParam !== '' ? "&id=" . urlencode($idParam) : '');
-        $res = fd_http_json($url, [], 'GET', 5);
+        $res = fd_http_json($url, [], 'GET', 15);
         if (isset($res['ok'])) {
             $fastPathDone = true;
             if (empty($fullTitle) && !empty($res['resolved_title'])) {
@@ -6829,6 +6841,10 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
                 $post = ['title' => $fullTitle, 'year' => (string) ($postYear ?? '')];
                 if ($postId > 0) {
                     $postMemoryCache[$postId] = $post;
+                }
+                if ($idParam !== '' && !str_starts_with($idParam, 'post:')) {
+                    $cFile = fd_cache_path('ext_meta_' . md5($idParam) . '.json');
+                    @file_put_contents($cFile, json_encode(['name' => $fullTitle, 'year' => (string) ($postYear ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
                 }
             }
             if (!empty($res['items']) && is_array($res['items'])) {
@@ -12810,9 +12826,20 @@ if ($isNuvioRoute) {
                             . ($cleanMovieTitle !== '' ? "&title=" . urlencode($cleanMovieTitle) : '')
                             . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
                             . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
-                        $res = fd_http_json($mUrl, [], 'GET', 5);
+                        $res = fd_http_json($mUrl, [], 'GET', 15);
                         if (isset($res['ok'])) {
                             $movieFastPathDone = true;
+                            if (empty($searchedTitle) && !empty($res['resolved_title'])) {
+                                $searchedTitle = (string) $res['resolved_title'];
+                                $primaryMovieTitle = $searchedTitle;
+                                if (empty($searchedYear) && !empty($res['resolved_year'])) {
+                                    $searchedYear = (string) $res['resolved_year'];
+                                }
+                            }
+                            if (!empty($res['resolved_title']) && $itemId !== '' && !str_starts_with($itemId, 'pm:')) {
+                                $cFile = fd_cache_path('ext_meta_' . md5($itemId) . '.json');
+                                @file_put_contents($cFile, json_encode(['name' => (string)$res['resolved_title'], 'year' => (string)($res['resolved_year'] ?? ''), 'aka' => ''], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                            }
                             if (!empty($res['items']) && is_array($res['items'])) {
                                 foreach ($res['items'] as $f) {
                                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
@@ -12831,7 +12858,7 @@ if ($isNuvioRoute) {
                         if ($cleanAkaTitle !== '') {
                             $apiBase = FD_WP_API_BASE;
                             $mUrl = "{$apiBase}/stream-files?title=" . urlencode($cleanAkaTitle) . "&type=movie&year=" . urlencode($searchedYear) . "&limit=150";
-                            $res = fd_http_json($mUrl, [], 'GET', 5);
+                            $res = fd_http_json($mUrl, [], 'GET', 15);
                             if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
                                 $movieFastPathDone = true;
                                 foreach ($res['items'] as $f) {

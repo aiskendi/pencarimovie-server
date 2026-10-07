@@ -794,6 +794,63 @@ function fd_is_guest_provision_in_progress(): bool
     return true; // Another process is currently holding the provision lock
 }
 
+/**
+ * Spawns a non-blocking background CLI or fire-and-forget process to provision a guest bot.
+ * Allows stream list delivery (/stream/...) to return in milliseconds without blocking
+ * on 15s-30s MTProto key generation and hitting reverse proxy timeouts (e.g. Heroku H12).
+ */
+function fd_spawn_guest_provision(): bool
+{
+    if (fd_has_local_session() && fd_get_bot_id() !== '') {
+        return true;
+    }
+    if (fd_is_guest_provision_in_progress()) {
+        return true;
+    }
+
+    $root = fd_get_app_root();
+    $phpBin = PHP_BINARY;
+    if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+        $prefix = (string) fd_env('PREFIX', '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+            if (is_file($candidate)) {
+                $phpBin = $candidate;
+            } elseif (is_file($root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp'))) {
+                $phpBin = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'frankenphp.exe' : 'frankenphp') . ' php-cli';
+            }
+        }
+    }
+
+    $backendScript = $root . DIRECTORY_SEPARATOR . 'backend.php';
+    if (!is_file($backendScript)) {
+        $backendScript = __DIR__ . DIRECTORY_SEPARATOR . 'backend.php';
+    }
+
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $backendScript . '"'
+        . ' provision';
+
+    fd_log('spawning background guest provision');
+
+    if (fd_is_windows()) {
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+    } else {
+        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    }
+
+    // Also trigger via local fire-and-forget HTTP request to /api/provision as fallback
+    $port = fd_get_listen_port();
+    if ($port > 0) {
+        fd_http_fire_and_forget("http://127.0.0.1:{$port}/api/provision", [], 'GET');
+    }
+
+    return true;
+}
+
 function fd_auto_provision_guest(): ?array
 {
     fd_ensure_autoload();
@@ -12468,52 +12525,15 @@ if ($isNuvioRoute) {
             fd_stremio_json(['streams' => $streams]);
         }
 
-        // If no bot is connected / bot is disconnected, attempt auto-provisioning first
+        // If no bot is connected / bot is disconnected, spawn non-blocking background provisioning
+        // so stream lists return immediately (<1.5s) without blocking on 15s-30s MTProto key generation.
+        // Full MadelineProto connection is only required when the player starts GET /api/download.
         if (!$hasSession || $botIdStr === '') {
-            if (fd_is_guest_provision_in_progress()) {
-                // Server is actively provisioning a guest bot session in the background
-                $streams[] = [
-                    'name' => 'PencariMovie',
-                    'description' => "Connecting guest bot in progress...\nPlease refresh or try again in a few seconds.",
-                    'externalUrl' => $baseUrl . '/#settings'
-                ];
-                fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
-            }
-
-            $autoProv = fd_auto_provision_guest();
-            if ($autoProv && !empty($autoProv['bot_id'])) {
-                $hasSession = true;
-                $botIdStr = (string) $autoProv['bot_id'];
-            } else {
-                // Surface the real reason instead of a generic "not connected".
-                // A clock-skew error is actionable and must be shown verbatim so
-                // the user knows to enable NTP; otherwise they only see a vague
-                // "Telegram bot not connected" and cannot fix anything.
-                $provErr = trim((string) ($autoProv['error'] ?? ''));
-                if ($provErr !== '') {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => $provErr,
-                        'externalUrl' => $baseUrl . '/#settings',
-                    ];
-                    fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
-                }
-                if (fd_is_guest_provision_in_progress()) {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => "Connecting guest bot in progress...\nPlease refresh or try again in a few seconds.",
-                        'externalUrl' => $baseUrl . '/#settings'
-                    ];
-                    fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
-                } else {
-                    $streams[] = [
-                        'name' => 'PencariMovie',
-                        'description' => "Telegram bot not connected\nOpen Settings and paste a bot token",
-                        'externalUrl' => $baseUrl . '/#settings'
-                    ];
-                    fd_stremio_json(['streams' => $streams]);
-                }
-            }
+            fd_log('stremio stream: no local bot session, triggering non-blocking guest provisioning', [
+                'has_session' => $hasSession,
+                'bot_id' => $botIdStr,
+            ]);
+            fd_spawn_guest_provision();
         }
 
         // ── Concurrent Pipeline Fan-Out ──
@@ -13656,6 +13676,15 @@ if ($isNuvioRoute) {
         if (!empty($streamCacheFile)) {
             @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
         }
+        $streamElapsedMs = round((microtime(true) - $streamStart) * 1000);
+        fd_log('stremio stream response ready', [
+            'itemType' => $itemType,
+            'itemId' => $itemId,
+            'elapsed_ms' => $streamElapsedMs,
+            'streams_count' => count($streams),
+            'has_playable' => $hasPlayableStreams,
+        ]);
+
         if ($hasPlayableStreams) {
             fd_stremio_json(['streams' => $streams], 200, 'max-age=300, public');
         } else {
@@ -15547,6 +15576,16 @@ if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
         if (!empty($codes)) {
             fd_warmup_resolve_batch($codes, $cliBotId, 40, $cliContext);
         }
+        exit(0);
+    }
+    if ($cliAction === 'provision') {
+        fd_log('cli background guest provisioning started');
+        $provResult = fd_auto_provision_guest();
+        fd_log('cli background guest provisioning finished', [
+            'ok' => (!empty($provResult['bot_id'])) ? 1 : 0,
+            'bot_id' => $provResult['bot_id'] ?? null,
+            'error' => $provResult['error'] ?? null,
+        ]);
         exit(0);
     }
     return true;

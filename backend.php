@@ -6504,6 +6504,7 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
         if ($files === []) {
             break;
         }
+        $isShortPage = count($files) < $pageSize;
 
         $newEpsThisPage = 0;
         foreach ($files as $file) {
@@ -12083,8 +12084,20 @@ if ($isNuvioRoute) {
                 }
             }
 
-            $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-            $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            fd_ensure_autoload();
+            $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
+            $isDirectSeriesType = ($itemType === 'series' || str_contains(strtolower($itemType), 'series'));
+
+            // If series is directly known from the route, fan out get_post and episode files concurrently
+            if ($isDirectSeriesType && $hasAmp) {
+                $postFuture = \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
+                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId));
+                [$postData, $files] = \Amp\Future\await([$postFuture, $filesFuture]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            } else {
+                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            }
 
             $title = $post['title'] ?? 'PencariMovie Media';
             $thumb = $post['thumbnail_url'] ?? '';
@@ -12092,11 +12105,13 @@ if ($isNuvioRoute) {
             $cats = (array) ($post['categories'] ?? []);
             $tags = (array) ($post['tags'] ?? []);
 
-            $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series')) || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
+            $isSeries = $isDirectSeriesType || preg_match('/tvseries|series|season|episode|drama/i', $title . ' ' . implode(' ', $cats));
             $resolvedType = ($itemType === 'series' || $isSeries) ? 'series' : 'movie';
 
             // Only series metadata requires episode files to construct the videos array
-            $files = ($resolvedType === 'series') ? fd_fetch_series_episode_files($postId) : [];
+            if (!isset($files)) {
+                $files = ($resolvedType === 'series') ? fd_fetch_series_episode_files($postId) : [];
+            }
 
             fd_log('stremio meta post resolved', [
                 'postId' => $postId,

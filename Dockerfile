@@ -1,23 +1,15 @@
 # syntax=docker/dockerfile:1
-# Multi-arch Dockerfile leveraging pre-packaged Linux releases (from scripts/build-release.bat)
-# or fallback to local files + frankenphp static binary.
+# Multi-arch Dockerfile leveraging pre-packaged Linux releases (from scripts/build-release.sh)
+# or fallback to local files + frankenphp static binary, based on lightweight Alpine Linux.
 
-FROM debian:bookworm-slim
+FROM alpine:latest AS builder
 
 ARG TARGETARCH
 
-# Install runtime dependencies (ca-certificates, curl, procps)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    procps \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates curl tar
 
-WORKDIR /app
+WORKDIR /tmp/build
 
-# Check and extract pre-built tarball from dist/ if available, otherwise copy repository files
-# In release workflow: dist/pencarimovie-downloader-linux-${TARGETARCH}.tar.gz
-# When TARGETARCH=amd64 -> linux-x86_64; TARGETARCH=arm64 -> linux-aarch64
 COPY . /tmp/repo/
 
 RUN set -e; \
@@ -27,8 +19,8 @@ RUN set -e; \
     else \
         ARCH_SUFFIX="linux-x86_64"; \
     fi; \
+    mkdir -p /app /tmp/extract; \
     TAR_PATH="/tmp/repo/dist/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
-    mkdir -p /tmp/extract; \
     if [ -f "$TAR_PATH" ]; then \
         echo "Extracting local release package: $TAR_PATH"; \
         tar -xzf "$TAR_PATH" --strip-components=1 -C /tmp/extract 2>/dev/null || tar -xzf "$TAR_PATH" -C /tmp/extract; \
@@ -67,11 +59,21 @@ RUN set -e; \
         sed -i 's/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1);/\$arguments = \\array_slice(\$GLOBALS\['\''argv'\''\], 1); if (isset(\$arguments[0]) \&\& (\\str_ends_with(\$arguments[0], '\''.php'\'') || (isset(\$arguments[1]) \&\& \\in_array(\$arguments[1], ['\''madeline-ipc'\'', '\''madeline-worker'\''], true)))) { \\array_shift(\$arguments); }/g' "$ENTRY" 2>/dev/null || true; \
     fi; \
     cp -a /tmp/extract/. /app/; \
-    rm -rf /tmp/extract /tmp/repo; \
-    mkdir -p /app/storage; \
+    mkdir -p /app/storage /tmp/caddy/data /tmp/caddy/config; \
     chmod -R 777 /app/storage; \
-    chmod +x /app/bin/frankenphp /app/bin/php /app/bin/ffmpeg 2>/dev/null || true; \
+    chmod +x /app/bin/frankenphp /app/bin/php 2>/dev/null || true; \
     test -x /app/bin/frankenphp || (echo "FATAL: /app/bin/frankenphp is missing or not executable!" && exit 1)
+
+# Final lightweight runner image
+FROM alpine:latest
+
+# Install lightweight runtime dependencies
+RUN apk add --no-cache ca-certificates curl procps
+
+WORKDIR /app
+
+# Copy prepared application from builder stage
+COPY --from=builder /app /app
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

@@ -181,7 +181,7 @@ DEBUG=0
 1. Open the **Eclipse Music** app (`https://eclipsemusic.app`) on your device.
 2. Go to **Settings** ➔ **Connections** ➔ **Add Connection** ➔ **Addon**.
 3. Enter your Eclipse manifest URL: `http://<YOUR-LAN-IP>:8088/eclipse/manifest.json` (or `http://127.0.0.1:8088/eclipse`).
-4. Stream audio tracks with automatic lossless ALAC-to-FLAC transcoding on compatible devices.
+4. Search and stream tracks directly with direct seekable playback.
 
 ---
 
@@ -231,7 +231,6 @@ _(Works across Windows, macOS, Linux, and Termux)._
 - **🔌 Plug & Play Local Setup**: Runs directly on user machines with auto-configured local session handling.
 - **⚡ High-Throughput Streaming**: HTTP 206 range-request support for instant video and audio seeking.
 - **📺 Stremio & Nuvio Protocol Compatible**: Implements the Stremio Addon v3 protocol specification for media playback.
-- **🎵 Audio Transcoding Engine**: On-the-fly ALAC-to-FLAC transcoding for broad platform compatibility (Android/iOS/Web).
 - **🎛️ Custom Upstream Addon Bridging**: Easily integrate and toggle custom third-party metadata catalogs.
 - **💻 Local Web Player Interface**: Built-in responsive web dashboard for local file access and player playback.
 - **📡 Home Network LAN Access**: Access streams on connected TV and mobile devices via local Wi-Fi (`http://<LAN-IP>:8088`).

@@ -12565,9 +12565,35 @@ if ($isNuvioRoute) {
             fd_stremio_json(['streams' => $streams]);
         }
 
+        // Clock pre-flight. A skewed device can NEVER provision: the MTProto handshake needs a
+        // clock within ~5 minutes of Telegram's, so provisioning would fail and the user would
+        // have no idea why. This must be surfaced here, as a stream item, because Stremio only
+        // renders a stream item's `description` — never an HTTP error body — so a 403 from
+        // /api/download is invisible (same reason the locked-stream response is a stream, not a 401).
+        // Returning early also keeps the skew out of the 300s stream cache.
+        // Cost: one unauthenticated HTTPS request to a Telegram DC (~0.5s, the frontend already
+        // pays it as a pre-flight) and it degrades to ok:false when Telegram is unreachable, so
+        // it can never turn into a new failure mode. Threshold matches fd_auto_provision_guest().
+        if (!$hasSession) {
+            $clockPreflight = fd_measure_clock_offset();
+            if ($clockPreflight['ok'] && abs((int) $clockPreflight['offset']) > 30) {
+                fd_log('stremio stream: clock skew blocks provisioning', [
+                    'offset_seconds' => (int) $clockPreflight['offset'],
+                ]);
+                $streams[] = [
+                    'name' => 'Device clock out of sync',
+                    'description' => fd_clock_skew_message(),
+                    'externalUrl' => rtrim($baseUrl, '/') . '/#settings',
+                ];
+                fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
+            }
+        }
+
         // If no bot is connected / bot is disconnected, spawn non-blocking background provisioning
         // so stream lists return immediately (<1.5s) without blocking on 15s-30s MTProto key generation.
         // Full MadelineProto connection is only required when the player starts GET /api/download.
+        // NOTE: this is fire-and-forget and returns bool, so it cannot report *why* it failed —
+        // the actionable cases (like the clock skew above) must be surfaced separately.
         if (!$hasSession || $botIdStr === '') {
             fd_log('stremio stream: no local bot session, triggering non-blocking guest provisioning', [
                 'has_session' => $hasSession,

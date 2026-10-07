@@ -1053,6 +1053,13 @@
   contain-intrinsic-size: auto 320px;
 }
 
+.search-screen-shell .search-results-row,
+.library-screen-shell .library-picker-groups,
+.library-main .library-grid-card {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 280px;
+}
+
 .loading-screen__spinner {
   width: 44px;
   height: 44px;

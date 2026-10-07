@@ -1262,8 +1262,34 @@ function fd_require_local_request(): void
 // list. Localhost / private-LAN requests bypass it so local installs are
 // unaffected. Remote clients pass a token as a /t/<token>/ path segment.
 
+/**
+ * Per-request memo for the auth state.
+ *
+ * fd_auth_load() used to re-read storage/auth.json AND re-derive a bcrypt hash
+ * on every call. password_hash() costs ~230ms on a shared-CPU container (PaaS)
+ * and the /stream route asks for the token twice per stream via
+ * fd_build_stremio_stream_url() -> fd_auth_enabled() + fd_auth_token(), i.e.
+ * ~200 bcrypt hashes per request. That alone pushed /stream responses to 53-61s
+ * and tripped the 30s reverse-proxy timeout (Heroku H12 / equivalent) whenever
+ * SERVER_PASSWORD was set. On a VPS without SERVER_PASSWORD no hashing happened,
+ * which is why the same build was fast there.
+ */
+function fd_auth_cache(?array $data = null): ?array
+{
+    static $cache = null;
+    if ($data !== null) {
+        $cache = $data;
+    }
+    return $cache;
+}
+
 function fd_auth_load(): array
 {
+    $cached = fd_auth_cache();
+    if ($cached !== null) {
+        return $cached;
+    }
+
     $path = FD_AUTH_PATH;
     $data = [];
     if (is_file($path)) {
@@ -1274,7 +1300,10 @@ function fd_auth_load(): array
     }
     $envPw = trim((string) (fd_env('SERVER_PASSWORD') ?: ''));
     if ($envPw !== '') {
-        $data['password_hash'] = password_hash($envPw, PASSWORD_DEFAULT);
+        // The env password is authoritative and is compared directly (constant
+        // time) by fd_auth_verify_password(). NEVER bcrypt it here — this runs on
+        // every load and bcrypt is ~230ms on a throttled container.
+        $data['env_password'] = true;
     } elseif (empty($data['password_hash'])) {
         $data['password_hash'] = password_hash(FD_AUTH_DEFAULT_PASSWORD, PASSWORD_DEFAULT);
     }
@@ -1291,6 +1320,7 @@ function fd_auth_load(): array
     if (!is_file($path)) {
         fd_auth_save($data);
     }
+    fd_auth_cache($data);
     return $data;
 }
 
@@ -1315,6 +1345,9 @@ function fd_auth_valid_tokens(): array
 
 function fd_auth_save(array $data): void
 {
+    // Keep the per-request memo in sync so a rotate/set-password in this request
+    // is visible to later fd_auth_token() / fd_auth_enabled() calls.
+    fd_auth_cache($data);
     @file_put_contents(FD_AUTH_PATH, json_encode($data, JSON_UNESCAPED_SLASHES), LOCK_EX);
 }
 
@@ -1338,6 +1371,13 @@ function fd_auth_rotate_token(): string
 
 function fd_auth_verify_password(string $pw): bool
 {
+    $envPw = trim((string) (fd_env('SERVER_PASSWORD') ?: ''));
+    if ($envPw !== '') {
+        // Constant-time compare of the env password. Skipping password_hash() /
+        // password_verify() here keeps bcrypt (~230ms per call on a throttled
+        // container) off the request hot path entirely.
+        return hash_equals($envPw, $pw);
+    }
     $hash = (string) (fd_auth_load()['password_hash'] ?? '');
     return $hash !== '' && password_verify($pw, $hash);
 }

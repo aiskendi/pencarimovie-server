@@ -1,6 +1,8 @@
 dist/*
 !dist/pencarimovie-downloader-linux-*.tar.gz
+pkgroot/
 target/
+node_modules/
 .git/
 android/
 termux-packages/

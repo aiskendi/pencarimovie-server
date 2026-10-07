@@ -12434,9 +12434,11 @@ if ($isNuvioRoute) {
                             'duration_seconds' => round(microtime(true) - $streamStart, 4),
                         ]);
                         fd_stremio_json($cachedData, 200, 'max-age=300, public');
+                    } elseif ((time() - (int)filemtime($streamCacheFile)) < 60) {
+                        // Short-cache negative/empty results for 60s to prevent rapid repeated lookup stampedes
+                        fd_stremio_json($cachedData, 200, 'no-cache, no-store, must-revalidate');
                     } else {
-                        // Cached file has no playable streams (e.g. stale "No streams found" placeholder).
-                        // Purge it so a fresh lookup is executed immediately.
+                        // Expired beyond 60s: purge so a fresh lookup can proceed
                         @unlink($streamCacheFile);
                     }
                 }
@@ -13650,17 +13652,14 @@ if ($isNuvioRoute) {
             ]);
         }
 
-        // Save to stream cache ONLY if real playable streams were found.
-        // NEVER cache "no stream found" so newly indexed files or resolved streams appear immediately.
-        if ($hasPlayableStreams && !empty($streamCacheFile)) {
+        // Save to stream cache. Real playable streams cached with 300s TTL; empty streams short-cached for 60s
+        if (!empty($streamCacheFile)) {
             @file_put_contents($streamCacheFile, json_encode(['streams' => $streams], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        }
+        if ($hasPlayableStreams) {
             fd_stremio_json(['streams' => $streams], 200, 'max-age=300, public');
         } else {
-            // If no playable streams, ensure any existing cache file is deleted
-            if (!empty($streamCacheFile) && is_file($streamCacheFile)) {
-                @unlink($streamCacheFile);
-            }
-            // Send no-cache headers so client/Stremio does not cache empty/no stream response
+            // Send no-cache headers so client/Stremio does not permanently cache, but server absorbs 60s stampedes
             fd_stremio_json(['streams' => $streams], 200, 'no-cache, no-store, must-revalidate');
         }
     }

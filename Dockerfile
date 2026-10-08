@@ -12,13 +12,20 @@ WORKDIR /tmp/build
 
 COPY . /tmp/repo/
 
+# 64-bit only. MadelineProto builds MTProto message IDs as `time() << 32`, which
+# overflows 32-bit PHP (fd_environment_preflight() rejects PHP_INT_SIZE < 8), and
+# FrankenPHP publishes no 32-bit build. An if/else fallback here would silently put
+# an x86_64 binary into an armv7/386 image: the build succeeds, `test -x frankenphp`
+# passes, and only exec fails at runtime. Fail the build instead.
+# TARGETARCH is BuildKit-provided; the `uname -m` default covers the legacy builder,
+# which ignores --platform and leaves TARGETARCH empty.
 RUN set -e; \
     ARCH_SUFFIX=""; \
-    if [ "$TARGETARCH" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then \
-        ARCH_SUFFIX="linux-aarch64"; \
-    else \
-        ARCH_SUFFIX="linux-x86_64"; \
-    fi; \
+    case "${TARGETARCH:-$(uname -m)}" in \
+        amd64|x86_64)  ARCH_SUFFIX="linux-x86_64" ;; \
+        arm64|aarch64) ARCH_SUFFIX="linux-aarch64" ;; \
+        *) echo "FATAL: unsupported target arch '${TARGETARCH:-$(uname -m)}': PencariMovie Server is 64-bit only (amd64/arm64) and FrankenPHP publishes no 32-bit build" >&2; exit 1 ;; \
+    esac; \
     mkdir -p /app /tmp/extract; \
     TAR_PATH="/tmp/repo/dist/pencarimovie-downloader-${ARCH_SUFFIX}.tar.gz"; \
     if [ -f "$TAR_PATH" ]; then \

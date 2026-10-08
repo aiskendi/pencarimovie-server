@@ -46,8 +46,11 @@ detect_target() {
         x86_64|amd64)  echo "linux-x86_64" ;;
         aarch64|arm64) echo "linux-aarch64" ;;
         armv7*|armv8l|armhf|arm)
-          # Many Android TV boxes / Xiaomi Mi Box devices run a 32-bit userland (armv7l)
-          # on top of a 64-bit ARM CPU kernel, or report armv7l.
+          # 32-bit userland. Many Android TV boxes / Xiaomi Mi Box devices report
+          # armv7l on top of a 64-bit ARM kernel, so accept it only when the kernel
+          # actually advertises a 64-bit ARM ABI. PencariMovie Server is 64-bit only
+          # (MadelineProto builds MTProto message IDs as time() << 32, which overflows
+          # 32-bit PHP) and no 32-bit FrankenPHP build exists.
           local abis=""
           if command -v getprop >/dev/null 2>&1; then
             abis="$(getprop ro.product.cpu.abilist64 2>/dev/null || true)"
@@ -56,21 +59,28 @@ detect_target() {
           if echo "$abis" | grep -qi "arm64"; then
             echo "linux-aarch64"
           else
-            echo "linux-aarch64"
+            echo "PencariMovie Server is 64-bit only and this device exposes no 64-bit ARM ABI (arch=$arch, abilist64='$abis'). Use a 64-bit OS or run it under an aarch64 proot." >&2
+            exit 1
           fi
           ;;
-        i686|i386) echo "linux-x86_64" ;;
-        *) echo "linux-aarch64" ;;
+        i586|i686|i386)
+          echo "PencariMovie Server is 64-bit only; 32-bit x86 ($arch) is not supported. Use a linux-x86_64 system." >&2
+          exit 1
+          ;;
+        *)
+          echo "Unsupported architecture: $arch. PencariMovie Server is 64-bit only (linux-x86_64 or linux-aarch64)." >&2
+          exit 1
+          ;;
       esac
       ;;
     Darwin)
       case "$arch" in
         arm64|aarch64) echo "mac-arm64" ;;
         x86_64|amd64)  echo "mac-x86_64" ;;
-        *) echo "Unsupported architecture: $arch"; exit 1 ;;
+        *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
       esac
       ;;
-    *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, macOS, Android (Termux/APK), and Windows."; exit 1 ;;
+    *) echo "Unsupported OS: $os. PencariMovie Server supports Linux, macOS, Android (Termux/APK), and Windows." >&2; exit 1 ;;
   esac
 }
 

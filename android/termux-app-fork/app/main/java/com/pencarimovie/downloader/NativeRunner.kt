@@ -257,14 +257,24 @@ class NativeRunner(
         return valid
     }
 
+    /**
+     * Release target for this device, or "" when the device cannot run the server at all.
+     *
+     * PencariMovie Server is 64-bit only: MadelineProto builds MTProto message IDs as
+     * `time() << 32`, which overflows 32-bit PHP, and FrankenPHP publishes no 32-bit
+     * build. Handing a 32-bit-only device an aarch64 tarball "works" until exec, so
+     * refuse up front instead.
+     *
+     * [Build.SUPPORTED_64_BIT_ABIS] is used rather than [Build.SUPPORTED_ABIS] so that a
+     * 32-bit install of this APK on a 64-bit-capable kernel still gets a 64-bit binary
+     * (the Xiaomi Mi Box / Android TV case).
+     */
     private fun releaseTarget(): String {
-        val abis = Build.SUPPORTED_ABIS.map { it.lowercase() }
-        val primary = abis.firstOrNull() ?: "arm64-v8a"
+        val abis64 = Build.SUPPORTED_64_BIT_ABIS.map { it.lowercase() }
         return when {
-            primary.contains("x86_64") || primary == "amd64" -> "linux-x86_64"
-            abis.any { it.contains("arm64") || it.contains("aarch64") } -> "linux-aarch64"
-            // For 32-bit arm (e.g. Xiaomi Mi Box / Android TV running 32-bit OS), fallback to universal linux-aarch64
-            else -> "linux-aarch64"
+            abis64.any { it.contains("x86_64") } -> "linux-x86_64"
+            abis64.any { it.contains("arm64") || it.contains("aarch64") } -> "linux-aarch64"
+            else -> ""
         }
     }
 
@@ -447,6 +457,14 @@ class NativeRunner(
      */
     private suspend fun installOrUpdate(force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         val target = releaseTarget()
+        if (target.isEmpty()) {
+            // 64-bit only. Refuse before downloading: the aarch64 tarball would download
+            // fine and only fail at exec, which reads as a random server crash.
+            val abis = Build.SUPPORTED_ABIS.joinToString()
+            Log.e(TAG, "Unsupported 32-bit-only device: ABIs=$abis, 64-bit ABIs=${Build.SUPPORTED_64_BIT_ABIS.joinToString()}")
+            emitProgress("[setup] This device has no 64-bit ABI (found: $abis). PencariMovie Server is 64-bit only and needs arm64-v8a or x86_64.")
+            return@withContext false
+        }
         emitProgress("[setup] Checking GitHub for updates...")
         val latest = fetchLatestTag()
         val current = readCurrentTag()
@@ -492,7 +510,8 @@ class NativeRunner(
     /** Download a release tarball and copy over [appDir], leaving storage/ in place. */
     private fun downloadExtract(target: String, tag: String): Boolean {
         val (url, fallbackUrl) = if (target == "server") {
-            val fullTarget = releaseTarget()
+            // Already validated in installOrUpdate(); never build a URL with an empty arch.
+            val fullTarget = releaseTarget().ifEmpty { return false }
             "https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz" to
             "https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$fullTarget.tar.gz"
         } else {

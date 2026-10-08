@@ -1,0 +1,17 @@
+# Exported from Render on 2026-10-08T13:24:11Z
+version: "1"
+services:
+- type: web
+  name: pencarimovie-server
+  runtime: docker
+  repo: https://github.com/aiskendi/pencarimovie-server
+  plan: free
+  envVars:
+  - key: SERVER_TOKEN
+    sync: false
+  - key: SERVER_PASSWORD
+    sync: false
+  region: singapore
+  dockerContext: .
+  dockerfilePath: ./Dockerfile
+  autoDeployTrigger: commit

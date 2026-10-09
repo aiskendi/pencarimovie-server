@@ -34,9 +34,10 @@ Launch the server with a single command on your platform of choice:
 
 #### 📱 Android (APK for TV / Phone / Tablet)
 
-> [**📥 Download Android APK (telegra.my/apk)**](https://telegra.my/apk) - arm64-v8a
+> [**📥 Download Android APK (telegra.my/apk)**](https://telegra.my/apk) - universal
 > _(Install on your Android TV, phone, or tablet, tap **Start Server**, and stream)_
-> _(Other ABIs - `armeabi-v7a` for older 32-bit devices and a `universal` build - are on the
+> _(The link serves the `universal` build so it runs on any device. Smaller per-ABI APKs
+> (`arm64-v8a`, `armeabi-v7a`) are on the
 > [APK releases page](https://github.com/aiskendi/pencarimovie-server/releases/tag/apk-server-latest).
 > The app updates itself from that release feed.)_
 

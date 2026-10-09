@@ -41,11 +41,25 @@ class BotPool(private val context: Context) {
     @Volatile private var activeId: String = ""
 
     fun initialize() {
-        // Removing the built-in primary bot must not trigger a fresh guest lease
-        // while other pooled bots are still logged in.
-        primary.shouldAutoProvision = { extras.none { it.mgr.hasSession } }
+        // Guest leasing is for an EMPTY pool only. Pooled bots restore their own
+        // sessions a few seconds after boot, so a "no live session yet" check races
+        // them: the primary reaches WaitPhoneNumber first and leases a guest even
+        // though a pool is saved — a wasted lease plus a bot the user must remove.
+        // Read the PERSISTED pool, not `extras`, so the answer cannot depend on
+        // loadExtras() having run or on how fast each bot authenticates.
+        primary.shouldAutoProvision = { !poolConfigured() }
         primary.initialize()
         loadExtras()
+    }
+
+    /** True when the persisted pool holds at least one configured bot token. */
+    private fun poolConfigured(): Boolean {
+        val raw = prefs.getString("bots", null) ?: return false
+        return try {
+            JSONArray(raw).length() > 0
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun loadExtras() {

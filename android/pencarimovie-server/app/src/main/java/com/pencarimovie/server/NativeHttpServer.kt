@@ -251,24 +251,56 @@ document.getElementById('f').addEventListener('submit', async function(ev){
         return jsonResponse(json)
     }
 
+    /**
+     * True for a real LAN address — mirrors backend.php fd_is_usable_lan_ipv4():
+     * RFC1918 only, and never loopback / link-local / Docker / VirtualBox ranges.
+     * A cellular address (rmnet, e.g. 21.x) must NOT be presented as a Wi-Fi/LAN URL.
+     */
+    private fun isUsableLanIpv4(ip: String): Boolean {
+        if (ip == "0.0.0.0") return false
+        if (ip.startsWith("127.") || ip.startsWith("169.254.") || ip.startsWith("192.168.56.")) return false
+        // Docker / VirtualBox host-only bridges.
+        for (x in 17..21) if (ip.startsWith("172.$x.")) return false
+        val parts = ip.split(".")
+        if (parts.size != 4) return false
+        val a = parts[0].toIntOrNull() ?: return false
+        val b = parts[1].toIntOrNull() ?: return false
+        return a == 10 || (a == 172 && b in 16..31) || (a == 192 && b == 168)
+    }
+
+    /** Mobile-data interfaces — Android exposes the name, so we can skip them outright. */
+    private fun isCellularIface(name: String): Boolean {
+        val n = name.lowercase()
+        return n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("pdp") ||
+            n.startsWith("wwan") || n.startsWith("clat") || n.startsWith("v4-rmnet")
+    }
+
     private fun handleLanIp(): Response {
-        val ips = JSONArray()
+        val candidates = ArrayList<String>()
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
             while (interfaces.hasMoreElements()) {
                 val iface = interfaces.nextElement()
                 if (iface.isLoopback || !iface.isUp) continue
+                if (isCellularIface(iface.name)) continue
                 val addresses = iface.inetAddresses
                 while (addresses.hasMoreElements()) {
                     val addr = addresses.nextElement()
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                        ips.put(addr.hostAddress)
+                        val host = addr.hostAddress?.substringBefore('%') ?: continue
+                        if (isUsableLanIpv4(host)) candidates.add(host)
                     }
                 }
             }
         } catch (ignored: Exception) {}
 
-        val primaryIp = if (ips.length() > 0) ips.getString(0) else "127.0.0.1"
+        // Prefer the ranges a home router actually hands out (192.168 > 172.16-31 > 10),
+        // then fall back to loopback — the same shape backend.php returns when it has
+        // no LAN address (the frontend then hides the Wi-Fi/LAN field).
+        val primaryIp = candidates.firstOrNull { it.startsWith("192.168.") }
+            ?: candidates.firstOrNull { it.startsWith("172.") }
+            ?: candidates.firstOrNull()
+            ?: "127.0.0.1"
         // Mirrors backend.php's /api/lan-ip shape exactly: {ok, lan_ip, port}.
         val json = JSONObject().apply {
             put("ok", 1)

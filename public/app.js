@@ -1315,8 +1315,14 @@ class PencariMovieApp {
           : 'Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.';
       }
       if (addonLanField) {
-        // Wi-Fi / LAN Manifest is ONLY for non-VPS local PC devices (localhost / 127.0.0.1)
-        const showLan = isLocal && !onTunnel && Boolean(lanUrl || this.lanIp);
+        // Wi-Fi / LAN Manifest is ONLY for non-VPS local PC devices (localhost / 127.0.0.1).
+        // Gate on `lanUrl`, which is already empty when `isUsableLanHost()` rejected the
+        // address — on mobile data the server reports a cellular/public IP, so lanUrl is ''
+        // while `this.lanIp` is still set, and the old `|| this.lanIp` clause kept the
+        // column visible with nothing in it. (Do NOT reference `lanHost` here: it is a
+        // local of the nested getAddonManifestUrls(), so it throws ReferenceError and the
+        // whole re-render aborts before this toggle runs.)
+        const showLan = isLocal && !onTunnel && Boolean(lanUrl);
         addonLanField.classList.toggle('hidden', !showLan);
       }
       if (addonLocalField) {
@@ -1826,7 +1832,9 @@ class PencariMovieApp {
       if (port > 0 && port < 65536) {
         this.listenPort = port;
       }
-      this.lanIp = (lanIp && lanIp !== '127.0.0.1') ? lanIp : '';
+      // RFC1918 only — a cellular/ISP address must never be presented as a Wi-Fi URL
+      // (mirrors backend.php fd_is_usable_lan_ipv4()).
+      this.lanIp = this._isUsableLanIp(lanIp) ? lanIp : '';
       if (this.lanIp) {
         localStorage.setItem('pm.lan_ip', this.lanIp);
       } else {
@@ -1836,6 +1844,21 @@ class PencariMovieApp {
     } catch (e) {
       // Non-fatal — never tied to bot session.
     }
+  }
+
+  /** RFC1918 LAN address only — mirrors backend.php fd_is_usable_lan_ipv4(). */
+  _isUsableLanIp(ip) {
+    const value = String(ip || '').trim();
+    const parts = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!parts) return false;
+    const a = Number(parts[1]);
+    const b = Number(parts[2]);
+    if (a === 127 || a === 0 || (a === 169 && b === 254)) return false;
+    if (value.indexOf('192.168.56.') === 0) return false; // VirtualBox host-only
+    for (let x = 17; x <= 21; x++) {
+      if (value.indexOf('172.' + x + '.') === 0) return false; // Docker bridges
+    }
+    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
   }
 
   _isIpHost(host) {

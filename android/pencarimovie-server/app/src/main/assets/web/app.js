@@ -1194,7 +1194,7 @@ class PencariMovieApp {
         addonModalDesc.textContent = isHttps ? "Copy a manifest URL for Nuvio, or click Add to Stremio." : "Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.";
       }
       if (addonLanField) {
-        const showLan = isLocal && !onTunnel && Boolean(lanUrl || this.lanIp);
+        const showLan = isLocal && !onTunnel && Boolean(lanUrl);
         addonLanField.classList.toggle("hidden", !showLan);
       }
       if (addonLocalField) {
@@ -1617,7 +1617,7 @@ class PencariMovieApp {
         if (port > 0 && port < 65536) {
           this.listenPort = port;
         }
-        this.lanIp = lanIp && lanIp !== "127.0.0.1" ? lanIp : "";
+        this.lanIp = this._isUsableLanIp(lanIp) ? lanIp : "";
         if (this.lanIp) {
           localStorage.setItem("pm.lan_ip", this.lanIp);
         } else {
@@ -1626,6 +1626,20 @@ class PencariMovieApp {
         (_a = this._updateAddonModalUrls) == null ? void 0 : _a.call(this);
       } catch (e) {}
     });
+  }
+  /** RFC1918 LAN address only — mirrors backend.php fd_is_usable_lan_ipv4(). */
+  _isUsableLanIp(ip) {
+    const value = String(ip || "").trim();
+    const parts = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!parts) return false;
+    const a = Number(parts[1]);
+    const b = Number(parts[2]);
+    if (a === 127 || a === 0 || a === 169 && b === 254) return false;
+    if (value.indexOf("192.168.56.") === 0) return false;
+    for (let x = 17; x <= 21; x++) {
+      if (value.indexOf("172." + x + ".") === 0) return false;
+    }
+    return a === 10 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168;
   }
   _isIpHost(host) {
     const h = String(host || "").trim();
@@ -2263,7 +2277,7 @@ class PencariMovieApp {
   // root blocks clicks and tab focus. Recompute from the DOM so every open/close
   // path (including the settings <-> addon switches) stays in sync.
   _syncOverlayFreeze() {
-    var _a;
+    var _a, _b;
     const visible = ["#settingsGate", "#addonModal", "#authGate"].some(sel => {
       const el = this.$(sel);
       return Boolean(el) && !el.classList.contains("hidden");
@@ -2272,12 +2286,19 @@ class PencariMovieApp {
     const app = this.$("#app") || this.$("#streamApp");
     setInert(app, visible);
     if (visible) this._overlayWasVisible = true;
+    if (visible && window.NuvioBootGuard && typeof window.NuvioBootGuard.ready === "function") {
+      window.NuvioBootGuard.ready();
+    }
     if (!visible && this._pendingInitialDataLoad && !window.__pmLegacyEngine) {
       this._pendingInitialDataLoad = false;
       this.loadInitialData().catch(err => console.warn("Deferred init data load failed:", err));
     }
     if (!visible && this._overlayWasVisible && !window.__pmLegacyEngine) {
-      (_a = window.__pmLoadShellBundle) == null ? void 0 : _a.call(window);
+      if (window.__pmShellFailed) {
+        (_a = this.openAddonModal) == null ? void 0 : _a.call(this);
+      } else {
+        (_b = window.__pmLoadShellBundle) == null ? void 0 : _b.call(window);
+      }
     }
     return visible;
   }

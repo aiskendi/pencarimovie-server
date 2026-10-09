@@ -2,18 +2,13 @@
   "use strict";
 
   var root = document.documentElement;
-
   function removeClass(name) {
-    root.className = (" " + root.className + " ")
-      .replace(new RegExp(" " + name + " ", "g"), " ")
-      .replace(/^\s+|\s+$/g, "");
+    root.className = (" " + root.className + " ").replace(new RegExp(" " + name + " ", "g"), " ").replace(/^\s+|\s+$/g, "");
   }
-
   function supports(prop, value) {
     var css = window.CSS;
     return Boolean(css && typeof css.supports === "function" && css.supports(prop, value));
   }
-
   try {
     var test = document.createElement("div");
     var child = document.createElement("div");
@@ -34,14 +29,10 @@
   } catch (error) {
     removeClass("no-flex-gap");
   }
-
   if (supports("display", "grid")) removeClass("no-css-grid");
   if (supports("font-size", "clamp(1px, 2px, 3px)")) removeClass("no-css-math");
   if (supports("aspect-ratio", "1 / 1")) removeClass("no-aspect-ratio");
-  if (
-    supports("backdrop-filter", "blur(1px)") ||
-    supports("-webkit-backdrop-filter", "blur(1px)")
-  ) {
+  if (supports("backdrop-filter", "blur(1px)") || supports("-webkit-backdrop-filter", "blur(1px)")) {
     removeClass("no-backdrop-filter");
   }
 })(window, document);

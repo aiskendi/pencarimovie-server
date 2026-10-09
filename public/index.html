@@ -10,7 +10,7 @@
     <meta name="theme-color" content="#141414" />
     <title>PencariMovie — Stream & Download</title>
     <link rel="stylesheet" href="stream-theme.css" />
-    <link rel="stylesheet" href="styles.css?v=20261009pm4" />
+    <link rel="stylesheet" href="styles.css?v=20261009pm8" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -1587,6 +1587,9 @@
 
     <!-- ─── Core JS and Nuvio Shell ───────────────────────────── -->
     <script src="boot-guard.js"></script>
+    <!-- fetch / Object.entries / closest / AbortController for old WebViews
+         (Android 5.1 = Chromium 39). No-ops on modern engines. -->
+    <script src="assets/runtime/legacy-polyfills.js"></script>
     <script
       defer
       src="core-js.bundle.js"
@@ -1603,21 +1606,37 @@
       (function () {
         var hash = String((window.location && window.location.hash) || "").toLowerCase();
         var overlayBoot = hash === "#addon" || hash === "#configure" || hash === "#settings";
+        // Android 5.1's AOSP WebView (Chromium 39-44) cannot PARSE the shell bundle
+        // (async/await is Chrome 55): loading it turned the page into a boot-guard
+        // SyntaxError screen. Suppress it on those engines and let app.js land on
+        // #settings / #addon instead — the downloader UI is plain ES5.
+        var legacyEngine = !!(
+          window.NuvioBootGuard &&
+          window.NuvioBootGuard.engineTooOld &&
+          window.NuvioBootGuard.engineTooOld()
+        );
+        window.__pmShellBundleSuppressed = legacyEngine;
         window.__pmLoadShellBundle = function () {
-          if (window.__pmShellBundleLoaded) return;
+          if (legacyEngine || window.__pmShellBundleLoaded) return;
           window.__pmShellBundleLoaded = true;
           var s = document.createElement("script");
-          s.src = "app.bundle.js?v=20261009pm4";
+          s.src = "app.bundle.js?v=20261009pm8";
+          // The Nuvio shell is OPTIONAL: #settings and #addon are the downloader UI and
+          // must keep working without it. A failed shell is a console warning, never a
+          // full-screen boot-guard error over the user's overlays.
           s.onerror = function () {
-            window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(s.src);
+            window.__pmShellFailed = true;
+            if (window.console && console.warn) {
+              console.warn("Nuvio shell bundle failed to load (optional):", s.src);
+            }
           };
           document.head.appendChild(s);
         };
-        if (!overlayBoot) {
+        if (!overlayBoot && !legacyEngine) {
           window.__pmLoadShellBundle();
         }
       })();
     </script>
-    <script defer src="app.js?v=20261009pm4"></script>
+    <script defer src="app.js?v=20261009pm8"></script>
   </body>
 </html>

@@ -91,6 +91,28 @@
     return match ? Number(match[1] || 0) : 0;
   }
 
+  // The Nuvio shell bundle (app.bundle.js) needs async/await (Chrome 55), class
+  // syntax (49) and a pile of modern runtime APIs. Android 5.1 ships the AOSP
+  // WebView (Chromium 39-44), where the bundle is a hard SyntaxError that the
+  // boot guard could only render as "Nuvio TV could not start". index.html asks
+  // this function before injecting the bundle, and app.js uses it to land on
+  // #settings / #addon instead of a home screen that cannot exist.
+  var MIN_SHELL_CHROME = 55;
+
+  function engineTooOld() {
+    var chrome = parseChromeMajor();
+    if (chrome > 0) {
+      return chrome < MIN_SHELL_CHROME;
+    }
+    // UA without a Chrome/Chromium token: probe for async functions (Chrome 55).
+    try {
+      new Function("return async function(){}");
+    } catch (ignored) {
+      return true;
+    }
+    return false;
+  }
+
   function mergeDeviceInfo(target, source) {
     var key;
     if (!source) {
@@ -788,6 +810,13 @@
     },
 
     runCompatibilityGate: runCompatibilityGate,
+
+    // True when the engine cannot parse the Nuvio shell bundle (see above).
+    engineTooOld: engineTooOld,
+
+    chromeMajor: parseChromeMajor,
+
+    minShellChrome: MIN_SHELL_CHROME,
 
     loadScript: loadScript,
 

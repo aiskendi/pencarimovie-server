@@ -8,6 +8,52 @@
  *   - Backend proxy for streaming data (/api/proxy-stream)
  *   - MadelineProto download integration (/api/download)
  */
+
+/**
+ * `[^\p{L}\p{N}]+` as a REGEX LITERAL is a SyntaxError on Chrome < 64, which made
+ * this whole file unparseable on Android 5.1's WebView (Chrome 52) — the boot
+ * guard then showed "Nuvio TV could not start" (BOOT-RUNTIME). Building the
+ * modern pattern from a STRING lets an old engine reject it at runtime instead
+ * of at parse time, so the fallback class (Latin, Greek, Cyrillic, Arabic,
+ * Devanagari, Thai, Kana, CJK, Hangul) can take over.
+ */
+const NON_ALNUM_RE = (function () {
+  try {
+    return new RegExp("[^\\p{L}\\p{N}]+", "gu");
+  } catch (ignored) {
+    return new RegExp(
+      "[^0-9A-Za-z\\u00C0-\\u024F\\u0370-\\u03FF\\u0400-\\u04FF\\u0600-\\u06FF" +
+        "\\u0900-\\u097F\\u0E00-\\u0E7F\\u3040-\\u30FF\\u4E00-\\u9FFF\\uAC00-\\uD7AF]+",
+      "g"
+    );
+  }
+})();
+
+/**
+ * `Element.prototype.toggleAttribute` is Chrome 69+ (and the `inert` attribute
+ * itself is Chrome 102+). Older WebViews — Android 5.1, and this project's
+ * LDPlayer image — throw `gate.toggleAttribute is not a function` during boot,
+ * which the boot guard renders as "Nuvio TV could not start" (BOOT-PROMISE).
+ * Fall back to set/removeAttribute; the gate that actually freezes the shell is
+ * the `nuvio-modal-open` class handled by the focus engine.
+ */
+const setInert = (function () {
+  if (
+    typeof Element !== 'undefined' &&
+    Element.prototype &&
+    typeof Element.prototype.toggleAttribute === 'function'
+  ) {
+    return function (el, on) {
+      if (el) el.toggleAttribute('inert', !!on);
+    };
+  }
+  return function (el, on) {
+    if (!el) return;
+    if (on) el.setAttribute('inert', '');
+    else el.removeAttribute('inert');
+  };
+})();
+
 class PencariMovieApp {
   constructor() {
     // ── Config ──
@@ -211,6 +257,35 @@ class PencariMovieApp {
           token: cleanToken
         };
       }
+    }
+
+    // Android 5.1's AOSP WebView (Chromium 39-44) cannot parse the Nuvio shell
+    // bundle, so index.html suppresses it. There is no home screen on that engine,
+    // and everything below assumes the shell's DOM exists — so land on the
+    // downloader overlays instead: #settings to connect a bot, #addon for the
+    // manifest URLs and the streams configuration.
+    const initialHash = window.location.hash;
+    const legacyEngine = !!(
+      window.NuvioBootGuard &&
+      window.NuvioBootGuard.engineTooOld &&
+      window.NuvioBootGuard.engineTooOld()
+    );
+    window.__pmLegacyEngine = legacyEngine;
+    if (legacyEngine) {
+      this._hideLoadingScreen();
+      const overlayDeepLink = initialHash === '#settings' || initialHash === '#configure' || initialHash === '#addon';
+      if (!overlayDeepLink) {
+        if (this.hasSession) this.openAddonModal?.();
+        else this.showSettingsGate({ forceToken: false });
+      }
+      this._syncOverlayFreeze?.();
+      // The page HAS booted — the overlays are the whole UI on this engine. Release
+      // the boot guard so a later, harmless error is not rendered as a full-screen
+      // "Nuvio TV could not start" (the guard only stops intercepting on ready()).
+      if (window.NuvioBootGuard && typeof window.NuvioBootGuard.ready === 'function') {
+        window.NuvioBootGuard.ready();
+      }
+      return;
     }
 
     // Loading screen is hidden by showSettingsGate() or hideSettingsGate()
@@ -2469,22 +2544,34 @@ class PencariMovieApp {
     });
     document.body.classList.toggle('nuvio-modal-open', visible);
     const app = this.$('#app') || this.$('#streamApp');
-    if (app) app.toggleAttribute('inert', visible);
+    setInert(app, visible);
     // Boot order matters: hideSettingsGate() runs before the hash branches open an
     // overlay, so "nothing visible yet" must not count as "overlay dismissed".
     // The shell bundle is only released once an overlay has actually been shown.
     if (visible) this._overlayWasVisible = true;
+    // Once a downloader overlay owns the screen the boot guard has done its job: a
+    // later error — including one thrown by the OPTIONAL Nuvio shell — must not
+    // replace #settings / #addon with a full-screen "Nuvio TV could not start".
+    if (visible && window.NuvioBootGuard && typeof window.NuvioBootGuard.ready === 'function') {
+      window.NuvioBootGuard.ready();
+    }
     // A deep link onto an overlay (#addon / #settings / #configure) defers the
     // home-screen load; this is the single place every overlay close routes
     // through, so the deferred load starts exactly when the screen is free.
-    if (!visible && this._pendingInitialDataLoad) {
+    if (!visible && this._pendingInitialDataLoad && !window.__pmLegacyEngine) {
       this._pendingInitialDataLoad = false;
       this.loadInitialData().catch((err) => console.warn('Deferred init data load failed:', err));
     }
-    if (!visible && this._overlayWasVisible) {
-      // An overlay deep link skipped the Nuvio shell on purpose (see
-      // __pmLoadShellBundle in index.html) — boot it now that the screen is free.
-      window.__pmLoadShellBundle?.();
+    if (!visible && this._overlayWasVisible && !window.__pmLegacyEngine) {
+      if (window.__pmShellFailed) {
+        // The shell is optional and could not load — reopening the addon overlay is
+        // better than closing onto an empty page.
+        this.openAddonModal?.();
+      } else {
+        // An overlay deep link skipped the Nuvio shell on purpose (see
+        // __pmLoadShellBundle in index.html) — boot it now that the screen is free.
+        window.__pmLoadShellBundle?.();
+      }
     }
     return visible;
   }
@@ -2543,7 +2630,7 @@ class PencariMovieApp {
       if (app) {
         app.classList.add('hidden');
         app.setAttribute('aria-hidden', 'true');
-        app.toggleAttribute('inert', true);
+        setInert(app, true);
       }
 
       // Show token input, hide connected info
@@ -2601,7 +2688,7 @@ class PencariMovieApp {
     if (gate) {
       gate.classList.add('hidden');
       gate.setAttribute('aria-hidden', 'true');
-      gate.toggleAttribute('inert', true);
+      setInert(gate, true);
     }
     if (app) {
       app.classList.remove('hidden');
@@ -3094,7 +3181,7 @@ class PencariMovieApp {
       return { isPart: false, baseKey: '', cleanBase: f, partNum: 0, totalParts: 0 };
     }
 
-    const baseKey = cleanBase.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '.').replace(/^\.+|\.+$/g, '');
+    const baseKey = cleanBase.toLowerCase().replace(NON_ALNUM_RE, '.').replace(/^\.+|\.+$/g, '');
     return { isPart: true, baseKey, cleanBase, partNum, totalParts };
   }
 
@@ -4596,7 +4683,10 @@ class PencariMovieApp {
    */
   _startHeroRotation() {
     this._stopHeroRotation();
-    if (this._heroPosts.length < 2) return;
+    // _heroPosts only exists after renderHero(); closing the settings gate before the
+    // home data loads (always the case on a shell-less legacy engine) used to throw
+    // "Cannot read property 'length' of undefined".
+    if (!Array.isArray(this._heroPosts) || this._heroPosts.length < 2) return;
     this.heroInterval = setInterval(() => {
       const next = (this.heroIndex + 1) % this._heroPosts.length;
       this.heroIndex = next;

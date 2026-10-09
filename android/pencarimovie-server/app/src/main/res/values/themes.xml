@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Black glass theme. Parent is the non-DayNight Material variant so the app
+      stays dark regardless of the system setting — the glass surfaces are
+      tuned for a near-black backdrop and would wash out on a light one.
+    -->
+    <style name="Theme.PencariMovie" parent="Theme.MaterialComponents.NoActionBar">
+        <!-- colorPrimary drives the status bar tint on some OEM skins, so it is
+             pinned to the background rather than the accent. The accent is
+             applied per-widget via backgroundTint instead. -->
+        <item name="colorPrimary">@color/glass_bg</item>
+        <item name="colorPrimaryVariant">@color/glass_bg</item>
+        <item name="colorOnPrimary">@color/glass_text</item>
+        <item name="colorPrimarySurface">@color/glass_bg</item>
+        <item name="colorPrimaryInverse">@color/glass_bg</item>
+        <item name="colorSecondary">@color/secondary</item>
+        <item name="colorSecondaryVariant">@color/secondary_dark</item>
+        <item name="colorOnSecondary">@color/black</item>
+
+        <!-- Surfaces -->
+        <item name="android:colorBackground">@color/glass_bg</item>
+        <item name="colorSurface">@color/glass_bg</item>
+        <item name="colorOnSurface">@color/glass_text</item>
+        <item name="colorOnBackground">@color/glass_text</item>
+        <item name="colorError">@color/glass_error</item>
+
+        <!-- System bars blend into the black background -->
+        <item name="android:statusBarColor">@color/glass_bg</item>
+        <item name="android:navigationBarColor">@color/glass_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+
+        <!-- Translucent window so the glass reads as glass -->
+        <item name="android:windowBackground">@color/glass_bg</item>
+    </style>
+</resources>

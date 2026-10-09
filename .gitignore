@@ -278,3 +278,38 @@ android/termux-app-fork-x86_64/.gradle_user_home/
 android/termux-app-fork-x86_64/.kotlin/
 android/termux-app-fork-x86_64/.idea/
 android/termux-app-fork-x86_64/local.properties
+
+# ---------------------------------------------------------------------------
+# android/pencarimovie-server — native Kotlin + TDLib server app.
+#
+# Source is tracked: .github/workflows/android-server-apk.yml builds it. Both
+# broad rules above (`android/*` and the bare `pencarimovie*`) match this tree
+# because the project directory itself starts with "pencarimovie", so git will
+# not descend into it without the re-include below — which must stay last.
+#
+# NOT tracked:
+#   - jniLibs: libtdjni.so (37 MB across both ABIs) plus the legacy 160 MB
+#     libfrankenphp.so. Binaries, and libfrankenphp.so is over GitHub's
+#     100 MB per-file limit. A CI build therefore cannot produce a working
+#     APK yet — the workflow's preflight step fails loudly instead of
+#     publishing a broken rolling release.
+#   - the signing keystores; they stay on the machine that cuts the release.
+#   - build output, caches, IDE state and local.properties.
+# ---------------------------------------------------------------------------
+# Re-include the excluded directory itself first: git refuses to re-add
+# anything below a directory that a broader rule excluded.
+!android/pencarimovie-server/
+!android/pencarimovie-server/**
+
+android/pencarimovie-server/app/src/main/jniLibs/
+android/pencarimovie-server/app/*.jks
+android/pencarimovie-server/app/build/
+android/pencarimovie-server/build/
+android/pencarimovie-server/.gradle/
+android/pencarimovie-server/.gradle_cache/
+android/pencarimovie-server/.kotlin/
+android/pencarimovie-server/.idea/
+android/pencarimovie-server/local.properties
+# Scratch files left in the project root while debugging (probe.ps1, cat.json…).
+android/pencarimovie-server/*.ps1
+android/pencarimovie-server/*.json

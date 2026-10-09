@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Black glass palette. The accent is a muted silver rather than a saturated
+      colour: on a near-black background a bright hue glares, while a light grey
+      reads as brushed metal and keeps the UI calm.
+    -->
+    <color name="primary">#E8E8EA</color>
+    <color name="primary_dark">#B8B8BC</color>
+    <color name="secondary">#9AA0A6</color>
+    <color name="secondary_dark">#6B7075</color>
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
+
+    <!-- Surfaces: near-black with a translucent white overlay so panels read
+         as frosted glass over the dark background. -->
+    <color name="glass_bg">#0A0A0C</color>
+    <color name="glass_surface">#14FFFFFF</color>
+    <color name="glass_surface_strong">#1FFFFFFF</color>
+    <color name="glass_border">#33FFFFFF</color>
+    <color name="glass_text">#F2FFFFFF</color>
+    <color name="glass_text_dim">#99FFFFFF</color>
+
+    <!-- Accent: muted silver for buttons and highlights. -->
+    <color name="glass_accent">#D6D6DA</color>
+    <color name="glass_accent_pressed">#B8B8BC</color>
+    <color name="glass_on_accent">#121214</color>
+
+    <!-- Status colours, desaturated to sit quietly on black. -->
+    <color name="glass_warn">#C9A227</color>
+    <color name="glass_error">#C25B5B</color>
+    <color name="glass_ok">#6FA97F</color>
+</resources>

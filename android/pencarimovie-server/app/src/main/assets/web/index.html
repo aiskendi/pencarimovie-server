@@ -9,16 +9,16 @@
     />
     <meta name="theme-color" content="#141414" />
     <title>PencariMovie — Stream & Download</title>
-    <link rel="stylesheet" href="stream-theme.css" />
-    <link rel="stylesheet" href="styles.css?v=20261009pm4" />
+    <link rel="stylesheet" href="stream-theme.css?v=20261009pm3" />
+    <link rel="stylesheet" href="styles.css?v=20261009pm3" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
       crossorigin="anonymous"
       referrerpolicy="no-referrer"
     />
-    <link rel="stylesheet" href="css/bundle.css" />
-    <script src="assets/runtime/legacy-features.js"></script>
+    <link rel="stylesheet" href="css/bundle.css?v=20261009pm3" />
+    <script src="assets/runtime/legacy-features.js?v=20261009pm3"></script>
     <script>
       (function configureTizenLaunch() {
         var root = typeof globalThis !== "undefined" ? globalThis : window;
@@ -111,7 +111,7 @@
         <h2 class="update-required__title">Update Required</h2>
         <p class="update-required__desc">
           Your app version is outdated. Please update to continue using
-          PencariMovie Downloader.
+          PencariMovie Server.
         </p>
         <div class="update-required__details">
           <span
@@ -1586,14 +1586,14 @@
     </div>
 
     <!-- ─── Core JS and Nuvio Shell ───────────────────────────── -->
-    <script src="boot-guard.js"></script>
+    <script src="boot-guard.js?v=20261009pm3"></script>
     <script
       defer
-      src="core-js.bundle.js"
+      src="core-js.bundle.js?v=20261009pm3"
       onerror="window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(this.src)"
     ></script>
-    <script defer src="nuvio.env.js"></script>
-    <script defer src="assets/libs/qrcode-generator.js"></script>
+    <script defer src="nuvio.env.js?v=20261009pm3"></script>
+    <script defer src="assets/libs/qrcode-generator.js?v=20261009pm3"></script>
     <!-- The Nuvio shell bundle boots the whole home screen behind whatever is on
          screen: /manifest.json, one request per catalog (local AND upstream) and
          ~1.9s of main-thread long tasks. A deep link straight onto an overlay
@@ -1607,7 +1607,7 @@
           if (window.__pmShellBundleLoaded) return;
           window.__pmShellBundleLoaded = true;
           var s = document.createElement("script");
-          s.src = "app.bundle.js?v=20261009pm4";
+          s.src = "app.bundle.js?v=20261009pm3";
           s.onerror = function () {
             window.NuvioBootGuard && window.NuvioBootGuard.scriptFailed(s.src);
           };
@@ -1618,6 +1618,6 @@
         }
       })();
     </script>
-    <script defer src="app.js?v=20261009pm4"></script>
+    <script defer src="app.js?v=20261009pm3"></script>
   </body>
 </html>

@@ -11592,7 +11592,12 @@ if ($isNuvioRoute) {
         ];
 
 
-        $logoUrl = str_starts_with($baseUrl, 'https://')
+        // Prefer the self-hosted logo (public/logo.png) so the addon logo does
+        // not depend on raw.githubusercontent.com being reachable — that host is
+        // blocked/slow on some ISPs, which made the logo disappear even though
+        // the server already hosts the identical image. Kept the GitHub copy as
+        // a fallback for deployments that do not ship public/logo.png.
+        $logoUrl = file_exists(__DIR__ . '/public/logo.png')
             ? rtrim($baseUrl, '/') . '/logo.png'
             : 'https://raw.githubusercontent.com/aiskendi/pencarimovie-server/main/public/logo.png';
         $manifest = [
@@ -13727,7 +13732,21 @@ if ($isNuvioRoute) {
             } else {
                 $noStreamTitle = 'No Streams Found';
                 $noStreamDesc = "⚠️ No streams available for this title.";
-                $fallbackUrl = $adUrl !== '' ? $adUrl : ($versionCheck['update_url'] ?? 'https://pencarimovie.com');
+                // Fallback links to the PencariMovie keyword search on the CURRENT
+                // origin the client is using (localhost / LAN / tunnel / VPS /
+                // custom domain) instead of the sponsor URL. The path segment is
+                // the title keyword (falling back to the item id).
+                $searchKeyword = '';
+                if (isset($cleanMovieTitle) && trim((string) $cleanMovieTitle) !== '') {
+                    $searchKeyword = trim((string) $cleanMovieTitle);
+                } elseif (isset($searchedTitle) && trim((string) $searchedTitle) !== '') {
+                    $searchKeyword = trim((string) $searchedTitle);
+                }
+                if ($searchKeyword === '') {
+                    $searchKeyword = isset($itemId) ? (string) $itemId : '';
+                }
+                $fallbackUrl = 'https://pencarimovie.com/search/' . rawurlencode($searchKeyword)
+                    . '?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'));
             }
             $streams[] = [
                 'name' => $noStreamTitle,

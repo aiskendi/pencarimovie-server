@@ -150,7 +150,10 @@ object UpdateChecker {
 
     private fun parse(json: String): UpdateInfo? {
         return try {
-            val o = JSONObject(json)
+            // A BOM (PowerShell's Set-Content UTF8 emits one) makes org.json throw, which
+            // silently disabled every update. Strip it, like backend.php
+            // fd_fetch_credentials_from_wordpress() does for the WordPress body.
+            val o = JSONObject(json.removePrefix("\uFEFF").trim())
 
             // Application-id guard: never offer an update built for another app
             // (e.g. the old com.pencarimovie.downloader release).

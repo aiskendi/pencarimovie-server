@@ -282,34 +282,18 @@ android/termux-app-fork-x86_64/local.properties
 # ---------------------------------------------------------------------------
 # android/pencarimovie-server — native Kotlin + TDLib server app.
 #
-# Source is tracked: .github/workflows/android-server-apk.yml builds it. Both
-# broad rules above (`android/*` and the bare `pencarimovie*`) match this tree
-# because the project directory itself starts with "pencarimovie", so git will
-# not descend into it without the re-include below — which must stay last.
+# LOCAL-ONLY working copy. The APK is built and signed on this machine and the
+# SOURCE IS DELIBERATELY NOT IN THE REPOSITORY — only the published release
+# assets are, on the rolling `apk-server-latest` tag. The `android/*` rule above
+# therefore excludes this whole tree; do NOT add a `!android/pencarimovie-server/`
+# re-include (it was intentionally removed — the repo carries releases + the PHP
+# server only).
 #
-# NOT tracked:
-#   - jniLibs: libtdjni.so (37 MB across both ABIs) plus the legacy 160 MB
-#     libfrankenphp.so. Binaries, and libfrankenphp.so is over GitHub's
-#     100 MB per-file limit. A CI build therefore cannot produce a working
-#     APK yet — the workflow's preflight step fails loudly instead of
-#     publishing a broken rolling release.
-#   - the signing keystores; they stay on the machine that cuts the release.
-#   - build output, caches, IDE state and local.properties.
+# Cutting a release from this machine:
+#   1. cd android/pencarimovie-server && gradlew :app:assembleDebug
+#   2. cd .. && powershell -File _stage_release.ps1      (stages + hashes + version.json)
+#   3. gh release upload apk-server-latest \
+#        _apk_dist/*.apk _apk_dist/*.sha256 _apk_dist/version.json --clobber
+# Keep version.json BOM-free: PowerShell's `Set-Content -Encoding UTF8` writes a
+# BOM and UpdateChecker's JSONObject() would throw, silently disabling updates.
 # ---------------------------------------------------------------------------
-# Re-include the excluded directory itself first: git refuses to re-add
-# anything below a directory that a broader rule excluded.
-!android/pencarimovie-server/
-!android/pencarimovie-server/**
-
-android/pencarimovie-server/app/src/main/jniLibs/
-android/pencarimovie-server/app/*.jks
-android/pencarimovie-server/app/build/
-android/pencarimovie-server/build/
-android/pencarimovie-server/.gradle/
-android/pencarimovie-server/.gradle_cache/
-android/pencarimovie-server/.kotlin/
-android/pencarimovie-server/.idea/
-android/pencarimovie-server/local.properties
-# Scratch files left in the project root while debugging (probe.ps1, cat.json…).
-android/pencarimovie-server/*.ps1
-android/pencarimovie-server/*.json

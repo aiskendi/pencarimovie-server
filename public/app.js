@@ -1699,6 +1699,41 @@ class PencariMovieApp {
       const tagsEl = this.$('#fileDetailTags');
       if (titleEl) titleEl.textContent = 'Stream playback failed';
       if (tagsEl) {
+        // A browser that cannot decode the container/codec answers with
+        // MEDIA_ERR_SRC_NOT_SUPPORTED (4); a dead /api/download answers with the session
+        // door instead. The two need different advice, otherwise an undecodable MKV tells
+        // the user to "Connect Bot" for a file the browser can never play.
+        const errCode = mediaEl.error ? Number(mediaEl.error.code) : 0;
+        let srcName = attrSrc.split('/').pop() || '';
+        try { srcName = decodeURIComponent(srcName); } catch (_) { /* keep raw */ }
+        const extM = srcName.match(/\.([a-z0-9]+)(?:$|\?)/i);
+        const ext = extM ? extM[1].toLowerCase() : '';
+        const riskyExt = ['mkv', 'avi', 'mov', 'ts', 'm2ts', 'wmv', 'flv', 'webm', '3gp'].indexOf(ext) !== -1;
+
+        if (this.hasSession && (errCode === 4 || riskyExt)) {
+          const streamUrl = currentSrc || attrSrc;
+          const label = ext ? ('.' + ext) : 'this file';
+          tagsEl.innerHTML = `
+            <div style="background:rgba(255,107,53,0.15);border:1px solid var(--accent);border-radius:8px;padding:10px 14px;margin-top:8px;">
+              <p style="color:var(--accent);font-weight:600;margin:0 0 4px 0;"><i class="fas fa-exclamation-triangle"></i> This browser cannot play ${label}</p>
+              <p style="color:var(--text-secondary);font-size:0.85rem;margin:0 0 8px 0;">The stream is fine - the browser cannot decode this container/codec (for example Matroska/x265). Play it in an external player (VLC, MX Player) or download it.</p>
+              <button id="fileDetailOpenExternalBtn" class="stream-btn stream-btn--primary stream-btn--sm" style="background:var(--accent);color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.8rem;margin-right:8px;">
+                <i class="fas fa-up-right-from-square"></i> Open externally
+              </button>
+              <button id="fileDetailDownloadFallbackBtn" class="stream-btn stream-btn--sm" style="background:transparent;color:var(--text-primary);border:1px solid var(--accent);padding:5px 12px;border-radius:4px;cursor:pointer;font-size:0.8rem;">
+                <i class="fas fa-download"></i> Download
+              </button>
+            </div>
+          `;
+          // Same URL the <video> was given: the server answers it with 206, so an external
+          // player can range-seek it exactly like the inline player would.
+          const openBtn = this.$('#fileDetailOpenExternalBtn');
+          if (openBtn) openBtn.addEventListener('click', () => window.open(streamUrl, '_blank'));
+          const dlBtn = this.$('#fileDetailDownloadFallbackBtn');
+          if (dlBtn) dlBtn.addEventListener('click', () => { window.location.href = streamUrl; });
+          return;
+        }
+
         tagsEl.innerHTML = `
           <div style="background:rgba(255,107,53,0.15);border:1px solid var(--accent);border-radius:8px;padding:10px 14px;margin-top:8px;">
             <p style="color:var(--accent);font-weight:600;margin:0 0 4px 0;"><i class="fas fa-exclamation-triangle"></i> Cannot play media stream</p>
@@ -1775,6 +1810,60 @@ class PencariMovieApp {
         return;
       }
 
+      // ── Hardware media keys ──
+      // A TV/AVR remote sends MediaPlayPause / MediaFastForward / ... key names, not the
+      // "k"/"f" letters the rest of this handler uses, so without this the transport
+      // buttons on a remote do nothing. Handled before the input guard below because a
+      // media key is never a typed character.
+      const mediaElForKey = this.$('#fileDetailVideo');
+      const mediaKey = String(e.key || '');
+      if (
+        mediaElForKey &&
+        mediaElForKey.src &&
+        !mediaElForKey.classList.contains('hidden') &&
+        mediaKey.indexOf('Media') === 0
+      ) {
+        const seekBy = (delta) => {
+          mediaElForKey.currentTime = Math.max(
+            0,
+            Math.min(mediaElForKey.duration || Infinity, mediaElForKey.currentTime + delta)
+          );
+        };
+        let handled = true;
+        switch (mediaKey) {
+          case 'MediaPlay':
+          case 'Play':
+            mediaElForKey.play();
+            break;
+          case 'MediaPause':
+          case 'Pause':
+            mediaElForKey.pause();
+            break;
+          case 'MediaPlayPause':
+            if (mediaElForKey.paused) mediaElForKey.play();
+            else mediaElForKey.pause();
+            break;
+          case 'MediaStop':
+            mediaElForKey.pause();
+            mediaElForKey.currentTime = 0;
+            break;
+          case 'MediaTrackNext':
+          case 'MediaFastForward':
+            seekBy(10);
+            break;
+          case 'MediaTrackPrevious':
+          case 'MediaRewind':
+            seekBy(-10);
+            break;
+          default:
+            handled = false;
+        }
+        if (handled) {
+          e.preventDefault();
+          return;
+        }
+      }
+
       // If typing in input/textarea, do not intercept player hotkeys
       const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
       if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') return;
@@ -1800,11 +1889,15 @@ class PencariMovieApp {
           videoEl.volume = Math.max(0, videoEl.volume - 0.05);
         } else if (e.key.toLowerCase() === 'f') {
           e.preventDefault();
-          if (!document.fullscreenElement) {
+          // Vendor-prefixed fullscreen: some TV browsers only implement the webkit form,
+          // so read the webkit element too - otherwise 'f' re-enters instead of exiting.
+          const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+          if (!fsEl) {
             if (videoEl.requestFullscreen) videoEl.requestFullscreen();
             else if (videoEl.webkitRequestFullscreen) videoEl.webkitRequestFullscreen();
           } else {
             if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
           }
         } else if (e.key.toLowerCase() === 'm') {
           e.preventDefault();

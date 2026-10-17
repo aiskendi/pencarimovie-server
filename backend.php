@@ -281,6 +281,7 @@ function fd_prune_cache_files(bool $force = false): void
         'post_identity_' => 604800, // 7d  (media_ids_idx post:<id> row)
         'file_title_'    => 604800, // 7d  (short_code -> file name, for subtitles)
         'tt_title_'      => 604800, // 7d  (title -> imdb, for subtitles)
+        'episode_names_' => 604800, // 7d (negative lookups expire at read-time after 1h)
     ];
 
     // 1. Move or purge legacy cache files scattered in storage/ root
@@ -8080,94 +8081,238 @@ function fd_filename_episode_subtitle(string $fileTitle, string $seriesTitle = '
 }
 
 /**
- * Load trusted episode names from configured upstream Stremio metadata.
- * Never infer an episode title from Telegram filenames: that would make a
- * wrong sibling release validate itself. Negative results are cached too.
- * This is optional enrichment: a metadata outage does not hide every stream.
- *
- * @return string[] Normalized, non-generic episode names.
+ * A verified upstream series record is allowed to supply episode titles.
+ * Unknown/mismatched metadata is NOT evidence that a stream is wrong: callers
+ * fall back to the existing series title, year and episode checks instead.
  */
-function fd_upstream_episode_names(string $mediaId, int $season, int $episode): array
+function fd_episode_meta_identity_matches(array $meta, string $mediaId, string $expectedTitle = '', string $expectedYear = ''): bool
 {
-    $mediaId = preg_replace('/:\d+:\d+$/', '', trim($mediaId));
-    if ($mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)) {
-        return [];
+    $actualId = trim((string) ($meta['id'] ?? ''));
+    if ($actualId === '' || strcasecmp($actualId, $mediaId) !== 0) {
+        return false;
     }
-    $cacheFile = fd_cache_path('episode_names_' . md5($mediaId . ':' . $season . ':' . $episode) . '.json');
-    if (is_file($cacheFile)) {
-        $cached = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($cached) && isset($cached['names']) && is_array($cached['names'])) {
-            $ttl = $cached['names'] !== [] ? 604800 : 3600;
-            if (time() - (int) @filemtime($cacheFile) < $ttl) {
-                return $cached['names'];
-            }
+    if (strtolower(trim((string) ($meta['type'] ?? ''))) !== 'series') {
+        return false;
+    }
+    if ($expectedTitle !== '') {
+        $actualTitle = fd_norm_title_for_match((string) ($meta['name'] ?? ''));
+        $wantedTitle = fd_norm_title_for_match($expectedTitle);
+        if ($actualTitle === '' || $wantedTitle === '' || $actualTitle !== $wantedTitle) {
+            return false;
         }
     }
+    // Missing upstream year is inconclusive; a known wrong year invalidates the
+    // metadata. The catalog title may itself contain years, so use releaseInfo.
+    if ($expectedYear !== '' && preg_match('/^(?:19|20)\d{2}$/', $expectedYear)) {
+        $release = trim((string) ($meta['releaseInfo'] ?? ''));
+        if ($release === '') $release = trim((string) ($meta['year'] ?? ''));
+        if (preg_match('/\b(19\d{2}|20\d{2})\b/', $release, $ym)
+            && abs((int) $ym[1] - (int) $expectedYear) > 1) {
+            return false;
+        }
+    }
+    return true;
+}
 
-    $urls = [];
-    foreach (array_slice(fd_get_upstream_resolver_manifests(), 0, 3) as $i => $upstream) {
-        $manifest = trim((string) ($upstream['url'] ?? ''));
-        if ($manifest === '') continue;
-        $base = preg_replace('#/manifest\.json(?:\?.*)?$#i', '', $manifest);
-        $urls['up_' . $i] = rtrim($base, '/') . '/meta/series/' . rawurlencode($mediaId) . '.json';
-    }
-    // Issue requests concurrently to avoid three serial metadata timeouts.
-    $payloads = [];
-    if ($urls !== [] && function_exists('fd_http_get_many_amp')) {
-        $multi = fd_http_get_many_amp($urls, ['timeout' => 3]);
-        if (!empty($multi['ok'])) {
-            foreach ((array) ($multi['results'] ?? []) as $row) {
-                $payloads[] = json_decode((string) ($row['body'] ?? ''), true);
-            }
-        }
-    }
-    if ($payloads === []) {
-        // The app already supports a non-Amp HTTP transport.
-        foreach ($urls as $url) {
-            $payloads[] = fd_http_json($url, [], 'GET', 3);
-        }
-    }
+/** @return string[] Verified episode names from ONE series metadata record. */
+function fd_extract_episode_names(array $meta, int $season, int $episode): array
+{
     $names = [];
-    foreach ($payloads as $data) {
-        if (!is_array($data)) continue;
-        foreach ((array) ($data['meta']['videos'] ?? []) as $video) {
-            if (!is_array($video)) continue;
-            $vSeason = (int) ($video['season'] ?? 0);
-            $vEpisode = (int) ($video['episode'] ?? ($video['number'] ?? 0));
-            if (($vSeason !== $season || $vEpisode !== $episode) &&
-                !preg_match('/:' . $season . ':' . $episode . '$/', (string) ($video['id'] ?? ''))) {
-                continue;
-            }
-            $name = fd_normalize_episode_name((string) ($video['name'] ?? ($video['title'] ?? '')));
+    foreach ((array) ($meta['videos'] ?? []) as $video) {
+        if (!is_array($video)) continue;
+        $hasSeason = isset($video['season']);
+        $hasEpisode = isset($video['episode']) || isset($video['number']);
+        $vSeason = (int) ($video['season'] ?? 0);
+        $vEpisode = (int) ($video['episode'] ?? ($video['number'] ?? 0));
+        $episodeIdMatches = (bool) preg_match('/:' . $season . ':' . $episode . '$/', (string) ($video['id'] ?? ''));
+        // Never let an ID suffix override contradictory explicit numbering.
+        if (($hasSeason && $vSeason !== $season) || ($hasEpisode && $vEpisode !== $episode)) {
+            continue;
+        }
+        if (!($hasSeason && $hasEpisode) && !$episodeIdMatches) {
+            continue;
+        }
+        // Use BOTH fields when available, so aliases supplied as a distinct
+        // title are not unnecessarily rejected. Do not interpret arbitrary
+        // unrelated metadata fields as episode-title aliases.
+        foreach (['name', 'title'] as $field) {
+            $name = fd_normalize_episode_name((string) ($video[$field] ?? ''));
             if ($name !== '' && !preg_match('/^(?:episode|ep|season|s)\s*\d*$/i', $name)) {
                 $names[$name] = true;
             }
         }
     }
-    $result = array_keys($names);
-    @file_put_contents($cacheFile, json_encode(['names' => $result], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
-    return $result;
+    return array_keys($names);
 }
 
 /**
- * A descriptive filename subtitle must agree with a trusted episode title.
- * If metadata is absent, preserve the existing title/year/episode matching
- * rather than universally hiding perfectly valid releases.
+ * Fetch public Stremio episode metadata WITHOUT the WordPress API secret.
+ * Unlike fd_http_json()/fd_http_get_contents(), this path honors a short
+ * timeout and does not retry slow upstream metadata requests.
+ */
+function fd_public_episode_meta_json(string $url, int $timeoutSeconds = 2): array
+{
+    if (!preg_match('#^https?://#i', $url)) return [];
+    $timeoutSeconds = max(1, min(3, $timeoutSeconds));
+    $raw = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) return [];
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT_MS => $timeoutSeconds * 1000,
+            CURLOPT_CONNECTTIMEOUT_MS => min(1000, $timeoutSeconds * 1000),
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+            CURLOPT_ENCODING => '',
+        ]);
+        $raw = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($status !== 200) return [];
+    } elseif ((bool) ini_get('allow_url_fopen')) {
+        $context = stream_context_create(['http' => [
+            'method' => 'GET', 'timeout' => $timeoutSeconds,
+            'follow_location' => 0, 'max_redirects' => 0,
+            'header' => "Accept: application/json\r\n",
+        ]]);
+        $raw = @file_get_contents($url, false, $context);
+    }
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($data) ? $data : [];
+}
+
+/**
+ * Resolve episode names from verified Stremio metadata with a bounded network
+ * budget. Providers are ordered by configuration priority; use the first valid
+ * episode record, NEVER union potentially contradictory providers' names.
+ * Positive cache: 7d. Verified no-episode cache: 1h. Transport/invalid: 5m.
+ * Cache keys include identity and upstream configuration to avoid cross-title
+ * contamination and invalidate legacy v2 entries automatically.
+ *
+ * @return string[] Validated, normalized episode names, or [] (fail open).
+ */
+function fd_upstream_episode_names(
+    string $mediaId,
+    int $season,
+    int $episode,
+    string $expectedTitle = '',
+    string $expectedYear = ''
+): array {
+    $mediaId = (string) preg_replace('/:\d+:\d+$/', '', trim($mediaId));
+    if ($mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)
+        || $season < 0 || $episode < 1) {
+        return [];
+    }
+
+    $urls = [];
+    foreach (array_slice(fd_get_upstream_resolver_manifests(), 0, 3) as $i => $upstream) {
+        $manifest = trim((string) ($upstream['url'] ?? ''));
+        if ($manifest === '' || !preg_match('#^https?://#i', $manifest)) continue;
+        $base = (string) preg_replace('#/manifest\.json(?:\?.*)?$#i', '', $manifest);
+        $urls['up_' . $i] = rtrim($base, '/') . '/meta/series/' . rawurlencode($mediaId) . '.json';
+    }
+    if ($urls === []) return [];
+
+    $cacheKey = hash('sha256', json_encode([
+        'v3', strtolower($mediaId), $season, $episode,
+        fd_norm_title_for_match($expectedTitle), trim($expectedYear), array_values($urls),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $cacheFile = fd_cache_path('episode_names_' . $cacheKey . '.json');
+    if (is_file($cacheFile)) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached) && isset($cached['names']) && is_array($cached['names'])) {
+            $ttl = (int) ($cached['ttl'] ?? ($cached['names'] !== [] ? 604800 : 3600));
+            if ($ttl > 0 && (time() - (int) @filemtime($cacheFile)) < min($ttl, 604800)) {
+                return array_values(array_filter($cached['names'], 'is_string'));
+            }
+        }
+    }
+
+    // The Amp helper bounds each concurrent request to 2s. Without Amp,
+    // query only the preferred provider, not three sequential timeouts.
+    $responses = [];
+    $usedAmp = false;
+    if (function_exists('fd_http_get_many_amp')) {
+        $multi = fd_http_get_many_amp($urls, ['timeout' => 2]);
+        if (!empty($multi['ok'])) {
+            $usedAmp = true;
+            foreach ($urls as $key => $_url) {
+                $row = $multi['results'][$key] ?? null;
+                if (!is_array($row) || (int) ($row['http'] ?? 0) !== 200) continue;
+                $data = json_decode((string) ($row['body'] ?? ''), true);
+                if (is_array($data)) $responses[$key] = $data;
+            }
+        }
+    }
+    if (!$usedAmp) {
+        $firstKey = array_key_first($urls);
+        $data = fd_public_episode_meta_json($urls[$firstKey], 2);
+        if ($data !== []) $responses[$firstKey] = $data;
+    }
+
+    $verified = false;
+    $names = [];
+    $source = '';
+    foreach ($urls as $key => $_url) {
+        $meta = $responses[$key]['meta'] ?? null;
+        if (!is_array($meta) || !fd_episode_meta_identity_matches($meta, $mediaId, $expectedTitle, $expectedYear)) {
+            continue;
+        }
+        $verified = true;
+        $candidate = fd_extract_episode_names($meta, $season, $episode);
+        if ($candidate !== []) {
+            $names = $candidate;
+            $source = $key;
+            break;
+        }
+    }
+
+    $ttl = $names !== [] ? 604800 : ($verified ? 3600 : 300);
+    @file_put_contents($cacheFile, json_encode([
+        'names' => $names, 'ttl' => $ttl,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+    fd_log('episode metadata lookup', [
+        'media_id' => $mediaId, 'season' => $season, 'episode' => $episode,
+        'verified' => $verified, 'source' => $source, 'name_count' => count($names),
+    ]);
+    return $names;
+}
+
+/**
+ * Release group labels are not episode titles. Unknown additional tags should
+ * be treated as inconclusive instead of hiding otherwise plausible streams.
+ */
+function fd_is_release_annotation(string $subtitle): bool
+{
+    return (bool) preg_match(
+        '/^(?:proper|repack|rerip|extended|uncut|uncensored|remastered|restored|internal|limited|multi|dual|dubbed|subbed|complete|batch)(?:\s|$)/i',
+        $subtitle
+    );
+}
+
+/**
+ * Compare an identifiable filename subtitle against verified episode names.
+ * Unknown filename structure, missing metadata, and release annotations are
+ * inconclusive (fail open). A definite descriptive mismatch is rejected.
  */
 function fd_episode_subtitle_matches(string $fileTitle, string $seriesTitle, array $episodeNames): bool
 {
     if ($episodeNames === []) return true;
     $subtitle = fd_filename_episode_subtitle($fileTitle, $seriesTitle);
-    if ($subtitle === '') return true;
+    if ($subtitle === '' || fd_is_release_annotation($subtitle)) return true;
+
     foreach ($episodeNames as $expected) {
         $expected = fd_normalize_episode_name((string) $expected);
-        if ($expected !== '' && (
-            $subtitle === $expected ||
-            str_starts_with($subtitle, $expected . ' ')
-        )) {
+        if ($expected !== '' && ($subtitle === $expected || str_starts_with($subtitle, $expected . ' '))) {
             return true;
         }
     }
+    fd_log('episode subtitle mismatch', [
+        'series' => $seriesTitle,
+        'subtitle' => substr($subtitle, 0, 120),
+        'expected' => array_slice($episodeNames, 0, 5),
+    ]);
     return false;
 }
 
@@ -9308,7 +9453,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     }
     $episodeNames = (array) ($preloadedPost['episode_names'] ?? []);
     if ($episodeNames === [] && $episodeMediaId !== '') {
-        $episodeNames = fd_upstream_episode_names($episodeMediaId, $season, $episode);
+        $episodeNames = fd_upstream_episode_names($episodeMediaId, $season, $episode, $fullTitle, (string) ($postYear ?? ''));
     }
 
     $filter = fd_episode_stream_filter($season, $episode);
@@ -15725,7 +15870,9 @@ if ($isNuvioRoute) {
                     $episodeNames = fd_upstream_episode_names(
                         $imdbId !== '' ? $imdbId : $itemId,
                         (int) $targetSeason,
-                        (int) $targetEpisode
+                        (int) $targetEpisode,
+                        $searchedTitle,
+                        $searchedYear
                     );
 
                     // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
@@ -16777,21 +16924,21 @@ if ($isNuvioRoute) {
                 $fallbackUrl = 'https://pencarimovie.com/search/' . rawurlencode($searchKeyword)
                     . '?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'));
             }
-            $streams[] = [
-                'name' => $noStreamTitle,
-                'description' => $noStreamDesc,
-                'externalUrl' => $fallbackUrl,
-            ];
+            // $streams[] = [
+                // 'name' => $noStreamTitle,
+                // 'description' => $noStreamDesc,
+                // 'externalUrl' => $fallbackUrl,
+            // ];
         }
 
         // ALWAYS add the sponsored message on top if configured (regardless of whether streams were found or empty)
-        if ($adUrl !== '') {
-            array_unshift($streams, [
-                'name' => $adName !== '' ? $adName : 'PencariMovie',
-                'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
-                'externalUrl' => $adUrl,
-            ]);
-        }
+        // if ($adUrl !== '') {
+            // array_unshift($streams, [
+                // 'name' => $adName !== '' ? $adName : 'PencariMovie',
+                // 'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
+                // 'externalUrl' => $adUrl,
+            // ]);
+        // }
 
         // Save to stream cache. Real playable streams cached with 300s TTL; empty streams short-cached for 60s
         if (!empty($streamCacheFile)) {

@@ -8020,6 +8020,158 @@ function fd_is_series_file(string $title, string $caption = ''): bool
 }
 
 /**
+ * Normalize a trusted episode title (not a file name). Stremio metadata often
+ * prefixes it with an episode number; do not treat that prefix as part of the title.
+ */
+function fd_normalize_episode_name(string $name): string
+{
+    $name = strtolower(trim((string) preg_replace('/[^\p{L}\p{N}]+/u', ' ', fd_clean_html_entities($name))));
+    $name = (string) preg_replace('/^(?:(?:season\s*\d+\s*)?episode\s*\d+|s\d{1,2}\s*e\d{1,4}|ep\s*\d+|\d{1,3})\s+/i', '', $name);
+    return trim((string) preg_replace('/\s+/', ' ', $name));
+}
+
+/**
+ * Parse the descriptive portion AFTER an explicit episode marker and BEFORE
+ * technical release tags. An empty result means there is no episode subtitle to
+ * verify. Unknown markers are not treated as names unless real metadata exists.
+ */
+function fd_filename_episode_subtitle(string $fileTitle, string $seriesTitle = ''): string
+{
+    $text = strtolower((string) preg_replace('/[^\p{L}\p{N}]+/u', ' ', fd_clean_media_title($fileTitle)));
+    $text = trim((string) preg_replace('/\s+/', ' ', $text));
+    $titleNorm = fd_normalize_episode_name($seriesTitle);
+    $titleNorm = trim((string) preg_replace('/\s+(?:19|20)\d{2}$/', '', $titleNorm));
+
+    if (preg_match('/(?:^|\s)(?:s\d{1,2}\s*e(?:p|ps|pisode)?\s*\d{1,4}|\d{1,2}\s*x\s*\d{1,4}|e(?:p|ps|pisode)?\s*\d{1,4})(?=\s|$)/i', $text, $match, PREG_OFFSET_CAPTURE)) {
+        // Some Asian releases put the SHOW title after E01 (CDL.E01.Show.Name).
+        // Only interpret the tail as an episode subtitle when the show title is
+        // already present before the episode marker.
+        if ($titleNorm !== '') {
+            $prefix = trim(substr($text, 0, $match[0][1]));
+            if (!str_contains(' ' . $prefix . ' ', ' ' . $titleNorm . ' ')) {
+                return '';
+            }
+        }
+        $afterMarker = $match[0][1] + strlen($match[0][0]);
+    } else {
+        // Bare numeric episodes are valid: Show.01.Pilot.mkv or
+        // Show.2023.01.Pilot.mkv. Do NOT interpret arbitrary numbers as an episode
+        // marker: require an exact known SHOW title directly before the number,
+        // with only an optional four-digit release year between them. This
+        // prevents years, resolutions, and unrelated numeric title fragments from
+        // being mistaken for episode titles.
+        if ($titleNorm === '' || !preg_match(
+            '/(?:^|\s)' . preg_quote($titleNorm, '/') . '\s+(?:(?:19|20)\d{2}\s+)?0*[1-9]\d{0,2}(?=\s|$)/u',
+            $text,
+            $match,
+            PREG_OFFSET_CAPTURE
+        )) {
+            return '';
+        }
+        $afterMarker = $match[0][1] + strlen($match[0][0]);
+    }
+
+    $tail = trim(substr($text, $afterMarker));
+    // Combined episode pack: do not mistake E02/E03 or a year for a subtitle.
+    $tail = (string) preg_replace('/^(?:(?:e(?:p|ps|pisode)?\s*\d{1,4})|(?:19|20)\d{2})\s+/i', '', $tail);
+    $tail = (string) preg_split('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hdtv|web|webrip|bluray|bdrip|brrip|remux|dvdrip|h264|h265|hevc|x264|x265|xvid|avc|aac|dts|flac|ddp|atmos|hdr|dv|nf|amzn|dsnp|multi|dual|audio|dub|dubbed|sub|subs|subbed|engsub|indosub|malaysub|hindi|eng|english|indo|indonesian|malay|korean|japanese|spanish|french|arabic|thai|batch|complete|mkv|mp4|avi|mov|ts|flv)\b/i', $tail, 2)[0];
+    $tail = trim((string) preg_replace('/\s+/', ' ', $tail));
+    return fd_normalize_episode_name($tail);
+}
+
+/**
+ * Load trusted episode names from configured upstream Stremio metadata.
+ * Never infer an episode title from Telegram filenames: that would make a
+ * wrong sibling release validate itself. Negative results are cached too.
+ * This is optional enrichment: a metadata outage does not hide every stream.
+ *
+ * @return string[] Normalized, non-generic episode names.
+ */
+function fd_upstream_episode_names(string $mediaId, int $season, int $episode): array
+{
+    $mediaId = preg_replace('/:\d+:\d+$/', '', trim($mediaId));
+    if ($mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)) {
+        return [];
+    }
+    $cacheFile = fd_cache_path('episode_names_' . md5($mediaId . ':' . $season . ':' . $episode) . '.json');
+    if (is_file($cacheFile)) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached) && isset($cached['names']) && is_array($cached['names'])) {
+            $ttl = $cached['names'] !== [] ? 604800 : 3600;
+            if (time() - (int) @filemtime($cacheFile) < $ttl) {
+                return $cached['names'];
+            }
+        }
+    }
+
+    $urls = [];
+    foreach (array_slice(fd_get_upstream_resolver_manifests(), 0, 3) as $i => $upstream) {
+        $manifest = trim((string) ($upstream['url'] ?? ''));
+        if ($manifest === '') continue;
+        $base = preg_replace('#/manifest\.json(?:\?.*)?$#i', '', $manifest);
+        $urls['up_' . $i] = rtrim($base, '/') . '/meta/series/' . rawurlencode($mediaId) . '.json';
+    }
+    // Issue requests concurrently to avoid three serial metadata timeouts.
+    $payloads = [];
+    if ($urls !== [] && function_exists('fd_http_get_many_amp')) {
+        $multi = fd_http_get_many_amp($urls, ['timeout' => 3]);
+        if (!empty($multi['ok'])) {
+            foreach ((array) ($multi['results'] ?? []) as $row) {
+                $payloads[] = json_decode((string) ($row['body'] ?? ''), true);
+            }
+        }
+    }
+    if ($payloads === []) {
+        // The app already supports a non-Amp HTTP transport.
+        foreach ($urls as $url) {
+            $payloads[] = fd_http_json($url, [], 'GET', 3);
+        }
+    }
+    $names = [];
+    foreach ($payloads as $data) {
+        if (!is_array($data)) continue;
+        foreach ((array) ($data['meta']['videos'] ?? []) as $video) {
+            if (!is_array($video)) continue;
+            $vSeason = (int) ($video['season'] ?? 0);
+            $vEpisode = (int) ($video['episode'] ?? ($video['number'] ?? 0));
+            if (($vSeason !== $season || $vEpisode !== $episode) &&
+                !preg_match('/:' . $season . ':' . $episode . '$/', (string) ($video['id'] ?? ''))) {
+                continue;
+            }
+            $name = fd_normalize_episode_name((string) ($video['name'] ?? ($video['title'] ?? '')));
+            if ($name !== '' && !preg_match('/^(?:episode|ep|season|s)\s*\d*$/i', $name)) {
+                $names[$name] = true;
+            }
+        }
+    }
+    $result = array_keys($names);
+    @file_put_contents($cacheFile, json_encode(['names' => $result], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+    return $result;
+}
+
+/**
+ * A descriptive filename subtitle must agree with a trusted episode title.
+ * If metadata is absent, preserve the existing title/year/episode matching
+ * rather than universally hiding perfectly valid releases.
+ */
+function fd_episode_subtitle_matches(string $fileTitle, string $seriesTitle, array $episodeNames): bool
+{
+    if ($episodeNames === []) return true;
+    $subtitle = fd_filename_episode_subtitle($fileTitle, $seriesTitle);
+    if ($subtitle === '') return true;
+    foreach ($episodeNames as $expected) {
+        $expected = fd_normalize_episode_name((string) $expected);
+        if ($expected !== '' && (
+            $subtitle === $expected ||
+            str_starts_with($subtitle, $expected . ' ')
+        )) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Strict Movie Title & Year Matcher:
  * Ensures only files matching the actual movie title and year are accepted,
  * preventing cross-matching unrelated movies (e.g. "Just You & Me with Charlie Laine"
@@ -8027,6 +8179,9 @@ function fd_is_series_file(string $title, string $caption = ''): bool
  */
 function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, string $searchedYear = '', string $searchedAka = '', string $fileCaption = ''): bool
 {
+    // Movie routes already enforce feature-film identity through strict title,
+    // year, and episodic-file rejection. Never apply episode-name checks to
+    // movies: their subtitles/sequel qualifiers belong to the movie title.
     if (fd_is_series_file($fileTitle, $fileCaption)) {
         return false;
     }
@@ -8038,7 +8193,13 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
 
     // 1. Strict Year check if year is known
     $searchedYear = trim($searchedYear);
-    $hasFileYear = (bool) preg_match_all('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fymAll);
+    // If filename has no year, the first caption line can disambiguate remakes.
+    $movieYearSource = $fileTitle;
+    if ($fileCaption !== '' && !preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle)) {
+        $captionFirstLine = trim((string) strtok($fileCaption, "\r\n"));
+        if ($captionFirstLine !== '') $movieYearSource .= ' ' . $captionFirstLine;
+    }
+    $hasFileYear = (bool) preg_match_all('/\b(19\d\d|20\d\d)\b/', $movieYearSource, $fymAll);
     if ($searchedYear !== '' && $hasFileYear) {
         $targetYear = (int) $searchedYear;
         $matchedAnyYear = false;
@@ -8313,7 +8474,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
  * the post-episode title portion ($afterEp), or Asian drama files will be truncated to
  * just their release group prefix (e.g. "cdl") and discarded.
  */
-function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = ''): bool
+function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = '', array $episodeNames = []): bool
 {
     // 1. Must match target season and episode
     $parsed = fd_classify_season_episode($fileTitle, $season, $episode, $fileCaption);
@@ -8469,6 +8630,13 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         if (preg_match('/\btv\s*sp\b|live[ ._-]?action/', $fileRegion) && !preg_match('/live[ ._-]?action/', $entryNorm)) {
             return false;
         }
+    }
+
+    // 5d. Generic episode-name guard (TV series, live action, anime, etc.).
+    // Never treat a subtitle after SxxExx as proof that it belongs to this show.
+    // Compare it against the selected episode's trusted metadata when known.
+    if (!fd_episode_subtitle_matches($fileTitle, $targetLower, $episodeNames)) {
+        return false;
     }
 
     // 6. Compare extracted title candidates with target series title
@@ -9098,6 +9266,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             $post = [
                 'title' => (string) ($localMeta['title'] ?? ''),
                 'year'  => (string) ($localMeta['year'] ?? ''),
+                'imdb_id' => (string) ($localMeta['imdb_id'] ?? ''),
             ];
             if (!empty($post['title'])) {
                 $postMemoryCache[$postId] = $post;
@@ -9123,10 +9292,29 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         $postYear = (string) $post['year'];
     }
 
+    // Resolve official episode-name metadata once for ALL stream retrieval paths.
+    // For post IDs, only use identity already cached locally; do not add an extra
+    // synchronous WordPress lookup to the episode hot path.
+    $episodeMediaId = trim((string) ($post['imdb_id'] ?? ($preloadedPost['imdb_id'] ?? '')));
+    if ($episodeMediaId === '' && $postId > 0) {
+        $identityFile = fd_cache_path('post_identity_' . $postId . '.json');
+        if (is_file($identityFile)) {
+            $identity = json_decode((string) @file_get_contents($identityFile), true);
+            $episodeMediaId = trim((string) ($identity['imdb_id'] ?? ''));
+        }
+    }
+    if ($episodeMediaId === '') {
+        $episodeMediaId = (string) ($preloadedPost['id'] ?? '');
+    }
+    $episodeNames = (array) ($preloadedPost['episode_names'] ?? []);
+    if ($episodeNames === [] && $episodeMediaId !== '') {
+        $episodeNames = fd_upstream_episode_names($episodeMediaId, $season, $episode);
+    }
+
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode, $episodeNames): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -9145,7 +9333,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             // Ensure the file title accurately matches the target series name, season, and episode.
             $fCaption = (string) ($file['caption'] ?? '');
             $seriesTitleToMatch = $fullTitle !== '' ? $fullTitle : (string) $keyword;
-            if (!fd_series_file_matches_title($fTitle, $seriesTitleToMatch, $season, $episode, (string) ($postYear ?? ''), $fCaption)) {
+            if (!fd_series_file_matches_title($fTitle, $seriesTitleToMatch, $season, $episode, (string) ($postYear ?? ''), $fCaption, $episodeNames)) {
                 continue;
             }
 
@@ -15534,6 +15722,11 @@ if ($isNuvioRoute) {
             if ($searchQuery !== '') {
                 if ($targetSeason !== null && $targetEpisode !== null) {
                     $imdbEpisodeFilter = fd_episode_stream_filter($targetSeason, $targetEpisode);
+                    $episodeNames = fd_upstream_episode_names(
+                        $imdbId !== '' ? $imdbId : $itemId,
+                        (int) $targetSeason,
+                        (int) $targetEpisode
+                    );
 
                     // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
                     if ($searchedTitle !== '' || $itemId !== '') {
@@ -15541,6 +15734,8 @@ if ($isNuvioRoute) {
                             'title' => $searchedTitle,
                             'year' => $searchedYear,
                             'id' => $itemId,
+                            'imdb_id' => $imdbId,
+                            'episode_names' => $episodeNames,
                         ]);
                     }
 
@@ -15604,7 +15799,7 @@ if ($isNuvioRoute) {
                         }
 
                         if ($matchedPostId !== null) {
-                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 250, $matchedPostData);
+                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 250, array_merge((array) $matchedPostData, ['episode_names' => $episodeNames, 'imdb_id' => $imdbId]));
                         }
 
                         // Fallback: If no post matched or post returned 0 files, probe search_files directly
@@ -15613,7 +15808,24 @@ if ($isNuvioRoute) {
                             $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
                             if (is_array($sf) && !empty($sf['files'])) {
                                 foreach ($sf['files'] as $f) {
-                                    if ($imdbEpisodeFilter($f)) {
+                                    if (!$imdbEpisodeFilter($f)) {
+                                        continue;
+                                    }
+                                    $fallbackTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fallbackCaption = (string) ($f['caption'] ?? '');
+                                    if ($fallbackCaption !== '' && preg_match('/^(?:video(?:\.\d+)*|\d+|document|file)\.(?:mp4|mkv|avi|mov|ts|flv)$/i', trim($fallbackTitle))) {
+                                        $captionTitle = trim((string) strtok($fallbackCaption, "\r\n"));
+                                        if ($captionTitle !== '') $fallbackTitle = $captionTitle;
+                                    }
+                                    if (fd_series_file_matches_title(
+                                        $fallbackTitle,
+                                        $searchedTitle,
+                                        (int) $targetSeason,
+                                        (int) $targetEpisode,
+                                        $searchedYear,
+                                        $fallbackCaption,
+                                        $episodeNames
+                                    )) {
                                         $filesToStream[] = $f;
                                     }
                                 }

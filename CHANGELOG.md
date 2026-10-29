@@ -39,6 +39,19 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Fixed
 
+- **A seek starts about 230 ms sooner.** The preflight prime is fetched from the enclosing
+  1 MB boundary and, past byte 0, rounds up to a full 1 MB head. `fetch_range_core()` holds
+  ONE connection permit for the whole call, so that head was two 512 KB `upload.getFile`
+  parts fetched back to back, and the response body did not start until both had arrived.
+  The two parts now go out together. Measured on a 406 MB 4K source, 4 MB range windows,
+  one bot, median of 8 rounds: first byte **954 ms before, 723 ms after** (24% sooner).
+  Sustained throughput is unchanged, because only the 1 MB head is split and the pipeline
+  behind it is untouched. A byte-0 prefix keeps its single 512 KB part and sees no change.
+  The part budget (`workers x inflight`) is shared, so it is worth stating: the split holds
+  2 permits at once instead of 1, for half as long, which keeps part-seconds level.
+  Pinned by `download::tests::prime_split_covers_the_head_in_legal_parts` and
+  `download::tests::only_one_part_heads_skip_the_split`.
+
 - **Saving catalog settings can no longer blank the configuration.**
   `write_catalog_settings()` truncated `storage/catalog_settings.json` with `fs::write` before
   filling it, while `read_catalog_settings()` sits on the config path of every `/catalog`,

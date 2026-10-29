@@ -161,11 +161,24 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     (skip0, want)
 }
 
-/// Fetch the preflight range in parallel when it spans more than one Telegram
-/// part. A seek usually needs the bytes before the requested offset plus the
-/// first playable bytes, so the 1 MB aligned prime is commonly two 512 KB
-/// requests. Fetching those serially delays the HTTP response and makes players
-/// report a stall while the seek is still being primed.
+/// Fetch the preflight range in PARALLEL whenever it needs more than one part.
+///
+/// WHICH requests this affects: `prime_window()` hands back 512 KB only when
+/// `start` sits exactly on a 1 MB boundary (byte 0, or a whole-MB offset). Every
+/// other range, which is every seek and every partial read a player sends,
+/// rounds the head up to 1 MB. `fetch_range_core()` holds ONE permit for the
+/// whole call, so that head was two 512 KB parts fetched back to back and the
+/// player waited for both before byte one. Measured here against a 406 MB 4K
+/// source, 4 MB range windows at 1 MB-block offsets, median of 8 rounds: first
+/// byte **954 ms serial, 723 ms split**. A byte-0 prefix still measures the same
+/// on both builds, because it was never two parts to begin with
+/// (`prefix_range_takes_no_skip`).
+///
+/// COST, stated because the part budget is shared by every viewer on the
+/// connection: the split holds 2 permits at once instead of 1, for half as long.
+/// Part-seconds are unchanged, so a neighbouring stream loses a slot for one RTT
+/// rather than two. Under `--inflight 1` the two futures simply queue, and the
+/// result is byte-identical to the serial fetch.
 async fn fetch_prime_gated(
     client: &grammers_client::Client,
     gate: &tokio::sync::Semaphore,
@@ -173,21 +186,41 @@ async fn fetch_prime_gated(
     pos: u64,
     want: u64,
 ) -> Result<Vec<u8>, crate::telegram::GramErr> {
-    if want <= crate::telegram::MAX_CHUNK {
+    let (want, split) = prime_split(want);
+    let Some((first_want, second_want)) = split else {
         return crate::telegram::fetch_range_gated(client, gate, target, pos, want).await;
-    }
-
-    // The prime is capped at 1 MB, so it is at most two legal 512 KB Telegram
-    // parts. The second offset remains part-aligned.
-    let first_want = crate::telegram::MAX_CHUNK;
+    };
+    // `pos` arrives 4096-aligned (it is `aligned`) and `MAX_CHUNK` is a whole
+    // number of `MIN_CHUNK` units, so `second_pos` stays legal for `plan_limit()`.
+    // Mis-align it and every following window collapses to 4 KB parts.
     let second_pos = pos.saturating_add(first_want);
-    let second_want = want - first_want;
+    log(
+        "preflight prime split across two parts",
+        &serde_json::json!({"pos": pos, "first": first_want, "second": second_want}),
+    );
     let (mut first, second) = tokio::try_join!(
         crate::telegram::fetch_range_gated(client, gate, target, pos, first_want),
         crate::telegram::fetch_range_gated(client, gate, target, second_pos, second_want),
     )?;
     first.extend_from_slice(&second);
     Ok(first)
+}
+
+/// `(clamped_want, Some((first, second)))`, or `(clamped_want, None)` when one
+/// Telegram part already covers the head.
+///
+/// The 1 MB cap is applied HERE and not trusted from the caller. Without it, a
+/// head above 1 MB would hand `fetch_range_core()` a `second` overrun, and it
+/// answers an overrun by fetching the extra parts SERIALLY inside the same
+/// permit: no error, no log, and the latency this function exists to remove is
+/// back. `PRIME_BYTES` is the knob that would do it, so the guard sits next to
+/// the arithmetic instead of riding on `prime_window()`'s `.min(MB)`.
+fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
+    let want = want.min(crate::telegram::MB);
+    if want <= crate::telegram::MAX_CHUNK {
+        return (want, None);
+    }
+    (want, Some((crate::telegram::MAX_CHUNK, want - crate::telegram::MAX_CHUNK)))
 }
 
 /// One fetch window, clamped so it never asks past the last byte. A window that
@@ -1963,6 +1996,60 @@ mod tests {
         // so the next window starts 1 MB aligned (no 4 KB collapse).
         assert_eq!(want, crate::telegram::MB);
         assert_eq!((aligned + want) % crate::telegram::MB, 0);
+    }
+
+    /// The split must never be reachable with a segment larger than one part,
+    /// and must cover exactly the requested head.
+    #[test]
+    fn prime_split_covers_the_head_in_legal_parts() {
+        use crate::telegram::{MAX_CHUNK, MB, MIN_CHUNK};
+
+        // Whatever a 1 MB-aligned start can produce is one part: no split.
+        for want in [1u64, MIN_CHUNK, PRIME_BYTES, MAX_CHUNK] {
+            let (clamped, split) = prime_split(want);
+            assert_eq!((clamped, split), (want, None), "want={want} fits one part");
+        }
+
+        // Every other start rounds the head up to 1 MB: exactly two parts.
+        assert_eq!(prime_split(MB), (MB, Some((MAX_CHUNK, MAX_CHUNK))));
+
+        // A head cut short by EOF keeps the remainder exact rather than rounded.
+        let (clamped, split) = prime_split(700_000);
+        assert_eq!(clamped, 700_000);
+        assert_eq!(split, Some((MAX_CHUNK, 700_000 - MAX_CHUNK)));
+
+        // The cap is enforced here, so a future `PRIME_BYTES` bump cannot push
+        // an overrun into `fetch_range_core()`'s serial fallback.
+        assert_eq!(prime_split(4 * MB).0, MB);
+        assert_eq!(prime_split(4 * MB).1, Some((MAX_CHUNK, MAX_CHUNK)));
+
+        // Why `second_pos` stays 4096-aligned without recomputing it.
+        assert_eq!(MAX_CHUNK % MIN_CHUNK, 0);
+    }
+
+    /// Ties the real player shapes to whether the split engages at all. A byte-0
+    /// prefix is the one everyday case that gets no benefit, and saying so here
+    /// stops a future "this did nothing" report from looking like a regression.
+    #[test]
+    fn only_one_part_heads_skip_the_split() {
+        use crate::telegram::{MAX_CHUNK, MB};
+
+        let (aligned, _skip0, want) = plan_for(0, 1_048_575);
+        assert_eq!(aligned, 0);
+        assert_eq!(want, PRIME_BYTES);
+        assert_eq!(prime_split(want).1, None, "a 0-based prefix primes one part");
+
+        // A plain range inside the file, and a seek, both round up to 1 MB.
+        for start in [900_000_000u64, 11_000_003] {
+            let (_aligned, skip0, want) = plan_for(start, start + 1_048_575);
+            assert!(skip0 > 0);
+            assert_eq!(want, MB, "start={start} rounds the head up");
+            assert_eq!(
+                prime_split(want).1,
+                Some((MAX_CHUNK, want - MAX_CHUNK)),
+                "start={start} must use the parallel path"
+            );
+        }
     }
 
     #[test]

@@ -4066,14 +4066,150 @@ fn is_private_ipv4(ip: &str) -> bool {
     )
 }
 
+/// Prefixes that are never the LAN a caller wants: cellular WAN, tunnels/VPNs, and
+/// the vendor pseudo-interfaces. `vgate` is OxygenOS/ColorOS's virtual gateway
+/// (`POINTOPOINT`, a private `/32`, reachable from the phone and nowhere else);
+/// `p2p` is Wi-Fi Direct, `ifb`/`dummy` are traffic shaping.
+///
+/// Names are the LAST line of defence, not the rule — a name list is exactly what
+/// missed `vgate0` for months. [`is_usable_lan_addr`] is what keeps an unknown
+/// vendor device out.
+fn is_never_lan_iface(name: &str) -> bool {
+    const NEVER: [&str; 17] = [
+        "lo", "rmnet", "ccmni", "pdp", "wwan", "clat", "dummy", "vgate", "p2p", "ifb", "sit",
+        "tun", "tap", "wg", "ppp", "ipsec", "tailscale",
+    ];
+    let n = name.to_ascii_lowercase();
+    NEVER.iter().any(|p| n.starts_with(p))
+}
+
+/// One `inet` line of `ip -4 addr`, with the interface it belongs to.
+struct LanAddr {
+    name: String,
+    ip: String,
+    prefix: u8,
+    point_to_point: bool,
+}
+
+/// Parse `ip -4 addr` into one entry per IPv4 address.
+///
+/// Android's toybox prints the link flags in the interface header
+/// (`32: vgate0: <POINTOPOINT,MULTICAST,NOARP,…>`), so `POINTOPOINT` is readable
+/// without knowing anything about the device. When a header carries no `<…>` the
+/// address is treated as broadcast-capable and only the name guard applies.
+fn parse_lan_addrs(text: &str) -> Vec<LanAddr> {
+    let mut out: Vec<LanAddr> = Vec::new();
+    let mut name = String::new();
+    let mut point_to_point = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let starts_block = t
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+            && t.contains(':');
+        if starts_block {
+            // "32: vgate0: <POINTOPOINT,MULTICAST,…> mtu 65500 …"
+            name = t.split(':').nth(1).unwrap_or("").trim().to_string();
+            point_to_point = t
+                .split('<')
+                .nth(1)
+                .and_then(|flags| flags.split('>').next())
+                .map(|flags| {
+                    flags
+                        .split(',')
+                        .any(|f| f.trim().eq_ignore_ascii_case("POINTOPOINT"))
+                })
+                .unwrap_or(false);
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("inet ") else {
+            continue;
+        };
+        let mut parts = rest.split('/');
+        let ip = parts.next().unwrap_or("").trim().to_string();
+        let prefix = parts
+            .next()
+            .and_then(|p| p.split_whitespace().next())
+            .and_then(|p| p.parse::<u8>().ok())
+            .unwrap_or(32);
+        out.push(LanAddr {
+            name: name.clone(),
+            ip,
+            prefix,
+            point_to_point,
+        });
+    }
+    out
+}
+
+/// Wi-Fi and tethering interfaces win over everything else.
+fn lan_iface_priority(name: &str) -> i32 {
+    let n = name.to_ascii_lowercase();
+    if n.starts_with("ap") || n.starts_with("softap") || n.starts_with("swlan") || n.starts_with("tether_wlan") {
+        100
+    } else if n.starts_with("wlan") {
+        90
+    } else if n.starts_with("eth") || n.starts_with("rndis") || n.starts_with("usb") {
+        80
+    } else {
+        50
+    }
+}
+
+/// A candidate has to pass three independent tests.
+///
+/// 1. Structural: broadcast-capable and on a real subnet. `/31` and `/32` have no
+///    LAN to be on, and a `POINTOPOINT` link has no peers to reach — this is what
+///    drops `vgate0` without naming it.
+/// 2. RFC1918: a public carrier address is never advertised.
+/// 3. The name guard above, for the ones that slip past 1 and 2.
+fn is_usable_lan_addr(a: &LanAddr) -> bool {
+    !a.point_to_point
+        && a.prefix < 31
+        && is_private_ipv4(&a.ip)
+        && !is_never_lan_iface(&a.name)
+}
+
+/// Choose the address to advertise. Pure, so the OnePlus snapshot in the tests can
+/// be replayed without a device.
+///
+/// The default-route address (the UDP-connect trick, no packet sent) only wins when
+/// its OWN interface is a usable LAN. Trusting it on the RFC1918 test alone is how
+/// `http://172.30.242.191:8088` reached the dashboard: a carrier or an OEM gateway
+/// can report a private egress that no device on the wifi can reach.
+pub(crate) fn pick_lan_ip(egress: Option<&str>, ip_addr_output: &str) -> String {
+    let addrs = parse_lan_addrs(ip_addr_output);
+    if addrs.is_empty() {
+        // No interface table at all — Windows and macOS have no `ip`, and a denied
+        // child process produces empty stdout. The default-route address is the only
+        // signal left, and RFC1918 is the only test available.
+        return match egress {
+            Some(ip) => ip.to_string(),
+            None => "127.0.0.1".to_string(),
+        };
+    }
+    let usable: Vec<&LanAddr> = addrs.iter().filter(|a| is_usable_lan_addr(a)).collect();
+    if let Some(ip) = egress {
+        if usable.iter().any(|a| a.ip == ip) {
+            return ip.to_string();
+        }
+    }
+    usable
+        .iter()
+        .max_by_key(|a| lan_iface_priority(&a.name))
+        .map(|a| a.ip.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 /// The address a device on the SAME NETWORK can reach, never the carrier's.
 ///
-/// The UDP-connect trick reports the EGRESS address, which on mobile data is the
-/// ISP's public IP — advertising `http://<public-ip>:8088` is wrong twice over: no
-/// LAN device can reach it, and it leaks the carrier address into the dashboard and
-/// the addon manifest. So the egress address is only accepted when it is private;
-/// otherwise the interfaces are scanned (preferring wifi/ethernet) and, failing
-/// that, loopback is returned so the caller falls back to the request's own host.
+/// `127.0.0.1` means "nothing here is a LAN", and the caller falls back to the
+/// request's own host — hiding the address is correct on mobile data.
 pub(crate) fn lan_ip() -> String {
     let egress = (|| -> Option<String> {
         let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -4085,49 +4221,14 @@ pub(crate) fn lan_ip() -> String {
             None
         }
     })();
-    if let Some(ip) = egress {
-        return ip;
-    }
-    // `ip -4 addr` is present on Android (toybox), Linux and macOS; parse `inet`.
+    // `ip -4 addr` is present on Android (toybox) and Linux; parse `inet`.
     // `proc::cmd` so a stray `ip.exe` on Windows cannot flash a console.
-    if let Ok(out) = crate::proc::cmd("ip").args(["-4", "addr"]).output() {
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
-        let mut best: Option<(i32, String)> = None;
-        let mut iface = String::new();
-        for line in text.lines() {
-            let t = line.trim();
-            if t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && t.contains(':') {
-                // "2: wlan0: <BROADCAST…>"
-                iface = t.split(':').nth(1).unwrap_or("").trim().to_string();
-                continue;
-            }
-            if let Some(rest) = t.strip_prefix("inet ") {
-                let ip = rest.split('/').next().unwrap_or("").trim().to_string();
-                if !is_private_ipv4(&ip) {
-                    continue;
-                }
-                let name = iface.to_ascii_lowercase();
-                let prio = if name.starts_with("ap") || name.starts_with("swlan") {
-                    100
-                } else if name.starts_with("wlan") {
-                    90
-                } else if name.starts_with("eth") || name.starts_with("rndis") {
-                    80
-                } else if name.starts_with("rmnet") || name.starts_with("tun") || name.starts_with("ppp") {
-                    0
-                } else {
-                    50
-                };
-                if prio > 0 && best.as_ref().map(|(p, _)| prio > *p).unwrap_or(true) {
-                    best = Some((prio, ip));
-                }
-            }
-        }
-        if let Some((_, ip)) = best {
-            return ip;
-        }
-    }
-    "127.0.0.1".to_string()
+    let ifaces = crate::proc::cmd("ip")
+        .args(["-4", "addr"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        .unwrap_or_default();
+    pick_lan_ip(egress.as_deref(), &ifaces)
 }
 
 /// PHP `fd_load_catalog_settings()` defaults. The `stream_config` keys are the
@@ -7431,6 +7532,72 @@ mod tests {
         for good in ["10.0.0.5", "172.16.4.9", "172.31.255.254", "192.168.2.118"] {
             assert!(super::is_private_ipv4(good), "{good} must be accepted");
         }
+    }
+
+    /// Real `ip -4 addr` from a OnePlus 12 (CPH2581) on mobile data only: no
+    /// `wlan0` at all, a public carrier address on `rmnet_data3`, and OxygenOS's
+    /// virtual gateway holding a private `/32`. The dashboard advertised the
+    /// vgate address as "Wi-Fi / LAN" and the APK as "LAN: http://172.30.242.191:8088".
+    const ONEPLUS_MOBILE_DATA: &str = "\
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 127.0.0.1/8 scope host lo
+27: rmnet_data3@rmnet_ipa0: <UP,LOWER_UP> mtu 1500 qdisc mq state UNKNOWN
+    inet 22.39.85.142/30 scope global rmnet_data3
+32: vgate0: <POINTOPOINT,MULTICAST,NOARP,ALLMULTI,PROMISC,DEBUG,DYNAMIC,AUTOMEDIA,PORTSEL,UP,LOWER_UP> mtu 65500
+    inet 172.30.242.191/32 scope global vgate0
+";
+
+    #[test]
+    fn a_vendor_point_to_point_interface_is_never_the_lan_address() {
+        // Nothing here is a LAN, so the caller must fall back to the page's host.
+        assert_eq!(super::pick_lan_ip(None, ONEPLUS_MOBILE_DATA), "127.0.0.1");
+        // Not even when the kernel reports the vgate address as the egress: the
+        // egress only wins when its own interface is a usable LAN.
+        assert_eq!(
+            super::pick_lan_ip(Some("172.30.242.191"), ONEPLUS_MOBILE_DATA),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn wifi_wins_over_a_private_carrier_address() {
+        // A carrier that NATs on 10/8 passes the RFC1918 test, so the interface —
+        // not the address — has to decide.
+        const WIFI_AND_CELLULAR: &str = "\
+27: rmnet_data0: <UP,LOWER_UP> mtu 1500
+    inet 10.71.4.22/29 scope global rmnet_data0
+32: vgate0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 65500
+    inet 172.30.242.191/32 scope global vgate0
+9: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.1.7/24 brd 192.168.1.255 scope global wlan0
+";
+        assert_eq!(
+            super::pick_lan_ip(Some("192.168.1.7"), WIFI_AND_CELLULAR),
+            "192.168.1.7"
+        );
+        assert_eq!(
+            super::pick_lan_ip(Some("10.71.4.22"), WIFI_AND_CELLULAR),
+            "192.168.1.7"
+        );
+        // No egress hint at all: the Wi-Fi address is still found.
+        assert_eq!(super::pick_lan_ip(None, WIFI_AND_CELLULAR), "192.168.1.7");
+    }
+
+    #[test]
+    fn a_hotspot_ap_interface_still_counts() {
+        const HOTSPOT: &str = "\
+14: ap0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.43.1/24 brd 192.168.43.255 scope global ap0
+";
+        assert_eq!(super::pick_lan_ip(None, HOTSPOT), "192.168.43.1");
+    }
+
+    #[test]
+    fn no_interface_table_falls_back_to_the_default_route() {
+        // Windows and macOS have no `ip`; RFC1918 egress is all there is, which is
+        // what the desktop builds have always advertised.
+        assert_eq!(super::pick_lan_ip(Some("192.168.2.118"), ""), "192.168.2.118");
+        assert_eq!(super::pick_lan_ip(None, ""), "127.0.0.1");
     }
 
     #[test]

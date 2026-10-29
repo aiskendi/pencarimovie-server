@@ -3,7 +3,7 @@
 # (Windows/Linux/macOS/Android), the same name as the Android app and the
 # published downloads. Do not reintroduce an engine suffix ("rust"/"port").
 name = "pencarimovie-server"
-version = "3.0.4"
+version = "3.0.5"
 edition = "2024"
 
 # Faithful port of backend.php onto grammers (Telegram) + axum.

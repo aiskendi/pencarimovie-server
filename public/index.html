@@ -567,21 +567,20 @@
             Add to Stremio
           </a>
         </div>
-              <div class="pm-card pm-card--inset">
-                <h3 class="pm-h3">Install without copying</h3>
+              <div class="pm-card pm-card--inset" id="addonSyncCard">
+                <h3 class="pm-h3">Install in Stremio from this page</h3>
                 <p class="pm-hint">
-                  Sends the address above to your Stremio account from this browser.
-                  Credentials go only to api.strem.io and are never stored on this server.
+                  Local and LAN only. Stremio Web will not accept a plain http addon
+                  address, so this page sends the http manifest to your Stremio account
+                  through Stremio's own API.
                 </p>
                 <div class="addon-stremio-sync" id="addonStremioSync">
           <div class="addon-stremio-sync__title">
             Install in Stremio (HTTP API Sync)
           </div>
           <p class="addon-stremio-sync__desc">
-            Stremio Web blocks HTTP addon URLs. This sends the selected HTTP
-            manifest to your Stremio account from the browser. Credentials go
-            only to
-            <code>api.strem.io</code> — nothing is stored on this server.
+            Your credentials go only to <code>api.strem.io</code>. Nothing is
+            stored on this server.
           </p>
 
           <div
@@ -1813,7 +1812,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261030notoken"></script>
+    <script defer src="app.js?v=20261030localonly"></script>
     <script defer src="dashboard.js?v=20261028dash25"></script>
   </body>
 </html>

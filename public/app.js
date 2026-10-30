@@ -554,6 +554,7 @@ class PencariMovieApp {
     const addonStremioDirectBtn = this.$("#addonStremioDirectBtn");
     const addonStremioLocalDirectBtn = this.$("#addonStremioLocalDirectBtn");
     const addonStremioSync = this.$("#addonStremioSync");
+    const addonSyncCard = this.$("#addonSyncCard");
     const addonNuvioInstructions = this.$("#addonNuvioInstructions");
     const copiedStatus = this.$("#addonCopiedStatus");
     const stremioSyncUrlPreview = this.$("#stremioSyncUrlPreview");
@@ -1414,7 +1415,9 @@ class PencariMovieApp {
       }
       if (addonModalTitle) addonModalTitle.textContent = "\u{1F9E9} Nuvio / Stremio Addon";
       if (addonModalDesc) {
-        addonModalDesc.textContent = "Copy a manifest URL for Nuvio, or let this page install the addon into Stremio.";
+        addonModalDesc.textContent = isHttps
+          ? "Copy a manifest URL for Nuvio, or add it to Stremio in one tap."
+          : "Copy a manifest URL for Nuvio, or install the address into Stremio from this page.";
       }
       if (addonLanField) {
         const showLan = isLocal && !onTunnel && Boolean(lanUrl);
@@ -1427,18 +1430,24 @@ class PencariMovieApp {
       if (addonTunnelField) {
         addonTunnelField.classList.toggle("hidden", !tunnelManifest);
       }
-      // The API install works over https as well: the manifest is fetched
-      // same-origin (see installStremioAddonViaApi) and api.strem.io answers the
-      // cross-origin POST. Hiding this card on an https page is what made
-      // "install without copying" vanish the moment the dashboard was opened
-      // from a tunnel or a served domain, leaving only the manifest text.
+      // The HTTP API install card exists for ONE case: the manifest is a plain
+      // http address (localhost, or a LAN IP) and Stremio Web refuses to add it.
+      // On an https origin (a tunnel, or a served domain) the manifest is already
+      // something Stremio can add directly, so asking for a Stremio password there
+      // buys nothing: the whole card is hidden instead.
+      const localInstallOnly = isHttps;
+      if (addonSyncCard) {
+        addonSyncCard.classList.toggle("hidden", localInstallOnly);
+      }
       if (addonStremioSync) {
         addonStremioSync.classList.remove("hidden");
       }
       if (addonNuvioInstructions) {
         addonNuvioInstructions.classList.remove("hidden");
       }
-      updateStremioSyncPreview();
+      if (!localInstallOnly) {
+        updateStremioSyncPreview();
+      }
       // Search on pencarimovie.com (Settings overlay). Mirrors backend.php's
       // no-streams fallback URL:
       //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'))

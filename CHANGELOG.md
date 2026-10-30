@@ -48,14 +48,16 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Fixed
 
-- **"Install into Stremio" no longer disappears when the dashboard is opened over https.**
-  `updateAddonModalUrls()` hid `#addonStremioSync` whenever `location.protocol === "https:"`
-  or the page was on a tunnel, so a dashboard opened from a tunnel or a served domain showed
-  only the manifest text and left the reader to copy it. The API install works on https (the
-  manifest is fetched same-origin and `api.strem.io` answers the cross-origin POST), so the
-  card is shown there too and its preview is refreshed. Verified on a live
-  `*.trycloudflare.com` origin: element present, `hidden: false`, preview naming the tunnel
-  manifest.
+- **The one-click Stremio install now says where it works, and hides where it cannot.**
+  The card asks for a Stremio password only because Stremio Web refuses a plain http addon
+  address, so it does anything useful only while the dashboard is opened on localhost or a
+  LAN IP. It was headed "Install without copying", which read as a general offer, and the
+  card body repeated the whole explanation a second time. The heading is now "Install in
+  Stremio from this page", the note under it opens with "Local and LAN only", the card body
+  carries only the credential claim, and the whole card is hidden on an https origin (a
+  tunnel, or a served domain), where the manifest is already something Stremio can add
+  directly. Verified on both: `localhost:8088` shows the card, a live
+  `*.trycloudflare.com` origin hides it.
 
 - **A seek starts about 230 ms sooner.** The preflight prime is fetched from the enclosing
   1 MB boundary and, past byte 0, rounds up to a full 1 MB head. `fetch_range_core()` holds

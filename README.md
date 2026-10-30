@@ -124,12 +124,6 @@ Deploy your personal PencariMovie Server to the cloud with a single click:
 > **Permanent Addon URL on Cloud / PaaS**:
 > Always set a static **`SERVER_TOKEN`** (such as `66ff097863dedb7ccd8401d5ffe616f2`) in your cloud provider's environment variables. This keeps your Stremio or Nuvio manifest URL (`https://<your-app>.up.railway.app/<token>/manifest.json`) permanent so you do not need to re-install addons when your container restarts or redeploys.
 
-> **Heroku repository lookup rate limit**:
-> If Heroku shows "Unable to connect to aiskendi/pencarimovie-server: this repository is either private or does not exist", the repository is public, but Heroku's unauthenticated lookup hit GitHub's 60 requests/hour IP limit. Choose either fix:
->
-> 1. **Authorize GitHub in Heroku**: Click _authenticate to continue_ on the error page (or go to Account Settings > Applications > Connect to GitHub) so Heroku uses authenticated API requests (5,000/hour), then reopen the deploy button.
-> 2. **Push the container build directly**:
->
 > ```bash
 > heroku create <app-name> --stack container
 > heroku git:remote -a <app-name>

@@ -301,8 +301,10 @@
             <details class="pm-details">
               <summary class="pm-details__summary">Access token</summary>
               <p class="pm-hint">
-                This token is part of every address below. Regenerate it only if it has
-                leaked; every client will then need the new address.
+                Only the public (server and tunnel) addresses below carry this token — a
+                localhost or Wi-Fi address never needs it, so it is left out there.
+                Regenerate it only if it has leaked; every public client will then need
+                the new address.
               </p>
               <div class="addon-catalog-card" id="addonTokenCard">
           <div class="addon-catalog-card__header">
@@ -1811,7 +1813,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261028dash27"></script>
+    <script defer src="app.js?v=20261030notoken"></script>
     <script defer src="dashboard.js?v=20261028dash25"></script>
   </body>
 </html>

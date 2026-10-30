@@ -1238,10 +1238,21 @@ class PencariMovieApp {
       // be handed to the music addon: that IP changes with DHCP. Only a real
       // hostname (a domain, or the tunnel) is a stable address.
       const pageHostIsLan = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(pageHost) || /\.local$/i.test(pageHost) || pageHost === "0.0.0.0";
-      const localUrl = "http://127.0.0.1".concat(portSuffix).concat(tokenPrefix, "/manifest.json");
-      let serverUrl = !isLocal && !onTunnel ? "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenPrefix, "/manifest.json") : "";
+      // Loopback and private-LAN hosts pass the server's own trust check
+      // (`auth::is_local_request`), so a token in those URLs buys nothing — and it
+      // turns a URL the user is meant to paste into a client into a URL they cannot
+      // screenshot or dictate. Only a public origin or the tunnel carries it.
+      const tokenForHost = host => {
+        const h = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+        if (!h || h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") {
+          return "";
+        }
+        return isUsableLanHost(h) ? "" : tokenPrefix;
+      };
+      const localUrl = "http://127.0.0.1".concat(portSuffix, "/manifest.json");
+      let serverUrl = !isLocal && !onTunnel ? "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenForHost(pageHost), "/manifest.json") : "";
       const lanHost = isUsableLanHost(this.lanIp) ? this.lanIp : isUsableLanHost(pageHost) ? pageHost : "";
-      const lanUrl = lanHost ? "http://".concat(lanHost).concat(portSuffix).concat(tokenPrefix, "/manifest.json") : "";
+      const lanUrl = lanHost ? "http://".concat(lanHost).concat(portSuffix, "/manifest.json") : "";
       let tunnelUrl = "";
       if (this.tunnelEnabled || onTunnel) {
         if (this.tunnelPublicUrl) {
@@ -1274,7 +1285,7 @@ class PencariMovieApp {
       } else if (tunnelUrl) {
         musicBase = "".concat(tunnelUrl).concat(tokenPrefix);
       } else {
-        musicBase = "http://127.0.0.1".concat(portSuffix).concat(tokenPrefix);
+        musicBase = "http://127.0.0.1".concat(portSuffix);
       }
       const eclipseUrl = "".concat(musicBase, "/music/manifest.json");
       return {
@@ -1403,7 +1414,7 @@ class PencariMovieApp {
       }
       if (addonModalTitle) addonModalTitle.textContent = "\u{1F9E9} Nuvio / Stremio Addon";
       if (addonModalDesc) {
-        addonModalDesc.textContent = isHttps ? "Copy a manifest URL for Nuvio, or click Add to Stremio." : "Copy a manifest URL for Nuvio, or install an address into Stremio via API sync.";
+        addonModalDesc.textContent = "Copy a manifest URL for Nuvio, or let this page install the addon into Stremio.";
       }
       if (addonLanField) {
         const showLan = isLocal && !onTunnel && Boolean(lanUrl);
@@ -1416,15 +1427,18 @@ class PencariMovieApp {
       if (addonTunnelField) {
         addonTunnelField.classList.toggle("hidden", !tunnelManifest);
       }
+      // The API install works over https as well: the manifest is fetched
+      // same-origin (see installStremioAddonViaApi) and api.strem.io answers the
+      // cross-origin POST. Hiding this card on an https page is what made
+      // "install without copying" vanish the moment the dashboard was opened
+      // from a tunnel or a served domain, leaving only the manifest text.
       if (addonStremioSync) {
-        addonStremioSync.classList.toggle("hidden", isHttps);
+        addonStremioSync.classList.remove("hidden");
       }
       if (addonNuvioInstructions) {
         addonNuvioInstructions.classList.remove("hidden");
       }
-      if (!isHttps) {
-        updateStremioSyncPreview();
-      }
+      updateStremioSyncPreview();
       // Search on pencarimovie.com (Settings overlay). Mirrors backend.php's
       // no-streams fallback URL:
       //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'))

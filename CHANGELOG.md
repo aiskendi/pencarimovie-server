@@ -20,6 +20,15 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Changed
 
+- **telegra.my is redesigned, and its Worker is now tracked.** The install page was five
+  glass cards with the platform name for a heading; it is now a mono synopsis: the local
+  dashboard address `http://127.0.0.1:8088` set as the hero figure, the five platform names
+  as an index, and one row per OS carrying its own command, its own fact and its Copy.
+  One signal colour, square surfaces, hairlines; the phone layout wraps the commands at 12px
+  instead of clipping them and drops the Copy button, because a phone copies by long-press.
+  [`cloudflare-worker-telegra-my.js`](cloudflare-worker-telegra-my.js:1) and
+  [`wrangler-telegra-my.toml`](wrangler-telegra-my.toml:1) are tracked from now on (the
+  landing page and its installers are the site); the relay worker stays ignored.
 - **The dashboard's Addon section is `#addon`** (was `#connect`), and the header nav item
   says "Addon". `#connect` and the PHP-era `#settings` still resolve through the legacy
   map, so links already out there keep working.
@@ -38,6 +47,15 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
   `title` field (stremio-core drops such rows).
 
 ### Fixed
+
+- **"Install into Stremio" no longer disappears when the dashboard is opened over https.**
+  `updateAddonModalUrls()` hid `#addonStremioSync` whenever `location.protocol === "https:"`
+  or the page was on a tunnel, so a dashboard opened from a tunnel or a served domain showed
+  only the manifest text and left the reader to copy it. The API install works on https (the
+  manifest is fetched same-origin and `api.strem.io` answers the cross-origin POST), so the
+  card is shown there too and its preview is refreshed. Verified on a live
+  `*.trycloudflare.com` origin: element present, `hidden: false`, preview naming the tunnel
+  manifest.
 
 - **A seek starts about 230 ms sooner.** The preflight prime is fetched from the enclosing
   1 MB boundary and, past byte 0, rounds up to a full 1 MB head. `fetch_range_core()` holds

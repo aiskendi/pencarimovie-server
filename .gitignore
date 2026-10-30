@@ -166,6 +166,12 @@ wrangler*.toml
 .wrangler/
 static-build.Dockerfile
 
+# ...except the telegra.my landing page, which IS product code: the page, the
+# installers it serves and the route table are the site. The relay worker and its
+# wrangler file stay ignored (they carry a KV namespace id and no page).
+!cloudflare-worker-telegra-my.js
+!wrangler-telegra-my.toml
+
 # Build extracts, bootstrap sources, and temporary sub-repos
 libtalloc_extract/
 php_extract/

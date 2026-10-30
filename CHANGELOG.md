@@ -6,6 +6,28 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ### Added
 
+- **`/api/download` now has per-client limits, and they count TITLES, not sockets.** Before
+  this there was no per-client limit at all: the token gate passes for every request when no
+  password is set or the caller is on the LAN, the concurrency gate (`--max-streams`) is
+  process-wide and defaults to uncapped, and the password lockout ladder is never consulted by
+  the download path. One address could therefore open hundreds of concurrent bodies and walk
+  the whole catalogue, each new title costing an origin `/resolve-file` relay and a Telegram
+  login. Three counters now live in [`src/ratelimit.rs`](src/ratelimit.rs:1):
+  `--max-titles-per-ip` (8, distinct short codes in flight), `--max-bodies-per-ip` (32, a
+  socket-flood backstop above every real download manager) and `--cold-starts-per-ip` (20 per
+  `--cold-start-window` 300 s, charged only where a resolve is actually issued). Each can be
+  set to `0` to turn that counter off; loopback, the LAN, link-local and CGNAT are exempt.
+  **The key is `(client, short_code)`, deliberately not `(client)`:** a seek, an `aria2 -x16` /
+  IDM / `yt-dlp` segmented download and a player preloading the next episode all produce
+  several bodies for ONE file, so counting sockets would have broken every real download.
+  Measured on real streams: 6 parallel bodies on one title answer
+  `206,206,206,206,206,206` with the title cap at `2`, while the 3rd concurrent _distinct_
+  title answers `429 IP_STREAM_LIMIT` with a `Retry-After` — never `403`/`503`/`404`. A
+  tunnelled request is never exempt: the key is `cf-connecting-ip`, else the **rightmost**
+  `x-forwarded-for` hop when a proxy is known to be in front (`PM_TRUST_XFF=1` or a PaaS host),
+  else the unforgeable peer address, with IPv6 collapsed to its `/64` so rotating `/128`s buys
+  nothing. Pinned by 21 tests in `ratelimit::tests`, `tools/probe_ip_limits.mjs` and
+  `tools/probe_stream_limits.mjs`.
 - **The dashboard header shows an update when the release feed has one.** A pill sits next
   to the version, and only when `/api/update/check` reports `update_available`: it opens a
   small card naming the path that works on that host — "Update now" (`POST

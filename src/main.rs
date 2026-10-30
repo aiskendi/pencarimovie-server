@@ -36,6 +36,7 @@ mod httpc;
 mod log;
 mod matcher;
 mod proc;
+mod ratelimit;
 mod resolve;
 mod respond;
 mod routes;
@@ -77,6 +78,17 @@ pub struct AppState {
     /// Global cap on concurrent `/api/download` responses (`--max-streams`).
     pub download_gate: Arc<tokio::sync::Semaphore>,
     pub max_streams: usize,
+    /// Per-client abuse limits (`ratelimit`). In-memory, so per process — the same
+    /// caveat the resolve and catalog caches carry.
+    pub limits: Arc<ratelimit::Limiter>,
+    /// Distinct short codes one client may have in flight (`0` = off).
+    pub max_titles_per_ip: usize,
+    /// Concurrent bodies one client may hold, a socket-flood backstop (`0` = off).
+    pub max_bodies_per_ip: usize,
+    /// Cold starts one client may spend per `cold_start_window` (`0` = off).
+    pub cold_starts_per_ip: usize,
+    /// The cold-start window, in seconds.
+    pub cold_start_window: u64,
     pub telegram: telegram::TelegramPool,
 }
 
@@ -89,6 +101,16 @@ fn arg_value(flag: &str) -> Option<String> {
 fn arg_pos(flag: &str) -> Option<usize> {
     let args: Vec<String> = std::env::args().collect();
     args.iter().position(|a| a == flag)
+}
+
+/// `0` means the counter is off, and the banner says so instead of printing a
+/// misleading `0`.
+fn cap_or_off(n: usize) -> String {
+    if n == 0 {
+        "unlimited".to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 /// One `AppState` per process; the router has a single fallback, so the state is
@@ -242,12 +264,51 @@ async fn main() -> anyhow::Result<()> {
         max_streams
     };
 
+    // Per-client abuse limits on `/api/download` (`ratelimit.rs`).
+    //
+    // `--max-titles-per-ip` counts DISTINCT short codes in flight, NOT sockets. A
+    // seek, a 16-connection download manager and a preload of the next episode all
+    // operate on the same code and therefore all cost one; 40 different titles in
+    // parallel cost 40, which is the scraper signature. Without that distinction a
+    // capability limit would break segmented downloads — see the tests in
+    // `ratelimit::tests`.
+    //
+    // `--max-bodies-per-ip` is the socket-flood backstop and sits above every real
+    // download manager (aria2 defaults to 16, IDM to 8).
+    //
+    // `--cold-starts-per-ip` is charged only where a resolve is actually issued, so
+    // a `Range` request, a seek and a warm short code are free.
+    //
+    // `0` disables a counter entirely — one integer compare, no map touched. A
+    // self-hosted box that wants today's behaviour exactly sets all of them to 0.
+    let max_titles_per_ip: usize = arg_value("--max-titles-per-ip")
+        .or_else(|| storage::env("PM_MAX_TITLES_PER_IP"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let max_bodies_per_ip: usize = arg_value("--max-bodies-per-ip")
+        .or_else(|| storage::env("PM_MAX_BODIES_PER_IP"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let cold_starts_per_ip: usize = arg_value("--cold-starts-per-ip")
+        .or_else(|| storage::env("PM_COLD_STARTS_PER_IP"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let cold_start_window: u64 = arg_value("--cold-start-window")
+        .or_else(|| storage::env("PM_COLD_START_WINDOW"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+
     let state = Arc::new(AppState {
         port,
         workers,
         inflight,
         download_gate: Arc::new(tokio::sync::Semaphore::new(gate_permits)),
         max_streams,
+        limits: ratelimit::Limiter::new(),
+        max_titles_per_ip,
+        max_bodies_per_ip,
+        cold_starts_per_ip,
+        cold_start_window,
         telegram: telegram::TelegramPool::new(workers, inflight),
     });
     storage::prune_cache_files(false);
@@ -370,6 +431,12 @@ async fn main() -> anyhow::Result<()> {
             "workers": workers,
             "inflight": inflight,
             "max_streams": max_streams,
+            // The per-client caps, reported so an operator (and a bug report)
+            // shows what is actually enforced instead of what the docs claim.
+            "max_titles_per_ip": state.max_titles_per_ip,
+            "max_bodies_per_ip": state.max_bodies_per_ip,
+            "cold_starts_per_ip": state.cold_starts_per_ip,
+            "cold_start_window": state.cold_start_window,
             "storage": storage::storage_dir().display().to_string(),
             "version": config::app_version(),
             "runtime": format!("pencarimovie-server {}", config::app_version()),
@@ -401,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
     // already gone to stderr above in the "listening" line.
     if !tray_requested {
         println!(
-            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n",
+            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
             shown,
             port,
             host,
@@ -410,7 +477,14 @@ async fn main() -> anyhow::Result<()> {
             workers,
             inflight,
             workers * inflight,
-            max_streams
+            max_streams,
+            // Counted per TITLE, not per socket: a seek, a segmented download and a
+            // preload of the same file all cost one. `0` = that counter is off.
+            cap_or_off(max_titles_per_ip),
+            cap_or_off(max_bodies_per_ip),
+            cap_or_off(cold_starts_per_ip),
+            cold_start_window,
+            // Local dashboard, LAN devices and a tunnel's own loopback dial are exempt.
         );
         if host == "0.0.0.0" || host == "::" {
             println!("  LAN/TV:      http://<this-device-ip>:{}\n", port);

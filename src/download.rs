@@ -654,6 +654,42 @@ fn record_refusal(
     );
 }
 
+/// Answer a per-client abuse refusal (`ratelimit`).
+///
+/// Always `429` + `Retry-After`: a player reads `5xx` and `404` as fatal and never
+/// retries, while `403` reads as "your account is gone" — AGENTS.md is explicit that
+/// a rate limit must answer 429. `Retry-After` is what makes a well-behaved client
+/// back off instead of hammering, which would keep its own budget spent.
+fn refuse_limit(
+    ctx: &ReqCtx,
+    started: std::time::Instant,
+    refusal: crate::ratelimit::Refusal,
+    short_code: &str,
+) -> Response {
+    let retry = refusal.retry_after.max(1);
+    record_refusal(
+        ctx,
+        started,
+        429,
+        refusal.error,
+        refusal.message,
+        short_code,
+        serde_json::json!({"retry_after": retry}),
+    );
+    let body = serde_json::json!({
+        "ok": 0,
+        "error": refusal.error,
+        "message": refusal.message,
+        "retry_after": retry,
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::RETRY_AFTER, retry.to_string())
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+        .unwrap_or_else(|_| json_response(429, &body))
+}
+
 pub fn plan_download_candidates(
     bot_id: &str,
     short_code: &str,
@@ -869,6 +905,59 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     let m = jstr(&entry, "mime");
                     file_mime = if m.is_empty() { jstr(&entry, "file_type") } else { m };
                 }
+            }
+        }
+    }
+
+    /* ── per-client abuse limits ────────────────────────────────────────── */
+    // Checked HERE, not at request entry: by now the short code (or the minted
+    // file_id) is known, so a seek, a segmented download and a preload of the SAME
+    // file fold onto one slot instead of spending the client's whole budget. That
+    // is what keeps a 16-connection download manager and a scrub bar from ever
+    // looking like a scraper — see `ratelimit.rs`.
+    //
+    // The guard MUST travel with the response body (it is moved into the streaming
+    // task far below). Released when this function returns, it would cap *requests*
+    // rather than live streams: the player's next Range request would be refused
+    // while the first is still being served.
+    let mut limit_guard: Option<crate::ratelimit::Guard> = None;
+    if let Some(limit_key) = crate::ratelimit::client_key(ctx) {
+        let limit_code = if short_code.is_empty() {
+            file_id.clone()
+        } else {
+            short_code.clone()
+        };
+        match state.limits.acquire(
+            &limit_key,
+            &limit_code,
+            state.max_titles_per_ip,
+            state.max_bodies_per_ip,
+        ) {
+            Ok(g) => limit_guard = Some(g),
+            Err(r) => return refuse_limit(ctx, started, r, &short_code),
+        }
+        // A COLD start is the only thing that costs the origin a resolve, so it is
+        // the only thing charged. A seek, a bare `Range` request and a replay of a
+        // warm short code arrive here with `file_id` already set and pay nothing.
+        // A request with neither a code nor a payload is a 400 on the next branch,
+        // not a resolve, so it is not charged either.
+        let has_work = !short_code.is_empty() || !encoded.is_empty();
+        if file_id.is_empty() && has_work {
+            if let Err(wait) = state.limits.check_cold(
+                &limit_key,
+                state.cold_starts_per_ip,
+                state.cold_start_window,
+            ) {
+                return refuse_limit(
+                    ctx,
+                    started,
+                    crate::ratelimit::Refusal {
+                        error: "IP_COLD_START_LIMIT",
+                        message: "Too many new streams from this address. Please retry shortly.",
+                        retry_after: wait,
+                    },
+                    &short_code,
+                );
             }
         }
     }
@@ -1683,6 +1772,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // Held for the whole body, so `--max-streams` covers the live stream and
         // is released when this task ends (completed, aborted, or client gone).
         let _stream_permit = stream_permit;
+        // Same lifetime rule for the per-client slot: the counter must cover the
+        // LIVE BODY, so it is released when this task ends, not when the handler
+        // returned. That end is prompt but NOT instant — `tx.is_closed()` is checked
+        // before the next window fetch, so a cancelled body (a seek, a closed tab)
+        // can hold its slot for up to one window. The default title cap is 8 rather
+        // than 1 or 2 for exactly that reason: overlap must never be able to look
+        // like abuse.
+        let _limit_guard = limit_guard;
         // Reported to the app as "streaming" activity for the whole body.
         let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
         // PIPELINE the chunks: fetch up to `pipeline_depth()` 1 MB windows

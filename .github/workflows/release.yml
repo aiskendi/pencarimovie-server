@@ -276,7 +276,12 @@ jobs:
           # bare sha for every artifact).
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # PINNED, not `@stable`. Cargo.toml documents 1.99.1 as the compiler every
+      # measurement in the README and the local release scripts were made against,
+      # and a moving `stable` is one more uncontrolled variable in an artifact whose
+      # only job is to behave identically on the user's machine. The 3.0.x AVX2
+      # hunt had exactly this shape: a build nobody could reproduce.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       # Skipped on the macOS Intel leg, which produces its binary via the cross
       # target below — building the host arch there too would compile the crate
@@ -421,6 +426,7 @@ jobs:
           QEMU="$QDIR/qemu-x86_64-static"
           chmod +x "$QEMU"
           "$QEMU" --version
+          echo "rustc: $(rustc -vV | head -1)"
 
           # The guest CPU states the property, not an era: a modern model with
           # AVX/AVX2/FMA removed. `-cpu Nehalem` was the first attempt and it broke

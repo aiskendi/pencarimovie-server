@@ -745,34 +745,41 @@ fn lock_owner_pid(path: &Path) -> Option<i64> {
 
 /// `fd_is_guest_provision_in_progress()`: a dead holder or a >300s lock is reclaimed.
 pub fn is_guest_provision_in_progress() -> bool {
-    let file = provision_lock_path();
-    if fs::metadata(&file).is_err() {
+    is_guest_provision_in_progress_at(&provision_lock_path())
+}
+
+/// The same check against an explicit lock file.
+///
+/// The path is a parameter because the real file lives under `storage/`, which the
+/// rest of the test suite also touches — including any spawned provision, whose
+/// `ProvisionLock::drop` DELETES it. A test asserting on the shared path is
+/// therefore asserting on whatever the suite did a moment later.
+fn is_guest_provision_in_progress_at(file: &Path) -> bool {
+    if fs::metadata(file).is_err() {
         return false;
     }
-    let age = crate::storage::mtime_secs(&file)
-        .map(|m| now() - m)
-        .unwrap_or(0);
+    let age = crate::storage::mtime_secs(file).map(|m| now() - m).unwrap_or(0);
     // Measured on a CPH2581: the engine was restarted at 06:54:03 with a provision
     // in flight, so its lock file survived with nobody to drop it. Every play then
     // answered `NO_SESSION` for seven minutes, each attempt first waiting 30 s on
     // this lock, until the 300 s age fallback finally fired at 07:01:27. A dead
     // owner is reclaimed on the FIRST check instead.
-    if let Some(owner) = lock_owner_pid(&file) {
+    if let Some(owner) = lock_owner_pid(file) {
         if !pid_still_running(owner) {
             log(
                 "reclaimed guest_provision.lock from a dead process",
                 &serde_json::json!({"pid": owner, "age": age}),
             );
-            let _ = fs::remove_file(&file);
+            let _ = fs::remove_file(file);
             return false;
         }
     }
     if age > 300 {
         log("reclaimed stale guest_provision.lock", &serde_json::json!({"age": age}));
-        let _ = fs::remove_file(&file);
+        let _ = fs::remove_file(file);
         return false;
     }
-    if let Ok(hb) = fs::read_to_string(provision_heartbeat_path()) {
+    if let Ok(hb) = fs::read_to_string(file.with_file_name("guest_provision.heartbeat")) {
         if let Ok(v) = hb.trim().parse::<i64>() {
             if now() - v < 30 {
                 return true;
@@ -1070,26 +1077,23 @@ mod tests {
         assert!(flood_remaining() <= 30);
     }
 
-    /// The two `guest_provision.lock` tests below share one file, and `cargo test`
-    /// runs them as parallel threads of the SAME process. Unguarded, the
-    /// dead-holder test deletes the file and writes its impossible pid between the
-    /// live-holder test's write and its assert — the live test then reads
-    /// `2147483646`, correctly reports "nobody is provisioning", and fails on a
-    /// machine where nothing is wrong. That is the 2026-10-31 CI failure
-    /// (`a live holder must be respected`), reproduced locally with just these two
-    /// tests selected.
-    static PROVISION_LOCK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn provision_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        // A panicking sibling poisons the mutex; the lock file is disposable, so
-        // take it back instead of failing every later test in the module.
-        PROVISION_LOCK_TEST.lock().unwrap_or_else(|e| e.into_inner())
+    /// Each lock test drives its OWN file under the temp dir.
+    ///
+    /// `storage/guest_provision.lock` is process-global: the runtime writes it, and
+    /// any `ProvisionLock` a spawned provision holds DELETES it on drop, so a test
+    /// asserting on the shared path races the whole suite. That is the 2026-10-31
+    /// CI failure — `a live holder must be respected`, with the server's own log
+    /// showing it had reclaimed pid 2147483646, a pid the live test never wrote.
+    /// Serialising the two tests was not enough; the file has to be private.
+    fn lock_test_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pm-provision-lock-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir.join("guest_provision.lock")
     }
 
-    /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
-    /// shares, so the parsing has to survive whatever an operator pastes into a
-    /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
-    /// accidental junk.
     /// A lock left by a process that is GONE must be reclaimed on the first look.
     ///
     /// Measured on a CPH2581: the engine was restarted with a provision in flight,
@@ -1098,13 +1102,12 @@ mod tests {
     /// until the 300 s age fallback fired.
     #[test]
     fn a_lock_from_a_dead_process_is_reclaimed_at_once() {
-        let _guard = provision_test_guard();
-        let path = provision_lock_path();
+        let path = lock_test_path("dead");
         let _ = fs::remove_file(&path);
         // A pid no process can have, so `pid_still_running` answers false on every OS.
         fs::write(&path, "2147483646").unwrap();
         assert!(
-            !is_guest_provision_in_progress(),
+            !is_guest_provision_in_progress_at(&path),
             "a dead holder must not count as a provision in progress"
         );
         assert!(!path.exists(), "the dead lock must be removed");
@@ -1113,17 +1116,20 @@ mod tests {
     /// The other half: a LIVE holder is still respected, or two logins would run.
     #[test]
     fn a_lock_from_a_live_process_counts_as_in_progress() {
-        let _guard = provision_test_guard();
-        let path = provision_lock_path();
+        let path = lock_test_path("live");
         let _ = fs::remove_file(&path);
         fs::write(&path, std::process::id().to_string()).unwrap();
         assert!(
-            is_guest_provision_in_progress(),
+            is_guest_provision_in_progress_at(&path),
             "a live holder must be respected"
         );
         let _ = fs::remove_file(&path);
     }
 
+    /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
+    /// shares, so the parsing has to survive whatever an operator pastes into a
+    /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
+    /// accidental junk.
     #[test]
     fn bot_token_list_parses_every_separator_and_dedupes() {
         let mut out = Vec::new();

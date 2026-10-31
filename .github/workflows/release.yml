@@ -211,6 +211,19 @@ jobs:
   native-build:
     needs: prepare
     runs-on: ${{ matrix.os }}
+    # ── WHY EVERY ARTIFACT PINS ITS ISA BASELINE ───────────────────────────────
+    # 3.0.x shipped x86_64 binaries that SIGILL'd (exit 132) a second after the
+    # banner on any CPU without AVX2 — i.e. every Synology x86 NAS (Atom
+    # C2538/C3538, Celeron J4125/J4025, N4000), every pre-2013 desktop. Nothing
+    # in the repository asks for AVX2, and a clean build of the SAME commit
+    # boots fine under `qemu-x86_64 -cpu Nehalem`; the released ones do not. So
+    # the ISA level leaked in from the build environment, not from the source.
+    # Pinning it here makes the artifact independent of whatever the runner (or
+    # a stale cargo config on a build box) decides today, and the
+    # "Portability gate" step below proves it on an emulated pre-AVX CPU before
+    # anything is uploaded. Never set this to `native`.
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -221,18 +234,22 @@ jobs:
             container_arch: amd64
             extra_target: ""
             bin_dir: target/release
+            rustflags: "-C target-cpu=x86-64"
           - os: ubuntu-24.04-arm
             artifact: linux-aarch64
             musl_target: aarch64-unknown-linux-musl
             container_arch: arm64
             extra_target: ""
             bin_dir: target/release
+            # aarch64 has no baseline flag to pin here; `generic` is the default.
+            rustflags: ""
           - os: windows-latest
             artifact: windows-x86_64
             musl_target: ""
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
+            rustflags: "-C target-cpu=x86-64"
           # macos-14 is arm64. Pinned (not macos-latest) so the two macOS legs
           # cannot collapse onto the same architecture when GitHub advances
           # `latest` — that would silently mislabel both artifacts.
@@ -242,12 +259,14 @@ jobs:
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
+            rustflags: ""
           - os: macos-14
             artifact: macos-x86_64
             musl_target: ""
             container_arch: ""
             extra_target: x86_64-apple-darwin
             bin_dir: target/x86_64-apple-darwin/release
+            rustflags: ""
     steps:
       - uses: actions/checkout@v5
         with:
@@ -378,6 +397,48 @@ jobs:
           kill $PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
           wait $PID 2>/dev/null || true
           echo "Smoke test passed for ${{ matrix.artifact }}"
+
+      # ── THE GATE THAT WOULD HAVE CAUGHT 3.0.x ─────────────────────────────
+      # A smoke test on the runner proves nothing about the CPUs users have: the
+      # runner has AVX-512, so an AVX2-only binary boots there and dies on a
+      # Celeron the moment it does real work. Both Linux artifacts are booted on
+      # an emulated Nehalem CPU (SSE4.2, NO AVX, NO AVX2) and must answer
+      # /api/version. `qemu-user-static` runs the static musl binary directly;
+      # for the glibc one, -L / supplies the host loader.
+      - name: Portability gate (pre-AVX CPU)
+        if: matrix.artifact == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          command -v qemu-x86_64-static
+
+          check() {
+            BIN="$1"; PORT="$2"
+            ROOT="$(mktemp -d)"
+            PM_APP_ROOT="$ROOT" qemu-x86_64-static -L / -cpu Nehalem \
+              "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
+            PID=$!
+            for _ in $(seq 1 90); do
+              if curl -fsS -m 3 "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
+                echo "PASS: $BIN boots and serves on Nehalem (no AVX/AVX2)"
+                kill "$PID" 2>/dev/null || true
+                return 0
+              fi
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) — this artifact would SIGILL (exit 132) on every Synology x86 NAS. Tail of its log:"
+            tail -n 25 "gate-$PORT.log" || true
+            kill "$PID" 2>/dev/null || true
+            return 1
+          }
+
+          # The glibc tarball users download...
+          check target/release/pencarimovie-server 18101
+          # ...and the musl binary baked into ghcr.io/<repo>:native.
+          check target/x86_64-unknown-linux-musl/release/pencarimovie-server 18102
 
       - name: Test Tray and Launchers (${{ matrix.artifact }})
         shell: bash

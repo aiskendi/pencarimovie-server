@@ -4,6 +4,23 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ## [Unreleased]
 
+### Fixed
+
+- **3.0.x releases exited with `132` (SIGILL) a second after the banner on every CPU without
+  AVX2** — every Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every
+  desktop older than 2013. It is not a hardware limitation and not the reporter's fault: the
+  published x86_64 artifacts carried AVX2 instructions while the source does not ask for them.
+  A clean build of the same commit boots fine under `qemu-x86_64-static -cpu Nehalem`; the
+  released binaries (`ghcr.io/<repo>:latest`, the `linux-x86_64` tarball, and `v3.0.0`/`v3.0.3`
+  before them) do not, and both build flavours were affected, so the ISA level leaked in from the
+  build environment rather than from the dependency graph (2.9.9 is unaffected because it predates
+  PM-auth, whose first Ed25519/X25519 work is what hits the vector code, one line after
+  `pm-auth enrol ... enrolling install-wide`). Fixed at the pipeline: every x86_64 lane now pins
+  `-C target-cpu=x86-64` explicitly ([`.github/workflows/release.yml`](.github/workflows/release.yml:1),
+  [`Dockerfile`](Dockerfile:1)), and a new **Portability gate** boots both Linux artifacts under
+  `qemu-x86_64-static -cpu Nehalem` and requires `/api/version` to answer before anything is
+  uploaded, so an AVX2-only binary can no longer reach a release.
+
 ### Security
 
 - **Six state-changing routes that had no gate now require the same machine or network, or a

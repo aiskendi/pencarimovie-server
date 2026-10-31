@@ -47,7 +47,18 @@ COPY desktop ./desktop
 # on each source build and works everywhere. CI does not use this file: the
 # release pipeline builds `Dockerfile.release` (COPY-only, from a prebuilt
 # musl binary).
-RUN cargo build --release --locked \
+# Pin the ISA baseline for x86_64. 3.0.x containers died with SIGILL (exit 132)
+# about a second after the banner on any CPU without AVX2 — which is every
+# Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every
+# pre-2013 desktop. The x86-64 baseline is already rustc's default for this
+# target, so stating it explicitly cannot change a correct build; it stops a
+# polluted build host (RUSTFLAGS, a stale ~/.cargo/config.toml) from silently
+# raising it, which is exactly how the released artifacts broke. Never use
+# `native` here. `uname -m` is the build/target arch: nothing in this file
+# cross-compiles.
+RUN set -eux; \
+    if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=x86-64"; fi; \
+    cargo build --release --locked \
  && cp target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
 
 FROM alpine:3.20

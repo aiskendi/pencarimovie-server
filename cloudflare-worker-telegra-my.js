@@ -131,44 +131,90 @@ if (-not (Test-Path -LiteralPath $vcrDll)) {
 }
 
 Write-Host "PencariMovie Server: $installDir" -ForegroundColor Cyan
+$exe = Join-Path $installDir 'pencarimovie-server.exe'
 $tmp = Join-Path $env:TEMP ('pm-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
     $url = "$base/$asset"
-    Write-Host "Downloading $asset"
-    Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp $asset) -UseBasicParsing
 
     # The .sha256 sidecar is served as application/octet-stream, so
     # Invoke-WebRequest hands it back as byte[] and .Trim() throws - which is why
     # an earlier run printed "no sidecar" even though it exists. WebClient
     # decodes it as text.
-    $shaUrl = "$url.sha256"
+    #
+    # It is fetched FIRST because it also names the release: it hashes the
+    # .tar.gz, NOT the exe inside it, so it can never be compared against the
+    # installed binary. What it can do is be recorded beside the exe on install -
+    # the same name on a later run means this install already IS that release.
+    # Without the stamp every re-run re-downloaded 20 MB and then fought the
+    # running exe for the file.
+    $stamp = Join-Path $installDir '.release-sha256'
+    $want = $null
     try {
-        $shaText = (New-Object System.Net.WebClient).DownloadString($shaUrl)
+        $shaText = (New-Object System.Net.WebClient).DownloadString("$url.sha256")
         $want = $shaText.Trim().Split(' ')[0].ToLower()
-        $got = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $tmp $asset)).Hash.ToLower()
-        if ($want -ne $got) {
-            Write-Host 'Checksum mismatch - nothing was installed.' -ForegroundColor Red
-            exit 1
-        }
-        Write-Host 'SHA-256 OK'
-    } catch {
-        Write-Host ('Checksum check skipped: ' + $_.Exception.Message) -ForegroundColor DarkGray
+    } catch { }
+
+    $current = $false
+    if ($want -and (Test-Path -LiteralPath $exe) -and (Test-Path -LiteralPath $stamp)) {
+        $current = ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $want)
     }
 
-    tar.exe -xzf (Join-Path $tmp $asset) -C $tmp
-    $rel = Join-Path $tmp 'pencarimovie-server-windows-x86_64'
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    # Copy over the top so storage/ (the bot session) is preserved.
-    Copy-Item -Path (Join-Path $rel '*') -Destination $installDir -Recurse -Force
-    Get-ChildItem -LiteralPath $installDir -Recurse -File -ErrorAction SilentlyContinue |
-        Unblock-File -ErrorAction SilentlyContinue
+    if ($current) {
+        Write-Host 'Already on the latest build - nothing to download.' -ForegroundColor DarkGray
+    } else {
+        Write-Host "Downloading $asset"
+        Invoke-WebRequest -Uri $url -OutFile (Join-Path $tmp $asset) -UseBasicParsing
+
+        if ($want) {
+            $got = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $tmp $asset)).Hash.ToLower()
+            if ($want -ne $got) {
+                Write-Host 'Checksum mismatch - nothing was installed.' -ForegroundColor Red
+                exit 1
+            }
+            Write-Host 'SHA-256 OK'
+        } else {
+            Write-Host 'Checksum check skipped: no .sha256 sidecar.' -ForegroundColor DarkGray
+        }
+
+        tar.exe -xzf (Join-Path $tmp $asset) -C $tmp
+        $rel = Join-Path $tmp 'pencarimovie-server-windows-x86_64'
+
+        # A running server holds pencarimovie-server.exe open, so the copy below
+        # failed with "The process cannot access the file ... used by another
+        # process". Stop it first and wait for the handle to drop. The tray lives
+        # INSIDE the binary, so this removes the icon too.
+        $running = Get-Process -Name 'pencarimovie-server' -ErrorAction SilentlyContinue
+        if ($running) {
+            Write-Host 'Stopping the running server to replace it...' -ForegroundColor DarkGray
+            $running | Stop-Process -Force -ErrorAction SilentlyContinue
+            $running | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+            # An instance started by another user (or elevated) survives this
+            # silently, and the run would then end with a bare "Already running".
+            if (Get-Process -Name 'pencarimovie-server' -ErrorAction SilentlyContinue) {
+                Write-Host 'A server started by another user or elevated outlived the stop; close it to finish updating.' -ForegroundColor Yellow
+            }
+        }
+
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+        # Copy over the top so storage/ (the bot session) is preserved.
+        try {
+            Copy-Item -Path (Join-Path $rel '*') -Destination $installDir -Recurse -Force
+            if ($want) { Set-Content -LiteralPath $stamp -Value $want -NoNewline -Encoding ASCII }
+        } catch {
+            Write-Host 'Could not replace the server binary.' -ForegroundColor Red
+            Write-Host ('  ' + $_.Exception.Message)
+            Write-Host 'The old process survived the stop. Close the tray icon (or this window), or run it from an elevated PowerShell, then re-run:  irm telegra.my/win | iex' -ForegroundColor Yellow
+            exit 1
+        }
+        Get-ChildItem -LiteralPath $installDir -Recurse -File -ErrorAction SilentlyContinue |
+            Unblock-File -ErrorAction SilentlyContinue
+    }
 }
 finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$exe = Join-Path $installDir 'pencarimovie-server.exe'
 if (-not (Test-Path -LiteralPath $exe)) {
     Write-Host 'The archive did not contain pencarimovie-server.exe.' -ForegroundColor Red
     exit 1
@@ -179,26 +225,45 @@ if (-not (Test-Path -LiteralPath $exe)) {
 # on PATH silently won - which is how an old PHP launcher got invoked.
 # (No backticks anywhere in this template literal: they would end it.)
 try {
+    # PREPEND, not append. Appending left any earlier entry to win, so on a box
+    # that already had a checkout or an old install on PATH the word "pms" kept
+    # running THAT launcher while the fresh copy sat unused in the folder this
+    # script had just written. Dropping the duplicate and going first makes the
+    # installed copy the one that runs.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @($userPath -split ';' | Where-Object { $_ -ne '' })
-    if ($parts -notcontains $installDir) {
-        [Environment]::SetEnvironmentVariable('Path', (($parts + $installDir) -join ';'), 'User')
-        Write-Host 'Added to PATH - open a new terminal before using pms.' -ForegroundColor DarkGray
+    $parts = @($userPath -split ';' | Where-Object { $_ -ne '' -and $_ -ne $installDir })
+    $newPath = (@($installDir) + $parts) -join ';'
+    if ($newPath -ne $userPath) {
+        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+        Write-Host 'Added to PATH for every new terminal.' -ForegroundColor DarkGray
     }
+    # iex runs inside THIS window, so its PATH can be patched here as well. Only
+    # the persistent user PATH was being set, which is why the very next line the
+    # user typed - "pms uninstall" - came back "not recognized".
+    $session = @($env:Path -split ';' | Where-Object { $_ -ne '' -and $_ -ne $installDir })
+    $env:Path = (@($installDir) + $session) -join ';'
+    Write-Host 'pms works in this window now.' -ForegroundColor DarkGray
 } catch {
     Write-Host ('Could not update PATH: ' + $_.Exception.Message) -ForegroundColor DarkGray
 }
-Write-Host 'Starting the server on http://127.0.0.1:8088' -ForegroundColor Green
-# start-tray.bat puts the icon in the notification area and starts the server
-# behind it. Launching the exe directly is what left the previous run with no
-# tray at all. (No backticks in this template literal: they would end it.)
-$tray = Join-Path $installDir 'start-tray.bat'
-if (Test-Path -LiteralPath $tray) {
-    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'start-tray.bat' -WorkingDirectory $installDir -WindowStyle Hidden
+# Two --tray processes fight over port 8088 and put two icons in the tray, so
+# only start when nothing is serving. An update that stopped the old process
+# leaves nothing running, so the new build still comes up here.
+if (Get-Process -Name 'pencarimovie-server' -ErrorAction SilentlyContinue) {
+    Write-Host 'Already running: http://127.0.0.1:8088' -ForegroundColor Green
 } else {
-    Start-Process -FilePath $exe -ArgumentList '--open' -WorkingDirectory $installDir -WindowStyle Hidden
+    Write-Host 'Starting the server on http://127.0.0.1:8088' -ForegroundColor Green
+    # start-tray.bat puts the icon in the notification area and starts the server
+    # behind it. Launching the exe directly is what left the previous run with no
+    # tray at all. (No backticks in this template literal: they would end it.)
+    $tray = Join-Path $installDir 'start-tray.bat'
+    if (Test-Path -LiteralPath $tray) {
+        Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'start-tray.bat' -WorkingDirectory $installDir -WindowStyle Hidden
+    } else {
+        Start-Process -FilePath $exe -ArgumentList '--open' -WorkingDirectory $installDir -WindowStyle Hidden
+    }
+    Write-Host 'The tray icon should now be visible; double-click it to open the dashboard.' -ForegroundColor DarkGray
 }
-Write-Host 'The tray icon should now be visible; double-click it to open the dashboard.' -ForegroundColor DarkGray
 `;
 
 /* ── Docker ───────────────────────────────────────────────────────────────── */

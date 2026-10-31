@@ -77,6 +77,73 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `/win`, `/linux` and `/docker` at telegra.my are STRING LITERALS inside one
+      # Cloudflare worker, so they have no compiler and no other test: a stray
+      # backtick ends the template literal (and the file still looks fine), a
+      # misplaced brace makes the emitted PowerShell throw on the user's machine,
+      # and nothing notices until somebody's install breaks. Parse each embedded
+      # script in its own language HERE, before a tag or release is created, so a
+      # broken installer cannot reach /releases/latest. Runs in `prepare`, which
+      # every build leg needs.
+      - name: Verify the telegra.my installer scripts
+        run: |
+          set -euo pipefail
+
+          # 1. The worker must stay valid ESM: an unescaped backtick inside a
+          #    template literal truncates it and fails right here.
+          cp cloudflare-worker-telegra-my.js /tmp/pm-worker.mjs
+          node --check /tmp/pm-worker.mjs
+
+          # 2. Cut the three embedded scripts out of the literals.
+          cat > /tmp/pm-extract.cjs <<'JS'
+          const fs = require('node:fs');
+          const src = fs.readFileSync('cloudflare-worker-telegra-my.js', 'utf8');
+
+          const pick = (name) => {
+            const mark = 'const ' + name + ' = `';
+            const start = src.indexOf(mark);
+            if (start < 0) throw new Error(name + ' is no longer a template literal');
+            const from = start + mark.length;
+            const end = src.indexOf('\n`;', from);
+            if (end < 0) throw new Error(name + ' is not terminated by a newline + backtick + semicolon');
+            const body = src.slice(from, end + 1);
+            fs.writeFileSync('/tmp/pm-' + name, body);
+            return body;
+          };
+
+          const ps1 = pick('PS1_INSTALL');
+          pick('SH_INSTALL');
+          pick('SH_DOCKER');
+
+          // The Windows installer must stop a running server BEFORE copying over
+          // it, otherwise Copy-Item dies with "The process cannot access the file
+          // ... because it is being used by another process" - the exact report
+          // this order exists to prevent.
+          const stop = ps1.indexOf('Stop-Process -Force');
+          const copy = ps1.indexOf('Copy-Item -Path (Join-Path $rel');
+          if (stop < 0) throw new Error('PS1_INSTALL no longer stops a running server');
+          if (copy < 0) throw new Error('PS1_INSTALL no longer copies the staged files');
+          if (stop > copy) throw new Error('PS1_INSTALL copies before it stops the server');
+          console.log('extracted 3 installer scripts; stop-before-copy order OK');
+          JS
+          node /tmp/pm-extract.cjs
+
+          # 3. Each string must parse as the language it is written in.
+          sh -n /tmp/pm-SH_INSTALL
+          sh -n /tmp/pm-SH_DOCKER
+          pwsh -NoProfile -Command '
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("/tmp/pm-PS1_INSTALL", [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                Write-Host ("::error file=cloudflare-worker-telegra-my.js::PS1_INSTALL line " + $_.Extent.StartLineNumber + ": " + $_.Message)
+              }
+              exit 1
+            }
+            "PS1_INSTALL parses as PowerShell"
+          '
+
       - name: Resolve the release tag
         id: vars
         env:
@@ -432,6 +499,103 @@ jobs:
             ( cd dist-rust && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
           fi
           ls -lh dist-rust/
+
+      # ── Verify Windows Installer & Updater Lifecycle ─────────────────────────
+      # On Windows, test that the installer script from telegra.my actually works:
+      # 1. Fresh install into a test directory.
+      # 2. Re-run when current skips download ("Already on the latest build").
+      # 3. Update over a RUNNING server kills old process and copies files with
+      #    no "process cannot access the file ... used by another process" error.
+      - name: Test Windows Installer & Updater Lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Testing Windows installer lifecycle against dist-rust package..."
+
+          # Extract the PowerShell installer script from the worker
+          node -e '
+            const fs = require("fs");
+            const src = fs.readFileSync("cloudflare-worker-telegra-my.js", "utf8");
+            const mark = "const PS1_INSTALL = `";
+            const start = src.indexOf(mark);
+            const end = src.indexOf("\n`;", start + mark.length);
+            fs.writeFileSync("/tmp/pm-installer-test.ps1", src.slice(start + mark.length, end + 1));
+          '
+
+          # Start mock HTTP server on 127.0.0.1:18097 serving dist-rust/
+          node -e '
+            const http = require("http");
+            const fs = require("fs");
+            const path = require("path");
+            http.createServer((req, res) => {
+              const file = path.join("dist-rust", path.basename(req.url));
+              if (fs.existsSync(file)) {
+                res.end(fs.readFileSync(file));
+              } else {
+                res.statusCode = 404; res.end();
+              }
+            }).listen(18097, "127.0.0.1");
+          ' &
+          MOCK_PID=$!
+          sleep 1
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
+            $ErrorActionPreference = "Stop"
+            $testRoot = Join-Path $env:TEMP ("pm-ci-" + [Guid]::NewGuid().ToString("N"))
+            $testInstall = Join-Path $testRoot "pencarimovie-server"
+
+            # Read installer and adapt $base and $installDir for local testing
+            $script = Get-Content -Raw /tmp/pm-installer-test.ps1
+            $script = $script -replace "\$base = .*", "\$base = '\''http://127.0.0.1:18097'\''"
+            $script = $script -replace "\$installDir = .*", "\$installDir = '\''$($testInstall -replace "\\", "/")'\''"
+            Set-Content /tmp/run-test.ps1 $script
+
+            Write-Host "1. Testing clean install..."
+            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            Write-Host $out1
+            if (-not (Test-Path "$testInstall\pencarimovie-server.exe")) {
+              throw "Installer failed: pencarimovie-server.exe not found"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed: .release-sha256 stamp not found"
+            }
+
+            Write-Host "2. Testing re-run when build is already latest (should skip download)..."
+            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            Write-Host $out2
+            if ($out2 -notmatch "Already on the latest build") {
+              throw "Installer failed to skip download when version matches"
+            }
+
+            Write-Host "3. Testing update over a RUNNING server process..."
+            # Start the installed binary in background
+            $proc = Start-Process "$testInstall\pencarimovie-server.exe" -ArgumentList "--port","18093","--no-open" -PassThru
+            Start-Sleep -Seconds 2
+
+            # Remove stamp to simulate a new release available
+            Remove-Item "$testInstall\.release-sha256" -Force
+
+            # Run installer again while server is running - must cleanly stop it and copy without file-lock error
+            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            Write-Host $out3
+            if ($out3 -match "used by another process") {
+              throw "Installer crashed with file-lock error during update!"
+            }
+            if ($out3 -notmatch "Stopping the running server") {
+              throw "Installer failed to detect and stop running server"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed to re-create .release-sha256 after update"
+            }
+
+            # Cleanup test root and process
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Windows Installer & Updater Lifecycle verification PASSED."
+          '
+
+          kill $MOCK_PID 2>/dev/null || true
 
       # `release-` prefix so `publish` can glob exactly the five tarball
       # artifacts without also pulling the `container-*` ones (whose payload is a

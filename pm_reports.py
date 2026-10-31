@@ -48,7 +48,12 @@ import re
 import sys
 
 INDEX = "server_reports_idx"
-MYSQL = "mysql -h127.0.0.1 -P9306 --batch"
+# `--skip-ssl` is not cosmetic: on 2026-10-30 the client started answering
+# `ERROR 2026 (HY000): TLS/SSL error: sslv3 alert handshake failure` against
+# Manticore's plain 9306 port, so every read failed. 9306 speaks the MySQL
+# protocol over LOCALHOST only (the index is not exposed off-box), so there is
+# nothing to protect with TLS and the handshake must be skipped explicitly.
+MYSQL = "mysql -h127.0.0.1 -P9306 --batch --skip-ssl"
 
 PREFERRED = [
     "created_at", "report_type", "platform", "device_id", "app_version",

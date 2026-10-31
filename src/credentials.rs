@@ -341,7 +341,7 @@ pub fn save_auth_token(token: &str, expires_at: i64) -> bool {
 /// never said whether the file was missing, the write had failed, the expiry had
 /// already passed when it was minted (a host clock ahead of the origin), or the
 /// origin had answered no expiry at all. This makes the answer explicit.
-pub fn auth_token_reason() -> String {
+fn auth_token_state() -> String {
     let path = auth_token_path();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -372,6 +372,40 @@ pub fn auth_token_reason() -> String {
     format!("token valid for {}s", exp - now)
 }
 
+/// Why the next renewal attempt is waiting, when the last one failed on transport.
+///
+/// Without this, a renewal outage and an expired lease read identically: the 401
+/// says `token already expired` and nothing admits that the engine is simply not
+/// allowed to try again yet. Reported with the countdown so "still dead" can be
+/// told apart from "dead until 14:32:05".
+fn enrol_hint() -> String {
+    use std::sync::atomic::Ordering;
+    let at = LAST_ENROL_TRANSPORT_AT.load(Ordering::SeqCst);
+    if at == 0 {
+        return String::new();
+    }
+    let now = crate::storage::now();
+    let (waited, delay) = enrol_wait(now);
+    let left = if waited == i64::MAX {
+        0
+    } else {
+        (delay - waited).max(0)
+    };
+    format!(
+        "; renewal attempt {}s ago could not reach the origin, next attempt in {}s",
+        now.saturating_sub(at),
+        left
+    )
+}
+
+pub fn auth_token_reason() -> String {
+    let state = auth_token_state();
+    if !auth_token().is_empty() {
+        return state;
+    }
+    format!("{state}{}", enrol_hint())
+}
+
 pub fn clear_auth_token() {
     let _ = std::fs::remove_file(auth_token_path());
 }
@@ -396,12 +430,66 @@ pub fn clear_auth_token() {
 /// through `http_json_h()`, which calls back into this module. Without the guard
 /// that is unbounded recursion; with it the inner call is a cheap no-op.
 static ENROLLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Don't hammer the origin when enrolment keeps failing (offline phone, revoked
-/// install): one attempt per minute, per process.
+/// When the last attempt started (`0` = none yet).
 static LAST_ENROLL_ATTEMPT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Delay before the next attempt, in seconds (`0` = the steady one a minute).
+///
+/// A REJECTION (the origin answered and refused, or the token could not be stored)
+/// keeps the minute: retrying in seconds cannot fix a revoked install or a
+/// read-only volume, and it would only burn traffic. A TRANSPORT failure is a
+/// different animal. The origin is unreachable, it may be reachable again a second
+/// later, and the install stays dead until something asks again.
+///
+/// Measured on a live process with a 45 s outage (tools/repro_issue14_lease.mjs):
+/// the fixed one-minute cap left **32 resolve calls unauthenticated for 55 s after
+/// connectivity returned**, which reads exactly like the install being wedged and
+/// made a restart the obvious way out. Hence the bounded backoff: 5 s, 10, 20, 40,
+/// then the steady 60.
+static ENROLL_DELAY_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// When the last attempt failed because the origin could not be reached (`0` = the
+/// last attempt did not fail that way). Surfaces through [`auth_token_reason()`], so
+/// a renewal outage reads as connectivity instead of as a clock or storage fault.
+static LAST_ENROL_TRANSPORT_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-/// [`ensure_enrolled()`] for the call path: at most one attempt a minute and never
-/// re-entrant, so it is safe to call before every origin request.
+/// What one enrolment attempt achieved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnrolOutcome {
+    /// A usable token is on disk.
+    Enrolled,
+    /// The origin answered and refused, or the token could not be stored.
+    Rejected,
+    /// The origin was unreachable. Worth retrying soon, with backoff.
+    Transport,
+}
+
+/// The next delay after a transport failure: double, and never past the steady
+/// minute. Pure so the policy can be pinned by a test instead of by a 60 s wait.
+fn next_transport_delay(current: i64) -> i64 {
+    match current {
+        0 => 5,
+        b => (b * 2).min(60),
+    }
+}
+
+/// `(seconds since the last attempt, seconds required before the next one)`.
+fn enrol_wait(now: i64) -> (i64, i64) {
+    use std::sync::atomic::Ordering;
+    let last = LAST_ENROLL_ATTEMPT.load(Ordering::SeqCst);
+    let delay = match ENROLL_DELAY_SECS.load(Ordering::SeqCst) {
+        0 => 60,
+        b => b,
+    };
+    let waited = if last == 0 {
+        i64::MAX
+    } else {
+        now.saturating_sub(last)
+    };
+    (waited, delay)
+}
+
+/// [`ensure_enrolled()`] for the call path: never re-entrant, and rate limited to
+/// one attempt per backoff window, so it is safe to call before every origin
+/// request.
 pub async fn ensure_enrolled_throttled() -> bool {
     use std::sync::atomic::Ordering;
     if !auth_token().is_empty() {
@@ -411,18 +499,28 @@ pub async fn ensure_enrolled_throttled() -> bool {
         return false;
     }
     let now = crate::storage::now();
-    let last = LAST_ENROLL_ATTEMPT.load(Ordering::SeqCst);
-    if last != 0 && now.saturating_sub(last) < 60 {
+    let (waited, delay) = enrol_wait(now);
+    if waited < delay {
         ENROLLING.store(false, Ordering::SeqCst);
         return !auth_token().is_empty();
     }
     LAST_ENROLL_ATTEMPT.store(now, Ordering::SeqCst);
-    let ok = ensure_enrolled().await;
+    let outcome = ensure_enrolled().await;
+    match outcome {
+        EnrolOutcome::Transport => {
+            let next = next_transport_delay(ENROLL_DELAY_SECS.load(Ordering::SeqCst));
+            ENROLL_DELAY_SECS.store(next, Ordering::SeqCst);
+            LAST_ENROL_TRANSPORT_AT.store(now, Ordering::SeqCst);
+        }
+        EnrolOutcome::Enrolled | EnrolOutcome::Rejected => {
+            ENROLL_DELAY_SECS.store(0, Ordering::SeqCst);
+        }
+    }
     ENROLLING.store(false, Ordering::SeqCst);
-    ok
+    outcome == EnrolOutcome::Enrolled
 }
 
-pub async fn ensure_enrolled() -> bool {
+pub async fn ensure_enrolled() -> EnrolOutcome {
     // NEVER gate enrolment on a bot id. The token is install-wide (`bot_id: 0`), so
     // needing a bot here was pointless — and actively harmful: when the pool was
     // emptied (the user removing the last bot while testing "Disconnect All"),
@@ -438,7 +536,7 @@ pub async fn ensure_enrolled() -> bool {
         );
     }
     if !auth_token().is_empty() {
-        return true;
+        return EnrolOutcome::Enrolled;
     }
     let (pk, _sk) = sign_keypair();
     let url = format!("{}/auth-enroll", crate::config::wp_api_base());
@@ -456,8 +554,11 @@ pub async fn ensure_enrolled() -> bool {
     ];
     // Boxed: http_json -> http_json_h -> ensure_enrolled_throttled -> here, so the
     // future would otherwise be infinitely sized (E0733: "recursion in an async fn
-    // requires boxing").
-    let resp = Box::pin(crate::httpc::http_json(&url, &params, "POST", 20)).await;
+    // requires boxing"). The STATUS is kept: `http_json` collapses "the origin
+    // refused us" and "the origin was unreachable" into the same empty body, and the
+    // two need different retry policies.
+    let (resp, status) =
+        Box::pin(crate::httpc::http_json_h_status(&url, &params, "POST", 20, &[])).await;
     let ok = resp
         .get("ok")
         .map(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) != 0)
@@ -465,14 +566,27 @@ pub async fn ensure_enrolled() -> bool {
     let token = resp.get("auth_token").and_then(|v| v.as_str()).unwrap_or("");
     let expires_at = resp.get("auth_expires_at").and_then(|v| v.as_i64()).unwrap_or(0);
     if !ok || token.is_empty() {
+        // `status == 0` never completed; 5xx is the origin saying "not now". Both
+        // are worth another attempt in seconds. Anything else is a decision by the
+        // origin (revoked install, bad install key) and keeps the minute delay.
+        let transport = status == 0 || status >= 500;
         crate::log::stderr_log(
-            "pm-auth enrol failed",
+            if transport {
+                "pm-auth enrol could not reach the origin - retrying with backoff"
+            } else {
+                "pm-auth enrol failed"
+            },
             Some(&serde_json::json!({
+                "status": status,
                 "status_ok": ok,
                 "message": resp.get("message").cloned().unwrap_or(serde_json::Value::Null),
             })),
         );
-        return false;
+        return if transport {
+            EnrolOutcome::Transport
+        } else {
+            EnrolOutcome::Rejected
+        };
     }
     // Trust what we can READ BACK, not what the origin promised. A POST that
     // succeeds while the token never lands on disk (read-only volume, a
@@ -491,9 +605,10 @@ pub async fn ensure_enrolled() -> bool {
                 "clock_offset": clock_offset(),
             })),
         );
-        return false;
+        // Not transport: another attempt in a second would hit the same wall.
+        return EnrolOutcome::Rejected;
     }
-    true
+    EnrolOutcome::Enrolled
 }
 
 pub fn sign_proof(method: &str, endpoint: &str, ts: i64, nonce: &str) -> Option<(String, String)> {
@@ -735,6 +850,25 @@ mod provision_tests {
         // 64-byte Ed25519 signature -> 86 base64url chars.
         assert_eq!(headers[4].1.len(), 86);
         assert_eq!(headers[0].1, "v1.dummy.claims");
+    }
+
+    /// The renewal backoff after a transport failure: 5 s doubling to the steady
+    /// minute, never past it.
+    ///
+    /// Measured before this existed (tools/repro_issue14_lease.mjs, live process,
+    /// 45 s outage): the fixed one-minute cap kept 32 resolve calls unauthenticated
+    /// for 55 s after connectivity returned.
+    #[test]
+    fn transport_failures_back_off_then_hold_at_the_steady_minute() {
+        let mut d = 0;
+        let mut ladder = Vec::new();
+        for _ in 0..8 {
+            d = next_transport_delay(d);
+            ladder.push(d);
+        }
+        assert_eq!(ladder, vec![5, 10, 20, 40, 60, 60, 60, 60]);
+        // A rejection resets to zero, so the next transport failure starts fast again.
+        assert_eq!(next_transport_delay(0), 5);
     }
 
     /// Issue #14: an enrolment whose token never reaches the disk must NOT report

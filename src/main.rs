@@ -376,11 +376,15 @@ async fn main() -> anyhow::Result<()> {
     // on old ones. Detached: a slow origin must not delay the listener.
     {
         tokio::spawn(async move {
-            let ok = credentials::ensure_enrolled().await;
+            let outcome = credentials::ensure_enrolled().await;
+            // `outcome` apart from `enrolled`: "the origin was unreachable" and
+            // "the origin refused this install" are the same `false` otherwise, and
+            // they send an operator in opposite directions.
             log::stderr_log(
                 "pm-auth enrolment",
                 Some(&serde_json::json!({
-                    "enrolled": ok,
+                    "enrolled": outcome == credentials::EnrolOutcome::Enrolled,
+                    "outcome": format!("{outcome:?}"),
                     "bot_id": session::get_bot_id(),
                 })),
             );

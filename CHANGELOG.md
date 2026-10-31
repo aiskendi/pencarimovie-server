@@ -70,6 +70,22 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Fixed
 
+- **A renewal that cannot reach the origin now retries in seconds instead of a minute, and says
+  which failure it is.** The follow-up on issue #14: after the install-wide token expired while
+  the origin was unreachable, the engine kept answering `wp 401 without a token` with the reason
+  `token already expired`, and nothing in that line admitted the real state, which is that
+  renewal was simply not allowed to try again yet. `ensure_enrolled_throttled()` now acts on what
+  [`ensure_enrolled()`](src/credentials.rs:517) achieved: `EnrolOutcome::Rejected` (the origin
+  answered and refused, or the token could not be stored) keeps the steady one-minute delay, and
+  `EnrolOutcome::Transport` (status 0 or 5xx) backs off 5 s, 10, 20, 40, then holds at 60.
+  Measured on a live process with a 45 s outage ([`tools/repro_issue14_lease.mjs`](tools/repro_issue14_lease.mjs:1)):
+  recovery after connectivity returned went from **55.2 s and 32 unauthenticated resolve calls to
+  10.9 s and 4**, with no restart and no manual token removal. The 401 line appends
+  `; renewal attempt Ns ago could not reach the origin, next attempt in Ms`, and the boot
+  `pm-auth enrolment` line reports `outcome` beside `enrolled`, so "the origin was unreachable"
+  cannot be mistaken for "the origin refused this install". Pinned by
+  `credentials::provision_tests::transport_failures_back_off_then_hold_at_the_steady_minute`.
+
 - **The one-click Stremio install now says where it works, and hides where it cannot.**
   The card asks for a Stremio password only because Stremio Web refuses a plain http addon
   address, so it does anything useful only while the dashboard is opened on localhost or a

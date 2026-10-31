@@ -718,7 +718,13 @@ fn provision_heartbeat_path() -> PathBuf {
 /// The recorded pid is the only durable proof of liveness on one machine, and it
 /// is what separates "someone is provisioning right now" from "someone was
 /// provisioning when the process died".
-fn pid_still_running(pid: i64) -> bool {
+///
+/// Linux and Android expose the process table at `/proc`. **macOS and the BSDs do
+/// not**, and the old unconditional `/proc/<pid>` read answered `false` there for
+/// every pid — so on a Mac a live provision always looked dead, and the macOS CI
+/// legs failed `a live holder must be respected` while every other platform
+/// passed. `kill -0` asks the kernel the same question portably.
+pub(crate) fn pid_still_running(pid: i64) -> bool {
     if pid <= 1 {
         return false;
     }
@@ -726,9 +732,24 @@ fn pid_still_running(pid: i64) -> bool {
     {
         crate::tunnel::win_pid_alive(pid)
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    {
+        // Exit status 0 = the pid exists and we may signal it. A pid owned by
+        // another user answers EPERM, which reads as "gone"; the lock lives in our
+        // own storage dir and is written by our own process, so that cannot happen
+        // for a real holder.
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
     #[cfg(not(any(windows, unix)))]
     {

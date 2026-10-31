@@ -707,9 +707,13 @@ pub async fn pid_alive(pid: i64, metrics_port: u16) -> bool {
     {
         win_pid_alive(pid)
     }
+    // NOT `/proc/<pid>`: that path does not exist on macOS, where this answered
+    // "the tunnel is gone" for a cloudflared that was running. `session` owns the
+    // portable answer now (and the `/proc` branch is still what Linux and Android
+    // take, so nothing changes there).
     #[cfg(not(windows))]
     {
-        Path::new(&format!("/proc/{}", pid)).exists()
+        crate::session::pid_still_running(pid)
     }
 }
 

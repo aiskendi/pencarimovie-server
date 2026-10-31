@@ -450,6 +450,21 @@ jobs:
             echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC; the glibc artifact is checked statically, the static musl binary is still booted"
           fi
 
+          # CONTROL, built here with the same compiler and the same flag. If a
+          # three-line program also traps, the runner's emulation (or the newly
+          # installed toolchain) is what is broken, and no verdict about our
+          # artifact can be trusted. Cheap, and it ends the guessing.
+          printf 'fn main(){println!("control ok");}' > /tmp/control.rs
+          if rustc --target x86_64-unknown-linux-musl -C linker=musl-gcc -O \
+                   -C target-cpu=x86-64 /tmp/control.rs -o /tmp/control 2>/tmp/control.err \
+             && "$QEMU" -cpu "$SPEC" /tmp/control; then
+            echo "control: a minimal -C target-cpu=x86-64 musl binary runs here"
+          else
+            echo "::error::even a three-line musl binary built with -C target-cpu=x86-64 traps on -cpu $SPEC here, so this runner's emulation cannot answer the question; see /tmp/control.err"
+            cat /tmp/control.err || true
+            exit 1
+          fi
+
 
           # boot_check <binary> <port> [extra qemu args...]
           boot_check() {
@@ -476,6 +491,12 @@ jobs:
             echo "--- emulated exit status / full log ($(wc -c < "gate-$PORT.log" 2>/dev/null || echo 0) bytes):"
             wait "$PID" 2>/dev/null || echo "emulated exit=$?"
             cat "gate-$PORT.log" || true
+            # The instruction that trapped, from qemu itself, so the next reader
+            # does not have to guess which opcode the CPU disliked.
+            echo "--- last translated block before the trap:"
+            timeout 30 env PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" -d in_asm -D "gate-$PORT.trace" \
+              "$BIN" --port "$PORT" --no-open >/dev/null 2>&1 || true
+            tail -n 12 "gate-$PORT.trace" || true
             kill "$PID" 2>/dev/null || true
             return 1
           }

@@ -25,6 +25,10 @@ if not defined PM_DIR (
     exit /b 1
 )
 
+rem Bind all interfaces unless the user chose one, so the LAN/TV add-on URL works
+rem on a fresh start. `--host 127.0.0.1` still wins (flags beat the environment).
+if not defined PM_LISTEN_HOST if not defined HOST set "PM_LISTEN_HOST=0.0.0.0"
+
 if /i "%~1"=="stop"       goto do_stop
 if /i "%~1"=="--stop"     goto do_stop
 if /i "%~1"=="restart"    goto do_restart

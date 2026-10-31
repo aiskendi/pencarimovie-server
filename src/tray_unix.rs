@@ -35,7 +35,7 @@ pub fn wanted(_stdout_is_terminal: bool) -> bool {
     std::env::args().any(|a| a == "--tray") || std::env::var_os("PM_TRAY").is_some()
 }
 
-pub fn spawn(server_port: u16) {
+pub fn spawn(server_port: u16, _listen_host: &str) {
     if cfg!(target_os = "macos") {
         crate::log::stderr_log(
             "no menu-bar icon on macOS (the LaunchAgent covers login start)",

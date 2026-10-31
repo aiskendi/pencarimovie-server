@@ -55,7 +55,11 @@ First run
      (or open http://127.0.0.1:8088/#addon and use the buttons)
 
 LAN / TV access
-  bind to all interfaces:  ./pencarimovie-server --host 0.0.0.0
+  The Windows launchers (start.bat, start-tray.bat, pms, the login entry) bind
+  all interfaces, so a TV on the same wifi can use the LAN URL they print.
+  Everything else (bare binary, Linux and macOS launchers) is loopback-only:
+  add --host 0.0.0.0 to reach it from another device.
+  Loopback again on Windows:  set PM_LISTEN_HOST=127.0.0.1  (a --host flag wins)
   the dashboard footer / /api/lan-ip show the LAN URL to install on a TV box.
 
 Flags

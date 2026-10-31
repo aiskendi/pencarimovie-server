@@ -10,6 +10,11 @@ rem open log, run at login, stop server).
 setlocal
 cd /d "%~dp0"
 if "%PORT%"=="" set PORT=8088
+rem Bind all interfaces unless the user already chose one. The tray, `pms` and
+rem the add-on URL the installer prints all assume a TV on this wifi can reach
+rem the port, and a loopback-only listener is unreachable from every other
+rem device. `--host` on the command line still wins over this.
+if not defined PM_LISTEN_HOST if not defined HOST set "PM_LISTEN_HOST=0.0.0.0"
 if not exist "%~dp0storage" mkdir "%~dp0storage" >nul 2>nul
 rem `start` returns at once, so this window closes immediately; the server gets
 rem its own console, which `--tray` hides itself. Do NOT call the exe directly

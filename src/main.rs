@@ -203,6 +203,9 @@ async fn main() -> anyhow::Result<()> {
     let host = arg_value("--host")
         .or_else(|| storage::env("PM_LISTEN_HOST"))
         .or_else(|| storage::env("HOST"))
+        // `set PM_LISTEN_HOST=0.0.0.0 && ...` keeps a trailing space in the value,
+        // and "0.0.0.0 :8088" then fails to parse as a socket address.
+        .map(|h| h.trim().to_string())
         .unwrap_or_else(|| default_bind_host(cfg!(target_os = "android"), paas_env_present()).to_string());
     // DEFAULT: 4 connections, on every platform.
     //
@@ -525,7 +528,7 @@ async fn main() -> anyhow::Result<()> {
     // ever sit in the hidden-icons flyout.
     #[cfg(not(target_os = "android"))]
     if tray_requested {
-        tray_impl::spawn(port);
+        tray_impl::spawn(port, &host);
     }
 
     let shutdown = shutdown_signal();

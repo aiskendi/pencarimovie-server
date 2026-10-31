@@ -223,6 +223,9 @@ const RUN_NAME: &str = "PencariMovie Server";
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static ICON: AtomicIsize = AtomicIsize::new(0);
 static PORT: AtomicU16 = AtomicU16::new(8088);
+/// The bind address this process actually serves on, so the login entry it
+/// writes reproduces it instead of silently falling back to loopback.
+static HOST: OnceLock<String> = OnceLock::new();
 /// `RegisterWindowMessageW("TaskbarCreated")`: Explorer restarted, re-add.
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
@@ -302,8 +305,9 @@ pub fn hide_console() {
 }
 
 /// Start the tray thread. Returns immediately; the server keeps serving.
-pub fn spawn(server_port: u16) {
+pub fn spawn(server_port: u16, listen_host: &str) {
     PORT.store(server_port, Ordering::Relaxed);
+    let _ = HOST.set(listen_host.to_string());
     hide_console();
     // No console to print to from here on: keep `storage/server.log` current so
     // the tray's "Open log" item has something to open.
@@ -661,7 +665,13 @@ fn toggle_autostart() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let command = format!("\"{}\" --tray --port {}", exe.display(), port());
+    // Carry the host: `--host 0.0.0.0` is what makes the LAN/TV URL reachable,
+    // and an entry without it came back on loopback after every reboot.
+    let host = HOST
+        .get()
+        .map(|h| format!(" --host {h}"))
+        .unwrap_or_default();
+    let command = format!("\"{}\" --tray --port {}{}", exe.display(), port(), host);
     let _ = Command::new("reg")
         .args([
             "add",

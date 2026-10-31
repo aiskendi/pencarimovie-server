@@ -39,5 +39,10 @@ if (-not $Port) {
     if ($env:PORT) { $Port = [int]$env:PORT } else { $Port = 8088 }
 }
 
+# Bind all interfaces unless the user chose one: the tray's "copy add-on URL" and
+# the installer both hand out a LAN address a TV has to reach, so a loopback-only
+# listener would make that address dead.
+if (-not $env:PM_LISTEN_HOST -and -not $env:HOST) { $env:PM_LISTEN_HOST = '0.0.0.0' }
+
 Start-Process -FilePath $exe -ArgumentList @('--tray', '--port', "$Port") `
     -WorkingDirectory $here -WindowStyle Hidden

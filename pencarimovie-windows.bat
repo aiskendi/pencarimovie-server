@@ -358,7 +358,12 @@ goto :eof
 
 :print_urls
 echo   Local:    http://127.0.0.1:%PORT%
-powershell -NoProfile -Command "& { $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Wi-Fi*','Ethernet*','vEthernet*' -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 -ExpandProperty IPAddress); if ($ip) { Write-Host ('  Network:  http://' + $ip + ':%PORT%') } }" 2>nul
+rem Ask the RUNNING server which address it advertises instead of guessing from
+rem the adapter list: the engine already vetoes carrier, VPN and vendor virtual
+rem adapters, and answers 127.0.0.1 when nothing here is a LAN.
+set "LANIP="
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "try { $ip = (Invoke-RestMethod ('http://127.0.0.1:%PORT%/api/lan-ip') -TimeoutSec 3).lan_ip } catch {}; if ($ip -and $ip -ne '127.0.0.1') { $ip }"`) do set "LANIP=%%I"
+if defined LANIP echo   Network:  http://%LANIP%:%PORT%
 goto :eof
 
 :install_or_update

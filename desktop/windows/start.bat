@@ -6,6 +6,9 @@ rem start-tray.bat, which runs the server hidden behind a tray icon.
 setlocal
 cd /d "%~dp0"
 if "%PORT%"=="" set PORT=8088
+rem Same default as start-tray.bat: a TV on this wifi has to reach the port.
+rem An explicit --host in %* still wins.
+if not defined PM_LISTEN_HOST if not defined HOST set "PM_LISTEN_HOST=0.0.0.0"
 set "EXE=pencarimovie-server.exe"
 if not exist "%EXE%" (
   echo pencarimovie-server.exe not found next to this file.

@@ -26,7 +26,11 @@
 # `Dockerfile` so Heroku, Render (render.yaml -> ghcr.io/...:native) and
 # docker-compose observe exactly the same container contract.
 
-FROM debian:bookworm-slim
+# ubuntu:24.04, NOT debian-slim: the binary is compiled on ubuntu-latest /
+# ubuntu-24.04-arm (glibc 2.39), and a bookworm base (glibc 2.36) dies at exec
+# with `version GLIBC_2.38 not found` the moment a newer symbol is used. The base
+# must be at least as new as the builder, so match it exactly.
+FROM ubuntu:24.04
 
 ARG ARCH=amd64
 

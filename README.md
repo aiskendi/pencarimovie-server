@@ -201,7 +201,7 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 | `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = unlimited (the default). Set a limit only on hosts with short request timeouts so clients receive an immediate `503` with `Retry-After` instead of timing out at the proxy. |
 | `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                           |
 | `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                      |
-| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                                                                                                                                       |
+| `PM_LISTEN_HOST`  | `0.0.0.0`            | Bind address: all interfaces by default (`127.0.0.1` for loopback only).                                                                                                                                        |
 
 ---
 

@@ -55,11 +55,9 @@ First run
      (or open http://127.0.0.1:8088/#addon and use the buttons)
 
 LAN / TV access
-  The Windows launchers (start.bat, start-tray.bat, pms, the login entry) bind
-  all interfaces, so a TV on the same wifi can use the LAN URL they print.
-  Everything else (bare binary, Linux and macOS launchers) is loopback-only:
-  add --host 0.0.0.0 to reach it from another device.
-  Loopback again on Windows:  set PM_LISTEN_HOST=127.0.0.1  (a --host flag wins)
+  The server binds all interfaces (0.0.0.0) by default on every platform,
+  so a TV or other device on the same Wi-Fi / LAN can reach it immediately.
+  Loopback only (restrict to this machine):  --host 127.0.0.1  (or env PM_LISTEN_HOST=127.0.0.1)
   the dashboard footer / /api/lan-ip show the LAN URL to install on a TV box.
 
 Flags

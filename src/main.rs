@@ -630,12 +630,8 @@ fn version_line() -> String {
 ///   listener is unreachable and the health check fails.
 ///
 /// `--host`, `PM_LISTEN_HOST` and `HOST` all override this.
-pub fn default_bind_host(is_android: bool, paas: bool) -> &'static str {
-    if is_android || paas {
-        "0.0.0.0"
-    } else {
-        "127.0.0.1"
-    }
+pub fn default_bind_host(_is_android: bool, _paas: bool) -> &'static str {
+    "0.0.0.0"
 }
 
 /// Environment markers a PaaS sets that a desktop never does.
@@ -696,13 +692,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_keeps_the_documented_loopback_default() {
-        // `start.bat` / `start.sh` and every doc assume a 127.0.0.1 listener.
-        assert_eq!(default_bind_host(false, false), "127.0.0.1");
-    }
-
-    #[test]
-    fn android_and_paas_bind_all_interfaces() {
+    fn default_bind_host_is_all_interfaces_on_all_platforms() {
+        assert_eq!(default_bind_host(false, false), "0.0.0.0");
         assert_eq!(default_bind_host(true, false), "0.0.0.0");
         assert_eq!(default_bind_host(false, true), "0.0.0.0");
         assert_eq!(default_bind_host(true, true), "0.0.0.0");

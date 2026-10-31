@@ -303,47 +303,22 @@ jobs:
         shell: bash
         run: cargo build --release --locked --target "${{ matrix.extra_target }}"
 
-      # ── Linux only: a SECOND, statically-linked build for the container ────
-      # The published image is alpine (musl). A gnu binary copied into it dies at
-      # exec with `not found` because /lib/ld-linux-*.so.1 does not exist there,
-      # so the container binary must be the musl target. This is native on both
-      # runners (ubuntu-latest is x86_64, ubuntu-24.04-arm is aarch64) — there is
-      # no QEMU anywhere in this workflow.
-      - name: Add musl target (Linux container binary)
+      # ── Linux only: stage the SAME binary the tarball ships, for the image ──
+      # The container used to carry a second, statically-linked musl build. That
+      # build is what carried `vmovd %eax,%xmm0` (plain AVX, no feature check) on
+      # CPUs without AVX/AVX2, i.e. the 3.0.x SIGILL, while the glibc build of the
+      # same commit was clean — the AVX came in with the static musl libc, not with
+      # our crates. The image is now glibc-based (Dockerfile.release) and ships the
+      # glibc binary, so there is exactly ONE Linux artifact for the gate to
+      # prove and one less toolchain in the release path.
+      - name: Stage the container binary (glibc)
         if: matrix.musl_target != ''
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          # `ring` (pulled in by reqwest/rustls) compiles C, so a musl libc
-          # compiler is required even though the rest of the tree is pure Rust.
-          sudo apt-get install -y -qq musl-tools
-          rustup target add "${{ matrix.musl_target }}"
-
-      - name: Build static musl binary (Linux container binary)
-        if: matrix.musl_target != ''
-        shell: bash
-        env:
-          MUSL_TARGET: ${{ matrix.musl_target }}
-        run: |
-          set -euo pipefail
-          UPPER="$(printf '%s' "$MUSL_TARGET" | tr 'a-z-' 'A-Z_')"
-          export "CARGO_TARGET_${UPPER}_LINKER=musl-gcc"
-          export "CC_${MUSL_TARGET//-/_}=musl-gcc"
-          cargo build --release --locked --target "$MUSL_TARGET"
-
-          BIN="target/$MUSL_TARGET/release/pencarimovie-server"
+          BIN="target/release/pencarimovie-server"
           [ -f "$BIN" ] || { echo "::error::missing $BIN"; exit 1; }
           file "$BIN"
-
-          # Guard the #1 way this pipeline breaks: a glibc binary in an alpine
-          # image. Fail here, loudly, instead of at `docker run`.
-          if file "$BIN" | grep -qi "dynamically linked"; then
-            echo "::error::$BIN is dynamically linked — it cannot run in alpine"
-            exit 1
-          fi
-          echo "Verified: $BIN is statically linked"
-
           # ABSOLUTE, not relative: a relative `dist-container/...` would land
           # under the crate dir and the upload-artifact step (which
           # resolves from the workspace root) then fails with
@@ -407,9 +382,8 @@ jobs:
       # A smoke test on the runner proves nothing about the CPUs users have: the
       # runner has AVX-512, so an AVX2-only binary boots there and dies on a
       # Celeron the moment it does real work. Both Linux artifacts are booted on
-      # an emulated Nehalem CPU (SSE4.2, NO AVX, NO AVX2) and must answer
-      # /api/version. `qemu-user-static` runs the static musl binary directly;
-      # for the glibc one, -L / supplies the host loader.
+      # a guest CPU with AVX/AVX2/FMA removed and must answer /api/version. The
+      # binary is the one artifact the release publishes, container included.
       - name: Portability gate (pre-AVX CPU)
         if: matrix.artifact == 'linux-x86_64'
         shell: bash
@@ -442,12 +416,16 @@ jobs:
           # not fatal: the static musl binary needs no loader and is booted fully
           # either way, and the glibc tarball falls back to a build-to-build
           # comparison of its vector instruction count.
+          # NO `-L /`. A same-architecture guest needs no loader prefix, and `-L`
+          # was what made even `/bin/true` trap on the CI runner while the very same
+          # command worked by hand. Verified both ways on a working harness; without
+          # it, dynamic binaries run here too.
           HARNESS_DYNAMIC=0
-          if "$QEMU" -L / -cpu "$SPEC" /bin/true 2>/dev/null; then
+          if "$QEMU" -cpu "$SPEC" /bin/true 2>/dev/null; then
             HARNESS_DYNAMIC=1
             echo "harness: a dynamic glibc binary runs on -cpu $SPEC"
           else
-            echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC; the glibc artifact is checked statically, the static musl binary is still booted"
+            echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC, so the boot half of this gate could not run here"
           fi
 
           # CONTROL, built here with the same compiler and the same flag. If a
@@ -455,12 +433,11 @@ jobs:
           # installed toolchain) is what is broken, and no verdict about our
           # artifact can be trusted. Cheap, and it ends the guessing.
           printf 'fn main(){println!("control ok");}' > /tmp/control.rs
-          if rustc --target x86_64-unknown-linux-musl -C linker=musl-gcc -O \
-                   -C target-cpu=x86-64 /tmp/control.rs -o /tmp/control 2>/tmp/control.err \
+          if rustc -O -C target-cpu=x86-64 /tmp/control.rs -o /tmp/control 2>/tmp/control.err \
              && "$QEMU" -cpu "$SPEC" /tmp/control; then
-            echo "control: a minimal -C target-cpu=x86-64 musl binary runs here"
+            echo "control: a minimal -C target-cpu=x86-64 binary runs here"
           else
-            echo "::error::even a three-line musl binary built with -C target-cpu=x86-64 traps on -cpu $SPEC here, so this runner's emulation cannot answer the question; see /tmp/control.err"
+            echo "::error::even a three-line binary built with -C target-cpu=x86-64 traps on -cpu $SPEC here, so this runner cannot answer the question; see /tmp/control.err"
             cat /tmp/control.err || true
             exit 1
           fi
@@ -502,20 +479,15 @@ jobs:
           }
 
           GNU=target/release/pencarimovie-server
-          MUSL=target/x86_64-unknown-linux-musl/release/pencarimovie-server
 
-
-          # 1. The static musl binary baked into ghcr.io/<repo>:native - the one
-          #    every NAS user pulls. Fully booted, no harness caveat.
-          boot_check "$MUSL" 18102 || exit 1
-
-          # 2. The glibc tarball the desktop installers download. Its only extra
-          #    requirement over the static build is the dynamic loader, which qemu
-          #    supplies with -L /. Same assertion, same CPU spec.
+          # ONE Linux artifact now: this binary is both the tarball and what the
+          # image runs (Dockerfile.release is glibc-based). Boot it on a CPU with
+          # AVX/AVX2 removed and require the HTTP surface.
           if [ "$HARNESS_DYNAMIC" = "1" ]; then
-            boot_check "$GNU" 18101 -L / || exit 1
+            boot_check "$GNU" 18101 || exit 1
           else
-            echo "::warning::this runner's qemu cannot run dynamic binaries, so the glibc tarball could not be booted; the static artifact (the one the published image ships) is gated"
+            echo "::warning::this runner's qemu cannot execute dynamic binaries (it cannot run /bin/true), so the boot half of this gate could not run here; the compile-time pin is what remains"
+            file "$GNU"
           fi
 
       - name: Test Tray and Launchers (${{ matrix.artifact }})
@@ -783,7 +755,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
 
-      - name: Download the prebuilt musl binary
+      - name: Download the prebuilt binary
         uses: actions/download-artifact@v5
         with:
           name: ${{ matrix.artifact }}
@@ -1049,8 +1021,8 @@ jobs:
             echo "| \`windows-x86_64\` | windows-latest |"
             echo "| \`macos-aarch64\` | macos-14 |"
             echo "| \`macos-x86_64\` | macos-14 (native cross-link) |"
-            echo "| container \`linux/amd64\` | ubuntu-latest (musl) |"
-            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (musl) |"
+            echo "| container \`linux/amd64\` | ubuntu-latest (glibc) |"
+            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (glibc) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notice the next version

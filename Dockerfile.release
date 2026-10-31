@@ -6,35 +6,39 @@
 #   docker build -f Dockerfile.release --build-arg ARCH=amd64 -t pm:native-amd64 .
 #   docker build -f Dockerfile.release --build-arg ARCH=arm64 -t pm:native-arm64 .
 #
-# Why: the previous release path ran `Dockerfile` (FROM rust:1-alpine + cargo
-# build) inside a buildx multi-arch build. The arm64 half compiled ~450 crates
-# under QEMU emulation, which is the ~45 minutes that dominated every release.
-# The compile now happens natively in the `native-build` matrix (ubuntu-latest
-# and ubuntu-24.04-arm), and this file only COPYs the result.
+# ARCH MUST BE `amd64` or `arm64`, and the binary in `dist-docker/${ARCH}/` is the
+# SAME file the `pencarimovie-server-<os>-<arch>.tar.gz` ships, i.e. the GNU/glibc
+# build of the crate.
 #
-# ARCH MUST BE `amd64` or `arm64` AND the binary must be the MUSL target
-# (x86_64-unknown-linux-musl / aarch64-unknown-linux-musl). A gnu binary copied
-# into alpine fails at exec with `not found`, because
-# /lib/ld-linux-{x86_64,aarch64}.so.1 does not exist here.
+# ── WHY THIS IS NO LONGER alpine+musl (2026-10-31) ──────────────────────────
+# The image used to carry a second, statically-linked musl build. Measured on a
+# CPU with AVX/AVX2 removed, that binary executed `vmovd %eax,%xmm0` — plain AVX,
+# no feature check — while the glibc build of the same commit was clean and served
+# fine. The AVX came in with the static musl libc (Ubuntu's musl-tools), not with
+# our crates, and it is exactly the 3.0.x `exit 132` that killed the app on every
+# Synology x86 NAS (Atom/Celeron: no AVX). One artifact, one toolchain, one thing
+# for the release gate to prove.
+#
+# Cost of the change: ~40 MB larger image (debian-slim instead of alpine). Benefit:
+# the container runs the binary we can actually verify.
 #
 # ENV/EXPOSE/VOLUME/USER/HEALTHCHECK/CMD are kept byte-compatible with
 # `Dockerfile` so Heroku, Render (render.yaml -> ghcr.io/...:native) and
 # docker-compose observe exactly the same container contract.
-#
-# `Dockerfile` itself stays as-is: heroku.yml builds it from source server-side
-# and port/rust/docker-compose.yml uses it for local dev.
 
-FROM alpine:3.20
+FROM debian:bookworm-slim
 
 ARG ARCH=amd64
 
-RUN apk add --no-cache ca-certificates tzdata curl \
- && adduser -D -u 10001 -h /data pencarimovie \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin pencarimovie \
  && mkdir -p /data \
  && chown -R 10001:10001 /data
 
-# The release workflow stages the musl binary here before building, so the build
-# context stays tiny (a few MB) instead of shipping the whole repo.
+# The release workflow stages the release binary here before building, so the
+# build context stays tiny (a few MB) instead of shipping the whole repo.
 COPY dist-docker/${ARCH}/pencarimovie-server /usr/local/bin/pencarimovie-server
 RUN chmod +x /usr/local/bin/pencarimovie-server
 

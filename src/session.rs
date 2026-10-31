@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rand::RngCore;
@@ -711,17 +711,62 @@ fn provision_heartbeat_path() -> PathBuf {
     storage_path("guest_provision.heartbeat")
 }
 
-/// `fd_is_guest_provision_in_progress()`: stale locks (>300s) are reclaimed.
+/// Is `pid` a process that still exists?
+///
+/// The provision lock is a FILE, so a holder that is killed (Android restarts the
+/// service, the watchdog fires, the user swipes the app away) can never remove it.
+/// The recorded pid is the only durable proof of liveness on one machine, and it
+/// is what separates "someone is provisioning right now" from "someone was
+/// provisioning when the process died".
+fn pid_still_running(pid: i64) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        crate::tunnel::win_pid_alive(pid)
+    }
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        true
+    }
+}
+
+/// The pid recorded in the lock file, when it looks sane.
+fn lock_owner_pid(path: &Path) -> Option<i64> {
+    let text = fs::read_to_string(path).ok()?;
+    let first = text.split_whitespace().next()?;
+    first.parse::<i64>().ok().filter(|p| *p > 1)
+}
+
+/// `fd_is_guest_provision_in_progress()`: a dead holder or a >300s lock is reclaimed.
 pub fn is_guest_provision_in_progress() -> bool {
     let file = provision_lock_path();
-    let meta = match fs::metadata(&file) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
+    if fs::metadata(&file).is_err() {
+        return false;
+    }
     let age = crate::storage::mtime_secs(&file)
         .map(|m| now() - m)
         .unwrap_or(0);
-    let _ = meta;
+    // Measured on a CPH2581: the engine was restarted at 06:54:03 with a provision
+    // in flight, so its lock file survived with nobody to drop it. Every play then
+    // answered `NO_SESSION` for seven minutes, each attempt first waiting 30 s on
+    // this lock, until the 300 s age fallback finally fired at 07:01:27. A dead
+    // owner is reclaimed on the FIRST check instead.
+    if let Some(owner) = lock_owner_pid(&file) {
+        if !pid_still_running(owner) {
+            log(
+                "reclaimed guest_provision.lock from a dead process",
+                &serde_json::json!({"pid": owner, "age": age}),
+            );
+            let _ = fs::remove_file(&file);
+            return false;
+        }
+    }
     if age > 300 {
         log("reclaimed stale guest_provision.lock", &serde_json::json!({"age": age}));
         let _ = fs::remove_file(&file);
@@ -746,21 +791,34 @@ impl ProvisionLock {
         loop {
             match fs::OpenOptions::new().write(true).create_new(true).open(&file) {
                 Ok(mut f) => {
-                    let _ = f.write_all(b"1");
+                    // Our own pid: the next process to look at this file can tell a
+                    // live holder from a killed one.
+                    let _ = f.write_all(std::process::id().to_string().as_bytes());
                     let _ = fs::write(provision_heartbeat_path(), now().to_string());
                     return Some(ProvisionLock);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(m) = crate::storage::mtime_secs(&file) {
-                        if now() - m > 300 {
-                            let _ = fs::remove_file(&file);
-                            continue;
-                        }
+                    let dead_owner = lock_owner_pid(&file)
+                        .map(|p| !pid_still_running(p))
+                        .unwrap_or(false);
+                    let too_old = crate::storage::mtime_secs(&file)
+                        .map(|m| now() - m > 300)
+                        .unwrap_or(false);
+                    if dead_owner || too_old {
+                        let owner = lock_owner_pid(&file).unwrap_or(0);
+                        log(
+                            "reclaimed guest_provision.lock",
+                            &serde_json::json!({"pid": owner, "dead_owner": dead_owner, "too_old": too_old}),
+                        );
+                        let _ = fs::remove_file(&file);
+                        continue;
                     }
                     if start.elapsed().as_millis() as u64 > wait_ms {
                         return None;
                     }
-                    let _ = fs::write(provision_heartbeat_path(), now().to_string());
+                    // Deliberately NO heartbeat write here. A waiter refreshing the
+                    // holder's heartbeat is what kept a dead lock looking alive for
+                    // the whole age window.
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 Err(_) => return None,
@@ -1016,6 +1074,38 @@ mod tests {
     /// shares, so the parsing has to survive whatever an operator pastes into a
     /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
     /// accidental junk.
+    /// A lock left by a process that is GONE must be reclaimed on the first look.
+    ///
+    /// Measured on a CPH2581: the engine was restarted with a provision in flight,
+    /// the lock file outlived the process that owned it, and every play answered
+    /// `NO_SESSION` for seven minutes (each attempt waiting 30 s on the lock first)
+    /// until the 300 s age fallback fired.
+    #[test]
+    fn a_lock_from_a_dead_process_is_reclaimed_at_once() {
+        let path = provision_lock_path();
+        let _ = fs::remove_file(&path);
+        // A pid no process can have, so `pid_still_running` answers false on every OS.
+        fs::write(&path, "2147483646").unwrap();
+        assert!(
+            !is_guest_provision_in_progress(),
+            "a dead holder must not count as a provision in progress"
+        );
+        assert!(!path.exists(), "the dead lock must be removed");
+    }
+
+    /// The other half: a LIVE holder is still respected, or two logins would run.
+    #[test]
+    fn a_lock_from_a_live_process_counts_as_in_progress() {
+        let path = provision_lock_path();
+        let _ = fs::remove_file(&path);
+        fs::write(&path, std::process::id().to_string()).unwrap();
+        assert!(
+            is_guest_provision_in_progress(),
+            "a live holder must be respected"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn bot_token_list_parses_every_separator_and_dedupes() {
         let mut out = Vec::new();
@@ -1242,9 +1332,25 @@ pub async fn auto_provision_guest(
         }
     }
 
-    let _lock = match ProvisionLock::acquire(30_000).await {
+    // 3 s, not 30. A real provision takes seconds, and the old 30 s wait was paid by
+    // EVERY play attempt while a stale lock existed: measured on a CPH2581, eight
+    // attempts in seven minutes, each blocked for 30 s before the 503. A caller that
+    // cannot get the lock in 3 s is told "in progress" and retries, which is cheap.
+    let _lock = match ProvisionLock::acquire(3_000).await {
         Some(l) => l,
         None => {
+            // A provision that finished while we waited is a SUCCESS: answer with the
+            // session instead of "in progress".
+            let done = get_bot_id();
+            if !done.is_empty() && crate::telegram::has_session_file(&done) {
+                let meta = load_session_meta();
+                return Ok(ProvisionResult {
+                    bot_id: done,
+                    bot_username: meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    error: None,
+                });
+            }
             log(
                 "auto provision skipped: another provision is currently in progress",
                 &serde_json::json!({}),
@@ -1269,28 +1375,51 @@ pub async fn auto_provision_guest(
         }
     }
 
-    // Orphan check, INSIDE the lock and AFTER the re-check.
+    // Orphan session, INSIDE the lock and AFTER the re-check.
     //
     // A login writes `storage/sessions/<bot_id>/` and persists `bot_id` a moment
-    // later, so checking for an orphan before the lock treated a login that was
-    // merely IN FLIGHT as a crashed one. Measured by `tools/smoke_boot.mjs`: the
-    // boot-time guest provision was still running when the harness called
-    // `/api/download`, which answered `503 A previous login did not finish. Please
-    // restart the server.` while the very same login then succeeded — a cold start
-    // that told the operator to restart a healthy server. Holding the lock first
-    // means anything still running has finished (the re-check above already
-    // served that case), leaving a directory with no `bot_id` and no lock holder,
-    // which is a genuine orphan.
+    // later, so the check must run while nothing else is provisioning. Holding the
+    // lock first does that (the re-check above already serves the "another worker
+    // just finished" case).
+    //
+    // This used to REFUSE service: "A previous login did not finish. Please restart
+    // the PencariMovie Server and try again." A restart could never honour that,
+    // because nothing on the boot path removes the directory. Measured on a
+    // CPH2581: `sessions/8582733572` survived an engine restart and every provision
+    // answered 500 for as long as it existed, which is the "auto provision not
+    // working" report. A session file with no `bot_id` is a COMPLETED login whose
+    // bookkeeping was lost, so ADOPT it first: it is a working bot and costs no
+    // origin provision. Only a session that will not boot is discarded, and then a
+    // fresh lease follows in the same call.
     if existing.is_empty() && get_bot_id().is_empty() {
         let orphan = find_orphan_session_bot_id();
         if !orphan.is_empty() {
-            log(
-                "auto provision aborted: orphan session dir present without bot_id",
-                &serde_json::json!({"orphan_bot_id": orphan}),
-            );
-            return Err(ProvisionResult::error(
-                "A previous login did not finish. Please restart the PencariMovie Server and try again.",
-            ));
+            match tg.boot(&orphan, None).await {
+                Ok(entry) => {
+                    save_session_meta(
+                        &entry.identity.id,
+                        &entry.identity.username,
+                        &entry.identity.first_name,
+                    );
+                    log(
+                        "adopted an orphan session instead of refusing to provision",
+                        &serde_json::json!({"bot_id": entry.identity.id}),
+                    );
+                    return Ok(ProvisionResult {
+                        bot_id: entry.identity.id.clone(),
+                        bot_username: entry.identity.username.clone(),
+                        bot_name: entry.identity.first_name.clone(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    log(
+                        "discarding an orphan session that will not boot",
+                        &serde_json::json!({"bot_id": orphan, "error": e}),
+                    );
+                    clear_session_directory(&storage_path(&format!("sessions/{}", orphan)));
+                }
+            }
         }
     }
 

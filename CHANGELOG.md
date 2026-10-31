@@ -99,6 +99,28 @@ docker compose up -d` in a code block for a container, "install the newest APK" 
 
 ### Fixed
 
+- **A provision killed mid-flight no longer locks the install out, and an orphan session no longer
+  locks it out for good.** Both were found on a CPH2581 in the field. The provision lock is a file,
+  so a holder that is killed (Android restarts the service, the watchdog fires, the app is swiped
+  away) can never remove it, and nothing separates "someone is provisioning now" from "someone was
+  provisioning when the process died": measured, the engine restarted at 06:54:03 with a provision
+  in flight, the lock survived, and eight play attempts over seven minutes each waited 30 s and then
+  answered `503 NO_SESSION` until the 300 s age fallback fired. The lock now records its owner pid
+  and is reclaimed on the FIRST look when that process is gone, the request path waits 3 s instead
+  of 30 s, and a waiter no longer refreshes the holder's heartbeat (which is what kept a dead lock
+  looking alive). Second, `auto_provision_guest()` used to refuse service outright when a session
+  file existed with no `bot_id`: `A previous login did not finish. Please restart the PencariMovie
+Server.` A restart could never honour that, because nothing on the boot path removes
+  `storage/sessions/<bot_id>/`, so an install that hit it answered 500 to every provision for as
+  long as the directory existed (measured: `sessions/8582733572` outlived an engine restart). It
+  now ADOPTS an orphan session (a working bot, and no origin provision spent) and only discards one
+  that will not boot, after which a fresh lease follows in the same call. Third, `/api/download`
+  validated its payload AFTER `auto_provision_guest`, so a request with no file id and no short
+  code could spend a provision or answer `503 Connecting guest bot in progress` instead of the 400
+  it needs; the shape check now runs first. Pinned by
+  `session::tests::a_lock_from_a_dead_process_is_reclaimed_at_once` and
+  `…_from_a_live_process_counts_as_in_progress`.
+
 - **A renewal that cannot reach the origin now retries in seconds instead of a minute, and says
   which failure it is.** The follow-up on issue #14: after the install-wide token expired while
   the origin was unreachable, the engine kept answering `wp 401 without a token` with the reason

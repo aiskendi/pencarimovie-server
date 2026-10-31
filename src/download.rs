@@ -981,6 +981,33 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }),
     );
 
+    // Nothing to serve is a CLIENT error, and it must not depend on the session.
+    //
+    // This check lived after `auto_provision_guest`, so a request carrying no file
+    // id at all could spend a provision, or answer `503 Connecting guest bot in
+    // progress` while one was starting, instead of the 400 the caller can act on.
+    // The 30 s provision wait hid it; the cold-start gate caught it the moment that
+    // wait became 3 s, with `/api/download` itself as the caller.
+    if file_id.is_empty() && short_code.is_empty() && encoded.is_empty() {
+        record_refusal(
+            ctx,
+            started,
+            400,
+            "MISSING_FILE_ID",
+            "file_id or valid short_code is required for local browser download.",
+            &short_code,
+            serde_json::json!({"payload_len": 0, "bot_id": get_bot_id(), "pool_bots": 0}),
+        );
+        return json_response(
+            400,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "file_id or valid short_code is required for local browser download.",
+                "hint": "Pass a Bot API file id or shortcode to resolve the file.",
+            }),
+        );
+    }
+
     let mut active_bot = get_bot_id();
     if !has_local_session("") {
         match auto_provision_guest(&state.telegram).await {

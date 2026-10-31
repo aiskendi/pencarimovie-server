@@ -422,6 +422,13 @@ jobs:
           chmod +x "$QEMU"
           "$QEMU" --version
 
+          # Harness sanity, once: a plain glibc binary must run on the emulated
+          # CPU. If this fails, the gate is broken, not the artifact.
+          "$QEMU" -L / -cpu Nehalem /bin/true && echo "harness OK" || {
+            echo "::error::qemu cannot run /bin/true on -cpu Nehalem - the gate itself is broken"
+            exit 1
+          }
+
           check() {
             # ABSOLUTE, always: qemu resolves a relative guest path against the
             # -L prefix, so `target/release/...` became `/target/release/...` and
@@ -430,7 +437,11 @@ jobs:
             # paths) and failed only in CI.
             BIN="$(realpath "$1")"; PORT="$2"
             echo "--- gate: $BIN"
+            echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
             file "$BIN" || true
+            # Proof, not inference: 256-bit registers anywhere in the artifact mean
+            # AVX/AVX2 code got compiled in, whatever the flags claimed.
+            echo "256-bit (ymm) instructions in the artifact: $(objdump -d "$BIN" 2>/dev/null | grep -c '%ymm' || true)"
             # Step 1 answers a different question than step 2, on purpose. If qemu
             # cannot even run `--version`, that is the harness (or a linker path),
             # NOT an AVX2 artifact, and saying so saves the next person an hour.

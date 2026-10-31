@@ -1070,6 +1070,22 @@ mod tests {
         assert!(flood_remaining() <= 30);
     }
 
+    /// The two `guest_provision.lock` tests below share one file, and `cargo test`
+    /// runs them as parallel threads of the SAME process. Unguarded, the
+    /// dead-holder test deletes the file and writes its impossible pid between the
+    /// live-holder test's write and its assert — the live test then reads
+    /// `2147483646`, correctly reports "nobody is provisioning", and fails on a
+    /// machine where nothing is wrong. That is the 2026-10-31 CI failure
+    /// (`a live holder must be respected`), reproduced locally with just these two
+    /// tests selected.
+    static PROVISION_LOCK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn provision_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking sibling poisons the mutex; the lock file is disposable, so
+        // take it back instead of failing every later test in the module.
+        PROVISION_LOCK_TEST.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
     /// shares, so the parsing has to survive whatever an operator pastes into a
     /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
@@ -1082,6 +1098,7 @@ mod tests {
     /// until the 300 s age fallback fired.
     #[test]
     fn a_lock_from_a_dead_process_is_reclaimed_at_once() {
+        let _guard = provision_test_guard();
         let path = provision_lock_path();
         let _ = fs::remove_file(&path);
         // A pid no process can have, so `pid_still_running` answers false on every OS.
@@ -1096,6 +1113,7 @@ mod tests {
     /// The other half: a LIVE holder is still respected, or two logins would run.
     #[test]
     fn a_lock_from_a_live_process_counts_as_in_progress() {
+        let _guard = provision_test_guard();
         let path = provision_lock_path();
         let _ = fs::remove_file(&path);
         fs::write(&path, std::process::id().to_string()).unwrap();

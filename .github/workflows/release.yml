@@ -234,7 +234,14 @@ jobs:
             container_arch: amd64
             extra_target: ""
             bin_dir: target/release
-            rustflags: "-C target-cpu=x86-64"
+            # BOTH flags. `target-cpu=x86-64` stops LLVM emitting VEX code on its
+            # own, but it does NOT stop a dependency from selecting a vector
+            # backend: several crates dispatch on `cfg!(target_feature = "avx…")`
+            # and build.rs-time probes, and those still saw AVX on the old build.
+            # Forbidding the features makes those cfgs false everywhere and forces
+            # every backend to its scalar path, which is what actually keeps the
+            # artifact bootable on a Celeron.
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
           - os: ubuntu-24.04-arm
             artifact: linux-aarch64
             musl_target: aarch64-unknown-linux-musl
@@ -249,7 +256,7 @@ jobs:
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
-            rustflags: "-C target-cpu=x86-64"
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
           # macos-15 is arm64. Pinned (not macos-latest) so the two macOS legs
           # cannot collapse onto the same architecture when GitHub advances
           # `latest` — that would silently mislabel both artifacts.

@@ -57,7 +57,9 @@ COPY desktop ./desktop
 # `native` here. `uname -m` is the build/target arch: nothing in this file
 # cross-compiles.
 RUN set -eux; \
-    if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="-C target-cpu=x86-64"; fi; \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+      export RUSTFLAGS="-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"; \
+    fi; \
     cargo build --release --locked \
  && cp target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
 

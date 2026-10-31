@@ -29,8 +29,8 @@ use serde_json::Value;
 use crate::auth::{
     ReqCtx, auth_client_ip, auth_cookie_header, auth_enabled, auth_lockout_check, auth_privileged,
     auth_record_failure, auth_record_success, auth_rotate_token, auth_set_password, auth_token,
-    auth_verify_password, is_authenticated, parse_cookies, require_privileged, strip_token_prefix,
-    url_host_is_public,
+    auth_verify_password, is_authenticated, parse_cookies, require_privileged,
+    require_trusted_device, strip_token_prefix, url_host_is_public,
 };
 use crate::config::{AUTH_DEFAULT_PASSWORD, app_version, wp_api_base, wp_version_url};
 use crate::credentials::{clear_api_secret, get_api_secret};
@@ -507,7 +507,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         // an attacker's manifest and every bridged catalog row, stream URL and
         // subtitle then comes from there. README stays open, because the dashboard
         // renders it before anyone has logged in.
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -918,7 +918,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     if p == "/api/bots" && m == "GET" {
         // Bot ids and usernames are the install's Telegram identity. They are not
         // secrets, but they are not for strangers either.
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let pool = get_bot_pool();
@@ -955,7 +955,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         // as, and the reply carries the pool. The dashboard reaches this over
         // loopback, which stays allowed; `/api/provision` has been gated this way
         // since it started returning `api_secret`.
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -1044,7 +1044,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/bots/remove" && m == "POST" {
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -1089,7 +1089,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/bots/set-active" && m == "POST" {
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -1336,7 +1336,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         // The success body carries `api_secret`, which is the credential every
         // other protected route accepts. Returning it to an anonymous caller was
         // the one place a real secret escaped without a token.
-        if let Some(resp) = require_privileged(&ctx) {
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
@@ -1378,8 +1378,8 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     if p == "/api/botlogout" && m == "POST" {
         // One anonymous POST here clears `session_meta`, `bot_id`, `bot_pool` and
         // `api_secret`, which is a remote stop of the whole install: nothing plays
-        // again until a bot is re-added. State-destroying, so it needs the token.
-        if let Some(resp) = require_privileged(&ctx) {
+        // again until a bot is re-added. State-destroying, so it needs the gate.
+        if let Some(resp) = require_trusted_device(&ctx) {
             return resp;
         }
         // Identity first, then sessions/pool (the PHP's self-resurrecting-pool fix).

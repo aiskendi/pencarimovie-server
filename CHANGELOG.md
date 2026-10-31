@@ -6,10 +6,10 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ### Security
 
-- **Six state-changing routes that had no gate now require the token or loopback.** The auth
-  system was applied per route, never globally, so a route simply forgot it and nothing noticed.
-  Every route that changes local state, spends an origin call, or returns a credential now calls
-  `require_privileged` ([`src/auth.rs`](src/auth.rs:236)): `POST /api/botlogout` (cleared
+- **Six state-changing routes that had no gate now require the same machine or network, or a
+  token.** The auth system was applied per route, never globally, so a route simply forgot it and
+  nothing noticed. Every route that changes local state, spends an origin call, or returns a
+  credential is now gated: `POST /api/botlogout` (cleared
   `session_meta`, `bot_id`, `bot_pool` and `api_secret`, so one anonymous POST stopped the whole
   install until a bot was re-added), `POST /api/botlogin` (its success body carried
   `api_secret`), `POST /api/catalog-settings` (rewrote `upstream_manifests`, so an attacker's
@@ -20,11 +20,18 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
   still answers `has_session` for the dashboard but blanks `bot_pool` and `bot_count`, and
   `GET /api/tunnel/status` still reports `enabled` / `running` / `starting` / `error` but blanks
   `tunnel_url`, `public_url`, `manifest_url` and `custom_domains`. The addon and player surface
-  stays open, because a Stremio client cannot send a header per request. Behaviour change worth
-  knowing: over a tunnel without a password, bot management now needs the dashboard opened on
-  loopback or a password set, which is how `/api/provision` already behaved. Pinned by
-  `tools/probe_auth_gates.mjs`, which calls every one of these routes twice, once as loopback and
-  once with `cf-connecting-ip` (17 checks, both directions).
+  stays open, because a Stremio client cannot send a header per request. The dashboard-driven
+  routes use a new `require_trusted_device()` ([`src/auth.rs`](src/auth.rs:251)) instead of
+  `require_privileged`: same machine or network, or a token. Each existing gate was wrong for
+  them in one direction. `require_privileged` refuses a LAN peer, which broke the dashboard
+  opened at `http://192.168.x.x:8088`: the page loads, the catalogs render, and then "Add bot"
+  and every catalog toggle answers 403 (measured on this box before the change). `require_auth`
+  closes nothing when no password is set, because it answers true for every caller in that
+  state, a tunnel included. A tunnel, a PaaS host or any proxied caller is still refused without
+  the token, since `is_local_request` checks that first. `/api/debug-mode` and `GET /api/logs`
+  stay machine-only, because the log they expose is not a dashboard feature. Pinned by
+  `tools/probe_auth_gates.mjs`, which calls each route as loopback, over the LAN address, and
+  with `cf-connecting-ip`: 21 checks across all three boundaries.
 
 ### Added
 

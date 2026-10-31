@@ -248,6 +248,36 @@ pub fn require_privileged(ctx: &ReqCtx) -> Option<Response> {
     }
 }
 
+/// The gate for the routes the DASHBOARD drives from a browser: same network, or
+/// a token.
+///
+/// Neither existing gate fits. [`require_auth`] answers true for every caller when
+/// no password is set (it returns true when `!auth_enabled()`), so it closes
+/// nothing on the common install. [`require_privileged`] refuses a LAN peer, which
+/// broke the dashboard opened at `http://192.168.x.x:8088`: the page loaded, the
+/// catalogs rendered, and then "Add bot" and every catalog toggle answered 403.
+///
+/// The boundary these routes actually need is "not the internet". `is_local_request`
+/// already refuses a tunnelled request first, and refuses a public
+/// `x-forwarded-for`, so a Cloudflare Tunnel, a PaaS host and any proxied caller
+/// still need the token. A machine on the same network is inside the trust boundary
+/// this whole install is built for, and it is already exempted on `/api/download`
+/// and from the per-client limits.
+pub fn require_trusted_device(ctx: &ReqCtx) -> Option<Response> {
+    if is_local_request(ctx) || auth_privileged(ctx) {
+        None
+    } else {
+        Some(json_response(
+            403,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "This action must be performed on this machine or network (or with a valid token).",
+                "local_only": true
+            }),
+        ))
+    }
+}
+
 pub async fn url_host_is_public(raw: &str) -> bool {
     let parsed = match url::Url::parse(raw) {
         Ok(u) => u,

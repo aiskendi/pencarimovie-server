@@ -7401,8 +7401,24 @@ fn manifest_response(ctx: &ReqCtx, doc: &Value) -> Response {
 /* ── version (fd_check_version, backend.php:7719) ─────────────────────────── */
 
 fn version_less(a: &str, b: &str) -> bool {
-    let pa: Vec<i64> = a.split('.').map(|n| n.parse().unwrap_or(0)).collect();
-    let pb: Vec<i64> = b.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+    // A component can be a git stamp rather than a number. `3.0.5-14-gf154c62`
+    // splits into "3", "0", "5-14-gf154c62", and `parse()` on the last one FAILS.
+    // Falling back to 0 made that build compare as 3.0.0, so the moment the
+    // WordPress `min_version` reached the same major.minor (`3.0.4`) every build
+    // from a git checkout reported `update_needed: true`: the dashboard showed an
+    // update pill for the newest binary, and `tools/smoke_boot.mjs` failed its
+    // version-payload check. Read the leading digits instead.
+    let num = |s: &str| -> i64 {
+        s.trim()
+            .trim_start_matches('v')
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    };
+    let pa: Vec<i64> = a.split('.').map(num).collect();
+    let pb: Vec<i64> = b.split('.').map(num).collect();
     for i in 0..pa.len().max(pb.len()) {
         let x = *pa.get(i).unwrap_or(&0);
         let y = *pb.get(i).unwrap_or(&0);
@@ -7513,6 +7529,26 @@ async fn check_version() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `git describe` build must compare by its X.Y.Z, not by a failed parse.
+    ///
+    /// `3.0.5-14-gf154c62` used to read its patch component as 0, so it compared
+    /// as 3.0.0 and claimed `update_needed: true` against the WordPress plugin's
+    /// `3.0.4` minimum. Every build from a git checkout showed an update pill for
+    /// the newest binary, and the cold-start gate failed its version-payload check.
+    #[test]
+    fn a_git_stamped_build_is_not_older_than_its_release() {
+        assert!(!version_less("3.0.5-14-gf154c62", "3.0.4"));
+        assert!(!version_less("3.0.4", "3.0.4"));
+        assert!(version_less("3.0.3-4-gf839d36", "3.0.4"));
+        assert!(version_less("v3.0.5", "3.0.6"));
+        let desktop = version_answer("", "3.0.5-14-gf154c62", "3.0.4", "http://telegra.my", "");
+        assert_eq!(
+            desktop["update_needed"], false,
+            "a build at or above the minimum must not be told to update: {desktop}"
+        );
+        assert_eq!(desktop["version"], "3.0.5", "the badge stays X.Y.Z");
+    }
 
     #[test]
     fn lan_ip_accepts_only_rfc1918() {

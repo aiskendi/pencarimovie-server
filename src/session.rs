@@ -1242,19 +1242,6 @@ pub async fn auto_provision_guest(
         }
     }
 
-    if existing.is_empty() {
-        let orphan = find_orphan_session_bot_id();
-        if !orphan.is_empty() {
-            log(
-                "auto provision aborted: orphan session dir present without bot_id",
-                &serde_json::json!({"orphan_bot_id": orphan}),
-            );
-            return Err(ProvisionResult::error(
-                "A previous login did not finish. Please restart the PencariMovie Server and try again.",
-            ));
-        }
-    }
-
     let _lock = match ProvisionLock::acquire(30_000).await {
         Some(l) => l,
         None => {
@@ -1279,6 +1266,31 @@ pub async fn auto_provision_guest(
                 bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 error: None,
             });
+        }
+    }
+
+    // Orphan check, INSIDE the lock and AFTER the re-check.
+    //
+    // A login writes `storage/sessions/<bot_id>/` and persists `bot_id` a moment
+    // later, so checking for an orphan before the lock treated a login that was
+    // merely IN FLIGHT as a crashed one. Measured by `tools/smoke_boot.mjs`: the
+    // boot-time guest provision was still running when the harness called
+    // `/api/download`, which answered `503 A previous login did not finish. Please
+    // restart the server.` while the very same login then succeeded — a cold start
+    // that told the operator to restart a healthy server. Holding the lock first
+    // means anything still running has finished (the re-check above already
+    // served that case), leaving a directory with no `bot_id` and no lock holder,
+    // which is a genuine orphan.
+    if existing.is_empty() && get_bot_id().is_empty() {
+        let orphan = find_orphan_session_bot_id();
+        if !orphan.is_empty() {
+            log(
+                "auto provision aborted: orphan session dir present without bot_id",
+                &serde_json::json!({"orphan_bot_id": orphan}),
+            );
+            return Err(ProvisionResult::error(
+                "A previous login did not finish. Please restart the PencariMovie Server and try again.",
+            ));
         }
     }
 

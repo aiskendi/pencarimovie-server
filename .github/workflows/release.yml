@@ -513,14 +513,16 @@ jobs:
           set -euo pipefail
           echo "Testing Windows installer lifecycle against dist-rust package..."
 
-          # Extract the PowerShell installer script from the worker
+          # Extract the PowerShell installer script from the worker into the runner temp directory
           node -e '
             const fs = require("fs");
+            const os = require("os");
+            const path = require("path");
             const src = fs.readFileSync("cloudflare-worker-telegra-my.js", "utf8");
             const mark = "const PS1_INSTALL = `";
             const start = src.indexOf(mark);
             const end = src.indexOf("\n`;", start + mark.length);
-            fs.writeFileSync("/tmp/pm-installer-test.ps1", src.slice(start + mark.length, end + 1));
+            fs.writeFileSync(path.join(os.tmpdir(), "pm-installer-test.ps1"), src.slice(start + mark.length, end + 1));
           '
 
           # Start mock HTTP server on 127.0.0.1:18097 serving dist-rust/
@@ -546,13 +548,15 @@ jobs:
             $testInstall = Join-Path $testRoot "pencarimovie-server"
 
             # Read installer and adapt $base and $installDir for local testing
-            $script = Get-Content -Raw /tmp/pm-installer-test.ps1
+            $testScript = Join-Path $env:TEMP "pm-installer-test.ps1"
+            $runTest = Join-Path $env:TEMP "run-test.ps1"
+            $script = Get-Content -Raw $testScript
             $script = $script -replace "\$base = .*", "\$base = '\''http://127.0.0.1:18097'\''"
             $script = $script -replace "\$installDir = .*", "\$installDir = '\''$($testInstall -replace "\\", "/")'\''"
-            Set-Content /tmp/run-test.ps1 $script
+            Set-Content $runTest $script
 
             Write-Host "1. Testing clean install..."
-            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
             Write-Host $out1
             if (-not (Test-Path "$testInstall\pencarimovie-server.exe")) {
               throw "Installer failed: pencarimovie-server.exe not found"
@@ -562,7 +566,7 @@ jobs:
             }
 
             Write-Host "2. Testing re-run when build is already latest (should skip download)..."
-            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
             Write-Host $out2
             if ($out2 -notmatch "Already on the latest build") {
               throw "Installer failed to skip download when version matches"
@@ -577,7 +581,7 @@ jobs:
             Remove-Item "$testInstall\.release-sha256" -Force
 
             # Run installer again while server is running - must cleanly stop it and copy without file-lock error
-            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File /tmp/run-test.ps1 | Out-String
+            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
             Write-Host $out3
             if ($out3 -match "used by another process") {
               throw "Installer crashed with file-lock error during update!"

@@ -410,14 +410,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static
-          command -v qemu-x86_64-static
+          # A PINNED static qemu, not `apt-get install qemu-user-static`. That
+          # package is "no installation candidate" on the current ubuntu-latest
+          # image (the first run of this gate died on it), and a gate that cannot
+          # install its own tool is a gate that silently stops existing.
+          QDIR="$(mktemp -d)"
+          curl -fsSL -m 180 -o /tmp/qemu.tgz \
+            https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/x86_64_qemu-x86_64-static.tar.gz
+          tar xzf /tmp/qemu.tgz -C "$QDIR"
+          QEMU="$QDIR/qemu-x86_64-static"
+          chmod +x "$QEMU"
+          "$QEMU" --version
 
           check() {
             BIN="$1"; PORT="$2"
             ROOT="$(mktemp -d)"
-            PM_APP_ROOT="$ROOT" qemu-x86_64-static -L / -cpu Nehalem \
+            PM_APP_ROOT="$ROOT" "$QEMU" -L / -cpu Nehalem \
               "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
             PID=$!
             for _ in $(seq 1 90); do
@@ -429,7 +437,7 @@ jobs:
               kill -0 "$PID" 2>/dev/null || break
               sleep 1
             done
-            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) — this artifact would SIGILL (exit 132) on every Synology x86 NAS. Tail of its log:"
+            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) - this artifact would SIGILL (exit 132) on every Synology x86 NAS. Tail of its log:"
             tail -n 25 "gate-$PORT.log" || true
             kill "$PID" 2>/dev/null || true
             return 1

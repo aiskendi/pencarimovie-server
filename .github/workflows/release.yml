@@ -250,17 +250,20 @@ jobs:
             extra_target: ""
             bin_dir: target/release
             rustflags: "-C target-cpu=x86-64"
-          # macos-14 is arm64. Pinned (not macos-latest) so the two macOS legs
+          # macos-15 is arm64. Pinned (not macos-latest) so the two macOS legs
           # cannot collapse onto the same architecture when GitHub advances
           # `latest` — that would silently mislabel both artifacts.
-          - os: macos-14
+          # macOS 14 images are RETIRED on 2026-11-02 (GitHub runner-images#13518)
+          # and are already in brownout: every run against macos-14 was failing
+          # with a runner-image notice while the other four legs ran normally.
+          - os: macos-15
             artifact: macos-aarch64
             musl_target: ""
             container_arch: ""
             extra_target: ""
             bin_dir: target/release
             rustflags: ""
-          - os: macos-14
+          - os: macos-15
             artifact: macos-x86_64
             musl_target: ""
             container_arch: ""

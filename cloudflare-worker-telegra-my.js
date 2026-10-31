@@ -118,7 +118,12 @@ $asset = 'pencarimovie-server-windows-x86_64.tar.gz'
 $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $installDir = Join-Path $homeDir 'pencarimovie-server'
 
-if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
+$tarExe = Join-Path (Join-Path $env:SystemRoot 'System32') 'tar.exe'
+if (-not (Test-Path -LiteralPath $tarExe)) {
+    $tarCmd = Get-Command tar.exe -ErrorAction SilentlyContinue
+    if ($tarCmd) { $tarExe = $tarCmd.Source }
+}
+if (-not $tarExe -or -not (Test-Path -LiteralPath $tarExe)) {
     Write-Host 'tar.exe is missing. Windows 10 1803+ and Windows 11 include it.' -ForegroundColor Red
     exit 1
 }
@@ -177,7 +182,7 @@ try {
             Write-Host 'Checksum check skipped: no .sha256 sidecar.' -ForegroundColor DarkGray
         }
 
-        tar.exe -xzf (Join-Path $tmp $asset) -C $tmp
+        & $tarExe -xzf (Join-Path $tmp $asset) -C $tmp
         $rel = Join-Path $tmp 'pencarimovie-server-windows-x86_64'
 
         # A running server holds pencarimovie-server.exe open, so the copy below

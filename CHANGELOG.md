@@ -4,6 +4,28 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ## [Unreleased]
 
+### Security
+
+- **Six state-changing routes that had no gate now require the token or loopback.** The auth
+  system was applied per route, never globally, so a route simply forgot it and nothing noticed.
+  Every route that changes local state, spends an origin call, or returns a credential now calls
+  `require_privileged` ([`src/auth.rs`](src/auth.rs:236)): `POST /api/botlogout` (cleared
+  `session_meta`, `bot_id`, `bot_pool` and `api_secret`, so one anonymous POST stopped the whole
+  install until a bot was re-added), `POST /api/botlogin` (its success body carried
+  `api_secret`), `POST /api/catalog-settings` (rewrote `upstream_manifests`, so an attacker's
+  manifest could own every bridged catalog row, stream URL and subtitle), `GET /api/bots` and
+  `POST /api/bots/{add,remove,set-active}`, and `/api/debug-mode` plus `GET /api/logs` (the
+  switch that makes the log, with its short codes and origin URLs, readable). Two routes keep
+  their public half and lose their private half instead of closing entirely: `GET /api/session`
+  still answers `has_session` for the dashboard but blanks `bot_pool` and `bot_count`, and
+  `GET /api/tunnel/status` still reports `enabled` / `running` / `starting` / `error` but blanks
+  `tunnel_url`, `public_url`, `manifest_url` and `custom_domains`. The addon and player surface
+  stays open, because a Stremio client cannot send a header per request. Behaviour change worth
+  knowing: over a tunnel without a password, bot management now needs the dashboard opened on
+  loopback or a password set, which is how `/api/provision` already behaved. Pinned by
+  `tools/probe_auth_gates.mjs`, which calls every one of these routes twice, once as loopback and
+  once with `cf-connecting-ip` (17 checks, both directions).
+
 ### Added
 
 - **`/api/download` now has per-client limits, and they count TITLES, not sockets.** Before

@@ -412,6 +412,17 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 }
             }
         }
+        // The public address is this install's front door, and a status poll does
+        // not need it. `enabled` / `running` / `starting` / `error` tell the
+        // dashboard everything it draws; the address is for the operator.
+        if !auth_privileged(&ctx) {
+            if let Some(obj) = status.as_object_mut() {
+                for k in ["tunnel_url", "public_url", "manifest_url"] {
+                    obj.insert(k.to_string(), serde_json::json!(""));
+                }
+                obj.insert("custom_domains".to_string(), serde_json::json!([]));
+            }
+        }
         return json_response(200, &status);
     }
 
@@ -491,6 +502,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/catalog-settings" && m == "POST" {
+        // This rewrites `storage/catalog_settings.json`, including
+        // `upstream_manifests`. Left open, one anonymous POST points the addon at
+        // an attacker's manifest and every bridged catalog row, stream URL and
+        // subtitle then comes from there. README stays open, because the dashboard
+        // renders it before anyone has logged in.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !input.is_object() {
             return json_response(400, &serde_json::json!({"ok": 0, "error": "Invalid JSON input"}));
@@ -801,8 +820,11 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "bot_name": if has_session { bot_name } else { String::new() },
                 "api_secret": if has_session && auth_privileged(&ctx) { get_api_secret() } else { String::new() },
                 "device_id": get_device_id(),
-                "bot_count": pool.len(),
-                "bot_pool": pool,
+                // The pool names every bot this install owns. `has_session` above is
+                // already public and is all the dashboard needs to pick a screen, so
+                // the identities stay with the operator.
+                "bot_count": if auth_privileged(&ctx) { pool.len() } else { 0 },
+                "bot_pool": if auth_privileged(&ctx) { pool } else { Vec::<Value>::new() },
                 "environment_ok": true,
                 "environment_fatal": false,
                 "environment_problems": [],
@@ -894,6 +916,11 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── bots (backend.php:18928-19112) ───────────────────────────────────── */
     if p == "/api/bots" && m == "GET" {
+        // Bot ids and usernames are the install's Telegram identity. They are not
+        // secrets, but they are not for strangers either.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let pool = get_bot_pool();
         let active = get_bot_id();
         let list: Vec<Value> = pool
@@ -924,6 +951,13 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/bots/add" && m == "POST" {
+        // Adding a bot makes the caller's identity the one this install downloads
+        // as, and the reply carries the pool. The dashboard reaches this over
+        // loopback, which stays allowed; `/api/provision` has been gated this way
+        // since it started returning `api_secret`.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !input.is_object() {
             return json_response(400, &serde_json::json!({"ok": 0, "message": "Invalid JSON body"}));
@@ -1010,6 +1044,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/bots/remove" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !input.is_object() {
             return json_response(400, &serde_json::json!({"ok": 0, "message": "Invalid JSON body"}));
@@ -1052,6 +1089,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/bots/set-active" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !input.is_object() {
             return json_response(400, &serde_json::json!({"ok": 0, "message": "Invalid JSON body"}));
@@ -1230,6 +1270,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── debug-mode / logs (backend.php:19206-19260) ──────────────────────── */
     if p == "/api/debug-mode" {
+        // Debug mode is the switch that makes `debug.log` readable, and that file
+        // carries short codes, origin URLs and bot ids. Whoever can flip this can
+        // read the install, so the switch itself is the thing to protect.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         if m == "POST" {
             let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
             set_debug_enabled(input.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false));
@@ -1245,6 +1291,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/logs" && m == "GET" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         if !is_debug_enabled() {
             return json_response(
                 403,
@@ -1284,6 +1333,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── bot login/logout (backend.php:19416-19576) ───────────────────────── */
     if p == "/api/botlogin" && m == "POST" {
+        // The success body carries `api_secret`, which is the credential every
+        // other protected route accepts. Returning it to an anonymous caller was
+        // the one place a real secret escaped without a token.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         let token = {
             let a = jstr(&input, "bot_token");
@@ -1321,6 +1376,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/botlogout" && m == "POST" {
+        // One anonymous POST here clears `session_meta`, `bot_id`, `bot_pool` and
+        // `api_secret`, which is a remote stop of the whole install: nothing plays
+        // again until a bot is re-added. State-destroying, so it needs the token.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
         // Identity first, then sessions/pool (the PHP's self-resurrecting-pool fix).
         let active = get_bot_id();
         let _ = std::fs::remove_file(storage_path("session_meta.json"));

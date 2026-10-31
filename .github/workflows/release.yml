@@ -422,6 +422,14 @@ jobs:
           chmod +x "$QEMU"
           "$QEMU" --version
 
+          # The guest CPU states the property, not an era: a modern model with
+          # AVX/AVX2/FMA removed. `-cpu Nehalem` was the first attempt and it broke
+          # qemu itself on this runner (even /bin/true SIGILLed there), which made
+          # the gate report the harness as if it were the artifact. Verified on a
+          # working harness that this spec boots a pinned build and still traps the
+          # shipped 3.0.5 binary, so it is green- and red-capable.
+          SPEC="max,-avx,-avx2,-fma,-f16c"
+
           # Can this qemu execute a DYNAMIC glibc binary on -cpu Nehalem at all?
           # On the current ubuntu-latest runner it cannot - even `/bin/true` SIGILLs
           # under qemu 7.2 - and that says nothing about our artifact. Recorded,
@@ -429,11 +437,11 @@ jobs:
           # either way, and the glibc tarball falls back to a build-to-build
           # comparison of its vector instruction count.
           HARNESS_DYNAMIC=0
-          if "$QEMU" -L / -cpu Nehalem /bin/true 2>/dev/null; then
+          if "$QEMU" -L / -cpu "$SPEC" /bin/true 2>/dev/null; then
             HARNESS_DYNAMIC=1
-            echo "harness: a dynamic glibc binary runs on -cpu Nehalem"
+            echo "harness: a dynamic glibc binary runs on -cpu $SPEC"
           else
-            echo "::warning::qemu on this runner cannot run even /bin/true on -cpu Nehalem; dynamic artifacts are checked statically, the static musl binary is still booted"
+            echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC; the glibc artifact is checked statically, the static musl binary is still booted"
           fi
 
           ymm_count() {
@@ -449,19 +457,19 @@ jobs:
             echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
             file "$BIN" || true
             ROOT="$(mktemp -d)"
-            PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu Nehalem \
+            PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" \
               "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
             PID=$!
             for _ in $(seq 1 90); do
               if curl -fsS -m 3 "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
-                echo "PASS: $BIN boots and serves on Nehalem (no AVX/AVX2)"
+                echo "PASS: $BIN boots and serves with AVX/AVX2 removed from the CPU"
                 kill "$PID" 2>/dev/null || true
                 return 0
               fi
               kill -0 "$PID" 2>/dev/null || break
               sleep 1
             done
-            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) - this artifact would SIGILL (exit 132) on every Synology x86 NAS."
+            echo "::error::$BIN did not serve on a CPU without AVX/AVX2 - this artifact would SIGILL (exit 132) on every Synology x86 NAS."
             echo "--- emulated exit status / full log ($(wc -c < "gate-$PORT.log" 2>/dev/null || echo 0) bytes):"
             wait "$PID" 2>/dev/null || echo "emulated exit=$?"
             cat "gate-$PORT.log" || true
@@ -492,7 +500,7 @@ jobs:
           else
             LIMIT=$(( MUSL_YMM / 2 + 200 ))
             if [ "$GNU_YMM" -gt "$LIMIT" ]; then
-              echo "::error::the glibc artifact carries $GNU_YMM 256-bit instructions against $MUSL_YMM in the static build that booted on Nehalem - vector code leaked into this build"
+              echo "::error::the glibc artifact carries $GNU_YMM 256-bit instructions against $MUSL_YMM in the static build that booted without AVX/AVX2 - vector code leaked into this build"
               exit 1
             fi
             echo "glibc artifact has no more vector code than the booted static build; boot check skipped because this runner's qemu cannot run dynamic binaries"

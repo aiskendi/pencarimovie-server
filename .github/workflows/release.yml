@@ -422,35 +422,34 @@ jobs:
           chmod +x "$QEMU"
           "$QEMU" --version
 
-          # Harness sanity, once: a plain glibc binary must run on the emulated
-          # CPU. If this fails, the gate is broken, not the artifact.
-          "$QEMU" -L / -cpu Nehalem /bin/true && echo "harness OK" || {
-            echo "::error::qemu cannot run /bin/true on -cpu Nehalem - the gate itself is broken"
-            exit 1
+          # Can this qemu execute a DYNAMIC glibc binary on -cpu Nehalem at all?
+          # On the current ubuntu-latest runner it cannot - even `/bin/true` SIGILLs
+          # under qemu 7.2 - and that says nothing about our artifact. Recorded,
+          # not fatal: the static musl binary needs no loader and is booted fully
+          # either way, and the glibc tarball falls back to a build-to-build
+          # comparison of its vector instruction count.
+          HARNESS_DYNAMIC=0
+          if "$QEMU" -L / -cpu Nehalem /bin/true 2>/dev/null; then
+            HARNESS_DYNAMIC=1
+            echo "harness: a dynamic glibc binary runs on -cpu Nehalem"
+          else
+            echo "::warning::qemu on this runner cannot run even /bin/true on -cpu Nehalem; dynamic artifacts are checked statically, the static musl binary is still booted"
+          fi
+
+          ymm_count() {
+            objdump -d "$(realpath "$1")" 2>/dev/null | grep -c '%ymm' || true
           }
 
-          check() {
+          # boot_check <binary> <port> [extra qemu args...]
+          boot_check() {
             # ABSOLUTE, always: qemu resolves a relative guest path against the
-            # -L prefix, so `target/release/...` became `/target/release/...` and
-            # the emulated process died instantly with an empty log. Verified the
-            # hard way, and the reason the same command works by hand (absolute
-            # paths) and failed only in CI.
-            BIN="$(realpath "$1")"; PORT="$2"
+            # -L prefix, so `target/release/...` became `/target/release/...`.
+            BIN="$(realpath "$1")"; PORT="$2"; shift 2
             echo "--- gate: $BIN"
             echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
             file "$BIN" || true
-            # Proof, not inference: 256-bit registers anywhere in the artifact mean
-            # AVX/AVX2 code got compiled in, whatever the flags claimed.
-            echo "256-bit (ymm) instructions in the artifact: $(objdump -d "$BIN" 2>/dev/null | grep -c '%ymm' || true)"
-            # Step 1 answers a different question than step 2, on purpose. If qemu
-            # cannot even run `--version`, that is the harness (or a linker path),
-            # NOT an AVX2 artifact, and saying so saves the next person an hour.
-            if ! "$QEMU" -L / -cpu Nehalem "$BIN" --version; then
-              echo "::error::$BIN does not run under qemu at all - harness problem, not an AVX2 artifact"
-              return 1
-            fi
             ROOT="$(mktemp -d)"
-            PM_APP_ROOT="$ROOT" "$QEMU" -L / -cpu Nehalem \
+            PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu Nehalem \
               "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
             PID=$!
             for _ in $(seq 1 90); do
@@ -470,10 +469,34 @@ jobs:
             return 1
           }
 
-          # The glibc tarball users download...
-          check target/release/pencarimovie-server 18101
-          # ...and the musl binary baked into ghcr.io/<repo>:native.
-          check target/x86_64-unknown-linux-musl/release/pencarimovie-server 18102
+          GNU=target/release/pencarimovie-server
+          MUSL=target/x86_64-unknown-linux-musl/release/pencarimovie-server
+
+          # Proof, not inference: 256-bit registers anywhere in the artifact mean
+          # AVX/AVX2 code got compiled in, whatever the flags claimed. Counted once
+          # per artifact because `objdump -d` on 31 MB is not free.
+          GNU_YMM="$(ymm_count "$GNU")"
+          MUSL_YMM="$(ymm_count "$MUSL")"
+          echo "vector (ymm) instructions - static musl: $MUSL_YMM, glibc: $GNU_YMM"
+
+          # 1. The static musl binary baked into ghcr.io/<repo>:native - the one
+          #    every NAS user pulls. Fully booted, no harness caveat.
+          boot_check "$MUSL" 18102 || exit 1
+
+          # 2. The glibc tarball the desktop installers download. Booted when this
+          #    runner's qemu can run dynamic binaries; otherwise compared against
+          #    the static build that just booted, so a build that leaked AVX2 into
+          #    only this artifact still fails here.
+          if [ "$HARNESS_DYNAMIC" = "1" ]; then
+            boot_check "$GNU" 18101 -L / || exit 1
+          else
+            LIMIT=$(( MUSL_YMM / 2 + 200 ))
+            if [ "$GNU_YMM" -gt "$LIMIT" ]; then
+              echo "::error::the glibc artifact carries $GNU_YMM 256-bit instructions against $MUSL_YMM in the static build that booted on Nehalem - vector code leaked into this build"
+              exit 1
+            fi
+            echo "glibc artifact has no more vector code than the booted static build; boot check skipped because this runner's qemu cannot run dynamic binaries"
+          fi
 
       - name: Test Tray and Launchers (${{ matrix.artifact }})
         shell: bash

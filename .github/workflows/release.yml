@@ -513,7 +513,7 @@ jobs:
           set -euo pipefail
           echo "Testing Windows installer lifecycle against dist-rust package..."
 
-          # Extract the PowerShell installer script from the worker into the runner temp directory
+          # Extract the PowerShell installer script from the worker and point base/homeDir to local test
           node -e '
             const fs = require("fs");
             const os = require("os");
@@ -522,7 +522,12 @@ jobs:
             const mark = "const PS1_INSTALL = `";
             const start = src.indexOf(mark);
             const end = src.indexOf("\n`;", start + mark.length);
-            fs.writeFileSync(path.join(os.tmpdir(), "pm-installer-test.ps1"), src.slice(start + mark.length, end + 1));
+            let script = src.slice(start + mark.length, end + 1);
+
+            script = script.replace(/\$base\s*=\s*'\''[^'\''\r\n]+'\''/, "$base = '\''http://127.0.0.1:18097'\''");
+            script = script.replace(/\$homeDir\s*=\s*[^\r\n]+/, "$homeDir = (Join-Path $env:TEMP '\''pm-ci-home'\'')");
+
+            fs.writeFileSync(path.join(os.tmpdir(), "pm-installer-test.ps1"), script);
           '
 
           # Start mock HTTP server on 127.0.0.1:18097 serving dist-rust/
@@ -544,19 +549,14 @@ jobs:
 
           powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
             $ErrorActionPreference = "Stop"
-            $testRoot = Join-Path $env:TEMP ("pm-ci-" + [Guid]::NewGuid().ToString("N"))
-            $testInstall = Join-Path $testRoot "pencarimovie-server"
-
-            # Read installer and adapt $base and $installDir for local testing
             $testScript = Join-Path $env:TEMP "pm-installer-test.ps1"
-            $runTest = Join-Path $env:TEMP "run-test.ps1"
-            $script = Get-Content -Raw $testScript
-            $script = $script -replace "\$base = .*", "\$base = '\''http://127.0.0.1:18097'\''"
-            $script = $script -replace "\$installDir = .*", "\$installDir = '\''$($testInstall -replace "\\", "/")'\''"
-            Set-Content $runTest $script
+            $testHome = Join-Path $env:TEMP "pm-ci-home"
+            $testInstall = Join-Path $testHome "pencarimovie-server"
+
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
 
             Write-Host "1. Testing clean install..."
-            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
+            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
             Write-Host $out1
             if (-not (Test-Path "$testInstall\pencarimovie-server.exe")) {
               throw "Installer failed: pencarimovie-server.exe not found"
@@ -566,7 +566,7 @@ jobs:
             }
 
             Write-Host "2. Testing re-run when build is already latest (should skip download)..."
-            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
+            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
             Write-Host $out2
             if ($out2 -notmatch "Already on the latest build") {
               throw "Installer failed to skip download when version matches"
@@ -581,7 +581,7 @@ jobs:
             Remove-Item "$testInstall\.release-sha256" -Force
 
             # Run installer again while server is running - must cleanly stop it and copy without file-lock error
-            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runTest | Out-String
+            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
             Write-Host $out3
             if ($out3 -match "used by another process") {
               throw "Installer crashed with file-lock error during update!"
@@ -595,7 +595,7 @@ jobs:
 
             # Cleanup test root and process
             if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-            Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "Windows Installer & Updater Lifecycle verification PASSED."
           '
 

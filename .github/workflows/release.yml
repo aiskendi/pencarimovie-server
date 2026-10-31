@@ -423,7 +423,21 @@ jobs:
           "$QEMU" --version
 
           check() {
-            BIN="$1"; PORT="$2"
+            # ABSOLUTE, always: qemu resolves a relative guest path against the
+            # -L prefix, so `target/release/...` became `/target/release/...` and
+            # the emulated process died instantly with an empty log. Verified the
+            # hard way, and the reason the same command works by hand (absolute
+            # paths) and failed only in CI.
+            BIN="$(realpath "$1")"; PORT="$2"
+            echo "--- gate: $BIN"
+            file "$BIN" || true
+            # Step 1 answers a different question than step 2, on purpose. If qemu
+            # cannot even run `--version`, that is the harness (or a linker path),
+            # NOT an AVX2 artifact, and saying so saves the next person an hour.
+            if ! "$QEMU" -L / -cpu Nehalem "$BIN" --version; then
+              echo "::error::$BIN does not run under qemu at all - harness problem, not an AVX2 artifact"
+              return 1
+            fi
             ROOT="$(mktemp -d)"
             PM_APP_ROOT="$ROOT" "$QEMU" -L / -cpu Nehalem \
               "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
@@ -437,8 +451,10 @@ jobs:
               kill -0 "$PID" 2>/dev/null || break
               sleep 1
             done
-            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) - this artifact would SIGILL (exit 132) on every Synology x86 NAS. Tail of its log:"
-            tail -n 25 "gate-$PORT.log" || true
+            echo "::error::$BIN did not serve on an emulated Nehalem CPU (no AVX/AVX2) - this artifact would SIGILL (exit 132) on every Synology x86 NAS."
+            echo "--- emulated exit status / full log ($(wc -c < "gate-$PORT.log" 2>/dev/null || echo 0) bytes):"
+            wait "$PID" 2>/dev/null || echo "emulated exit=$?"
+            cat "gate-$PORT.log" || true
             kill "$PID" 2>/dev/null || true
             return 1
           }

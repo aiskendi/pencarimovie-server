@@ -6,7 +6,7 @@
 #
 #   PORT            listen port                       (default 8088; PaaS sets it)
 #   PM_LISTEN_HOST  bind address                      (default 0.0.0.0 here)
-#   PM_APP_ROOT     where storage/ lives              (default /app)
+#   PM_APP_ROOT     where storage/ lives              (the image sets /data)
 #   PM_WORKERS      Telegram connections (one each)   (default 1)
 #   PM_INFLIGHT     upload.getFile parts per conn     (default 8)
 #   PM_MAX_STREAMS  concurrent /api/download bodies   (default 256)
@@ -31,5 +31,11 @@ EXTRA=""
 [ -n "${PM_MAX_STREAMS:-}" ] && EXTRA="$EXTRA --max-streams $PM_MAX_STREAMS"
 
 cd "$(dirname "$0")"
+# The binary has been `pencarimovie-server` since the Rust port landed; this
+# script still exec'd `./pencarimovie-rust`, a name no image ever shipped, so it
+# could only ever fail with "not found". Prefer the PATH entry the images install
+# (/usr/local/bin/pencarimovie-server) and fall back to a sibling copy.
+BIN="pencarimovie-server"
+[ -x "./$BIN" ] && BIN="./$BIN"
 # shellcheck disable=SC2086
-exec ./pencarimovie-rust --port "$PORT" --host "$HOST" $EXTRA "$@"
+exec "$BIN" --port "$PORT" --host "$HOST" $EXTRA "$@"

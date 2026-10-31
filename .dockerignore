@@ -1,7 +1,7 @@
 dist/_
 !dist/pencarimovie-downloader-linux-_.tar.gz
 
-# Dockerfile.release COPYs the PREBUILT musl binary from here. It must stay in the
+# Dockerfile.release COPYs the PREBUILT glibc binary from here. It must stay in the
 
 # build context: `dist/*` does not match `dist-docker/`, but an over-broad ignore
 
@@ -21,15 +21,15 @@ dist/
 dist-native/
 target/
 tests/
-node_modules/
+node*modules/
 .git/
 android/
 termux-packages/
 libtalloc_extract/
 php_extract/
 proot/
-storage/_
+storage/*
 !storage/.gitkeep
 _.zip
 _.deb
-_.apk
+\_.apk

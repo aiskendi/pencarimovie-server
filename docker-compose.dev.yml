@@ -1,38 +1,42 @@
-# PencariMovie Server - Rust/grammers port.
+# PencariMovie Server — build from source (developer loop).
 #
-#   docker compose -f server/docker-compose.yml up -d --build
-#   docker compose -f server/docker-compose.yml logs -f
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml logs -f
 #
-# Context is the repository root (the dashboard is compiled into the binary).
+# Context is the REPOSITORY ROOT: `src/` and the dashboard (`public/`) are
+# compiled into the binary by the root `Dockerfile`. This file used to point at
+# `context: ../..` + `server/Dockerfile` from a `server/` directory that does not
+# exist, so `docker compose` failed before it ever reached cargo.
+#
+# The image behaves like the published one: PM_APP_ROOT=/data, binds 0.0.0.0,
+# listens on 8088. Only the host port is worth overriding.
 services:
-  pm-rust:
+  pencarimovie:
     build:
-      context: ../..
-      dockerfile: server/Dockerfile
-    image: pencarimovie-rust:local
-    container_name: pm-rust
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Stamped into `--version` and /api/version by build.rs. Without it the
+        # image reports the crate version (0.1.0) and every client shows
+        # "update available" on a build that is in fact current.
+        PM_BUILD_VERSION: ${PM_BUILD_VERSION:-local}
+    image: pencarimovie-server:dev
+    container_name: pencarimovie-server-dev
     restart: unless-stopped
     ports:
-      # host:container - change only the host side if 8092 is taken
-      - "8092:8092"
+      - "${PORT:-8088}:8088"
     environment:
-      # PaaS-style overrides; every one of these is optional.
-      PORT: "8092"
-      PM_LISTEN_HOST: "0.0.0.0"
-      PM_PAAS: "1"
-      PM_APP_ROOT: "/app"
+      # Optional knobs; the image already sets PORT / PM_LISTEN_HOST.
       # PM_WORKERS: "4"        # one Telegram connection per worker
       # PM_INFLIGHT: "8"       # upload.getFile parts in flight per connection
       # PM_MAX_STREAMS: "256"  # concurrent /api/download bodies
+      TZ: ${TZ:-UTC}
     volumes:
-      # sessions, auth.json, caches - MUST persist across image upgrades
-      - pm-rust-storage:/app/storage
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8092/api/version"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      # sessions, auth.json, caches — MUST persist across image upgrades.
+      # /data, not /app/storage: PM_APP_ROOT=/data is what the engine reads, so a
+      # volume mounted on /app/storage is silently discarded and every recreate
+      # starts from an empty install.
+      - pm-storage:/data
 
 volumes:
-  pm-rust-storage:
+  pm-storage:

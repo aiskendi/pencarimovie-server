@@ -61,6 +61,10 @@ get_lan_ip() {
 # ── Setup Files ──────────────────────────────────────────────────────────────
 setup_files() {
   mkdir -p "$APP_DIR/storage"
+  # The published image runs as uid 10001 and reads PM_APP_ROOT=/data, so this
+  # host directory is bind-mounted over /data and must be writable by that uid —
+  # a 0755 dir owned by the invoking user makes every session/auth write fail.
+  chmod 0777 "$APP_DIR/storage" 2>/dev/null || true
   cd "$APP_DIR"
 
   # Always sync latest docker-compose.yml, Dockerfile, and docker-entrypoint.sh from repository (with cache buster)
@@ -117,7 +121,7 @@ do_start() {
       --name pencarimovie-server \
       --restart unless-stopped \
       -p "${PORT}:8088" \
-      -v "$APP_DIR/storage:/app/storage" \
+      -v "$APP_DIR/storage:/data" \
       ghcr.io/aiskendi/pencarimovie-server:latest
   fi
 

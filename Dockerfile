@@ -2,7 +2,7 @@
 #
 # PencariMovie Server - Alpine (musl) image.
 #
-#   docker build -f Dockerfile.rust -t pencarimovie-server .
+#   docker build -f Dockerfile -t pencarimovie-server .
 #   docker run --rm -p 8088:8088 -v pmdata:/data pencarimovie-server
 #
 # The whole server is ONE binary: `public/` is embedded at compile time
@@ -46,7 +46,11 @@ COPY desktop ./desktop
 # cache mounts made the template undeployable. A plain RUN costs a full recompile
 # on each source build and works everywhere. CI does not use this file: the
 # release pipeline builds `Dockerfile.release` (COPY-only, from a prebuilt
-# musl binary).
+# glibc binary).
+#
+# This file is the Heroku / one-click / `docker-compose.dev.yml` path: it
+# compiles for the host arch with no cross-compilation, so the `uname -m` guard
+# below is enough and no buildx/QEMU is involved.
 # Pin the ISA baseline for x86_64. 3.0.x containers died with SIGILL (exit 132)
 # about a second after the banner on any CPU without AVX2 — which is every
 # Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every

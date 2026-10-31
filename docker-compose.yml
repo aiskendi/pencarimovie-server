@@ -21,6 +21,11 @@ services:
       #
       # There is deliberately NO `build:` here: this file consumes the PUBLISHED
       # multi-arch image. To build locally use
-      # `docker compose -f port/rust/docker-compose.yml up`, which compiles from
-      # source with the developer Dockerfile.
+      # `docker compose -f docker-compose.dev.yml up -d --build`, which compiles
+      # from source with the root Dockerfile.
+      #
+      # `:latest` only moves on a TAGGED release. `:native` is mirrored on every
+      # release-workflow run and is what render.yaml pins, so use
+      # `ghcr.io/aiskendi/pencarimovie-server:native` if you want a fix before the
+      # next version tag.
       - ./storage:/data

@@ -101,9 +101,14 @@ docker run -d \
   --name pencarimovie-server \
   --restart unless-stopped \
   -p 8088:8088 \
-  -v pencarimovie-data:/app/storage \
+  -v pencarimovie-data:/data \
   ghcr.io/aiskendi/pencarimovie-server:latest
 ```
+
+The image runs as uid 10001 with `PM_APP_ROOT=/data`, so the volume must be
+mounted on **`/data`** (a `/app/storage` mount is silently ignored and every
+restart starts from an empty install). With a bind mount, make the host directory
+writable by that uid: `sudo chown -R 10001:10001 ./storage`.
 
 Once started, open the web dashboard:
 **`http://127.0.0.1:8088`** _(or the local LAN IP printed in your terminal)_
@@ -143,7 +148,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./storage:/app/storage
+      - ./storage:/data
 ```
 
 ### Environment Variables (`.env`)

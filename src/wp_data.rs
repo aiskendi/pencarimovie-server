@@ -592,6 +592,232 @@ pub async fn lookup_id(prefix: &str, id: &str) -> Value {
     v
 }
 
+/* ── media_ids_idx write-back (`fd_media_ids_upsert`, backend.php:2801) ──── */
+
+/// How long a discovered identity is remembered locally — the TTL of the PHP's
+/// `ext_meta_<md5(id)>.json` (backend.php:3065: `(time() - filemtime) < 86400`).
+const EXT_META_TTL: i64 = 86_400;
+
+/// PHP `crc32()` — CRC-32/IEEE, the same polynomial `hashlib.crc32` uses. The
+/// pseudo document id of a CUSTOM prefix is `(int) sprintf('%u', crc32(...))`
+/// (backend.php:3380), so the port must produce the identical number or the two
+/// lineages would index the same id under two different rows.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// The `post_id` an upserted `media_ids_idx` row is keyed on.
+///
+/// `media_ids_idx` does not need a real WordPress post: the PHP invents a pseudo
+/// id per id family — `9000000000 + imdb % 1e9` (backend.php:3144),
+/// `8000000000 + tmdb` (3247), `7000000000 + kitsu` (3319), `crc32(prefix:value)`
+/// (3380) — and a `pm:post:<pseudo>` id is exactly what those rows are read back
+/// as later (`handle_post_stream` step 2b).
+pub fn pseudo_post_id(prefix: &str, value: &str) -> i64 {
+    match prefix {
+        "imdb" | "tt" => {
+            let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+            let n: i64 = digits.parse().unwrap_or(0);
+            9_000_000_000 + (n % 1_000_000_000)
+        }
+        "tmdb" => 8_000_000_000 + value.trim().parse::<i64>().unwrap_or(0),
+        "kitsu" => 7_000_000_000 + value.trim().parse::<i64>().unwrap_or(0),
+        _ => crc32_ieee(format!("{}:{}", prefix, value).as_bytes()) as i64,
+    }
+}
+
+/// The `(prefix, value)` pairs one id maps to: its OWN prefix plus the IMDb id
+/// the resolver learned (backend.php:3145, 3243-3246, 3315-3318, 3376-3379).
+///
+/// An `imdb`/`tt` id is written under BOTH spellings, because `/lookup-id` is
+/// asked with either one depending on the caller — the `/stream` path asks
+/// `imdb`, the `/meta` path asks `tt` first and `imdb` second.
+pub fn media_id_pairs(prefix: &str, value: &str, imdb_id: &str) -> Vec<(String, String)> {
+    fn push(out: &mut Vec<(String, String)>, p: &str, v: &str) {
+        let p = p.trim().to_lowercase();
+        let v = v.trim();
+        if p.is_empty() || v.is_empty() {
+            return;
+        }
+        if out.iter().any(|(a, _)| *a == p) {
+            return;
+        }
+        out.push((p, v.to_string()));
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    match prefix {
+        "imdb" | "tt" => {
+            push(&mut out, "imdb", value);
+            push(&mut out, "tt", value);
+        }
+        _ => {
+            push(&mut out, prefix, value);
+            push(&mut out, "imdb", imdb_id);
+        }
+    }
+    out
+}
+
+/// The `{name, year}` this id was resolved to earlier (`ext_meta_<id>.json`).
+///
+/// This is the LOCAL half of self-discovery, and the reason the whole thing is
+/// instant: the origin's `media_ids_idx` write is not readable right away
+/// (measured against the live origin — `POST /media-ids` answered
+/// `{"written":3}` while `lookup-id?prefix=imdb&id=tt35062707` kept answering
+/// 404 for minutes), so a resolution that only wrote to the origin would be
+/// re-derived on every single request.
+pub fn ext_meta_cached(media_id: &str) -> Option<(String, String)> {
+    let key = media_id.trim().to_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    let hit = crate::cache::get("ext_meta", &key)?;
+    let title = hit.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let year = match hit.get("year") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    Some((title, year))
+}
+
+fn ext_meta_store(media_id: &str, title: &str, year: &str) {
+    let key = media_id.trim().to_lowercase();
+    if key.is_empty() || title.trim().is_empty() {
+        return;
+    }
+    crate::cache::put(
+        "ext_meta",
+        &key,
+        &serde_json::json!({"name": title.trim(), "year": year.trim()}),
+        EXT_META_TTL,
+        0,
+    );
+}
+
+/// `fd_media_ids_upsert()` (backend.php:2801): write the discovered mapping back
+/// into the origin's `media_ids_idx`, so this id is answered by ONE index read
+/// next time instead of the whole `lookup-id → upstream meta → title search`
+/// ladder.
+///
+/// The PHP schedules the POST with `\Amp\async()` and returns before it runs, so
+/// a stream response is never delayed by it; here that is one `tokio::spawn`,
+/// which this server's long-lived runtime is guaranteed to drive to completion
+/// (a per-request PHP worker is not).
+///
+/// The `lookup_id` cache is invalidated only AFTER a write that reported rows,
+/// because that cache stores the MISS as well: without the invalidation a
+/// freshly written id stays invisible for the full 900 s TTL, which is exactly
+/// the "I added the id and nothing changed" symptom.
+pub fn media_ids_upsert(
+    post_id: i64,
+    pairs: Vec<(String, String)>,
+    title: &str,
+    year: i64,
+    imdb_id: &str,
+    media_type: &str,
+) {
+    let title = title.trim().to_string();
+    // Owned, because the spawned task outlives this call's borrows.
+    let media_type = media_type.to_string();
+    if post_id <= 0 || pairs.is_empty() || title.is_empty() {
+        return;
+    }
+    let map: serde_json::Map<String, Value> = pairs
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    // Same wire shape as the `/api/media-ids` route: `media_ids` is the JSON text
+    // of the map, because `httpc::http_json()` posts a FLAT object of strings.
+    let params = vec![
+        ("media_ids".to_string(), Value::Object(map).to_string()),
+        ("title".to_string(), title.clone()),
+        ("year".to_string(), year.to_string()),
+        ("imdb_id".to_string(), imdb_id.trim().to_string()),
+        ("media_type".to_string(), media_type.to_string()),
+        ("post_id".to_string(), post_id.to_string()),
+    ];
+    let url = format!("{}/media-ids", config::wp_api_base().trim_end_matches('/'));
+    let pairs_for_log: Vec<String> = pairs.iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+    tokio::spawn(async move {
+        let res = httpc::http_json(&url, &params, "POST", 8).await;
+        let written = res
+            .get("written")
+            .and_then(|v| v.as_i64())
+            .or_else(|| res.get("written").and_then(|v| v.as_u64()).map(|n| n as i64))
+            .unwrap_or(0);
+        let ok = res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ok || written > 0 {
+            for (p, v) in &pairs {
+                crate::cache::invalidate("lookup_id", &format!("{}:{}", p, v));
+            }
+        }
+        log(
+            "media ids upsert",
+            &serde_json::json!({
+                "post_id": post_id,
+                "ids": pairs_for_log,
+                "title": title,
+                "year": year,
+                "media_type": media_type,
+                "written": written,
+                "ok": ok,
+            }),
+        );
+    });
+}
+
+/// Persist one self-discovered identity: remember it locally AND write it back to
+/// `media_ids_idx`. Returns whether an origin write was fired.
+///
+/// EVERY path that resolves a title for an id the origin does not know must call
+/// this — that is what makes the second request cheap and what makes the id
+/// exist for the scraper. The port had no such path at all (no `upsert` anywhere
+/// in `src/`), so an unindexed `tt…` id stayed unresolved forever: `/stream`
+/// answered its empty card, `lookup-id` kept answering 404, and the same
+/// upstream call was paid again on every open.
+#[allow(clippy::too_many_arguments)]
+pub fn remember_external_identity(
+    media_id: &str,
+    prefix: &str,
+    value: &str,
+    title: &str,
+    year: &str,
+    imdb_id: &str,
+    media_type: &str,
+) -> bool {
+    let title = title.trim();
+    if title.is_empty() {
+        return false;
+    }
+    ext_meta_store(media_id, title, year);
+    let pairs = media_id_pairs(prefix, value, imdb_id);
+    if pairs.is_empty() {
+        return false;
+    }
+    let year_n: i64 = year.trim().parse().unwrap_or(0);
+    media_ids_upsert(
+        pseudo_post_id(prefix, value),
+        pairs,
+        title,
+        year_n,
+        imdb_id,
+        media_type,
+    );
+    true
+}
+
 /// `GET {WP_API_BASE}/stream-files?type=…&title=…&year=…&id=…`.
 ///
 /// Used for ids that are not one of our own posts (`tt…`, `tmdb:…`): the origin
@@ -1135,5 +1361,90 @@ mod tests {
         assert_eq!(post_year(&p), "2011");
         let p = serde_json::json!({"title": "No Year Here"});
         assert_eq!(post_year(&p), "");
+    }
+
+    /// The self-discovery write keys its row on a PSEUDO post id, so the number
+    /// itself is the contract (`backend.php:3144/3247/3319/3380`). Two lineages
+    /// that disagree on it index the same id twice and neither lookup finds the
+    /// other's row.
+    #[test]
+    fn pseudo_post_ids_match_the_php_lineage() {
+        // imdb: 9000000000 + (numeric imdb % 1000000000) — backend.php:3144.
+        assert_eq!(pseudo_post_id("imdb", "tt35062707"), 9_035_062_707);
+        assert_eq!(pseudo_post_id("tt", "tt35062707"), 9_035_062_707);
+        // Leading zeros are digits too: tt0944947 -> 0944947 -> 944947.
+        assert_eq!(pseudo_post_id("imdb", "tt0944947"), 9_000_944_947);
+        // A 10-digit imdb id keeps only its last 9 digits (the modulo).
+        assert_eq!(pseudo_post_id("imdb", "tt1000000000"), 9_000_000_000);
+        // tmdb / kitsu — backend.php:3247 / 3319.
+        assert_eq!(pseudo_post_id("tmdb", "1399"), 8_000_001_399);
+        assert_eq!(pseudo_post_id("kitsu", "1"), 7_000_000_001);
+        // Any other prefix is `(int) sprintf('%u', crc32("prefix:value"))`.
+        assert_eq!(crc32_ieee(b"hello"), 0x3610_a686);
+        assert_eq!(
+            pseudo_post_id("tvdb", "81797"),
+            crc32_ieee(b"tvdb:81797") as i64
+        );
+    }
+
+    /// What one discovered id is written AS. An `imdb`/`tt` id must land under
+    /// BOTH spellings (the `/stream` path asks `imdb`, the `/meta` path asks `tt`
+    /// first), and a `tmdb:` id must carry the IMDb id it resolved to — that is
+    /// what stops the next request from asking any addon at all.
+    #[test]
+    fn media_id_pairs_cover_both_spellings_and_the_imdb_alias() {
+        assert_eq!(
+            media_id_pairs("imdb", "tt35062707", ""),
+            vec![
+                ("imdb".to_string(), "tt35062707".to_string()),
+                ("tt".to_string(), "tt35062707".to_string()),
+            ]
+        );
+        assert_eq!(
+            media_id_pairs("tmdb", "1399", "tt0944947"),
+            vec![
+                ("tmdb".to_string(), "1399".to_string()),
+                ("imdb".to_string(), "tt0944947".to_string()),
+            ]
+        );
+        // No IMDb id yet: only the prefix the client used, never an empty pair.
+        assert_eq!(
+            media_id_pairs("tmdb", "1399", ""),
+            vec![("tmdb".to_string(), "1399".to_string())]
+        );
+        // Garbage in, nothing out — an empty pair would write a row no lookup
+        // can ever find, and `media_ids_idx` is shared with the scraper.
+        assert!(media_id_pairs("", "", "").is_empty());
+        // A known IMDb id is worth writing even when the client's own value is
+        // blank: the point of the row is that the id maps to a title at all.
+        assert_eq!(
+            media_id_pairs("tvdb", "", "tt1"),
+            vec![("imdb".to_string(), "tt1".to_string())]
+        );
+    }
+
+    /// Self-discovery must never persist a placeholder. The by-id probe falls
+    /// back to the ITEM ID when the origin resolved no title, and writing that
+    /// would poison the index with a row whose "title" is `tt35062707`.
+    #[test]
+    fn a_resolution_without_a_title_is_never_persisted() {
+        assert!(!remember_external_identity(
+            "tt35062707",
+            "imdb",
+            "tt35062707",
+            "",
+            "2026",
+            "tt35062707",
+            "movie"
+        ));
+        assert!(!remember_external_identity(
+            "tt35062707",
+            "imdb",
+            "tt35062707",
+            "   ",
+            "",
+            "",
+            "movie"
+        ));
     }
 }

@@ -62,7 +62,15 @@ const EDITION_TAGS: &str = "(?i)\\b(?:extended(?:\\s*cut)?|directors?\\s*cut|unr
 const SEQUEL_RE: &str = "(?i)\\b(?:part\\s*(?:ii|iii|iv|v|\\d+)|(?:2|3|4|5|6|7|8|9)|chapter\\s*\\d+)\\b";
 const UPLOADER_RE: &str = "(?i)^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd)\\b\\s*)+$";
 const TARGET_TAGS: &str = "(?i)\\b(?:2160p|1080p|720p|480p|360p|uhd|fhd|hd|sd|hdtv|web-?dl|webrip|bluray|blu-ray|remux|dvdrip|hevc|x264|x265|h264|h265|\\d+(?:\\.\\d+)?\\s*(?:gb|mb))\\b";
-const LEADING_GROUPS: &str = "(?i)^(?:prakytv|ngefilm\\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\\s*time\\s*studio\\s*ghibli\\s*movie\\s*\\d*|mcu|pms|pahe\\.li|layarkaca\\d*|cinemaindo|indoxxi|sklink(?:\\s*office)?|movie\\s*king|movie\\s*world|film\\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)\\s+";
+// The separator class after a known group is `.`, `_`, `-` OR whitespace, not just
+// whitespace. Telegram uploads separate words with DOTS (`PrakyTV.Avaraachan.&.Sons.
+// 2026.Tamil…`), so with `\s+` the `prakytv` entry never fired, the uploader prefix
+// stayed part of the title, and every such file was rejected — measured on
+// `pm:post:9296788885` "Avaraachan & Sons 2026", whose six origin files all failed
+// while `pm_search_files` listed seven. Stripping is followed by the strict title
+// comparison, so widening the separator can only remove a PREFIX, never turn a
+// different film into a match.
+const LEADING_GROUPS: &str = "(?i)^(?:prakytv|ngefilm\\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\\s*time\\s*studio\\s*ghibli\\s*movie\\s*\\d*|mcu|pms|pahe\\.li|layarkaca\\d*|cinemaindo|indoxxi|sklink(?:\\s*office)?|movie\\s*king|movie\\s*world|film\\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)[._\\s-]+";
 const COUNTRY_PREFIX: &str = "(?i)^(?:ph|id|ina|my|kr|kor|jp|jpn|th|thai|cn|chi|us|uk|hk|vn|tw|ru|tr|es|fr|de|it|in)\\s+";
 /// `^(?:video(\.\d+)*|\d+|document|file)\.(?:mp4|mkv|avi|mov|ts|flv)$` — a file
 /// whose NAME carries nothing, so the caption's first line is the real title.
@@ -2173,6 +2181,40 @@ mod tests {
             "",
             ""
         ));
+    }
+
+    /* reported: a title with an ampersand ------------------------------- */
+
+    /// `pm:post:9296788885` "Avaraachan & Sons 2026 • Movie": the origin
+    /// returned SIX files for this post and the matcher rejected all of them, so
+    /// the title answered "No Streams Found" while everything it needed was
+    /// present. The `&` is the suspect: the TARGET is rewritten to " and ", the
+    /// FILE side keeps a bare `&` (dropped as punctuation by `clean_media_title`)
+    /// or spells it "and", and the two forms have to meet.
+    #[test]
+    fn movie_matches_a_title_with_an_ampersand() {
+        let title = "Avaraachan & Sons 2026 • Movie";
+        for f in [
+            "PrakyTV.Avaraachan.&.Sons.2026.Tamil.TRUE.WEB.DL.mkv",
+            "PrakyTV.Avaraachan.&.Sons.2026.Tamil.HQ.HDRip.720.mkv",
+            "Avaraachan.and.Sons.2026.Submalay.mp4",
+        ] {
+            assert!(
+                movie_file_matches_title(f, title, "2026", "", ""),
+                "the ampersand title must match {f}"
+            );
+        }
+        // The control: the same title with the entity decoded must behave the
+        // same way, or the `&` is not what the rule is testing.
+        for f in ["PrakyTV.Avaraachan.&.Sons.2026.Tamil.TRUE.WEB.DL.mkv"] {
+            assert!(movie_file_matches_title(
+                f,
+                "Avaraachan & Sons 2026 • Movie",
+                "2026",
+                "",
+                ""
+            ));
+        }
     }
 
     /* trap 5: accents -------------------------------------------------------- */

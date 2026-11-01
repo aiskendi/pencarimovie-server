@@ -2295,6 +2295,31 @@ async fn handle_post_stream(
         let (_, _, f2) = crate::wp_data::stream_files_by_title(kind0, &aka, &year, item_id).await;
         files = f2;
     }
+    // A PSEUDO id owns no files of its own.
+    //
+    // `pm:post:9296788885` is a `media_ids_idx` row (`9000000000 + imdb`), not a
+    // WordPress post, so `post-files?post_id=9296788885` answers nothing and the
+    // item answered "No Streams Found" while the origin held SEVEN files for the
+    // same film (a catalog row, a `media_ids_idx` row and the files were all
+    // present — only the file set was looked up under an id that cannot own one).
+    // The row knows the title, so search by it; the matcher still decides.
+    if files.is_empty() {
+        let kind0 = if is_series { "series" } else { "movie" };
+        let (r, _, f2) =
+            crate::wp_data::stream_files_by_title(kind0, &title, &year, item_id).await;
+        if !f2.is_empty() {
+            log(
+                "stream: post has no files of its own, searched by title",
+                &serde_json::json!({
+                    "post_id": post_id, "title": title, "files": f2.len(),
+                }),
+            );
+            if !r.is_empty() {
+                title = r;
+            }
+            files = f2;
+        }
+    }
     build_streams_from_files(
         ctx,
         item_type,
@@ -2776,7 +2801,21 @@ async fn handle_external_stream(
     upstream: Option<tokio::task::JoinHandle<Vec<Value>>>,
 ) -> Option<Response> {
     let (prefix, value, season, episode) = parse_external_id(item_id)?;
-    let row = crate::wp_data::lookup_id(prefix, &value).await;
+    // LOCAL IDENTITY MEMORY, before ANY origin call (`ext_meta_<id>.json`,
+    // backend.php:3062). A hit replaces both the `media_ids_idx` index read and
+    // the upstream meta call, so an id this server already self-discovered opens
+    // with one cache lookup — that is the "instant" half of self-discovery.
+    //
+    // The origin index read is skipped on purpose when this id is remembered: a
+    // row we wrote ourselves carries no `aka` there is anything to lose, and the
+    // index read is a real round-trip on every fresh process (the 900 s miss
+    // cache does not survive a restart).
+    let remembered = crate::wp_data::ext_meta_cached(&crate::upstream::strip_episode_suffix(item_id));
+    let row = if remembered.is_some() {
+        Value::Null
+    } else {
+        crate::wp_data::lookup_id(prefix, &value).await
+    };
     let mut title = jstr(&row, "title");
     let mut year = jstr(&row, "year");
     if year.is_empty() {
@@ -2801,6 +2840,27 @@ async fn handle_external_stream(
     // The by-id page, when it did NOT cover the requested episode: kept as a SEED
     // for the episode ladder below instead of being returned on its own.
     let mut by_id_seed: Vec<crate::wp_data::WpFile> = Vec::new();
+
+    // (0) Apply the identity memory read above. It sits FIRST because it is the
+    // cheapest evidence available: an id already resolved here must not pay the
+    // origin lookup, the upstream meta call, or the title search again — and it
+    // must still answer while the origin's `media_ids_idx` write has not become
+    // readable (measured on the live origin: `POST /media-ids` reported
+    // `written: 3` while `lookup-id` kept answering 404 for minutes).
+    if title.is_empty() {
+        if let Some((t, y)) = remembered {
+            log(
+                "stream: external id served from the local identity memory",
+                &serde_json::json!({"item_id": item_id, "title": t, "year": y}),
+            );
+            if !t.is_empty() {
+                title = t;
+            }
+            if year.is_empty() && !y.is_empty() {
+                year = y;
+            }
+        }
+    }
 
     // A row may already know which catalog post owns the id — then the post path
     // is exact and the title search is unnecessary.
@@ -2841,7 +2901,9 @@ async fn handle_external_stream(
             let t = if by_id_title.is_empty() {
                 item_id.to_string()
             } else {
-                by_id_title
+                // Cloned: the original is still needed below to decide whether
+                // the identity may be persisted at all.
+                by_id_title.clone()
             };
             // The origin resolved the year too (PHP backend.php:17212-17217): it is
             // the only place it exists for an id that is not in `media_ids_idx`, and
@@ -2853,6 +2915,21 @@ async fn handle_external_stream(
                 "stream: external id resolved by origin id search",
                 &serde_json::json!({"item_id": item_id, "title": &t, "files": by_id_files.len()}),
             );
+            // Persist what the origin just told us. The id was NOT in
+            // `media_ids_idx` (that is why this probe ran), so this is the write
+            // that makes the NEXT request a single index read. Never on the
+            // `item_id` fallback above: that is a placeholder, not a title.
+            if !by_id_title.is_empty() {
+                crate::wp_data::remember_external_identity(
+                    &crate::upstream::strip_episode_suffix(item_id),
+                    prefix,
+                    &value,
+                    &by_id_title,
+                    &by_id_year,
+                    if prefix == "imdb" { &value } else { "" },
+                    if kind == "series" { "tvseries" } else { "movie" },
+                );
+            }
             // A SERIES' by-id page is ONE page of the whole show, not the episode.
             // Measured on `tt35324004` ("Tigers Sniff the Rose") on a phone running
             // 1.0.92: the probe answered 5 rows, none of them the requested
@@ -2911,6 +2988,30 @@ async fn handle_external_stream(
                     "stream: external id resolved from upstream meta",
                     &serde_json::json!({"item_id": item_id, "title": title, "year": year}),
                 );
+                // Self-discover → upsert, exactly the `fd_media_ids_upsert()` pair
+                // at backend.php:3142-3145. The resolved title is the ONLY thing
+                // that can turn this id into a real row, and it is in hand right
+                // here — before this call existed the port threw it away and asked
+                // upstream for it again on the next open.
+                {
+                    let meta_imdb = jstr(&meta, "imdb_id");
+                    let imdb_for_write = if !meta_imdb.is_empty() {
+                        meta_imdb
+                    } else if prefix == "imdb" {
+                        value.clone()
+                    } else {
+                        String::new()
+                    };
+                    crate::wp_data::remember_external_identity(
+                        &crate::upstream::strip_episode_suffix(item_id),
+                        prefix,
+                        &value,
+                        &title,
+                        &year,
+                        &imdb_for_write,
+                        if kind == "series" { "tvseries" } else { "movie" },
+                    );
+                }
             }
         }
     }
@@ -3223,11 +3324,16 @@ async fn build_streams_from_files(
     }
 
     if matched.is_empty() {
+        // `files` is reported because the two causes of an empty list are
+        // completely different fixes: `files:0` means the ORIGIN has nothing to
+        // offer under this title, while a non-zero count means the matcher
+        // rejected everything it was given.
         log(
             "stream: no file matched the title",
             &serde_json::json!({
                 "item_id": item_id, "title": title, "year": year,
                 "season": season, "episode": episode, "is_series": is_series,
+                "files": files.len(),
             }),
         );
         crate::diagnostics::record(
@@ -6247,6 +6353,46 @@ async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
     // prefix, and this addon advertises `tt`/`tmdb:`/… .
     let settings = load_catalog_settings_merged();
     if let Some(body) = upstream::forward_meta(&settings, &item_type, &id).await {
+        // Self-discover on OPEN, not only on Play.
+        //
+        // Opening an item is the earliest moment this server can learn an
+        // unindexed id's title, and the PHP learns it in exactly the same pass
+        // (`fd_resolve_external_media_metadata()`, whose tail calls
+        // `fd_media_ids_upsert()` for every id family). Without this the id
+        // stayed unknown until the user pressed Play — and then the stream route
+        // re-asked the same addon for the same meta it had in hand here.
+        if let Some((prefix, value, _season, _episode)) = parse_external_id(&id) {
+            let meta = body.get("meta").cloned().unwrap_or(Value::Null);
+            let name = jstr(&meta, "name");
+            if !name.is_empty() {
+                let rel = {
+                    let r = jstr(&meta, "releaseInfo");
+                    if r.is_empty() { jstr(&meta, "year") } else { r }
+                };
+                let year = first_year_of(&rel);
+                let meta_imdb = jstr(&meta, "imdb_id");
+                let imdb_for_write = if !meta_imdb.is_empty() {
+                    meta_imdb
+                } else if prefix == "imdb" {
+                    value.clone()
+                } else {
+                    String::new()
+                };
+                crate::wp_data::remember_external_identity(
+                    &crate::upstream::strip_episode_suffix(&id),
+                    prefix,
+                    &value,
+                    &name,
+                    &year,
+                    &imdb_for_write,
+                    if item_type == "series" || item_type.contains("series") {
+                        "tvseries"
+                    } else {
+                        "movie"
+                    },
+                );
+            }
+        }
         return stremio_json(200, &body, "max-age=3600, public");
     }
     // ── local `media_ids_idx` fallback (backend.php:16456-16478) ───────────

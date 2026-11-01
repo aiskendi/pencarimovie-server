@@ -82,6 +82,23 @@ pub fn set_debug_enabled(enabled: bool) {
     }
 }
 
+/// Write a line to stderr WITHOUT the panic path.
+///
+/// `eprint!`/`eprintln!` PANIC when the write fails, and that panic kills the
+/// caller's task: the response is never written and the client sees the
+/// connection close with nothing on it. `STDERR_LIVE` does not cover it, because
+/// that flag is a STARTUP snapshot — a console that dies later (a recycled
+/// terminal, a detached daemon) still passes the guard and then panics on the
+/// next line.
+///
+/// Measured on this workstation: a long-lived instance answered `/api/version`
+/// (which does not log) in 2.9 ms and `/thumb/…` (cache hit, no log) in 3.9 ms,
+/// while `/manifest.json` closed the connection with no response in 27 ms.
+fn write_stderr(line: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 /// Always-on stderr line (`fd_log_stderr`).
 pub fn stderr_log(message: &str, ctx: Option<&Value>) {
     let suffix = match ctx {
@@ -89,7 +106,7 @@ pub fn stderr_log(message: &str, ctx: Option<&Value>) {
         _ => String::new(),
     };
     if STDERR_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[PencariMovie] {}{}", message, suffix);
+        write_stderr(&format!("[PencariMovie] {}{}\n", message, suffix));
     }
     if MIRROR_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
         let line = format!("[{}] [PencariMovie] {}{}\n", stamp(now()), message, suffix);
@@ -136,7 +153,7 @@ pub fn log(message: &str, ctx: &Value) {
     // response in 0.2-0.5 s — the exact signature of a panicking handler. A fresh
     // process with a live stderr served the same download at 5.3 MB/s.
     if STDERR_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprint!("[PencariMovie Server] {}{}\n", message, suffix);
+        write_stderr(&format!("[PencariMovie Server] {}{}\n", message, suffix));
     }
     limit_file_size(&path, MAX_LOG_SIZE);
 }

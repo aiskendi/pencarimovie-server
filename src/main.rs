@@ -43,6 +43,7 @@ mod routes;
 mod session;
 mod storage;
 mod telegram;
+mod thumb;
 // The tray lives in the binary (`--tray`), so a folder holding only the
 // executable still gets an icon: no `tray.ps1`, no PowerShell, no loose script.
 // `tray.rs` is the native Windows icon; `tray_unix.rs` drives `yad` on Linux.
@@ -148,6 +149,120 @@ pub(crate) fn request_shutdown() {
     shutdown_trigger().notify_one();
 }
 
+/// `--thumb-probe`: what those bytes actually are. A byte count alone cannot
+/// tell a 4 KB JPEG thumbnail from a 4 KB slice of the media, and a "success"
+/// that returns the wrong object is worse than an error.
+fn bytes_kind(b: &[u8]) -> &'static str {
+    if b.is_empty() {
+        "empty"
+    } else if b.len() >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
+        "jpeg"
+    } else if b.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "png"
+    } else if b.len() >= 12 && &b[0..4] == b"RIFF".as_slice() && &b[8..12] == b"WEBP".as_slice() {
+        "webp"
+    } else {
+        "unknown"
+    }
+}
+
+/// Width x height from a JPEG's first SOF marker (`None` = not a JPEG, or no
+/// marker in the bytes we fetched). Thumbnail sizes are chosen on these numbers,
+/// so the probe reports them instead of "some bytes arrived".
+fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
+    if bytes_kind(b) != "jpeg" {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 9 < b.len() {
+        if b[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = b[i + 1];
+        // SOF0..SOF15, minus DHT (C4), JPG (C8) and DAC (CC), which share the range.
+        if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
+            let h = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
+            let w = u16::from_be_bytes([b[i + 7], b[i + 8]]) as u32;
+            return Some((w, h));
+        }
+        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// `--thumb-probe` read: one `upload.getFile`, and on `FILE_REFERENCE_EXPIRED`
+/// exactly one re-resolve + retry — the recovery `/api/download` performs
+/// (`resolve_shortcode_fresh` = `force=1&nocache=1`).
+///
+/// Without it the probe reports the resolve CACHE's expired reference as if it
+/// were the answer: the first run against a short code failed all seven reads
+/// with `FILE_REFERENCE_EXPIRED` while the same code streams fine through the
+/// server, because the cached id was older than its ~1 h `file_reference`.
+/// Both a media document and a stored `thumb_file_id` (type 0) are read through
+/// `inputDocumentFileLocation`: the difference is only which object the id names.
+/// Only a media read with `thumb_size` empty is a whole-file read.
+fn probe_target(file_id: &str, file_size: u64, thumb_size: &str) -> Result<telegram::DocTarget, String> {
+    if thumb_size.is_empty() {
+        telegram::prepare_file_target(file_id, file_size)
+    } else {
+        telegram::prepare_thumb_target(file_id, thumb_size)
+    }
+}
+
+async fn probe_fetch(
+    client: &grammers_client::Client,
+    file_id: &mut String,
+    file_size: &mut u64,
+    thumb_size: &str,
+    short_code: &str,
+    bot: &str,
+) -> Result<Vec<u8>, String> {
+    for attempt in 0..2 {
+        let target = probe_target(file_id.as_str(), *file_size, thumb_size);
+        let target = target?;
+        match telegram::fetch_range(client, &target, 0, telegram::MAX_CHUNK).await {
+            Ok(b) => return Ok(b),
+            Err(e) => {
+                if e.file_reference && attempt == 0 && !short_code.is_empty() {
+                    let res = resolve::resolve_shortcode_fresh(short_code, bot).await;
+                    let id = {
+                        let a = res.get("file_id_mt").and_then(|v| v.as_str()).unwrap_or("");
+                        if a.is_empty() {
+                            res.get("file_id").and_then(|v| v.as_str()).unwrap_or("")
+                        } else {
+                            a
+                        }
+                    }
+                    .trim()
+                    .to_string();
+                    if id.is_empty() {
+                        return Err(format!("{} (re-resolve returned no file_id)", e));
+                    }
+                    // A refresh that hands back the SAME id is the origin serving
+                    // its own cache (or a 503 with a stale fallback); retrying it
+                    // only spends a round-trip to fail identically.
+                    if &id == file_id {
+                        return Err(format!("{} (re-resolve returned the same id)", e));
+                    }
+                    *file_id = id;
+                    *file_size = res
+                        .get("file_size")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                        .unwrap_or(*file_size);
+                    continue;
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+    Err("probe: re-resolve retry did not settle".to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // `--version` / `-V`: one line, no storage, no network. This is what the
@@ -188,6 +303,179 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // `--thumb-probe <file_id_mt|short_code> [bot_id]`: ask Telegram for this
+    // document's THUMBNAILS the way `/api/download` asks for its bytes.
+    //
+    // The origin's thumbnail endpoint is gone, so the question is whether the
+    // engine can mint posters from Telegram itself. A thumbnail is not a second
+    // file: it is the same `id`/`access_hash`/`file_reference`/dc with
+    // `thumb_size` set (`s`/`m`/`x`/`y`/`w`), so a `file_id_mt` that already
+    // streams carries its own posters and needs no resolve of its own. This prints
+    // what each size actually answers (bytes, jpeg/png, dimensions) rather than
+    // leaving it as a guess.
+    if let Some(i) = arg_pos("--thumb-probe") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(raw) = args.get(i + 1) else {
+            eprintln!("usage: pencarimovie-server --thumb-probe <file_id_mt|short_code> [bot_id]");
+            std::process::exit(2);
+        };
+        let bot = args
+            .get(i + 2)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(session::get_bot_id);
+        if bot.is_empty() {
+            eprintln!("{{\"ok\":0,\"error\":\"no bot_id: pass one as the second argument\"}}");
+            std::process::exit(2);
+        }
+
+        let mut file_id = raw.trim().to_string();
+        let mut file_size = 0u64;
+        // Only a short code can be re-resolved when Telegram says the reference
+        // expired; a bare `file_id_mt` has no second source.
+        let mut short_code = String::new();
+        if fileid::decode_file_id(&file_id).is_err() {
+            // Not a file_id, so treat it as a short code: resolve it through the
+            // real path, exactly like an incoming `/api/download` would.
+            short_code = raw.trim().to_string();
+            let res = resolve::resolve_shortcode(&file_id, &bot, false).await;
+            let id = {
+                let a = res.get("file_id_mt").and_then(|v| v.as_str()).unwrap_or("");
+                if a.is_empty() {
+                    res.get("file_id").and_then(|v| v.as_str()).unwrap_or("")
+                } else {
+                    a
+                }
+            }
+            .trim()
+            .to_string();
+            file_size = res
+                .get("file_size")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0);
+            if id.is_empty() {
+                eprintln!(
+                    "{{\"ok\":0,\"error\":\"resolve returned no file_id_mt\",\"resolve\":{}}}",
+                    serde_json::to_string(&res).unwrap_or_default()
+                );
+                std::process::exit(1);
+            }
+            file_id = id;
+            // Two separate questions this probe answers:
+            //   • is the origin's poster still a real per-file image at all;
+            //   • is `…/tgthumb/<n>.jpg` the MEDIA document's id (a thumb of the
+            //     file we already resolve) or a SEPARATE thumbnail file id? The
+            //     reply prints the decoded media id next to that number, so the two
+            //     can be compared instead of assumed.
+            let thumb_url = res
+                .get("thumbnail_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let doc_id = fileid::decode_file_id(&file_id)
+                .map(|d| d.id.to_string())
+                .unwrap_or_default();
+            let thumb_n = thumb_url
+                .split("/tgthumb/")
+                .nth(1)
+                .and_then(|s| s.split('.').next())
+                .unwrap_or("")
+                .to_string();
+            println!(
+                "{{\"bot_id\":\"{}\",\"short_code\":\"{}\",\"file_size\":{},\"origin_thumbnail_url\":\"{}\",\"media_document_id\":\"{}\",\"origin_thumb_id\":\"{}\",\"thumb_id_is_the_media_doc\":{}}}",
+                bot,
+                raw.trim(),
+                file_size,
+                thumb_url,
+                doc_id,
+                thumb_n,
+                (!thumb_n.is_empty() && thumb_n == doc_id)
+            );
+            // Every field the origin actually sent, with the two id fields elided.
+            // A dedicated `thumbnail_file_id` would show up here — and if it exists
+            // it is a downloadable object in its own right, not just a `thumb_size`.
+            let mut dump = res.clone();
+            if let Some(o) = dump.as_object_mut() {
+                for k in ["file_id_mt", "file_id"] {
+                    if let Some(v) = o.get(k) {
+                        let n = v.as_str().map(|s| s.len()).unwrap_or(0);
+                        o.insert(k.to_string(), serde_json::json!(format!("<redacted len={}>", n)));
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&dump).unwrap_or_default());
+        } else {
+            println!("{{\"bot_id\":\"{}\",\"file_id_mt\":\"{}\"}}", bot, file_id);
+        }
+
+        // One connection is enough for a probe, and it keeps the session's other
+        // worker files untouched.
+        let pool = telegram::TelegramPool::new(1, 8);
+        let entry = match pool.boot(&bot, None).await {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"bot boot failed: {}\"}}", e);
+                std::process::exit(1);
+            }
+        };
+        let client = entry.pick();
+
+        // A stored `thumb_file_id` is a PHOTO object, not a document: there is no
+        // "the file itself" to read and the sizes are the photo's own. A media
+        // document takes the media read plus `thumb_size`.
+        let is_photo = fileid::decode_file_id(&file_id)
+            .map(|d| fileid::location_kind(&d) == "photo")
+            .unwrap_or(false);
+        let sizes: &[&str] = if is_photo {
+            &["s", "m", "x", "y", "w"]
+        } else {
+            &["", "s", "m", "x", "y", "w"]
+        };
+
+        if !is_photo {
+            // The media first: without it nothing else means anything.
+            match probe_fetch(&client, &mut file_id, &mut file_size, "", &short_code, &bot).await {
+                Ok(b) => println!("media     bytes={} kind={}", b.len(), bytes_kind(&b)),
+                Err(e) => println!("media     ERR {}", e),
+            }
+        }
+        for size in sizes {
+            let size: &str = size;
+            let label = if size.is_empty() { "(none)" } else { size };
+            match probe_fetch(&client, &mut file_id, &mut file_size, size, &short_code, &bot).await {
+                Err(e) => println!("thumb {:<8} ERR {}", label, e),
+                Ok(b) => {
+                    let kind = bytes_kind(&b);
+                    // A thumb_size the document does not have does NOT error:
+                    // Telegram serves the FILE from offset 0 instead, so a poster
+                    // route that trusts "some bytes arrived" hands the player the
+                    // first 512 KB of the movie.
+                    let note = if kind == "unknown" {
+                        "  <-- FALLBACK: no such thumb_size, these are the file's bytes"
+                    } else {
+                        ""
+                    };
+                    match jpeg_dims(&b) {
+                        Some((w, h)) => println!(
+                            "thumb {:<8} bytes={} kind={} {}x{}{}",
+                            label,
+                            b.len(),
+                            kind,
+                            w,
+                            h,
+                            note
+                        ),
+                        None => {
+                            println!("thumb {:<8} bytes={} kind={}{}", label, b.len(), kind, note)
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
     }
 
     // `--audio-probe` was REMOVED with the ALAC decoder (`src/audio.rs` and the

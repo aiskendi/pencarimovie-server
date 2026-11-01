@@ -50,6 +50,52 @@ pub fn is_connection_reset(message: &str) -> bool {
         || s.contains("etimedout")
         || s.contains("econnrefused")
         || s.contains("connection reset")
+        // Added after the reqwest cause chain started being logged: a pooled
+        // connection the peer already closed, a TLS handshake the middlebox ate,
+        // and a body cut mid-stream all arrive as these.
+        || s.contains("connection closed")
+        || s.contains("connection aborted")
+        || s.contains("incomplete message")
+        || s.contains("body error")
+        || s.contains("tcp connect error")
+        || s.contains("dns error")
+        || s.contains("error decoding response body")
+        || s.contains("unexpected eof")
+        || s.contains("broken pipe")
+        // reqwest words a client timeout as `operation timed out`, so the PHP-era
+        // `etimedout` needle above never matched it. Measured: every `hary*` search
+        // went straight to a `status:0` failure with this text while the identical
+        // query answered on a second attempt.
+        || s.contains("timed out")
+        || s.contains("timeout")
+}
+
+/// reqwest's `Display` for a send failure is ONLY
+/// `error sending request for url (…)`; the reason — "connection reset by peer",
+/// "tcp connect error", "dns error" — lives in the `source()` chain.
+///
+/// Logging the bare message made [`is_connection_reset()`] unable to classify ANY
+/// transport failure, so the `telegra.my` DPI fallback never fired and a burst of
+/// dashboard traffic just filled the log with `status:0` (measured: 34 lines in
+/// two minutes, against pencarimovie.com AND aiometadata.elfhosted.com, while the
+/// same URLs answered 200 to another client on the same machine).
+fn err_text(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    let mut depth = 0;
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push_str(": ");
+            out.push_str(&t);
+        }
+        src = s.source();
+        depth += 1;
+        if depth > 6 {
+            break;
+        }
+    }
+    out
 }
 
 async fn raw_get(url: &str, timeout_secs: u64, extra: &HashMap<String, String>) -> (bool, u16, String, Option<String>) {
@@ -64,10 +110,10 @@ async fn raw_get(url: &str, timeout_secs: u64, extra: &HashMap<String, String>) 
             let ok = r.status().is_success();
             match r.text().await {
                 Ok(t) => (ok, status, t, None),
-                Err(e) => (false, status, String::new(), Some(e.to_string())),
+                Err(e) => (false, status, String::new(), Some(err_text(&e))),
             }
         }
-        Err(e) => (false, 0, String::new(), Some(e.to_string())),
+        Err(e) => (false, 0, String::new(), Some(err_text(&e))),
     }
 }
 
@@ -77,6 +123,21 @@ pub async fn get_contents(url: &str, timeout_secs: u64, extra: HashMap<String, S
     let (ok, status, text, err) = raw_get(url, timeout_secs, &extra).await;
     if ok {
         return Some(text);
+    }
+    let mut err = err;
+    // ONE same-host retry before the DPI fallback. A pooled connection the peer
+    // has already closed fails exactly once and then works, which is the pattern
+    // that emptied whole catalogs (`catalog built {"count":0}`) on a healthy host.
+    if err.as_deref().map(is_connection_reset).unwrap_or(false) {
+        log(
+            "outbound request reset, retrying once",
+            &serde_json::json!({"url": url}),
+        );
+        let (ok2, _s2, text2, err2) = raw_get(url, timeout_secs, &extra).await;
+        if ok2 {
+            return Some(text2);
+        }
+        err = err2;
     }
     if let Some(e) = &err {
         if is_connection_reset(e) {
@@ -236,10 +297,10 @@ pub async fn http_json_h_status(
                     let ok = r.status().is_success();
                     match r.text().await {
                         Ok(t) => (ok, status, t, None::<String>),
-                        Err(e) => (false, status, String::new(), Some(e.to_string())),
+                        Err(e) => (false, status, String::new(), Some(err_text(&e))),
                     }
                 }
-                Err(e) => (false, 0, String::new(), Some(e.to_string())),
+                Err(e) => (false, 0, String::new(), Some(err_text(&e))),
             }
         }
     };
@@ -569,5 +630,29 @@ mod tests {
         assert!(!needs_wp_retry(&serde_json::json!({"ok": 1, "items": []})));
         assert!(!needs_wp_retry(&serde_json::json!({"ok": 1, "total": 0})));
         assert!(!needs_wp_retry(&serde_json::Value::Null));
+    }
+
+    /// The bug this closes: reqwest's `Display` alone is
+    /// `error sending request for url (…)`, which matched NOTHING here, so the
+    /// retry and the DPI fallback were dead code for every transport failure.
+    /// The cause only arrives once `err_text()` walks the `source()` chain.
+    #[test]
+    fn a_reqwest_send_error_is_classified_only_with_its_cause_chain() {
+        let bare = "error sending request for url (https://pencarimovie.com/wp-json/x)";
+        assert!(!is_connection_reset(bare), "the bare Display carries no cause");
+
+        for msg in [
+            "error sending request for url (…): connection reset by peer (os error 10054)",
+            "error sending request for url (…): tcp connect error: Connection refused (os error 111)",
+            "error sending request for url (…): dns error: failed to lookup address information",
+            "error decoding response body: connection closed before message completed",
+            "error sending request for url (…): TLS handshake failed: unexpected eof",
+            // reqwest's own wording; the PHP-era `etimedout` needle never matched it.
+            "error sending request for url (…): operation timed out",
+        ] {
+            assert!(is_connection_reset(msg), "should be retried: {msg}");
+        }
+        // An HTTP answer is never a transport failure, whatever the status.
+        assert!(!is_connection_reset("503 Service Unavailable"));
     }
 }

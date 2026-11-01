@@ -628,6 +628,47 @@ pub fn prepare_file_target(file_id_mt: &str, size: u64) -> Result<DocTarget, Str
     })
 }
 
+/// One of the document's THUMBNAILS, addressed exactly like the media itself.
+///
+/// A thumbnail is not a separate file on Telegram: it is the same
+/// `id`/`access_hash`/`file_reference`/`dc_id` with a non-empty `thumb_size`
+/// (`s`/`m`/`x`/`y`/`w`, largest last) in `inputDocumentFileLocation`. So a
+/// `file_id_mt` the engine can already stream carries its own posters — no
+/// resolve, no second id, and nothing the WordPress thumbnail endpoint used to
+/// mint has to exist.
+///
+/// `size` is deliberately `0`: the thumb's length is unknown until Telegram
+/// answers, and `Downloadable::size() -> None` is what lets `iter_download`
+/// stream to the end of the object instead of planning a fixed-length read.
+pub fn prepare_thumb_target(file_id_mt: &str, thumb_size: &str) -> Result<DocTarget, String> {
+    let decoded: DecodedFileId = crate::fileid::decode_file_id(file_id_mt)?;
+    // A stored `thumb_file_id` decodes as type 0 (`thumbnail`), NOT as one of the
+    // media document types — and Telegram still serves it from
+    // `inputDocumentFileLocation` + `thumb_size` (measured on a thumb id minted by
+    // the downloading bot: `s` answered an 18628-byte JPEG; every
+    // `inputPhotoFileLocation` size answered FILE_REFERENCE_EXPIRED, so the photo
+    // location is NOT the right one for these ids). Media streaming stays strict:
+    // `prepare_file_target()` is what enforces document-only for real playback.
+    if !is_document_file_id(&decoded) && decoded.file_type != 0 {
+        return Err(format!(
+            "file_id type \"{}\" carries no document thumbs",
+            decoded.type_name
+        ));
+    }
+    Ok(DocTarget {
+        dc_id: decoded.dc_id,
+        size: 0,
+        location: tl::enums::InputFileLocation::InputDocumentFileLocation(
+            tl::types::InputDocumentFileLocation {
+                id: decoded.id,
+                access_hash: decoded.access_hash,
+                file_reference: decoded.file_reference.unwrap_or_default(),
+                thumb_size: thumb_size.to_string(),
+            },
+        ),
+    })
+}
+
 pub const MIN_CHUNK: u64 = 4096;
 pub const MAX_CHUNK: u64 = 512 * 1024;
 pub const MB: u64 = 1024 * 1024;

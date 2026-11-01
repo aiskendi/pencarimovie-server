@@ -1449,6 +1449,13 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         return allow_private_network(handle_download(&state, &ctx).await);
     }
 
+    /* ── /api/thumb — the poster twin of /api/download ────────────────────── */
+    // Same public contract, same input shapes, so an external site can point an
+    // `<img>` at a poster exactly the way it already points a player at a stream.
+    if crate::thumb::is_public_thumb_path(&p) {
+        return allow_private_network(handle_thumb_api(&state, &ctx).await);
+    }
+
     /* ── addon aliases + manifest ─────────────────────────────────────────── */
     let mut addon_path = p.clone();
     if let Some(rest) = p.strip_prefix("/nuvio") {
@@ -1492,6 +1499,26 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
     if addon_path.starts_with("/subtitles/") {
         return handle_subtitles(&addon_path).await;
+    }
+
+    /* ── /thumb — a poster from Telegram itself ───────────────────────────── */
+    // PUBLIC, like `/catalog` and `/meta`: a client renders this in an `<img>`,
+    // which cannot carry the app token. The origin's per-file thumbnail endpoint
+    // is gone, so the file's own `thumb_size` is the only real poster left.
+    if let Some(rest) = addon_path.strip_prefix("/thumb/") {
+        let code = crate::download::percent_decode(rest.trim_end_matches(".jpg"));
+        return match crate::thumb::serve(&state, &code).await {
+            Some(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                // A poster of one file never changes: let the browser keep it and
+                // keep the round-trip off the origin entirely.
+                .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| not_found_json()),
+            None => not_found_json(),
+        };
     }
 
     /* ── eclipse ──────────────────────────────────────────────────────────── */
@@ -4142,6 +4169,95 @@ fn language_flags(title: &str, caption: &str) -> Vec<&'static str> {
     out
 }
 
+/// `GET /api/thumb/<short_code>[.jpg]`
+///
+/// The poster counterpart of `/api/download`, and it accepts the SAME shapes so a
+/// caller never has to know which one its data came in:
+///
+/// * `/api/thumb/<short_code>` (or `.jpg`/`.jpeg`/`.png`)
+/// * `?short_code=` / `?sc=`
+/// * `?d=<base64url payload>` — the same payload the stream URL carries
+/// * `?file_id_mt=` / `?file_id=` — a media id the caller already holds
+///
+/// An `<img>` cannot send the auth token, so the token may also ride in the path
+/// (`/<token>/api/thumb/…`, stripped before this runs) exactly like the download
+/// URL. Public on purpose: it answers one cached JPEG, and it is the only way a
+/// third-party page can show our posters.
+async fn handle_thumb_api(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
+    let image = |bytes: Vec<u8>| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "image/jpeg")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0})))
+    };
+
+    let mut code = String::new();
+    if let Some(rest) = ctx.path.strip_prefix("/api/thumb/") {
+        let decoded = crate::download::percent_decode(rest);
+        code = crate::thumb::strip_thumb_ext(&decoded).to_string();
+    }
+    if code.is_empty() {
+        code = ctx.first_param(&["short_code", "sc"]);
+    }
+    let mut file_id = {
+        let a = ctx.first_param(&["file_id_mt"]);
+        if a.is_empty() {
+            ctx.first_param(&["file_id"])
+        } else {
+            a
+        }
+    };
+    // `?d=<payload>`, or a payload that arrived as the path segment (a short code
+    // is alphanumeric, a base64url payload is not — same test `/api/download` uses).
+    let mut encoded = ctx.qs("d");
+    if encoded.is_empty()
+        && !code.is_empty()
+        && !code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        encoded = code.clone();
+        code.clear();
+    }
+    if !encoded.is_empty() {
+        let payload = crate::download::decode_download_payload(&encoded);
+        if code.is_empty() {
+            code = jstr(&payload, "short_code");
+        }
+        if file_id.is_empty() {
+            let a = jstr(&payload, "file_id_mt");
+            file_id = if a.is_empty() {
+                jstr(&payload, "file_id")
+            } else {
+                a
+            };
+        }
+    }
+
+    if file_id.is_empty() && code.is_empty() {
+        return json_response(
+            400,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "A short_code, a payload (`d`) or a file_id is required.",
+            }),
+        );
+    }
+
+    let bytes = if !file_id.is_empty() {
+        crate::thumb::serve_file_id(state, &file_id).await
+    } else {
+        crate::thumb::serve(state, &code).await
+    };
+    match bytes {
+        Some(b) => image(b),
+        // 404, never a 5xx: an `<img>` treats 5xx as retryable and hammers it.
+        None => not_found_json(),
+    }
+}
+
 fn build_stream_url(base_url: &str, payload_b64: &str, file_name: &str) -> String {
     let token = if auth_enabled() { auth_token() } else { String::new() };
     let token_segment = if token.is_empty() {
@@ -5652,6 +5768,7 @@ fn series_released_anchor(post: &Value) -> Option<String> {
 ///      the port kept the raw scan order, so the episode list rendered — and
 ///      next-episode/autoplay advanced — out of order.
 fn series_videos(
+    base: &str,
     media_id: &str,
     files: &[crate::wp_data::WpFile],
     poster: &Value,
@@ -5670,10 +5787,16 @@ fn series_videos(
             continue;
         }
         // The PHP's episode label is `S{s}E{e}` with NO zero padding.
-        let thumb = if f.thumbnail.is_empty() {
+        //
+        // The origin's per-file poster is gone — every FILE row answers the same
+        // `tg-placeholder` image — so an unusable `thumbnail_url` becomes the
+        // file's own Telegram thumb (`/thumb/<code>`), and only then the post's
+        // poster. A REAL origin poster still passes through untouched.
+        let local = crate::thumb::poster_url(base, &f.thumbnail, &f.short_code);
+        let thumb = if local.is_empty() {
             poster.clone()
         } else {
-            serde_json::json!(f.thumbnail)
+            serde_json::json!(local)
         };
         let released = if f.added_date > 0 {
             serde_json::json!(iso_from_unix(f.added_date))
@@ -5755,6 +5878,7 @@ fn episode_gaps(files: &[crate::wp_data::WpFile]) -> std::collections::BTreeSet<
 /// like "The Witch 2025" has E11–E15 missing everywhere, and must not pay an
 /// origin search on every `/meta` request.
 async fn gap_episode_videos(
+    base: &str,
     media_id: &str,
     post_id: &str,
     title: &str,
@@ -5819,7 +5943,7 @@ async fn gap_episode_videos(
     let videos = if extra.is_empty() {
         Vec::new()
     } else {
-        series_videos(media_id, &extra, poster, anchor)
+        series_videos(base, media_id, &extra, poster, anchor)
     };
     log(
         "meta: episode gaps backfilled from the index",
@@ -5851,6 +5975,7 @@ async fn gap_episode_videos(
 /// `pm_topkw_<hash>` keyword, else `__latest__` (the origin's "newest files"
 /// token).
 async fn file_catalog_metas(
+    base: &str,
     cat_id: &str,
     search: &str,
     genre: &str,
@@ -5926,7 +6051,9 @@ async fn file_catalog_metas(
             "id": format!("pm_file_{}", f.short_code),
             "type": "other",
             "name": title,
-            "poster": f.thumbnail,
+            // `tg-placeholder` is not a poster: a row that carries it (or nothing)
+            // is served the file's own Telegram thumb instead.
+            "poster": crate::thumb::poster_url(base, &f.thumbnail, &f.short_code),
             "posterShape": "poster",
             "description": format!("{} · {}\n\n{}", prefix, pill_line, title),
             "genres": genres,
@@ -6038,7 +6165,7 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
                 metas.push(meta_from_post(&post, ptype));
             }
         }
-        metas.extend(file_catalog_metas(&cat_id, &search, &genre, &year, skip).await);
+        metas.extend(file_catalog_metas(&ctx.base_url, &cat_id, &search, &genre, &year, skip).await);
         let body = serde_json::json!({"metas": metas});
         if body
             .get("metas")
@@ -6164,7 +6291,7 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
     stremio_json(200, &body, "no-store")
 }
 
-async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
+async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
     let Some((item_type, id, _)) = split_addon(path, "/meta/") else {
         // A malformed `/meta/…` path: the PHP's route regex does not match it
         // either, so it never reaches the meta builder.
@@ -6189,7 +6316,7 @@ async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
         if item_type == "series" {
             let files = crate::wp_data::fetch_post_files_paged(pid, 200, 600, 3).await;
             let anchor = series_released_anchor(&post);
-            let mut videos = series_videos(&id, &files, &meta["poster"], anchor.as_deref());
+            let mut videos = series_videos(&ctx.base_url, &id, &files, &meta["poster"], anchor.as_deref());
             // The post is not always the whole show: episodes whose files live
             // only in the origin index are answerable by `/stream` but were
             // absent from the picker. See `gap_episode_videos()`.
@@ -6201,6 +6328,7 @@ async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
                 .to_string();
             videos.extend(
                 gap_episode_videos(
+                    &ctx.base_url,
                     &id,
                     pid,
                     &series_title,
@@ -6305,6 +6433,11 @@ async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
                 size = res.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
             }
         }
+        // `thumbnail_url` is no longer a per-file poster: the origin answers ONE
+        // `tg-placeholder` image for every file now, so an unusable value becomes
+        // this file's own Telegram thumb (`/thumb/<code>`). A real poster — a post
+        // row's featured image — is kept as-is.
+        let thumb = crate::thumb::poster_url(&ctx.base_url, &thumb, &code);
         // A direct file is NEVER null: the PHP falls back to `File <code>`
         // (backend.php:16121-16123), because a null meta hides the Play button.
         if title.trim().is_empty() {
@@ -9077,8 +9210,8 @@ mod tests {
         ];
         let poster = serde_json::json!("https://example.invalid/p.jpg");
         let anchor = Some("2018-01-01T00:00:00Z");
-        let a = series_videos("pm:post:1", &files, &poster, anchor);
-        let b = series_videos("pm:post:1", &files, &poster, anchor);
+        let a = series_videos("", "pm:post:1", &files, &poster, anchor);
+        let b = series_videos("", "pm:post:1", &files, &poster, anchor);
         assert_eq!(a, b, "the videos list must be stable across calls");
         // Sorted (S01E01 first), so index 1 is the row that HAS an added_date.
         assert_eq!(a[0]["released"], serde_json::json!("2018-01-01T00:00:00Z"));
@@ -9090,7 +9223,7 @@ mod tests {
         );
 
         // No anchor at all -> `null`, not a fabricated date.
-        let no_anchor = series_videos("pm:post:1", &files, &poster, None);
+        let no_anchor = series_videos("", "pm:post:1", &files, &poster, None);
         assert_eq!(no_anchor[0]["released"], Value::Null);
     }
 
@@ -9201,7 +9334,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let videos = series_videos("pm:post:2", &files, &Value::Null, None);
+        let videos = series_videos("", "pm:post:2", &files, &Value::Null, None);
         let seq: Vec<(i64, i64)> = videos
             .iter()
             .map(|v| (v["season"].as_i64().unwrap(), v["episode"].as_i64().unwrap()))

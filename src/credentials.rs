@@ -487,6 +487,78 @@ fn enrol_wait(now: i64) -> (i64, i64) {
     (waited, delay)
 }
 
+/// When the re-entrancy latch was taken (`0` = free). Used to notice a latch that
+/// outlived its attempt.
+static ENROLLING_SINCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Last time a skipped attempt was logged (`0` = never).
+static LAST_SKIP_LOG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// A latch held longer than this belonged to an attempt that will never finish.
+///
+/// `ensure_enrolled()` POSTs with a 20 s timeout, so no real attempt can outlive
+/// this. A long-running server must recover on its OWN — waiting for an operator
+/// to restart the app is not a fix, and 120 s made the outage look permanent.
+const ENROL_LATCH_STALE_SECS: i64 = 25;
+
+/// Holds the re-entrancy latch and ALWAYS releases it — including while unwinding.
+///
+/// The manual `ENROLLING.store(true)` / `…store(false)` pair it replaces could
+/// latch FOREVER: a panic (or a cancelled future) inside `ensure_enrolled()` skipped
+/// the release, and every later 401 then returned `false` at the `swap` with no log
+/// line at all. Measured on the Android app: 400 engine log lines of
+/// `wp 401 without a token, enrolling` and **not one** `pm-auth enrol failed` or
+/// `pm-auth enrolment` beside them, `download refused … MISSING_FILE_ID` for every
+/// play — the install never tried again until the process restarted.
+struct EnrolLatch;
+
+impl EnrolLatch {
+    /// `None` when another attempt is genuinely in flight.
+    fn take() -> Option<EnrolLatch> {
+        use std::sync::atomic::Ordering;
+        let now = crate::storage::now();
+        if ENROLLING.swap(true, Ordering::SeqCst) {
+            let since = ENROLLING_SINCE.load(Ordering::SeqCst);
+            if since > 0 && now.saturating_sub(since) < ENROL_LATCH_STALE_SECS {
+                return None;
+            }
+            // Held past any real attempt: take it over instead of waiting forever.
+            crate::log::stderr_log(
+                "pm-auth enrol latch was stale, taking it over",
+                Some(&serde_json::json!({"held_s": if since > 0 { now - since } else { -1 }})),
+            );
+        }
+        ENROLLING_SINCE.store(now, Ordering::SeqCst);
+        Some(EnrolLatch)
+    }
+}
+
+impl Drop for EnrolLatch {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        ENROLLING_SINCE.store(0, Ordering::SeqCst);
+        ENROLLING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Log a skipped attempt at most once per 30 s. The caller already logs the 401
+/// itself, and a per-request line on top of that is noise — but a skip with no
+/// reason at all is what made this look like "the app suddenly cannot download".
+fn log_skip(reason: &str, extra: serde_json::Value) {
+    use std::sync::atomic::Ordering;
+    let now = crate::storage::now();
+    let last = LAST_SKIP_LOG.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 30 {
+        return;
+    }
+    LAST_SKIP_LOG.store(now, Ordering::Relaxed);
+    let mut ctx = serde_json::json!({"reason": reason});
+    if let (Some(dst), Some(src)) = (ctx.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    crate::log::stderr_log("pm-auth enrol skipped", Some(&ctx));
+}
+
 /// [`ensure_enrolled()`] for the call path: never re-entrant, and rate limited to
 /// one attempt per backoff window, so it is safe to call before every origin
 /// request.
@@ -495,13 +567,17 @@ pub async fn ensure_enrolled_throttled() -> bool {
     if !auth_token().is_empty() {
         return true;
     }
-    if ENROLLING.swap(true, Ordering::SeqCst) {
+    let Some(_latch) = EnrolLatch::take() else {
+        log_skip("another attempt is in flight", serde_json::json!({}));
         return false;
-    }
+    };
     let now = crate::storage::now();
     let (waited, delay) = enrol_wait(now);
     if waited < delay {
-        ENROLLING.store(false, Ordering::SeqCst);
+        log_skip(
+            "backoff",
+            serde_json::json!({"retry_in_s": delay - waited, "waited_s": waited}),
+        );
         return !auth_token().is_empty();
     }
     LAST_ENROLL_ATTEMPT.store(now, Ordering::SeqCst);
@@ -516,7 +592,6 @@ pub async fn ensure_enrolled_throttled() -> bool {
             ENROLL_DELAY_SECS.store(0, Ordering::SeqCst);
         }
     }
-    ENROLLING.store(false, Ordering::SeqCst);
     outcome == EnrolOutcome::Enrolled
 }
 

@@ -96,11 +96,104 @@ for f in "$dir"/*.sh "$dir"/*.command; do
 done
 
 echo "Installed to $dir"
-echo "Starting the server..."
-if [ -x "$dir/start.sh" ]; then
-  exec "$dir/start.sh"
+
+# A curl-to-sh run leaves no prompt to come back to: the old tail exec'd the
+# launcher, so the server held the terminal forever and the only way out was
+# Ctrl+C or closing the window. Start it detached and hand the prompt back.
+# PM_FOREGROUND=1 keeps the old behaviour when the log belongs in the terminal.
+port=\${PORT:-8088}
+log="$dir/storage/server.log"
+mkdir -p "$dir/storage"
+
+# stop.sh is what the pms CLI, the systemd unit and the macOS LaunchAgent already
+# call in this directory, and neither release tarball ships one. Only written when
+# absent, so a tarball that starts shipping it wins. The two patterns are the ones
+# do_stop in pencarimovie-linux.sh settled on: the launchers exec the binary as
+# "./pencarimovie-server", so the install path appears in neither argv, which is
+# why a pidfile lookup by path found nothing and left the server running.
+if [ ! -f "$dir/stop.sh" ]; then
+  cat > "$dir/stop.sh" <<'PMSTOP'
+#!/bin/sh
+set -eu
+dir=$(cd "$(dirname "$0")" && pwd)
+pkill -9 -f "$dir/pencarimovie-server" 2>/dev/null || true
+pkill -9 -f "\\./pencarimovie-server --port" 2>/dev/null || true
+echo "PencariMovie Server stopped."
+PMSTOP
+  chmod +x "$dir/stop.sh"
 fi
-exec "$dir/pencarimovie-server"
+
+reachable() {
+  curl -fsS -m 2 "http://127.0.0.1:$port/api/version" >/dev/null 2>&1
+}
+
+if reachable; then
+  # An update replaced the files on disk, but the running process still has the
+  # old binary mapped, so it keeps serving the old build until it is restarted.
+  echo "Already running on http://127.0.0.1:$port - nothing started."
+  echo "These files take effect after a restart:"
+  echo "  $dir/stop.sh"
+  echo "then run this installer again to start the new build."
+elif [ "\${PM_FOREGROUND:-}" = "1" ]; then
+  echo "Starting the server in this window (Ctrl+C stops it)..."
+  if [ -x "$dir/start.sh" ]; then
+    exec "$dir/start.sh"
+  fi
+  exec "$dir/pencarimovie-server" --port "$port"
+else
+  echo "Starting the server in the background..."
+  # PORT is passed explicitly: start.sh defaults to 8088 and start.command to
+  # 8092, and neither is necessarily the port probed above. PENCARIMOVIE_NO_BANNER
+  # drops the launcher's four-line banner, which the engine repeated in full.
+  launcher="$dir/start.sh"
+  [ -x "$launcher" ] || launcher="$dir/start.command"
+  # setsid detaches the server from this shell's process group, so closing the
+  # terminal (or the Cloud Shell tab) does not take the server down with it.
+  # PM_NO_OPEN stops macOS start.command from popping a browser window at a
+  # moment nobody asked for it; PENCARIMOVIE_NO_BANNER stops it repeating the
+  # engine's own banner; PORT pins the port this script just probed.
+  if [ -x "$launcher" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+      setsid env PORT="$port" PM_NO_OPEN=1 PENCARIMOVIE_NO_BANNER=1 "$launcher" </dev/null >>"$log" 2>&1 &
+    else
+      nohup env PORT="$port" PM_NO_OPEN=1 PENCARIMOVIE_NO_BANNER=1 "$launcher" </dev/null >>"$log" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
+    setsid "$dir/pencarimovie-server" --port "$port" </dev/null >>"$log" 2>&1 &
+  else
+    nohup "$dir/pencarimovie-server" --port "$port" </dev/null >>"$log" 2>&1 &
+  fi
+  # Give it up to 20s to answer before reporting, so a slow first resolve (a cold
+  # Telegram login) does not read as a failed start.
+  i=0
+  while [ "$i" -lt 40 ] && ! reachable; do
+    i=$((i + 1))
+    sleep 0.5
+  done
+
+  echo ""
+  echo "  dashboard : http://127.0.0.1:$port/"
+  echo "  add-on    : http://127.0.0.1:$port/manifest.json"
+  echo "  log       : $log"
+  echo "  stop      : $dir/stop.sh"
+  echo ""
+  if ! reachable; then
+    echo "Port $port has not answered yet. If it never does, read $log."
+    echo ""
+  fi
+  if [ -z "\${SERVER_PASSWORD:-}" ]; then
+    echo "No password is set, and port $port is bound on every interface, so your"
+    echo "LAN can reach the dashboard. The engine also trusts every request that"
+    echo "arrives from 127.0.0.1, and a preview or port-forward URL (Cloud Shell,"
+    echo "Codespaces, an IDE forwarder) reaches this port from localhost: that URL"
+    echo "needs no login at all, so treat it as full access to this install and stop"
+    echo "sharing it when you are done."
+    echo "For clients that reach the port over the network instead:"
+    echo "  curl -fsS -X POST http://127.0.0.1:$port/api/auth/reset"
+    echo "  curl -fsS -X POST -H 'Content-Type: application/json' -d '{\\"current\\":\\"123456\\",\\"next\\":\\"your-password\\"}' http://127.0.0.1:$port/api/auth/password"
+    echo ""
+  fi
+fi
 `;
 
 /* ── Windows ──────────────────────────────────────────────────────────────── */
@@ -681,7 +774,11 @@ const HTML_HOMEPAGE = `<!DOCTYPE html>
 `;
 
 function text(body, cache) {
-  return new Response(body, {
+  // These payloads are piped straight into sh or iex. A CRLF line ending turns
+  // `then` into `then\r` and a heredoc terminator into `PMSTOP\r`, which matches
+  // nothing, so every line after it is swallowed into the heredoc body. Editors
+  // on Windows save this file with CRLF, so normalise on the way out.
+  return new Response(body.replace(/\r\n?/g, "\n"), {
     status: 200,
     headers: {
       "Content-Type": "text/plain; charset=utf-8",

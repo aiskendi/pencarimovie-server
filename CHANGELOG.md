@@ -6,6 +6,22 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ### Fixed
 
+- **`curl -fsSL telegra.my/linux | sh` never came back to the prompt.** The Linux and macOS
+  installers are one shared payload whose tail ended with `exec "$dir/start.sh"`, so the server
+  ran in the foreground, the piped script held the terminal, and the "Ctrl+C to stop" it printed
+  was the only way out. It now starts detached (via `setsid`, or `nohup` where there is none),
+  appends to `storage/server.log`, waits up to 20s for `/api/version` and prints the dashboard,
+  log and stop paths before returning; `PM_FOREGROUND=1` restores the old foreground behaviour.
+  It also writes the `stop.sh` that `pms stop`, the systemd unit and the macOS LaunchAgent already
+  call and that neither tarball ships, and explains the exposure of a non-loopback bind: a Cloud
+  Shell or Codespaces preview URL reaches the port from localhost, the engine trusts loopback, so
+  that URL needs no password at all. Launcher-side the duplicate banner is gone:
+  `PENCARIMOVIE_NO_BANNER=1` silences [`desktop/linux/start.sh`](desktop/linux/start.sh:35) and
+  [`desktop/macos/start.command`](desktop/macos/start.command:22), and `PM_NO_OPEN=1` stops the
+  macOS launcher opening a browser in the middle of an install.
+  [`cloudflare-worker-telegra-my.js`](cloudflare-worker-telegra-my.js:1) also normalises CRLF on
+  the way out now, because a Windows-saved copy of that file emitted `then\r` and a heredoc
+  terminator that matched nothing.
 - **3.0.x releases exited with `132` (SIGILL) a second after the banner on every CPU without
   AVX2** — every Synology x86 NAS (Atom C2538/C3538, Celeron J4125/J4025, N4000) and every
   desktop older than 2013. It is not a hardware limitation and not the reporter's fault: the

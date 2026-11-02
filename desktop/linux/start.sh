@@ -32,8 +32,14 @@ if [ "$OPEN" = "1" ]; then
   ) &
 fi
 
-echo "PencariMovie Server"
-echo "  dashboard : http://127.0.0.1:$PORT/"
-echo "  add-on    : http://127.0.0.1:$PORT/manifest.json"
-echo "  Ctrl+C to stop"
+# The engine prints its own banner with the storage path, worker count and rate
+# limits, so this four-line one is only useful when a human is watching the
+# terminal. PENCARIMOVIE_NO_BANNER=1 (set by the installers when they start the
+# server detached) suppresses it instead of printing both.
+if [ -z "${PENCARIMOVIE_NO_BANNER:-}" ]; then
+  echo "PencariMovie Server"
+  echo "  dashboard : http://127.0.0.1:$PORT/"
+  echo "  add-on    : http://127.0.0.1:$PORT/manifest.json"
+  echo "  Ctrl+C to stop"
+fi
 exec "$BIN" --port "$PORT" "$@"

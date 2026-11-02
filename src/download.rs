@@ -690,6 +690,33 @@ fn refuse_limit(
         .unwrap_or_else(|_| json_response(429, &body))
 }
 
+/// What an empty resolve MEANS.
+///
+/// A short_code that resolved to nothing is the client's fault only when the origin
+/// ANSWERED. When it never answered — DNS, TCP, timeout — the fault is upstream, and
+/// saying so is the whole difference between a recoverable stream and a dead one:
+/// ExoPlayer retries a `5xx` on its own, while it renders a `400` verbatim as
+/// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and gives up. Measured on a
+/// phone (2026-11-02) where the origin timed out: every play showed exactly that 400.
+///
+/// ponytail: reads the 20 s origin gate, so a genuine miss arriving right after an
+/// outage also answers 503 for at most those 20 s — the retry gets the real 400/404.
+fn empty_resolve_refusal(origin_down_secs: i64) -> (u16, &'static str, &'static str) {
+    if origin_down_secs > 0 {
+        (
+            503,
+            crate::httpc::ORIGIN_UNREACHABLE,
+            crate::httpc::ORIGIN_UNREACHABLE_MSG,
+        )
+    } else {
+        (
+            400,
+            "MISSING_FILE_ID",
+            "file_id or valid short_code is required for local browser download.",
+        )
+    }
+}
+
 pub fn plan_download_candidates(
     bot_id: &str,
     short_code: &str,
@@ -1188,24 +1215,34 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     }
 
     if file_id.is_empty() {
+        let down = crate::httpc::wp_origin_down_secs();
+        let (status, stage, message) = empty_resolve_refusal(down);
         record_refusal(
-            ctx, started, 400, "MISSING_FILE_ID",
-            "file_id or valid short_code is required for local browser download.",
-            &short_code,
+            ctx, started, status, stage, message, &short_code,
             serde_json::json!({
                 "payload_len": encoded.len(),
                 "bot_id": bot_id,
                 "pool_bots": candidates.len(),
+                "origin_down_secs": down,
             }),
         );
-        return json_response(
-            400,
-            &serde_json::json!({
-                "ok": 0,
-                "message": "file_id or valid short_code is required for local browser download.",
-                "hint": "Pass a Bot API file id or shortcode to resolve the file.",
-            }),
-        );
+        let body = serde_json::json!({
+            "ok": 0,
+            "error": stage,
+            "message": message,
+            "short_code": short_code,
+            "retry_after": down,
+            "hint": "Pass a Bot API file id or shortcode to resolve the file.",
+        });
+        if status == 503 {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, down.max(1).to_string())
+                .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+                .unwrap_or_else(|_| json_response(503, &body));
+        }
+        return json_response(400, &body);
     }
 
     file_name = stream_filename(&file_name, &file_mime);
@@ -2203,6 +2240,16 @@ mod tests {
         // A window well inside the file is untouched.
         assert_eq!(window(0, crate::telegram::MB, REAL_SIZE),
                    Some((0, crate::telegram::MB)));
+    }
+
+    /// The one behaviour this change exists for: an outage must not be reported as a
+    /// client error, because the player does not retry a 400.
+    #[test]
+    fn an_unreachable_origin_is_a_503_not_a_missing_file_id() {
+        let (status, stage, _) = empty_resolve_refusal(20);
+        assert_eq!((status, stage), (503, "ORIGIN_UNREACHABLE"));
+        let (status, stage, _) = empty_resolve_refusal(0);
+        assert_eq!((status, stage), (400, "MISSING_FILE_ID"));
     }
 
     #[test]

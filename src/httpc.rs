@@ -401,6 +401,17 @@ pub async fn http_json_h_status(
             }
         }
     }
+    // THE arming point for the origin-down gate.
+    //
+    // Every origin call outside the catalog path lands here — `resolve-file`,
+    // `resolve-files`, the auth routes — and none of them went through
+    // `cached_wp_json()`, which was the only place that called `wp_note_status()`.
+    // So `status == 0` from a resolve recorded nothing, and the next thing to ask
+    // "is the origin reachable?" got "yes" and burned another full timeout. Measured
+    // on a phone (2026-11-02): `http_json failed … operation timed out`, then
+    // `resolve returned no file id … status:0`, then `/api/download` answered
+    // `400 MISSING_FILE_ID` — a client error for the origin's outage.
+    wp_note_status(status);
     if !ok {
         log(
             "http_json failed",
@@ -445,9 +456,29 @@ const WP_STALE_BUDGET_S: u64 = 3;
 ///
 /// A transport timeout is not a property of ONE url: it is the origin being gone.
 /// So the first `status == 0` arms this gate and every later call fails fast
-/// instead of re-discovering the same outage. 20 s is short enough that a blip
-/// recovers on its own and long enough to cover one browse.
-const WP_DOWN_SECS: i64 = 20;
+/// instead of re-discovering the same outage.
+///
+/// 45 s, and the reason is exact: a resolve ladder is bounded by
+/// `resolve::RESOLVE_BUDGET` = **20 s**, and it is that ladder's LAST failed attempt
+/// which arms this. The old 20 s therefore expired at the same instant the ladder
+/// gave up, so the caller asking "was that an outage?" one line later always read
+/// `0` — measured on 2026-11-02 against an unresolvable origin: `/api/download`
+/// answered `400 MISSING_FILE_ID` for a request whose every hop had failed to
+/// connect. The window must outlive the ladder that arms it; it is still short
+/// enough that a blip recovers on its own.
+const WP_DOWN_SECS: i64 = 45;
+
+/// The refusal code for "the origin never answered".
+///
+/// One name, because the same outage reaches the user through three different
+/// routes (`/api/download`, the guest provision, `/stream`), and three spellings of
+/// one fault is what made it unfindable in the incident log.
+pub const ORIGIN_UNREACHABLE: &str = "ORIGIN_UNREACHABLE";
+
+/// One sentence for it too — host-free on purpose, because `wp_api_base()` is
+/// env-overridable and a hard-coded domain would be a lie on a self-hosted origin.
+pub const ORIGIN_UNREACHABLE_MSG: &str =
+    "The catalog origin is unreachable. Retry in a few seconds.";
 
 /// Until this instant the origin counts as down (`0` = healthy).
 static WP_DOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -654,5 +685,32 @@ mod tests {
         }
         // An HTTP answer is never a transport failure, whatever the status.
         assert!(!is_connection_reset("503 Service Unavailable"));
+    }
+
+    /// Only a request that never completed is an outage. A 404/401/500 is the
+    /// origin talking, and telling the user "unreachable" for those would hide a
+    /// real answer — `note_wp_origin_answered()` clears the gate on any of them.
+    #[test]
+    fn only_a_status_of_zero_arms_the_origin_gate() {
+        wp_note_status(200);
+        assert_eq!(wp_origin_down_secs(), 0, "healthy origin: gate closed");
+        wp_note_status(404);
+        assert_eq!(wp_origin_down_secs(), 0, "a 404 proves the origin is alive");
+        wp_note_status(0);
+        assert!(wp_origin_down_secs() > 0, "a transport failure arms the gate");
+        wp_note_status(200);
+        assert_eq!(wp_origin_down_secs(), 0, "first answer after an outage reopens it");
+    }
+
+    /// The regression that made the whole classification useless: the window was
+    /// 20 s and `resolve::RESOLVE_BUDGET` is 20 s, so the gate armed by the ladder's
+    /// last failed attempt expired at the instant the ladder gave up — every later
+    /// `wp_origin_down_secs()` read 0 and `/api/download` answered 400.
+    #[test]
+    fn the_origin_down_window_outlives_a_resolve_ladder() {
+        assert!(
+            WP_DOWN_SECS > 20,
+            "must outlive resolve::RESOLVE_BUDGET (20 s), or the caller reads 0"
+        );
     }
 }

@@ -1952,6 +1952,32 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             )
             .await;
         }
+        // An outage is NOT "provisioning, wait a few seconds".
+        //
+        // Exercised on a session-less install with an unreachable origin (2026-11-02):
+        // `/stream` answered "⏳ Provisioning a guest Telegram bot — this takes a few
+        // seconds" while the lease could never be granted, and it answered the same
+        // thing on every reopen, because no session was ever created. Stremio renders
+        // `description` and nothing else, so this card is the only place the user can
+        // learn why nothing plays.
+        if crate::httpc::wp_origin_down_secs() > 0 {
+            log(
+                "stream blocked: origin unreachable, no bot session",
+                &serde_json::json!({"type": item_type, "id": item_id}),
+            );
+            return single_card_streams(
+                &ctx.base_url,
+                serde_json::json!({
+                    "name": "PencariMovie",
+                    "description": format!(
+                        "{}\nNo bot session yet, and a guest bot cannot be provisioned until the origin answers.",
+                        crate::httpc::ORIGIN_UNREACHABLE_MSG
+                    ),
+                    "externalUrl": format!("{}/#settings", base),
+                }),
+            )
+            .await;
+        }
         let already = is_guest_provision_in_progress();
         if !already {
             let st = state.clone();

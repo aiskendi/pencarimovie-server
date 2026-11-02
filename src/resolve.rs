@@ -265,6 +265,21 @@ pub async fn resolve_shortcode(short_code: &str, bot_id: &str, bypass_cache: boo
 /// Hard-bounded by [`RESOLVE_BUDGET`]: a ladder that runs out of time answers
 /// status `0`, which both callers already read as "origin busy" → 503 +
 /// `Retry-After`, instead of hanging into the router's own kill.
+/// The one body a resolve answers when the origin could not be reached at all.
+///
+/// `status 0` is what every caller already treats as "origin busy", and
+/// `/api/download` turns it into `503 ORIGIN_UNREACHABLE` instead of a 400.
+fn origin_unreachable_result() -> (Value, u16) {
+    (
+        serde_json::json!({
+            "ok": 0,
+            "error": crate::httpc::ORIGIN_UNREACHABLE,
+            "message": crate::httpc::ORIGIN_UNREACHABLE_MSG,
+        }),
+        0,
+    )
+}
+
 pub async fn resolve_shortcode_status(
     short_code: &str,
     bot_id: &str,
@@ -330,6 +345,26 @@ async fn resolve_shortcode_status_inner(
         }
     }
 
+    // Fail fast while the origin gate is armed.
+    //
+    // Without this, every Play re-ran the whole 20 s ladder to rediscover the same
+    // outage: measured against a dead origin, two consecutive `/api/download` for
+    // different codes took **20.0 s each** and the answer arrived after the player
+    // had already given up. The cache lookup above still runs first, so a code whose
+    // id is already held keeps working (and stays instant) through an outage.
+    let down = crate::httpc::wp_origin_down_secs();
+    if down > 0 {
+        log(
+            "resolve skipped - origin down, answering unreachable",
+            &serde_json::json!({
+                "short_code": short_code,
+                "bot_id": bot,
+                "for_secs": down,
+            }),
+        );
+        return origin_unreachable_result();
+    }
+
     let url = format!("{}/resolve-file", wp_api_base());
     let mut params = vec![
         ("short_code".to_string(), short_code.to_string()),
@@ -357,6 +392,13 @@ async fn resolve_shortcode_status_inner(
             "message": res.get("message").cloned().unwrap_or(Value::Null),
         }),
     );
+    // The origin is not going to answer five seconds from now: the call that just
+    // failed ARMED the gate. Everything below — the 5 s backoff and the three
+    // 1.2/1.5/1.5 s polls — was pure dead wait with the answer already known,
+    // measured at 9.4 s per Play against a dead origin.
+    if status == 0 && crate::httpc::wp_origin_down_secs() > 0 {
+        return origin_unreachable_result();
+    }
     // An origin 5xx (or a request that never completed) is NOT a miss: the relay
     // is still running and the origin advertised `retry_after: 5`. Wait that out
     // once before the fast ladder, or a busy origin looks like a dead track.

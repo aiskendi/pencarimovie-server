@@ -1630,7 +1630,16 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                 .and_then(|m| m.as_str())
                 .map(|m| m.trim().to_string())
                 .unwrap_or_default();
-            last_error = Some(if detail.is_empty() {
+            // An EMPTY body is a request that never completed — `http_json_h`
+            // answers `{}` for a transport failure — and it is NOT an origin saying
+            // `ok:0`. Exercised on a session-less install (2026-11-02) against an
+            // unreachable origin: the player was shown "unreachable" followed by
+            // "Last error: provision-session returned ok=0", which sends the reader
+            // looking for a refused lease that never happened.
+            let silent = resp.as_object().map(|o| o.is_empty()).unwrap_or(true);
+            last_error = Some(if silent {
+                "provision-session did not answer (transport failure or empty body)".to_string()
+            } else if detail.is_empty() {
                 format!(
                     "provision-session returned {}",
                     if ok { "no bot_token" } else { "ok=0" }
@@ -1743,6 +1752,27 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                 continue;
             }
         }
+    }
+    // An unreachable origin is not a refused lease.
+    //
+    // When the request never completed at all, `http_json_h` answers `{}`, so the
+    // attempt above recorded `provision-session returned ok=0` — the guest was told
+    // the origin had REJECTED it while the real fault was the network, and that
+    // string sent every investigation looking for a bad lease. The gate armed by
+    // that same call knows the difference, and the dashboard renders `error` verbatim.
+    if crate::httpc::wp_origin_down_secs() > 0 {
+        let detail = last_error.unwrap_or_default();
+        let message = if detail.is_empty() {
+            crate::httpc::ORIGIN_UNREACHABLE_MSG.to_string()
+        } else {
+            format!(
+                "{} ({}) Last error: {}",
+                crate::httpc::ORIGIN_UNREACHABLE_MSG,
+                crate::httpc::ORIGIN_UNREACHABLE,
+                detail
+            )
+        };
+        return Err(message);
     }
     Err(last_error
         .unwrap_or_else(|| "Could not obtain guest bot session from server.".to_string()))

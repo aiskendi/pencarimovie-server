@@ -331,6 +331,38 @@ fn random_hex(bytes: usize) -> String {
     hex::encode(buf)
 }
 
+/// The "your addon URL just changed" warning, printed ONCE per process.
+///
+/// This is the user report "the streams list says the token/password changed"
+/// (2026-11-03), and it is not a bug in the card: `/<token>/manifest.json` is the
+/// addon URL, and the token is minted RANDOMLY at boot whenever `SERVER_TOKEN` is
+/// unset and `auth.json` is not on disk ([`auth_load`]). On a host whose `storage/`
+/// is not persistent — the Render instance wiped `/data/storage` on a redeploy,
+/// proven by `device_id` changing with it — every installed addon therefore starts
+/// answering the locked "Addon URL changed or password required" card, and
+/// re-installing only lasts until the next restart.
+///
+/// Measured: the token that played fine at 20:43 (`ec7bb245…`) answered the locked
+/// card at 21:04 while the new one (`a966a104…`) served 61 rows — same process
+/// otherwise, so the rotation is the whole fault.
+///
+/// The operator has to be told this, not the user, so it goes out always-on:
+/// `stderr_log`, not `log()`.
+fn log_minted_token_once() {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    crate::log::stderr_log(
+        "addon token minted for this boot",
+        Some(&serde_json::json!({
+            "why": "SERVER_TOKEN is unset and storage held no auth.json",
+            "effect": "every installed addon URL /<token>/... answers the locked card until it is re-installed, and again after the next restart if storage is not persistent",
+            "fix": "set SERVER_TOKEN to a stable string so the token survives restarts",
+        })),
+    );
+}
+
 pub fn auth_load() -> AuthData {
     if let Ok(guard) = cache().lock() {
         if let Some(d) = guard.as_ref() {
@@ -349,6 +381,7 @@ pub fn auth_load() -> AuthData {
         // NEVER hash on the load path (backend.php:1515).
         data.password_hash = Some(String::new());
     }
+    let mut minted = false;
     match env("SERVER_TOKEN") {
         Some(t) => {
             data.token = Some(t.split(',').next().unwrap_or("").trim().to_string());
@@ -356,8 +389,12 @@ pub fn auth_load() -> AuthData {
         None => {
             if data.token.as_deref().unwrap_or("").is_empty() {
                 data.token = Some(random_hex(16));
+                minted = true;
             }
         }
+    }
+    if minted {
+        log_minted_token_once();
     }
     if data.enabled.is_none() {
         data.enabled = Some(true);

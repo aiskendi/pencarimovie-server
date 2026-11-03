@@ -1217,7 +1217,19 @@ class PencariMovieApp {
       }
       const ipv4 = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
       if (!ipv4) {
-        return value !== "127.0.0.1";
+        // A NAME is a LAN host only when it is mDNS (`.local`). Everything else
+        // with letters in it is a real DNS name — a domain, a PaaS hostname, the
+        // tunnel — and the token MUST stay in its addon URL.
+        //
+        // This used to be `return value !== "127.0.0.1"`, which is true for any
+        // hostname, so `tokenForHost()` stripped the token from
+        // `…onrender.com/manifest.json` and the dashboard printed a public
+        // SERVER MANIFEST URL with no token — the 2026-11-03 report "Server
+        // Manifest … no token!", whose consequence is the locked "Addon URL
+        // changed or password required" card on every installed client.
+        // Loopback/LAN keep omitting the token on purpose (the server treats
+        // those peers as privileged, and a pasteable URL should stay readable).
+        return /\.local$/i.test(value);
       }
       const a = Number(ipv4[1]);
       const b = Number(ipv4[2]);
@@ -1248,7 +1260,16 @@ class PencariMovieApp {
         if (!h || h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0") {
           return "";
         }
-        return isUsableLanHost(h) ? "" : tokenPrefix;
+        if (isUsableLanHost(h)) {
+          return "";
+        }
+        // Public origin: the token is mandatory, even if we somehow do not have it
+        // loaded yet — a URL without it is a URL that answers the locked card, so
+        // say so in the log rather than print a broken manifest address.
+        if (!tokenPrefix) {
+          console.warn("[addon] public host without an access token — log in so the manifest URL carries it:", h);
+        }
+        return tokenPrefix;
       };
       const localUrl = "http://127.0.0.1".concat(portSuffix, "/manifest.json");
       let serverUrl = !isLocal && !onTunnel ? "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenForHost(pageHost), "/manifest.json") : "";

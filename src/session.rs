@@ -725,7 +725,10 @@ fn provision_heartbeat_path() -> PathBuf {
 /// legs failed `a live holder must be respected` while every other platform
 /// passed. `kill -0` asks the kernel the same question portably.
 pub(crate) fn pid_still_running(pid: i64) -> bool {
-    if pid <= 1 {
+    // PID **1** is a legitimate holder in a container: the platform (Render,
+    // Heroku, Docker) runs the server AS pid 1, so rejecting `<= 1` made every
+    // lock written there permanently unreadable — see `lock_owner_pid`.
+    if pid < 1 {
         return false;
     }
     #[cfg(windows)]
@@ -758,10 +761,18 @@ pub(crate) fn pid_still_running(pid: i64) -> bool {
 }
 
 /// The pid recorded in the lock file, when it looks sane.
+///
+/// `>= 1`, not `> 1`. In a container the server IS pid 1, and the old filter
+/// threw that pid away: `lock_owner_pid` answered `None`, `acquire()` read
+/// `dead_owner = false`, and the only way out was the 300 s age fallback. That
+/// is the Render report (2026-11-03) — `reclaimed guest_provision.lock
+/// {"dead_owner":false,"pid":0,"too_old":true}` every five minutes, with
+/// `/api/provision` answering "Connecting guest bot in progress" in between, so
+/// the instance never provisioned.
 fn lock_owner_pid(path: &Path) -> Option<i64> {
     let text = fs::read_to_string(path).ok()?;
     let first = text.split_whitespace().next()?;
-    first.parse::<i64>().ok().filter(|p| *p > 1)
+    first.parse::<i64>().ok().filter(|p| *p >= 1)
 }
 
 /// `fd_is_guest_provision_in_progress()`: a dead holder or a >300s lock is reclaimed.
@@ -842,6 +853,19 @@ impl ProvisionLock {
                         continue;
                     }
                     if start.elapsed().as_millis() as u64 > wait_ms {
+                        // Recorded because "Connecting guest bot in progress"
+                        // reached the user for five minutes at a time with no
+                        // evidence of WHO held the lock (Render, 2026-11-03).
+                        log(
+                            "guest_provision.lock still held, giving up",
+                            &serde_json::json!({
+                                "waited_ms": start.elapsed().as_millis() as u64,
+                                "owner_pid": lock_owner_pid(&file),
+                                "age_secs": crate::storage::mtime_secs(&file)
+                                    .map(|m| now() - m)
+                                    .unwrap_or(-1),
+                            }),
+                        );
                         return None;
                     }
                     // Deliberately NO heartbeat write here. A waiter refreshing the
@@ -1143,6 +1167,27 @@ mod tests {
         assert!(
             is_guest_provision_in_progress_at(&path),
             "a live holder must be respected"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A container runs the server as PID 1, so a lock written there must be
+    /// readable.
+    ///
+    /// The old `filter(|p| *p > 1)` threw that pid away, `acquire()` then read
+    /// `dead_owner = false`, and the 300 s age fallback was the only escape —
+    /// exactly the Render report (2026-11-03): `reclaimed guest_provision.lock
+    /// {"dead_owner":false,"pid":0,"too_old":true}` every five minutes while
+    /// every play answered "Connecting guest bot in progress".
+    #[test]
+    fn a_pid_of_one_is_a_readable_holder() {
+        let path = lock_test_path("pid1");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, "1").unwrap();
+        assert_eq!(
+            lock_owner_pid(&path),
+            Some(1),
+            "PID 1 (the container entrypoint) is a legitimate lock holder"
         );
         let _ = fs::remove_file(&path);
     }
@@ -1860,7 +1905,17 @@ pub async fn ensure_guest_bot(tg: &crate::telegram::TelegramPool) -> usize {
                 &serde_json::json!({"bot_id": res.bot_id, "bots": count()}),
             );
         }
-        Err(e) => log("pool lease failed", &serde_json::json!({"error": e})),
+        Err(e) => {
+            log("pool lease failed", &serde_json::json!({"error": e}));
+            // Always-on, not `log()`: on a fresh container (ephemeral storage,
+            // no debug pre-enabled, no session yet) this single line is the only
+            // record of why the install has no bot. Without it the Render log
+            // showed a healthy boot and then nothing at all.
+            crate::log::stderr_log(
+                "guest bot lease failed",
+                Some(&serde_json::json!({"error": e})),
+            );
+        }
     }
     count()
 }

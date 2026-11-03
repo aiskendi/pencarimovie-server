@@ -3708,23 +3708,59 @@ async fn finish_streams(
     filtered: bool,
     files_before_filter: usize,
 ) -> Response {
+    let real_rows = streams.len();
     if streams.is_empty() {
         streams.push(no_streams_card(ctx, title, item_id, filtered, files_before_filter));
     }
-    // The cache holds the LIST ONLY. Baking the sponsor (and the update notice)
-    // into the cached body meant one failed WordPress call hid the sponsor from
-    // every client for the next [`STREAM_CACHE_TTL`] seconds, and froze an
-    // "update available" card long after the update, both intermittent
-    // "the sponsor is not on top" reports.
-    crate::cache::put(
-        "stream",
-        &stream_cache_key(item_type, item_id, &ctx.base_url),
-        &serde_json::json!({"streams": &streams}),
-        STREAM_CACHE_TTL,
-        0,
-    );
+    // A list is only worth freezing for [`STREAM_CACHE_TTL`] when it holds REAL
+    // rows AND the origin was answering while it was built.
+    //
+    // Measured on a phone on mobile data (2026-11-03): the carrier→Cloudflare TLS
+    // path to the origin failed 12 of 16 attempts, each burning the full 8-10 s
+    // timeout, so the origin gate opened and closed every few seconds. `get_post`
+    // then answered empty, `stream: post has no title` was logged, the list
+    // collapsed to the "No Streams Found" card — and this function stored that
+    // card for 300 s. The viewer kept getting a one-row list (sponsor + card) long
+    // after connectivity returned, which is the "streams list is broken, only show
+    // sponsored message" shape arriving from a new direction.
+    //
+    // A degraded answer is therefore never cached: it costs one recompute, and the
+    // title heals on the next tap instead of five minutes later.
+    let origin_down_secs = crate::httpc::wp_origin_down_secs();
+    if stream_cache_allowed(real_rows, origin_down_secs) {
+        // The cache holds the LIST ONLY. Baking the sponsor (and the update notice)
+        // into the cached body meant one failed WordPress call hid the sponsor from
+        // every client for the next [`STREAM_CACHE_TTL`] seconds, and froze an
+        // "update available" card long after the update, both intermittent
+        // "the sponsor is not on top" reports.
+        crate::cache::put(
+            "stream",
+            &stream_cache_key(item_type, item_id, &ctx.base_url),
+            &serde_json::json!({"streams": &streams}),
+            STREAM_CACHE_TTL,
+            0,
+        );
+    } else {
+        log(
+            "stream cache skipped",
+            &serde_json::json!({
+                "item_id": item_id,
+                "rows": real_rows,
+                "origin_down_secs": origin_down_secs,
+            }),
+        );
+    }
     let streams = decorate_streams(&ctx.base_url, streams).await;
     stremio_json(200, &serde_json::json!({"streams": streams}), "no-store")
+}
+
+/// May a finished stream list be frozen for [`STREAM_CACHE_TTL`]?
+///
+/// `rows` counts the REAL rows, before [`no_streams_card`] places its placeholder.
+/// A placeholder rebuilds itself from the item id for free, so caching one only
+/// ever pins the moment this server could not see the origin.
+fn stream_cache_allowed(rows: usize, origin_down_secs: i64) -> bool {
+    rows > 0 && origin_down_secs == 0
 }
 
 /// Build the "update available" item from a `/api/update/check` answer
@@ -8558,6 +8594,28 @@ mod tests {
         let ctx = ctx_with(&[], "http://127.0.0.1:8088", &[]);
         let name = "F1.The.Movie.2025.Hybrid.2160p.WEB.DL.DV.HDR.DDP5.1.Atmos.H265.AOC.mkv";
         stream_item(&ctx, "d63Zs9", name, "", 4_159_930_455, "video/x-matroska", item)
+    }
+
+    /// A degraded `/stream` answer must never be frozen for [`STREAM_CACHE_TTL`].
+    ///
+    /// 2026-11-03, phone on mobile data: 12 of 16 TLS attempts to the origin failed
+    /// (each 8-10 s), the origin gate flapped, `get_post` answered empty,
+    /// `stream: post has no title` was logged and the list fell back to the
+    /// "No Streams Found" card. `finish_streams()` cached that card for 300 s, so
+    /// the viewer kept seeing sponsor + "No Streams Found" for a title that had 5
+    /// playable rows the moment the network returned. The cache is for a healthy
+    /// answer; a degraded one must be recomputed on the next tap.
+    #[test]
+    fn a_degraded_stream_list_is_never_cached() {
+        // Healthy origin and real rows: the only case worth caching.
+        assert!(stream_cache_allowed(5, 0), "a real list from a live origin caches");
+        // Gate armed: never, even with rows — whatever we built is a subset of a
+        // title's files because the origin never answered.
+        assert!(!stream_cache_allowed(5, 7), "origin down must never be pinned");
+        assert!(!stream_cache_allowed(0, 7), "the fallback card must never be pinned");
+        // Empty on a healthy origin: recompute per tap. The card is free and a
+        // wrongly-cached "No Streams Found" is the exact bug this pins.
+        assert!(!stream_cache_allowed(0, 0), "an empty answer is recomputed, not frozen");
     }
 
     /// HARD RULE — a `/stream` item must NEVER carry a `title` field.

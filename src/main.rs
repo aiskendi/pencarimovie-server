@@ -273,6 +273,33 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Name a panic instead of letting it become an anonymous 502.
+    //
+    // A panicking request task produces NO response and never reaches `log()`, so
+    // the player gets whatever the edge substitutes and the operator gets nothing.
+    // Measured on the Render instance (2026-11-03): `/stream/movie/pm%3Apost%3A9000016051.json`
+    // answered **HTTP 502 with an empty body in ~130 ms**, reproducibly, while its
+    // neighbours answered 200 — and `debug.log` held no line for it at all. This
+    // hook turns that class of failure into one always-on stderr line carrying the
+    // message and the exact source location.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        let ctx = serde_json::json!({"message": message, "location": location});
+        // Always-on (the platform log), and debug.log too when it is enabled so
+        // `/api/logs` can serve it remotely.
+        log::stderr_log("panic", Some(&ctx));
+        log::log("panic", &ctx);
+    }));
+
     // The APP shell that launched this engine (the Android APK's versionName).
     // `/api/version` reports it as `client_version`; without it the dashboard
     // could only show the engine version, so users could not tell which APK they

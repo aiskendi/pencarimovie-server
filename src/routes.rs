@@ -337,10 +337,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             );
         }
         auth_set_password(&next);
-        // The password change ROTATES the token. Re-issue the cookie in the same
-        // response or the browser keeps a dead `pm_auth` while the JSON body
-        // hands it a live `X-Auth-Token`: the gate never reappears, but every
-        // `/<old-token>/…` URL already installed in a player answers locked.
+        // Decoupled: password change preserves the existing addon token so
+        // installed addon URLs on TVs/Stremio do not break. Re-issue the cookie
+        // in the same response so the browser's cookie matches `auth_token()`.
         let token = auth_token();
         let mut resp = json_response(200, &serde_json::json!({"ok": 1, "token": token}));
         if let Ok(v) = header::HeaderValue::from_str(&auth_cookie_header(&ctx, &token)) {

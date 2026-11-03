@@ -559,13 +559,14 @@ pub fn auth_set_password(password: &str) {
     let mut data = auth_load();
     let salt = random_hex(16);
     data.password_hash = Some(format!("sha256${}${}", salt, hash_password(password, &salt)));
-    // A password change rotates the addon token too. That is deliberate (a
-    // changed password must not leave the old URLs working) — but it breaks every
-    // installed addon at once, so it is announced. See [`log_token_rotated`].
-    data.token = Some(random_hex(16));
+    // Decoupled: changing the password preserves the existing addon token so
+    // installed addon URLs on TVs/Stremio do not break on a routine admin
+    // password change. Only /api/auth/token/rotate rotates the token.
+    if data.token.as_deref().unwrap_or("").is_empty() {
+        data.token = Some(random_hex(16));
+    }
     data.enabled = Some(true);
     auth_save(&data);
-    log_token_rotated("password change");
 }
 
 pub fn auth_client_ip(ctx: &ReqCtx) -> String {

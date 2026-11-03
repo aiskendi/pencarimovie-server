@@ -443,7 +443,33 @@ pub fn auth_rotate_token() -> String {
     let mut data = auth_load();
     data.token = Some(random_hex(16));
     auth_save(&data);
+    log_token_rotated("explicit rotate");
     data.token.unwrap_or_default()
+}
+
+/// Announced on every rotation, always-on (`stderr_log`, not `log()`).
+///
+/// The token IS the addon URL (`/<token>/manifest.json`), so rotating it
+/// invalidates every installed addon **without a restart** — which is the user
+/// report "the streams list shows the token/password changed" (2026-11-03) from
+/// someone who had not redeployed. The triggers are all deliberate:
+/// [`auth_set_password`] (reached by `/api/auth/password`, `/api/auth/reset`),
+/// [`auth_rotate_token`] (`/api/auth/token/rotate`), and a boot that mints a
+/// fresh token when `SERVER_TOKEN` is unset and storage was wiped
+/// (see [`log_minted_token_once`]).
+///
+/// Rotation on a password change is correct; being silent about it is not. One
+/// line here is the difference between "the addon broke" and "somebody changed
+/// the password".
+fn log_token_rotated(cause: &str) {
+    crate::log::stderr_log(
+        "addon token rotated",
+        Some(&serde_json::json!({
+            "cause": cause,
+            "effect": "every installed addon URL /<old-token>/... now answers the locked card until it is re-installed from #addon",
+            "note": "the new token is in this response body and in the dashboard addon section; set SERVER_TOKEN to stop boot-time rotation",
+        })),
+    );
 }
 
 /// The `Set-Cookie` value for a freshly minted token.
@@ -533,9 +559,13 @@ pub fn auth_set_password(password: &str) {
     let mut data = auth_load();
     let salt = random_hex(16);
     data.password_hash = Some(format!("sha256${}${}", salt, hash_password(password, &salt)));
+    // A password change rotates the addon token too. That is deliberate (a
+    // changed password must not leave the old URLs working) — but it breaks every
+    // installed addon at once, so it is announced. See [`log_token_rotated`].
     data.token = Some(random_hex(16));
     data.enabled = Some(true);
     auth_save(&data);
+    log_token_rotated("password change");
 }
 
 pub fn auth_client_ip(ctx: &ReqCtx) -> String {

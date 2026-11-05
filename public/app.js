@@ -1469,16 +1469,28 @@ class PencariMovieApp {
       if (!localInstallOnly) {
         updateStremioSyncPreview();
       }
-      // Search on pencarimovie.com (Settings overlay). Mirrors backend.php's
-      // no-streams fallback URL:
-      //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'))
-      // $baseUrl there is the origin the CLIENT used (fd_get_stremio_base_url()), so
-      // this uses the page's own origin: localhost / LAN / tunnel as opened.
+      // Search on pencarimovie.com (Settings overlay). Mirrors the engine's
+      // no-streams fallback URL (routes::no_streams_card → ddl_domain_value()):
+      //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(<origin>[/token])
+      //
+      // The TOKEN matters. A non-loopback origin (LAN IP, tunnel, custom domain)
+      // is auth-gated, so `ddldomain=<origin>` alone made every download button on
+      // that page answer 401 — the "no stream found" symptom again, this time from
+      // the dashboard's own button. The token rides in the PATH (`/<token>`), the
+      // transport strip_token_prefix() and the WordPress plugin both understand,
+      // and only where it is needed: loopback is privileged already.
       const settingsSearchWebsiteBtn = this.$("#settingsSearchWebsiteBtn");
       if (settingsSearchWebsiteBtn) {
-        const ddldomain = window.location.origin;
+        const ddlOrigin = window.location.origin;
+        const ddlHost = String(window.location.hostname || "").toLowerCase();
+        const ddlLoopback = ddlHost === "localhost" || ddlHost.endsWith(".localhost") ||
+          ddlHost === "::1" || ddlHost === "[::1]" || /^127\./.test(ddlHost);
+        const ddlToken = ddlLoopback ? "" : String(this._authToken || "").trim();
+        const ddldomain = ddlOrigin + (ddlToken ? "/" + encodeURIComponent(ddlToken) : "");
         settingsSearchWebsiteBtn.href = "https://pencarimovie.com/search/?ddldomain=" + encodeURIComponent(ddldomain);
-        settingsSearchWebsiteBtn.title = "Download domain: " + ddldomain;
+        // The tooltip names the origin only: it is read on a shared screen more
+        // often than the href is, and the token is a credential.
+        settingsSearchWebsiteBtn.title = "Download domain: " + ddlOrigin;
       }
     };
     this._updateAddonModalUrls = updateAddonModalUrls;

@@ -730,7 +730,7 @@
     return [String(Math.round(n)), 'MB'];
   }
 
-  function renderLive(diag, cache, session) {
+  function renderLive(diag, session) {
     var activity = (diag && diag.activity) || {};
     var info = (diag && diag.info) || {};
     var dash = '\u2014';
@@ -751,27 +751,27 @@
     if (activity.cpu_percent == null) setTile('pmLiveCpu', dash);
     else setTile('pmLiveCpu', String(Math.round(activity.cpu_percent)), '%');
 
-    // Process share first, host total second: "16 MB / 16 GB". The total is 0 on
-    // Windows today, so the share is shown alone rather than as "16 MB / 0".
+    /*
+     * "617 MB of 1 GB" — the ceiling is the CONTAINER's (cgroup), not the host's.
+     * `total_memory_mb` is that ceiling; `host_total_memory_mb` is the machine's RAM
+     * and must never be shown as available to us, because on a dyno it says 62 GB
+     * while the process dies at 1 GB. The note says which of the two it is.
+     */
     var ram = info.process_rss_mb == null ? null : formatMegabytes(info.process_rss_mb);
-    var total = info.total_memory_mb == null ? 0 : Number(info.total_memory_mb);
+    var limit = info.total_memory_mb == null ? 0 : Number(info.total_memory_mb);
+    var ramNote = el('pmLiveRamNote');
     if (!ram) setTile('pmLiveRam', dash);
-    else if (total > 0) {
-      var tot = formatMegabytes(total);
+    else if (limit > 0) {
+      var tot = formatMegabytes(limit);
       setTile('pmLiveRam', ram[0] + ' ' + ram[1], '/ ' + tot[0] + ' ' + tot[1]);
-    } else setTile('pmLiveRam', ram[0], ram[1]);
+      if (ramNote) ramNote.textContent = info.container ? 'of this container\u2019s limit' : 'of this machine';
+    } else {
+      setTile('pmLiveRam', ram[0], ram[1]);
+      if (ramNote) ramNote.textContent = 'in use';
+    }
 
     if (info.proc_uptime_s == null) setTile('pmLiveUptime', dash);
     else setTile('pmLiveUptime', formatUptime(info.proc_uptime_s));
-
-    var hits = (cache && cache.l1 && Number(cache.l1.hits)) || 0;
-    var misses = (cache && cache.l1 && Number(cache.l1.misses)) || 0;
-    var lookups = hits + misses;
-    if (lookups > 0) setTile('pmLiveCache', String(Math.round((hits / lookups) * 100)), '%');
-    else setTile('pmLiveCache', dash);
-
-    var disk = info.disk_free_mb == null ? null : formatMegabytes(info.disk_free_mb);
-    setTile('pmLiveDisk', disk ? disk[0] : dash, disk ? disk[1] : '');
 
     /*
      * Bots are a POOL. `status` on a `bot_pool` row is what was written when the
@@ -799,13 +799,11 @@
   function refreshLive() {
     if (liveBusy || document.hidden) return;
     liveBusy = true;
-    Promise.all([
-      getJson('/api/diagnostics'),
-      getJson('/api/cache/stats'),
-      getJson('/api/session')
-    ]).then(
+    // Two endpoints, not three: `/api/cache/stats` was only feeding the cache tile,
+    // which no longer exists — its hit rate is a tuning number, not a user fact.
+    Promise.all([getJson('/api/diagnostics'), getJson('/api/session')]).then(
       function (rows) {
-        renderLive(rows[0], rows[1], rows[2]);
+        renderLive(rows[0], rows[1]);
         liveBusy = false;
       },
       function () {

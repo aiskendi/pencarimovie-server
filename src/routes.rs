@@ -9662,6 +9662,12 @@ mod tests {
         assert!(v["info"]["process_rss_mb"].is_number());
         assert!(v["info"]["proc_uptime_s"].is_number());
         assert!(v["info"]["host_uptime_s"].is_number());
+        // The ceiling the UI shows is the container's when there is one, and the
+        // host's RAM stays in its own key so "62 GB" can never be rendered as
+        // headroom on a 1 GB dyno.
+        assert!(v["info"]["total_memory_mb"].is_number());
+        assert!(v["info"]["host_total_memory_mb"].is_number());
+        assert!(v["info"]["container"].is_boolean());
         // The keys the Android service already reads must survive unchanged.
         assert_eq!(v["ok"], 1);
         assert!(v["counts"].is_object());

@@ -634,6 +634,35 @@ fn proc_value(path: &str, key: &str) -> u64 {
     0
 }
 
+/// The memory ceiling this PROCESS actually has, in kB, and whether it came from a
+/// cgroup (i.e. we are inside a container).
+///
+/// `/proc/meminfo` reports the HOST's RAM: on a Heroku Standard-2X dyno it says
+/// **62 GB** while the process is killed at 1024 MB, so "617 MB / 62 GB" is a number
+/// nobody can act on and every user reads as "plenty of room". cgroup v2
+/// (`memory.max`) and v1 (`memory/memory.limit_in_bytes`) carry the real ceiling, so
+/// that wins; the host total is only the fallback (bare metal, Termux, Android).
+fn memory_limit_kb() -> (u64, bool) {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        let raw = read_first_line(path);
+        let t = raw.trim();
+        // cgroup v2 writes the literal `max` for "no limit"; v1 writes a sentinel
+        // near 2^63. Neither is a ceiling a user should see.
+        if t.is_empty() || t.eq_ignore_ascii_case("max") {
+            continue;
+        }
+        if let Ok(v) = t.parse::<u64>() {
+            if v > 0 && v < (1u64 << 50) {
+                return (v / 1024, true);
+            }
+        }
+    }
+    (0, false)
+}
+
 /// `fd_device_info()` (backend.php:11339) with `/proc` metrics.
 ///
 /// **Android**: every `/proc` read here degrades to `0`/`""` because a
@@ -645,6 +674,9 @@ fn proc_value(path: &str, key: &str) -> u64 {
 pub fn device_info() -> Value {
     let mem_total_kb = proc_value("/proc/meminfo", "MemTotal");
     let mem_avail_kb = proc_value("/proc/meminfo", "MemAvailable");
+    // What the user can act on: the container's ceiling when there is one.
+    let (limit_kb, container) = memory_limit_kb();
+    let effective_kb = if limit_kb > 0 { limit_kb } else { mem_total_kb };
     let rss_kb = process_rss_kb();
     let uptime_s = {
         let raw = read_first_line("/proc/uptime");
@@ -683,7 +715,11 @@ pub fn device_info() -> Value {
         "auto_report": auto_report_enabled(),
         "disk_free_mb": disk_free_mb(),
         "hostname": hostname,
-        "total_memory_mb": mem_total_kb / 1024,
+        // The ceiling that matters: cgroup limit inside a container, host RAM bare metal.
+        "total_memory_mb": effective_kb / 1024,
+        // Kept for anyone comparing against the host; never shown as "available to us".
+        "host_total_memory_mb": mem_total_kb / 1024,
+        "container": container,
         "free_memory_mb": mem_avail_kb / 1024,
         "process_rss_mb": rss_kb / 1024,
         "open_fds": fd_count,

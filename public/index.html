@@ -15,7 +15,7 @@
     <link rel="stylesheet" href="styles.css?v=20261024music2" />
     <!-- last on purpose: the Titanium tokens must win over the legacy
          media-shell stylesheets for the relocated settings markup -->
-    <link rel="stylesheet" href="dashboard.css?v=20261105livestats4" />
+    <link rel="stylesheet" href="dashboard.css?v=20261105livestats5" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -283,19 +283,24 @@
 
             <div class="pm-card" id="pmLiveCard">
               <h2 class="pm-h2">Live</h2>
-              <!-- Counters only. Streams and titles are ONE readout: two identical
-                   zeros side by side say nothing, "1 / 1" says a stream is playing
-                   one title. -->
+              <!-- Every tile answers a question in words, and carries the words that
+                   make its number mean something. "Memory 617 MB of 1 GB" is a fact;
+                   "RAM 617 MB / 62 GB" was the dyno HOST's RAM, which nobody can act
+                   on. Disk and cache are deliberately absent: one is the host's
+                   ephemeral volume, the other is a tuning number with no user meaning.
+                   They stay available at /api/cache/stats and in the reports. -->
               <div class="pm-statgrid" id="pmLiveGrid">
                 <div class="pm-stat" data-state="ok" id="pmLiveStreams">
-                  <span class="pm-stat__label">Streams / titles</span>
+                  <span class="pm-stat__label">Watching</span>
                   <span class="pm-stat__value">&mdash;</span>
                   <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">players / different titles</small>
                 </div>
                 <div class="pm-stat" data-state="ok" id="pmLiveOnline">
-                  <span class="pm-stat__label">Online</span>
+                  <span class="pm-stat__label">People online</span>
                   <span class="pm-stat__value">&mdash;</span>
-                  <span class="pm-stat__unit">clients</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">seen in the last 5 min</small>
                 </div>
                 <!-- Bots are a POOL: "2 / 3 up" is healthy members over pool size.
                      A single "Connected" hid the two bots that were flood-waited. -->
@@ -303,31 +308,25 @@
                   <span class="pm-stat__label">Bots</span>
                   <span class="pm-stat__value">&mdash;</span>
                   <span class="pm-stat__unit">up</span>
+                  <small class="pm-stat__note">able to stream right now</small>
                 </div>
                 <div class="pm-stat" data-state="ok" id="pmLiveCpu">
                   <span class="pm-stat__label">CPU</span>
                   <span class="pm-stat__value">&mdash;</span>
                   <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">of one core</small>
                 </div>
                 <div class="pm-stat" data-state="ok" id="pmLiveRam">
-                  <span class="pm-stat__label">RAM</span>
+                  <span class="pm-stat__label">Memory</span>
                   <span class="pm-stat__value">&mdash;</span>
                   <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note" id="pmLiveRamNote">in use</small>
                 </div>
                 <div class="pm-stat" data-state="ok" id="pmLiveUptime">
-                  <span class="pm-stat__label">Uptime</span>
+                  <span class="pm-stat__label">Running for</span>
                   <span class="pm-stat__value">&mdash;</span>
                   <span class="pm-stat__unit"></span>
-                </div>
-                <div class="pm-stat" data-state="ok" id="pmLiveCache">
-                  <span class="pm-stat__label">Cache hit</span>
-                  <span class="pm-stat__value">&mdash;</span>
-                  <span class="pm-stat__unit"></span>
-                </div>
-                <div class="pm-stat" data-state="ok" id="pmLiveDisk">
-                  <span class="pm-stat__label">Disk free</span>
-                  <span class="pm-stat__value">&mdash;</span>
-                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">since the last restart</small>
                 </div>
               </div>
             </div>
@@ -1867,6 +1866,6 @@
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
     <script defer src="app.js?v=20261103addontoken"></script>
-    <script defer src="dashboard.js?v=20261105livestats6"></script>
+    <script defer src="dashboard.js?v=20261105livestats7"></script>
   </body>
 </html>

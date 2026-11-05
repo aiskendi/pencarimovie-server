@@ -547,6 +547,16 @@ button.pm-pill--logout:disabled {
   color: var(--pm-text-secondary);
 }
 
+/* The words that make the number mean something: "of one core", "seen in the last
+   5 min". A naked counter is what made the first version unreadable. */
+.pm-stat__note {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--pm-text-muted);
+}
+
 /* Colour is the second signal: the label carries it, the number stays
    high-contrast so the tile still reads on a monochrome TV. */
 .pm-stat[data-state='warn'] .pm-stat__label {

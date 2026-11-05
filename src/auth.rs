@@ -777,14 +777,31 @@ pub fn require_auth(ctx: &ReqCtx) -> Option<Response> {
     }
 }
 
+/// Strip the token segment(s) so the router sees a real route.
+///
+/// The loop is not paranoia: a page that rebuilds its links from an ALREADY
+/// tokenised href produced `/<token>/<token>/api/download` (the WordPress
+/// `markServerActive()` rewrite, fixed 2026-11-05). Stripping one copy left
+/// `/<token>/api/download`, which is not a route, so the answer was the SPA
+/// (200 `text/html`) instead of the file — a download that "doesn't work" with
+/// no error anywhere. Two copies are tolerated forever; a third answer would
+/// have no meaning, so the loop is bounded.
 pub fn strip_token_prefix(path: &str) -> String {
-    if let Some((_, tail)) = find_token_prefix(path) {
-        return tail;
+    let mut out = path.to_string();
+    for _ in 0..4 {
+        let next = match find_token_prefix(&out) {
+            Some((_, tail)) => tail,
+            None => match find_t_prefix(&out) {
+                Some((_, tail)) => tail,
+                None => return out,
+            },
+        };
+        if next == out {
+            return out;
+        }
+        out = next;
     }
-    if let Some((_, tail)) = find_t_prefix(path) {
-        return tail;
-    }
-    path.to_string()
+    out
 }
 
 #[cfg(test)]
@@ -803,6 +820,30 @@ mod tests {
     #[test]
     fn strips_t_token_prefix() {
         assert_eq!(strip_token_prefix("/t/abc123/manifest.json"), "/manifest.json");
+    }
+
+    /// The doubled token a page can produce when it rebuilds an already-tokenised
+    /// href. Stripping one copy left a path with no route, so the answer was the
+    /// SPA (200 `text/html`) instead of the API — measured on
+    /// `https://stream.pencarimovie.com/<t>/<t>/api/download?short_code=…`,
+    /// which the browser received as HTML and never downloaded.
+    #[test]
+    fn strips_a_doubled_token_prefix() {
+        let t = "66ff097863dedb7ccd8401d5ffe616f3";
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/{t}/api/download")),
+            "/api/download"
+        );
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/{t}/manifest.json")),
+            "/manifest.json"
+        );
+        assert_eq!(strip_token_prefix(&format!("/{t}/{t}")), "/");
+        // A token then a `/t/` copy is the same mistake in the other spelling.
+        assert_eq!(
+            strip_token_prefix(&format!("/{t}/t/{t}/api/download")),
+            "/api/download"
+        );
     }
 
     #[test]

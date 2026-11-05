@@ -469,6 +469,160 @@ fn os_version_string() -> String {
         .clone()
 }
 
+/* ── live process metrics ───────────────────────────────────────────────── */
+
+/// Stamped from `main` before the server accepts, so this is the PROCESS uptime,
+/// not `/proc/uptime`: a NAS that has been on for months answers the host value
+/// even when this server restarted a minute ago.
+static PROC_START: OnceLock<std::time::Instant> = OnceLock::new();
+
+pub fn record_process_start() {
+    let _ = PROC_START.set(std::time::Instant::now());
+}
+
+pub fn process_uptime_s() -> u64 {
+    PROC_START.get().map(|s| s.elapsed().as_secs()).unwrap_or(0)
+}
+
+/// Percent of ONE core, over the interval between two calls. The first call has
+/// no previous sample and answers `None`; the tile shows `—` until the next poll.
+pub fn cpu_percent_now() -> Option<f64> {
+    static LAST: OnceLock<Mutex<Option<(u64, std::time::Instant)>>> = OnceLock::new();
+    let now = std::time::Instant::now();
+    let total = cpu_total_ns()?;
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+    let mut prev = match cell.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let percent = match *prev {
+        Some((prev_total, prev_at)) => percent_between(prev_total, prev_at, total, now),
+        None => None,
+    };
+    *prev = Some((total, now));
+    percent
+}
+
+fn percent_between(
+    prev_cpu_ns: u64,
+    prev_at: std::time::Instant,
+    cpu_ns: u64,
+    now: std::time::Instant,
+) -> Option<f64> {
+    let wall = now.checked_duration_since(prev_at)?.as_nanos();
+    if wall == 0 {
+        return None;
+    }
+    let cpu = cpu_ns.saturating_sub(prev_cpu_ns);
+    Some(cpu as f64 / wall as f64 * 100.0)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[cfg(windows)]
+fn filetime_100ns(t: FileTime) -> u64 {
+    ((t.high as u64) << 32) | t.low as u64
+}
+
+/// Cumulative CPU time of this process, in nanoseconds.
+#[cfg(windows)]
+fn cpu_total_ns() -> Option<u64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = (
+        FileTime { low: 0, high: 0 },
+        FileTime { low: 0, high: 0 },
+        FileTime { low: 0, high: 0 },
+        FileTime { low: 0, high: 0 },
+    );
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some((filetime_100ns(kernel) + filetime_100ns(user)) * 100)
+}
+
+/// `/proc/self/stat` is readable on Linux, Android and Termux; macOS without
+/// `/proc` has no counter here, so the tile shows `—` rather than a made-up 0.
+/// `USER_HZ` is 100 on Linux and Android, hence the 10 ms tick.
+#[cfg(not(windows))]
+fn cpu_total_ns() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    // Field 14 (`utime`) is the 12th value after the closing `)`: fields 3-13.
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some((utime + stime) * 10_000_000)
+}
+
+#[cfg(windows)]
+fn process_rss_kb() -> u64 {
+    #[repr(C)]
+    struct Counters {
+        cb: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_nonpaged: usize,
+        quota_nonpaged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+    }
+    let mut counters = Counters {
+        cb: std::mem::size_of::<Counters>() as u32,
+        page_faults: 0,
+        peak_working_set: 0,
+        working_set: 0,
+        quota_peak_paged: 0,
+        quota_paged: 0,
+        quota_peak_nonpaged: 0,
+        quota_nonpaged: 0,
+        pagefile: 0,
+        peak_pagefile: 0,
+    };
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok == 0 {
+        0
+    } else {
+        counters.working_set as u64 / 1024
+    }
+}
+
+#[cfg(not(windows))]
+fn process_rss_kb() -> u64 {
+    proc_value("/proc/self/status", "VmRSS")
+}
+
 fn proc_value(path: &str, key: &str) -> u64 {
     let text = fs::read_to_string(path).unwrap_or_default();
     for line in text.lines() {
@@ -491,7 +645,7 @@ fn proc_value(path: &str, key: &str) -> u64 {
 pub fn device_info() -> Value {
     let mem_total_kb = proc_value("/proc/meminfo", "MemTotal");
     let mem_avail_kb = proc_value("/proc/meminfo", "MemAvailable");
-    let rss_kb = proc_value("/proc/self/status", "VmRSS");
+    let rss_kb = process_rss_kb();
     let uptime_s = {
         let raw = read_first_line("/proc/uptime");
         raw.split('.').next().unwrap_or("0").parse::<u64>().unwrap_or(0)
@@ -533,7 +687,11 @@ pub fn device_info() -> Value {
         "free_memory_mb": mem_avail_kb / 1024,
         "process_rss_mb": rss_kb / 1024,
         "open_fds": fd_count,
+        // `uptime_s` stays the HOST value for every existing reader; the
+        // process's own uptime is the new key the overview tile reads.
         "uptime_s": uptime_s,
+        "host_uptime_s": uptime_s,
+        "proc_uptime_s": process_uptime_s(),
         "runtime": "pencarimovie-server",
     })
 }
@@ -955,6 +1113,19 @@ ro.build.description=generic_x86-user 5.1.1 LMY48Z 30 test-keys
         let crlf = "  ro.product.model = Pixel 7  \r\nro.build.version.release=14\r\n";
         assert_eq!(build_prop_lookup(crlf, "ro.product.model"), "Pixel 7");
         assert_eq!(build_prop_lookup(crlf, "ro.build.version.release"), "14");
+    }
+
+    #[test]
+    fn cpu_percent_is_the_ratio_of_two_samples() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(2);
+        // 200 ms of CPU over 2 s of wall is a tenth of one core.
+        let pct = percent_between(0, t0, 200_000_000, t1).expect("a sample");
+        assert!((pct - 10.0).abs() < 0.001, "got {pct}");
+        // A counter that did not move is 0%, not a divide-by-zero.
+        assert_eq!(percent_between(500, t0, 500, t1), Some(0.0));
+        // No elapsed wall time cannot produce a ratio.
+        assert_eq!(percent_between(0, t0, 100, t0), None);
     }
 
     #[test]

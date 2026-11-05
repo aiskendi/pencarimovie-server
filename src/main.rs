@@ -273,6 +273,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Before any request can ask how long the server has been up.
+    diagnostics::record_process_start();
+
     // Name a panic instead of letting it become an anonymous 502.
     //
     // A panicking request task produces NO response and never reaches `log()`, so

@@ -71,6 +71,44 @@ fn header_json(req: &Request<Body>) -> HashMap<String, String> {
     HashMap::new()
 }
 
+/// The `/api/diagnostics` body.
+///
+/// `activity` is what the Android app polls every 3 s to decide whether it is
+/// "Active" (hold the wake/Wi-Fi lock, say so in the notification) or "Idle" —
+/// the TDLib app's markActive / ACTIVE_LOCK_TIMEOUT_MS behaviour — so its keys
+/// may be added but never renamed or retyped.
+fn diagnostics_payload(reports: Vec<Value>) -> Value {
+    let streams = crate::download::active_streams();
+    let preflights = crate::download::active_preflights();
+    serde_json::json!({
+        "ok": 1,
+        "info": device_info(),
+        "counts": diag_counts(),
+        "activity": {
+            "streams": streams,
+            "preflights": preflights,
+            "total": streams + preflights,
+            "titles": crate::download::active_titles(),
+            "online": crate::ratelimit::online_count(crate::ratelimit::ONLINE_WINDOW_S),
+            "cpu_percent": crate::diagnostics::cpu_percent_now(),
+            "refused_429": crate::download::refused_429(),
+        },
+        // The REST origin is not a catalog source, it is the whole app: catalogs,
+        // meta, stream lists, `resolve-file`, provisioning and trending all come from
+        // it, so it gets its own object and its real host rather than being called a
+        // "catalog" that happens to be down. `down_s` is the fail-fast gate every
+        // WordPress call arms; `resolve_cooldown_s` is the same outage seen from the
+        // resolve layer. `0` means healthy in both. Atomics / one cache read, so this
+        // is free on a 3 s poll.
+        "origin": {
+            "host": crate::config::wp_api_host(),
+            "down_s": crate::httpc::wp_origin_down_secs(),
+            "resolve_cooldown_s": crate::resolve::resolve_cooldown_remaining_sec(),
+        },
+        "reports": reports,
+    })
+}
+
 pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, MAX_BODY).await {
@@ -824,6 +862,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 // the identities stay with the operator.
                 "bot_count": if auth_privileged(&ctx) { pool.len() } else { 0 },
                 "bot_pool": if auth_privileged(&ctx) { pool } else { Vec::<Value>::new() },
+                // Pool rows carry the "online" they were written with, so the count
+                // above says nothing about what can stream NOW. This is the same
+                // question `pick_pool_bot()` answers, in one small object.
+                "bot_pool_health": if auth_privileged(&ctx) {
+                    crate::session::pool_health()
+                } else {
+                    Value::Null
+                },
                 "environment_ok": true,
                 "environment_fatal": false,
                 "environment_problems": [],
@@ -1163,26 +1209,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         }
         let mut reports = diag_list();
         reports.truncate(10);
-        // `activity` is what the Android app polls to decide whether it is
-        // "Active" (hold the wake/Wi-Fi lock, say so in the notification) or
-        // "Idle" (release them after a grace period) — the TDLib app's
-        // markActive/ACTIVE_LOCK_TIMEOUT_MS behaviour.
-        let streams = crate::download::active_streams();
-        let preflights = crate::download::active_preflights();
-        return json_response(
-            200,
-            &serde_json::json!({
-                "ok": 1,
-                "info": device_info(),
-                "counts": diag_counts(),
-                "activity": {
-                    "streams": streams,
-                    "preflights": preflights,
-                    "total": streams + preflights,
-                },
-                "reports": reports,
-            }),
-        );
+        return json_response(200, &diagnostics_payload(reports));
     }
 
     if p == "/api/diagnostics/settings" {
@@ -1464,6 +1491,16 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
     if addon_path.is_empty() {
         addon_path = "/manifest.json".to_string();
+    }
+    // Player polls only: a `/stream` body never re-enters this function per
+    // chunk, and `/catalog` + `/meta` are fetched once per screen.
+    if addon_path.starts_with("/stream/")
+        || addon_path.starts_with("/catalog/")
+        || addon_path.starts_with("/meta/")
+    {
+        if let Some(key) = crate::ratelimit::client_id(&ctx) {
+            crate::ratelimit::note_seen(&key);
+        }
     }
     if addon_path == "/manifest.json" {
         // `ETag` + `max-age=1800, stale-while-revalidate=3600`, 304 on a matching
@@ -3904,21 +3941,82 @@ fn no_streams_card(
     }
     // The keyword comes from the TITLE, falling back to the item id. The link
     // points at the keyword search on the CURRENT origin, not at the sponsor.
-    let keyword = if !title.trim().is_empty() {
-        title.trim().to_string()
-    } else {
-        item_id.to_string()
+    //
+    // The title here is a WordPress post title, decoration and all
+    // (`"Kudrat 1968: High Council 2026 • Movie"`). The search page on
+    // pencarimovie.com matches keywords literally, so the `• Movie` tail — the
+    // one part no filename ever carries — turned a real hit into "no stream
+    // found". Only the type decoration is dropped; a year INSIDE the title
+    // ("Kudrat 1968") stays, because it is part of the name.
+    let keyword = {
+        let raw = if !title.trim().is_empty() {
+            title.trim().to_string()
+        } else {
+            item_id.to_string()
+        };
+        let cleaned = clean_post_title(&raw);
+        if cleaned.is_empty() {
+            raw
+        } else {
+            cleaned
+        }
     };
-    let base = ctx.base_url.trim_end_matches('/');
     serde_json::json!({
         "name": "No Streams Found",
         "description": "⚠️ No streams available for this title.",
         "externalUrl": format!(
             "https://pencarimovie.com/search/{}?ddldomain={}",
             urlencode_component(&keyword),
-            urlencode_component(base)
+            urlencode_component(&ddl_domain_value(&ctx.base_url))
         ),
     })
+}
+
+/// The `ddldomain` handed to pencarimovie.com's fallback search.
+///
+/// Loopback is the one origin that needs no credential: this machine is
+/// `auth_privileged()`, so `http://127.0.0.1:8088/api/download` answers. Every
+/// other origin (LAN IP, tunnel hostname, custom domain) is `is_local_request()`'s
+/// remote branch and must carry the server token, or the fallback page's
+/// `/api/version` probe and every `/api/download` click answer 401 and the page
+/// looks empty — the exact "on streams list no stream found" report for a title
+/// that played fine from `127.0.0.1`.
+///
+/// The token goes in the PATH (`https://host:port/<token>`), the same transport
+/// [`strip_token_prefix()`] and the WP plugin understand; a token is never put
+/// in a query string here because the value ends up in the cookie jar verbatim.
+fn ddl_domain_value(base_url: &str) -> String {
+    let base = rtrim(base_url);
+    if !auth_enabled() {
+        return base;
+    }
+    let host = url::Url::parse(&base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_default();
+    if host_is_loopback(&host) {
+        return base;
+    }
+    let token = auth_token();
+    if token.is_empty() {
+        return base;
+    }
+    format!("{}/{}", base, urlencode_component(&token))
+}
+
+/// `localhost`, `127.0.0.0/8` and `::1` — never any other name or address.
+/// Suffixed `.localhost` names (a browser resolves them to loopback) are included.
+fn host_is_loopback(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.is_empty() {
+        return false;
+    }
+    let h = h.to_ascii_lowercase();
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h == "::1"
+        || h == "0:0:0:0:0:0:0:1"
+        || h.starts_with("127.")
 }
 
 /// The sponsored message from `GET {WP_API_BASE}/version` (`sponsor.{name,
@@ -8576,6 +8674,82 @@ mod tests {
         }
     }
 
+    /* ── the pencarimovie.com fallback link ───────────────────────────────── */
+
+    /// The card's link is the ONLY way out of an empty stream list, so the
+    /// keyword it searches for and the origin it points at both have to work.
+    ///
+    /// Reported as "on streams list no stream found" for
+    /// `.../search/Kudrat 1968: High Council 2026 • Movie?ddldomain=` — the
+    /// post-title decoration went into the keyword and nothing matched.
+    #[test]
+    fn no_streams_card_searches_the_clean_title_on_this_origin() {
+        let ctx = ctx_with(&[("host", "127.0.0.1:8088")], "http://127.0.0.1:8088", &[]);
+        let card = no_streams_card(
+            &ctx,
+            "Kudrat 1968: High Council 2026 • Movie",
+            "pm:post:9000031194",
+            false,
+            0,
+        );
+        let url = card["externalUrl"].as_str().unwrap();
+        // The year inside the title stays; only the type decoration goes.
+        assert!(
+            url.contains("Kudrat%201968%3A%20High%20Council%202026?"),
+            "{url}"
+        );
+        assert!(!url.contains("Movie"), "{url}");
+        // Loopback needs no credential, so no token segment is appended.
+        assert!(url.starts_with("https://pencarimovie.com/search/"), "{url}");
+        assert!(
+            url.ends_with("?ddldomain=http%3A%2F%2F127.0.0.1%3A8088"),
+            "{url}"
+        );
+    }
+
+    /// A title that is ALREADY clean must survive untouched — a series whose
+    /// real name ends in a type word must not lose it.
+    #[test]
+    fn no_streams_card_keeps_an_undecorated_title_whole() {
+        let ctx = ctx_with(&[], "http://127.0.0.1:8088", &[]);
+        let card = no_streams_card(&ctx, "The Galaxy Movie", "tvdb:1", false, 0);
+        let url = card["externalUrl"].as_str().unwrap();
+        assert!(
+            url.contains("The%20Galaxy%20Movie?"),
+            "only a `• Type` TAIL may be dropped: {url}"
+        );
+    }
+
+    #[test]
+    fn loopback_ddl_domains_carry_no_token() {
+        assert_eq!(ddl_domain_value("http://127.0.0.1:8088/"), "http://127.0.0.1:8088");
+        assert_eq!(ddl_domain_value("http://localhost:8088"), "http://localhost:8088");
+        assert_eq!(ddl_domain_value("http://[::1]:8088/"), "http://[::1]:8088");
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_and_nothing_else_is() {
+        for h in [
+            "127.0.0.1",
+            "127.10.20.30",
+            "localhost",
+            "app.localhost",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(host_is_loopback(h), "{h} must be loopback");
+        }
+        for h in [
+            "",
+            "192.168.2.225",
+            "stream.pencarimovie.com",
+            "10.0.0.5",
+            "localhost.evil.test",
+        ] {
+            assert!(!host_is_loopback(h), "{h} must NOT be loopback");
+        }
+    }
+
     /* ── issue #9: every entry needs a `title` ────────────────────────────── */
 
     #[test]
@@ -9467,5 +9641,34 @@ mod tests {
         );
         let nothing = serde_json::json!({"title": "Untitled"});
         assert_eq!(series_released_anchor(&nothing), None);
+    }
+
+    #[test]
+    fn diagnostics_activity_reports_titles_and_online() {
+        let v = diagnostics_payload(Vec::new());
+        let activity = &v["activity"];
+        for key in [
+            "streams",
+            "preflights",
+            "total",
+            "titles",
+            "online",
+            "refused_429",
+        ] {
+            assert!(activity[key].is_number(), "activity.{key} must be a number: {activity}");
+        }
+        // Null until a second CPU sample exists, a number after.
+        assert!(activity["cpu_percent"].is_null() || activity["cpu_percent"].is_number());
+        assert!(v["info"]["process_rss_mb"].is_number());
+        assert!(v["info"]["proc_uptime_s"].is_number());
+        assert!(v["info"]["host_uptime_s"].is_number());
+        // The keys the Android service already reads must survive unchanged.
+        assert_eq!(v["ok"], 1);
+        assert!(v["counts"].is_object());
+        assert!(v["reports"].is_array());
+        // The REST origin is its own object, not a catalog: host + the two gates.
+        assert!(v["origin"]["host"].is_string(), "origin.host is the configured endpoint");
+        assert!(v["origin"]["down_s"].is_number());
+        assert!(v["origin"]["resolve_cooldown_s"].is_number());
     }
 }

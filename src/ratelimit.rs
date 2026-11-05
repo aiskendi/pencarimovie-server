@@ -47,7 +47,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::auth::ReqCtx;
 
@@ -97,6 +97,16 @@ pub fn client_key(ctx: &ReqCtx) -> Option<String> {
     if crate::auth::is_local_request(ctx) {
         return None;
     }
+    key_from_headers(ctx)
+}
+
+/// The same identity **without** the local/LAN exemption: the TV on the Wi-Fi is
+/// exactly who the overview wants to count. Counting only, never a limit.
+pub fn client_id(ctx: &ReqCtx) -> Option<String> {
+    key_from_headers(ctx)
+}
+
+fn key_from_headers(ctx: &ReqCtx) -> Option<String> {
     if !ctx.hdr("cf-ray").is_empty() || !ctx.hdr("cf-connecting-ip").is_empty() {
         if let Some(k) = key_of(&ctx.hdr("cf-connecting-ip")) {
             return Some(k);
@@ -176,6 +186,54 @@ fn key_of(raw: &str) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/* ── clients online ──────────────────────────────────────────────────────── */
+
+/// Window for "online": 300 s survives the gap between a player's polls and
+/// answers the same question Whatap's concurrent-user count does.
+pub const ONLINE_WINDOW_S: u64 = 300;
+
+/// `client key -> last seen (unix seconds)`. Written only where a player polls
+/// (`/stream`, `/catalog`, `/meta`), read only by `/api/diagnostics`, so the lock
+/// is touched once per refresh instead of once per byte of a body.
+fn online() -> &'static Mutex<HashMap<String, u64>> {
+    static MAP: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn online_map() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+    match online().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+pub fn note_seen(key: &str) {
+    let now = crate::storage::now().max(0) as u64;
+    note_at(&mut online_map(), key, now);
+}
+
+pub fn online_count(window_secs: u64) -> usize {
+    let now = crate::storage::now().max(0) as u64;
+    count_since(&mut online_map(), now, window_secs)
+}
+
+fn note_at(map: &mut HashMap<String, u64>, key: &str, ts: u64) {
+    if key.is_empty() {
+        return;
+    }
+    if map.len() >= MAX_KEYS {
+        map.retain(|_, seen| ts.saturating_sub(*seen) < ONLINE_WINDOW_S);
+    }
+    map.insert(key.to_string(), ts);
+}
+
+/// Counts the keys seen inside the window and drops the rest, so the map stays
+/// bounded by whoever showed up in the last five minutes.
+fn count_since(map: &mut HashMap<String, u64>, now: u64, window_secs: u64) -> usize {
+    map.retain(|_, seen| now.saturating_sub(*seen) < window_secs);
+    map.len()
 }
 
 /* ── refusal ─────────────────────────────────────────────────────────────── */
@@ -667,6 +725,21 @@ mod tests {
             (1..=300).contains(&wait),
             "retry_after must be positive and inside the window, got {wait}"
         );
+    }
+
+    #[test]
+    fn online_counts_only_recent_clients() {
+        let mut map = HashMap::new();
+        note_at(&mut map, "v4:203.0.113.5", 1_000_000);
+        note_at(&mut map, "v4:203.0.113.6", 999_400);
+        assert_eq!(count_since(&mut map, 1_000_000, 300), 1);
+        assert_eq!(map.len(), 1, "the stale key is swept on read");
+        assert_eq!(count_since(&mut map, 1_000_600, 300), 0, "the last key ages out too");
+        // An empty key is not a client, and a zero window counts nothing.
+        note_at(&mut map, "", 1_000_000);
+        assert!(map.is_empty());
+        note_at(&mut map, "v4:203.0.113.7", 1_000_000);
+        assert_eq!(count_since(&mut map, 1_000_000, 0), 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@
     <link rel="stylesheet" href="styles.css?v=20261024music2" />
     <!-- last on purpose: the Titanium tokens must win over the legacy
          media-shell stylesheets for the relocated settings markup -->
-    <link rel="stylesheet" href="dashboard.css?v=20261028dash26" />
+    <link rel="stylesheet" href="dashboard.css?v=20261105livestats4" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -281,8 +281,62 @@
               </div>
             </div>
 
+            <div class="pm-card" id="pmLiveCard">
+              <h2 class="pm-h2">Live</h2>
+              <!-- Counters only. Streams and titles are ONE readout: two identical
+                   zeros side by side say nothing, "1 / 1" says a stream is playing
+                   one title. -->
+              <div class="pm-statgrid" id="pmLiveGrid">
+                <div class="pm-stat" data-state="ok" id="pmLiveStreams">
+                  <span class="pm-stat__label">Streams / titles</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveOnline">
+                  <span class="pm-stat__label">Online</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit">clients</span>
+                </div>
+                <!-- Bots are a POOL: "2 / 3 up" is healthy members over pool size.
+                     A single "Connected" hid the two bots that were flood-waited. -->
+                <div class="pm-stat" data-state="ok" id="pmLiveBots">
+                  <span class="pm-stat__label">Bots</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit">up</span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveCpu">
+                  <span class="pm-stat__label">CPU</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveRam">
+                  <span class="pm-stat__label">RAM</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveUptime">
+                  <span class="pm-stat__label">Uptime</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveCache">
+                  <span class="pm-stat__label">Cache hit</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveDisk">
+                  <span class="pm-stat__label">Disk free</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                </div>
+              </div>
+            </div>
+
             <div class="pm-card" id="pmSetupCard">
               <h2 class="pm-h2">Finish setup</h2>
+              <!-- Every row here, including "The PencariMovie API answers", is rendered
+                   by `renderChecklist()` from a live endpoint. The list hides itself and
+                   only #pmChecklistReady shows once nothing is wrong. -->
               <ul class="pm-checklist" id="pmChecklist"></ul>
               <p class="pm-done hidden" id="pmChecklistReady">All set. Every step below is done.</p>
             </div>
@@ -1813,6 +1867,6 @@
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
     <script defer src="app.js?v=20261103addontoken"></script>
-    <script defer src="dashboard.js?v=20261028dash25"></script>
+    <script defer src="dashboard.js?v=20261105livestats6"></script>
   </body>
 </html>

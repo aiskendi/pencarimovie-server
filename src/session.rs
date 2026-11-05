@@ -521,6 +521,108 @@ pub fn pick_pool_bot() -> Option<Value> {
     None
 }
 
+/// What the pool can ACTUALLY stream right now, not what its rows claim.
+///
+/// A `bot_pool` row says `"status": "online"` because that is what was written the
+/// day the bot was added; it survives restarts and flood waits untouched, so
+/// counting it always reports a fully healthy pool while playback fails. The two
+/// tests that decide whether a stream can go through a bot are the ones
+/// [`pick_pool_bot()`] applies: a session file on THIS instance, and no cooldown
+/// left. Bounded by the pool size (20 bots = 20 stats + 20 cache reads), so it is
+/// safe to call on a dashboard poll.
+pub fn pool_health() -> Value {
+    summarise_pool(&get_bot_pool(), now(), crate::telegram::has_session_file, flood_remaining_for)
+}
+
+/// Pure core of [`pool_health`]: `has_session` and `flood_for` are injected so the
+/// rules can be tested without a `storage/sessions/` tree or a cache.
+pub fn summarise_pool(
+    pool: &[Value],
+    ts: i64,
+    has_session: impl Fn(&str) -> bool,
+    flood_for: impl Fn(&str) -> i64,
+) -> Value {
+    let active = get_bot_id();
+    let mut total = 0usize;
+    let mut ready = 0usize;
+    let mut flooded = 0usize;
+    let mut no_session = 0usize;
+    let mut flood_seconds = 0i64;
+    let mut active_ready = false;
+    for b in pool {
+        let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        total += 1;
+        let cooldown = b.get("cooldown_until").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wait = flood_for(id).max(cooldown - ts).max(0);
+        if wait > 0 {
+            flooded += 1;
+            flood_seconds = flood_seconds.max(wait);
+        }
+        let has = has_session(id);
+        if !has {
+            no_session += 1;
+        }
+        if has && wait == 0 {
+            ready += 1;
+            if !active.is_empty() && id == active {
+                active_ready = true;
+            }
+        }
+    }
+    serde_json::json!({
+        "total": total,
+        "ready": ready,
+        "flooded": flooded,
+        "no_session": no_session,
+        "flood_seconds": flood_seconds,
+        "active_ready": active_ready,
+    })
+}
+
+#[cfg(test)]
+mod pool_health_tests {
+    use super::*;
+
+    /// The pool is healthiest-looking exactly when it is least useful: every row
+    /// says "online", while two of the four cannot stream. Only `ready` may count.
+    #[test]
+    fn ready_counts_only_bots_that_can_stream_now() {
+        let ts = 1_000;
+        let pool = vec![
+            serde_json::json!({"bot_id": "a", "status": "online", "cooldown_until": 0}),
+            serde_json::json!({"bot_id": "b", "status": "online", "cooldown_until": 2_000}),
+            serde_json::json!({"bot_id": "c", "status": "online", "cooldown_until": 0}),
+            // A flood that lives in the cache rather than in the row.
+            serde_json::json!({"bot_id": "d", "status": "online", "cooldown_until": 0}),
+            // No id: not a bot, must not pad the total either.
+            serde_json::json!({"bot_id": "", "status": "online"}),
+        ];
+        let h = summarise_pool(
+            &pool,
+            ts,
+            |id| id != "c", // "c" has no session file on this instance
+            |id| if id == "d" { 300 } else { 0 },
+        );
+        assert_eq!(h["total"], 4);
+        assert_eq!(h["ready"], 1, "only 'a' has a session and no wait");
+        assert_eq!(h["flooded"], 2, "'b' by cooldown_until, 'd' by the cache");
+        assert_eq!(h["no_session"], 1);
+        assert_eq!(h["flood_seconds"], 1_000, "cooldown 2000 - now 1000 beats the 300");
+    }
+
+    /// An empty pool is all zeros, never a panic or a fabricated 1/1.
+    #[test]
+    fn an_empty_pool_reports_zeroes() {
+        let h = summarise_pool(&[], 1_000, |_| true, |_| 0);
+        assert_eq!(h["total"], 0);
+        assert_eq!(h["ready"], 0);
+        assert_eq!(h["active_ready"], false);
+    }
+}
+
 /// Exactly ONE guest bot is leased per instance — no more, and there is **no
 /// knob** to raise it.
 ///

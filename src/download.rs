@@ -18,6 +18,7 @@
 //! divides that offset and does not cross a 1 MB boundary, so every
 //! `upload.getFile` call satisfies Telegram's alignment rules.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -42,7 +43,7 @@ use crate::session::{
     pick_pool_bot,
 };
 use crate::storage::now;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Live transfer counters, read by `/api/diagnostics` and used by the Android
 /// app to drive its notification indicator and battery saver from real activity
@@ -50,12 +51,63 @@ use std::sync::OnceLock;
 /// holding a wake lock forever.
 static ACTIVE_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ACTIVE_PREFLIGHTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static REFUSED_429: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Distinct short codes with a live body. The per-code count is why two bodies
+/// of one film cost one title: a seek and a segmented download open the same code.
+static ACTIVE_TITLES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 
 pub fn active_streams() -> usize {
     ACTIVE_STREAMS.load(std::sync::atomic::Ordering::Relaxed)
 }
 pub fn active_preflights() -> usize {
     ACTIVE_PREFLIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn refused_429() -> usize {
+    REFUSED_429.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn active_titles() -> usize {
+    titles_map().len()
+}
+
+fn titles_map() -> std::sync::MutexGuard<'static, HashMap<String, u32>> {
+    let map = ACTIVE_TITLES.get_or_init(|| Mutex::new(HashMap::new()));
+    match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// One live body for a short code. The entry disappears when the last body for
+/// that code ends, so a cancelled stream cannot leave a title behind.
+struct TitleGuard(String);
+
+impl TitleGuard {
+    fn new(short_code: &str) -> Self {
+        if !short_code.is_empty() {
+            *titles_map().entry(short_code.to_string()).or_insert(0) += 1;
+        }
+        TitleGuard(short_code.to_string())
+    }
+}
+
+impl Drop for TitleGuard {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut map = titles_map();
+        let last = match map.get_mut(&self.0) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                *n == 0
+            }
+            None => false,
+        };
+        if last {
+            map.remove(&self.0);
+        }
+    }
 }
 
 /// Decrements its counter when dropped, including on every early `return`
@@ -666,6 +718,7 @@ fn refuse_limit(
     refusal: crate::ratelimit::Refusal,
     short_code: &str,
 ) -> Response {
+    REFUSED_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let retry = refusal.retry_after.max(1);
     record_refusal(
         ctx,
@@ -1846,6 +1899,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let _limit_guard = limit_guard;
         // Reported to the app as "streaming" activity for the whole body.
         let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&short_code_for_task);
         // PIPELINE the chunks: fetch up to `pipeline_depth()` 1 MB windows
         // concurrently and emit them IN ORDER (`StreamExt::buffered`). Fetching one
         // chunk at a time made every megabyte pay a full Telegram round-trip —
@@ -2075,6 +2129,23 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_titles_tracks_guard_lifetime() {
+        let before = active_titles();
+        {
+            let _a = TitleGuard::new("title_guard_lifetime");
+            assert_eq!(active_titles(), before + 1);
+            let _b = TitleGuard::new("title_guard_lifetime");
+            assert_eq!(active_titles(), before + 1, "two bodies of one code count once");
+        }
+        assert_eq!(active_titles(), before, "the title leaves when its last body ends");
+        // A request with no short code is not a title and must not add an entry.
+        {
+            let _empty = TitleGuard::new("");
+            assert_eq!(active_titles(), before);
+        }
+    }
 
     #[test]
     fn guesses_video_mime_when_omitted() {

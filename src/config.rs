@@ -22,6 +22,19 @@ pub fn wp_version_url() -> String {
     format!("{}/version", wp_api_base())
 }
 
+/// Host of the REST origin, so a UI can name the endpoint it is actually talking to.
+///
+/// `wp_api_base()` is env-overridable (`FD_WP_API_BASE`) and a self-hosted origin is
+/// a first-class deployment, so the dashboard prints the CONFIGURED host instead of
+/// hard-coding `pencarimovie.com`. Empty when the value does not parse as a URL, and
+/// the UI then shows the state without a host.
+pub fn wp_api_host() -> String {
+    url::Url::parse(&wp_api_base())
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default()
+}
+
 // There is deliberately NO `admin-ajax.php` URL here. The PHP runtime proxied
 // the dashboard's `stream_*` AJAX actions; this port reads the same data from
 // the plugin's REST namespace (`wp_api_base()`), which is what every route

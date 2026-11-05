@@ -512,6 +512,52 @@ button.pm-pill--logout:disabled {
   padding: 16px;
 }
 
+/* ── Live stat tiles ───────────────────────────────────────────── */
+.pm-statgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.pm-stat {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--pm-bg-surface-elevated);
+  border: 1px solid var(--pm-border-subtle);
+  border-radius: var(--pm-radius-md);
+}
+
+.pm-stat__label {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--pm-text-secondary);
+}
+
+.pm-stat__value {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--pm-text-primary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.pm-stat__unit {
+  margin-left: 3px;
+  font-size: 0.76rem;
+  color: var(--pm-text-secondary);
+}
+
+/* Colour is the second signal: the label carries it, the number stays
+   high-contrast so the tile still reads on a monochrome TV. */
+.pm-stat[data-state='warn'] .pm-stat__label {
+  color: var(--pm-status-warn);
+}
+
+.pm-stat[data-state='bad'] .pm-stat__label {
+  color: var(--pm-status-danger);
+}
+
+
 /* ── Buttons ───────────────────────────────────────────────────── */
 .pm-btn {
   display: inline-flex;

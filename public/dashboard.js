@@ -95,6 +95,7 @@
 
   function onEnter(section) {
     var app = window.app;
+    if (section !== 'overview') stopLive();
     try {
       if (section === 'addon') {
         // app.js refreshed these inside openAddonModal(), which is gone.
@@ -119,6 +120,7 @@
         if (app && typeof app.loadCatalogSettings === 'function') app.loadCatalogSettings();
       } else if (section === 'overview') {
         refreshChecklist();
+        startLive();
       }
     } catch (e) {
       if (window.console) console.warn('dashboard: refresh on enter failed', e);
@@ -522,6 +524,40 @@
 
   var CHECK_ROWS = [
     {
+      key: 'origin',
+      // The card lists what is WRONG, so this row behaves like every other one: it
+      // says its name and state, and when all is well the whole list collapses to
+      // "All set". There is no button because nothing on this machine fixes an origin
+      // outage — the hint names the host and how long the gate has been armed.
+      label: 'The PencariMovie API answers',
+      section: 'system',
+      noAction: true,
+      ok: function (d) {
+        if (!d || !d.origin) return null;
+        return !(Number(d.origin.down_s) > 0) && !(Number(d.origin.resolve_cooldown_s) > 0);
+      },
+      danger: function (d) {
+        return !!(d && d.origin) &&
+          (Number(d.origin.down_s) > 0 || Number(d.origin.resolve_cooldown_s) > 0);
+      },
+      hint: function (d) {
+        var o = d && d.origin;
+        if (!o) return '';
+        var host = o.host || 'the API';
+        var down = Number(o.down_s) || 0;
+        var pause = Number(o.resolve_cooldown_s) || 0;
+        if (down > 0) {
+          return host + ' is not answering (down ' + formatUptime(down) +
+            '). New titles cannot resolve until it does.';
+        }
+        if (pause > 0) {
+          return host + ': resolves paused ' + formatUptime(pause) +
+            '. New titles wait for the origin; playing streams carry on.';
+        }
+        return host + ' · reachable';
+      }
+    },
+    {
       key: 'bot',
       label: 'A Telegram bot is connected',
       section: 'bots',
@@ -599,15 +635,18 @@
       var ok = verdict === null ? true : verdict;
       var optional = !!row.optional;
       var danger = !ok && typeof row.danger === 'function' ? row.danger(results[row.key]) : false;
+      // `hint` may be a live sentence built from the response, not only a constant.
+      var hint = typeof row.hint === 'function' ? row.hint(results[row.key]) : row.hint;
       if (!ok && !optional) allDone = false;
       var cls = ok ? ' pm-check--ok' : danger ? ' pm-check--danger' : optional ? ' pm-check--optional' : '';
       html +=
         '<li class="pm-check' + cls + '">' +
         '<span class="pm-check__mark" aria-hidden="true">' + (ok ? '\u2713' : danger ? '!' : '') + '</span>' +
         '<span class="pm-check__text">' + row.label +
-        (row.hint ? '<small class="pm-check__hint">' + row.hint + '</small>' : '') +
+        (hint ? '<small class="pm-check__hint">' + hint + '</small>' : '') +
         '</span>' +
-        (ok
+        // A row with nothing local to fix must not grow a dead button.
+        (ok || row.noAction
           ? ''
           : '<button type="button" class="pm-btn pm-btn--sm' +
             (danger ? ' pm-btn--danger' : '') +
@@ -637,14 +676,18 @@
       getJson('/api/session'),
       getJson('/api/tunnel/status'),
       getJson('/api/catalog-settings'),
-      getJson('/api/auth/status')
+      getJson('/api/auth/status'),
+      // The origin row is the only checklist entry that is live state rather than a
+      // step, so it reads the same `/api/diagnostics` the Live tiles use.
+      getJson('/api/diagnostics')
     ]).then(
       function (rows) {
         renderChecklist({
           bot: rows[0],
           tunnel: rows[1],
           catalogs: rows[2],
-          password: rows[3]
+          password: rows[3],
+          origin: rows[4]
         });
         checklistBusy = false;
       },
@@ -652,6 +695,139 @@
         checklistBusy = false;
       }
     );
+  }
+
+  /* ── Live tiles ───────────────────────────────────────────────────── */
+
+  var LIVE_POLL_MS = 5000;
+  var liveTimer = null;
+  var liveBusy = false;
+
+  function setTile(id, value, unit, state) {
+    var tile = el(id);
+    if (!tile) return;
+    tile.setAttribute('data-state', state || 'ok');
+    var v = tile.querySelector('.pm-stat__value');
+    var u = tile.querySelector('.pm-stat__unit');
+    if (v) v.textContent = value;
+    if (u) u.textContent = unit || '';
+  }
+
+  function formatUptime(secs) {
+    var s = Math.max(0, Math.floor(Number(secs) || 0));
+    var d = Math.floor(s / 86400);
+    var h = Math.floor((s % 86400) / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    if (d) return d + 'd ' + h + 'h';
+    if (h) return h + 'h ' + m + 'm';
+    if (m) return m + 'm';
+    return s + 's';
+  }
+
+  function formatMegabytes(mb) {
+    var n = Math.max(0, Number(mb) || 0);
+    if (n >= 1024) return [(n / 1024).toFixed(n >= 10240 ? 0 : 1), 'GB'];
+    return [String(Math.round(n)), 'MB'];
+  }
+
+  function renderLive(diag, cache, session) {
+    var activity = (diag && diag.activity) || {};
+    var info = (diag && diag.info) || {};
+    var dash = '\u2014';
+
+    /*
+     * "1 / 1" = one stream playing one distinct title. They belong together: a
+     * stream count above the title count only means the same film is being pulled
+     * through several bodies (a seek, or a segmented download manager), which on
+     * its own looks like a fault and in this pair reads as normal.
+     */
+    var streams = activity.streams == null ? null : Number(activity.streams);
+    var titles = activity.titles == null ? null : Number(activity.titles);
+    if (streams == null || titles == null) setTile('pmLiveStreams', dash);
+    else setTile('pmLiveStreams', streams + ' / ' + titles);
+
+    setTile('pmLiveOnline', activity.online != null ? String(activity.online) : dash);
+
+    if (activity.cpu_percent == null) setTile('pmLiveCpu', dash);
+    else setTile('pmLiveCpu', String(Math.round(activity.cpu_percent)), '%');
+
+    // Process share first, host total second: "16 MB / 16 GB". The total is 0 on
+    // Windows today, so the share is shown alone rather than as "16 MB / 0".
+    var ram = info.process_rss_mb == null ? null : formatMegabytes(info.process_rss_mb);
+    var total = info.total_memory_mb == null ? 0 : Number(info.total_memory_mb);
+    if (!ram) setTile('pmLiveRam', dash);
+    else if (total > 0) {
+      var tot = formatMegabytes(total);
+      setTile('pmLiveRam', ram[0] + ' ' + ram[1], '/ ' + tot[0] + ' ' + tot[1]);
+    } else setTile('pmLiveRam', ram[0], ram[1]);
+
+    if (info.proc_uptime_s == null) setTile('pmLiveUptime', dash);
+    else setTile('pmLiveUptime', formatUptime(info.proc_uptime_s));
+
+    var hits = (cache && cache.l1 && Number(cache.l1.hits)) || 0;
+    var misses = (cache && cache.l1 && Number(cache.l1.misses)) || 0;
+    var lookups = hits + misses;
+    if (lookups > 0) setTile('pmLiveCache', String(Math.round((hits / lookups) * 100)), '%');
+    else setTile('pmLiveCache', dash);
+
+    var disk = info.disk_free_mb == null ? null : formatMegabytes(info.disk_free_mb);
+    setTile('pmLiveDisk', disk ? disk[0] : dash, disk ? disk[1] : '');
+
+    /*
+     * Bots are a POOL. `status` on a `bot_pool` row is what was written when the
+     * bot was added, so counting it always says "everyone online"; the server
+     * computes `bot_pool_health.ready` with the same two tests `pick_pool_bot()`
+     * uses — a session file on this instance, and no flood cooldown.
+     */
+    var health = (session && session.bot_pool_health) || null;
+    var botsTotal = health ? Number(health.total) || 0 : 0;
+    var botsReady = health ? Number(health.ready) || 0 : 0;
+    if (!session) setTile('pmLiveBots', dash, 'up', 'ok');
+    else if (botsTotal > 0) {
+      setTile(
+        'pmLiveBots',
+        botsReady + ' / ' + botsTotal,
+        'up',
+        botsReady === botsTotal ? 'ok' : botsReady > 0 ? 'warn' : 'bad'
+      );
+    } else setTile('pmLiveBots', dash, 'up', 'bad');
+
+    // The REST origin is not a tile: it is a row in the setup checklist, rendered by
+    // `renderChecklist()` from the same `/api/diagnostics`. Live tiles stay counters.
+  }
+
+  function refreshLive() {
+    if (liveBusy || document.hidden) return;
+    liveBusy = true;
+    Promise.all([
+      getJson('/api/diagnostics'),
+      getJson('/api/cache/stats'),
+      getJson('/api/session')
+    ]).then(
+      function (rows) {
+        renderLive(rows[0], rows[1], rows[2]);
+        liveBusy = false;
+      },
+      function () {
+        liveBusy = false;
+      }
+    );
+  }
+
+  function startLive() {
+    stopLive();
+    refreshLive();
+    liveTimer = window.setInterval(function () {
+      // A hidden tab still fires the timer; skip the fetch, it resumes on show.
+      if (!document.hidden) refreshLive();
+    }, LIVE_POLL_MS);
+  }
+
+  function stopLive() {
+    if (liveTimer !== null) {
+      window.clearInterval(liveTimer);
+      liveTimer = null;
+    }
   }
 
   /* ── wiring ───────────────────────────────────────────────────────── */
@@ -708,6 +884,11 @@
       if (!target) return;
       target.textContent = detail.message || '';
       target.style.color = detail.success ? 'var(--pm-status-online)' : 'var(--pm-status-danger)';
+    });
+
+    // Returning to a backgrounded tab shows stale numbers until the next tick.
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden && current === 'overview') refreshLive();
     });
 
     window.addEventListener('hashchange', function () {

@@ -2908,7 +2908,7 @@ async fn handle_external_stream(
     item_id: &str,
     upstream: Option<tokio::task::JoinHandle<Vec<Value>>>,
 ) -> Option<Response> {
-    let (prefix, value, season, episode) = parse_external_id(item_id)?;
+    let (prefix, value, mut season, episode) = parse_external_id(item_id)?;
     // LOCAL IDENTITY MEMORY, before ANY origin call (`ext_meta_<id>.json`,
     // backend.php:3062). A hit replaces both the `media_ids_idx` index read and
     // the upstream meta call, so an id this server already self-discovered opens
@@ -3129,6 +3129,41 @@ async fn handle_external_stream(
                     );
                 }
             }
+        }
+    }
+
+    // An ITEM that IS a season numbers its episodes from 1. AIOMetadata publishes
+    // Black Clover season 2 as `kitsu:50024` (13 videos, ids `kitsu:50024:1..13`)
+    // and the origin files those as `S02E01..S02E13`, so read literally its
+    // episode 2 is S01E02 and the list showed the FIRST season under a season-2
+    // episode ("it show season 1"). Two sources, in order:
+    //
+    //   1. the item's OWN video entry, whose `season` field says it belongs to
+    //      season 2 (the meta's `name` is just "Black Clover" for both ids, so
+    //      only the video entry can tell them apart);
+    //   2. a season marker in the resolved title ("… Season 2").
+    if is_episode_numbered_prefix(prefix)
+        && (item_type.contains("series") || season > 0 || episode > 0)
+        && season <= 1
+        && episode > 0
+    {
+        let bare_media = format!("{}:{}", prefix, value);
+        let settings = load_catalog_settings_merged();
+        let mut named = upstream::episode_item_season(&settings, &bare_media, item_id, &title, &year)
+            .await;
+        let source = if named > 1 { "video entry" } else { "" };
+        if named <= 1 {
+            named = crate::matcher::season_from_title(&title);
+        }
+        if named > 1 {
+            log(
+                "stream: season adopted for an episode-numbered item",
+                &serde_json::json!({
+                    "item_id": item_id, "title": title, "season": named,
+                    "source": if source.is_empty() { "title" } else { source },
+                }),
+            );
+            season = named;
         }
     }
 

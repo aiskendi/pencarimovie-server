@@ -1012,6 +1012,99 @@ pub async fn sibling_episode_names(
     names
 }
 
+/// The season a meta's OWN video entry for `item_id` belongs to, or `0`.
+///
+/// An addon can publish one season of a show as a separate item whose episodes
+/// are numbered from 1: AIOMetadata lists Black Clover season 2 as `kitsu:50024`
+/// with 13 videos, and the ids of those videos (`kitsu:50024:1` … `:13`) are the
+/// ids the client asks about. The parent record still says which SEASON each id
+/// belongs to — measured: `kitsu:50024:2` carries `season: 2` while
+/// `kitsu:13209:16` carries `season: 1` — which is the only thing that tells the
+/// two apart, because the metadata's `name` is just "Black Clover" for both.
+pub fn video_season_for_item(meta: &Value, item_id: &str) -> i32 {
+    let want = item_id.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return 0;
+    }
+    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    for video in videos {
+        let id = video
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if id == want {
+            if let Some(s) = video.get("season").and_then(|v| v.as_i64()) {
+                if s > 0 {
+                    return s as i32;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// [`video_season_for_item()`] for a live item: fetches the same meta
+/// [`episode_names()`] does (so the second call is a cache hit) and reports the
+/// season the item's own video entry belongs to.
+#[allow(clippy::too_many_arguments)]
+pub async fn episode_item_season(
+    settings: &Value,
+    media_id: &str,
+    item_id: &str,
+    expected_title: &str,
+    expected_year: &str,
+) -> i32 {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty() || item_id.trim().is_empty() {
+        return 0;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for up in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push(format!(
+            "{}/meta/series/{}.json",
+            base_of(manifest),
+            rawurlencode(&media_id)
+        ));
+    }
+    if urls.is_empty() {
+        return 0;
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|url| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object()
+            || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year)
+        {
+            continue;
+        }
+        let season = video_season_for_item(meta, item_id);
+        if season > 0 {
+            return season;
+        }
+    }
+    0
+}
+
 /// Every episode title of `season` EXCEPT the requested episode, normalised and
 /// de-duplicated. Same field rules as [`extract_episode_names()`].
 pub fn extract_sibling_names(meta: &Value, season: i32, episode: i32) -> Vec<String> {
@@ -1276,6 +1369,25 @@ mod tests {
         // A season-0 special must never answer a season-1 request.
         assert!(extract_episode_names(&meta, 1, 3).is_empty());
         assert!(extract_episode_names(&meta, 2, 1).is_empty());
+    }
+
+    /// Reported: opening Black Clover season 2 listed season 1's files. The
+    /// addon's `name` is the same ("Black Clover") for the parent id and the
+    /// season id, so the ONLY evidence is the video entry's own `season`.
+    #[test]
+    fn a_video_entry_knows_its_own_season() {
+        let meta = serde_json::json!({"videos": [
+            {"id": "kitsu:13209:16", "season": 1, "episode": 16, "title": "The Diamond Mage"},
+            {"id": "kitsu:50024:2", "season": 2, "episode": 2, "title": "The Door to Hell"},
+        ]});
+        assert_eq!(video_season_for_item(&meta, "kitsu:13209:16"), 1);
+        assert_eq!(video_season_for_item(&meta, "kitsu:50024:2"), 2);
+        // Case and whitespace are not identity.
+        assert_eq!(video_season_for_item(&meta, " KITSU:50024:2 "), 2);
+        // An id the meta does not publish is not evidence.
+        assert_eq!(video_season_for_item(&meta, "kitsu:50024:9"), 0);
+        assert_eq!(video_season_for_item(&serde_json::json!({}), "kitsu:1"), 0);
+        assert_eq!(video_season_for_item(&meta, ""), 0);
     }
 
     #[test]

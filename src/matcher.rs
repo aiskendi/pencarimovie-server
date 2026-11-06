@@ -236,6 +236,43 @@ pub fn strip_title_decorations(title: &str) -> String {
     squash(&t)
 }
 
+/// The season a title names, or `0` when it names none.
+///
+/// An addon item can BE one season of a show: AIOMetadata publishes Black Clover
+/// season 2 as a separate entry titled "Black Clover Season 2 2026" whose videos
+/// are numbered 1..13. Those episodes are `S02E01..S02E13` in the origin's files,
+/// so treating the item's episode 2 as "S01E02" listed the FIRST season under a
+/// season-2 episode (reported: "it show season 1").
+pub fn season_from_title(title: &str) -> i32 {
+    let t = decode_html_entities(title);
+    if let Some(g) = groups("(?i)\\bseason\\s*0*(\\d{1,2})\\b", &t) {
+        if let Ok(n) = g[1].parse::<i32>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    if let Some(g) = groups("(?i)\\b0*(\\d{1,2})(?:st|nd|rd|th)\\s+season\\b", &t) {
+        if let Ok(n) = g[1].parse::<i32>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    for (word, n) in [
+        ("second", 2i32),
+        ("third", 3),
+        ("fourth", 4),
+        ("fifth", 5),
+        ("sixth", 6),
+    ] {
+        if has(&format!("(?i)\\b{}\\s+season\\b", word), &t) {
+            return n;
+        }
+    }
+    0
+}
+
 /// `normTitleForMatch`: decorations stripped, lowercased, punctuation collapsed.
 pub fn norm_title_for_match(title: &str) -> String {
     let t = strip_title_decorations(title).to_lowercase();
@@ -2301,6 +2338,21 @@ mod tests {
             &own,
             &siblings
         ));
+    }
+
+    /// Reported: opening Black Clover **season 2** listed season 1's files.
+    /// The addon item is "Black Clover Season 2 2026" (`kitsu:50024`) whose
+    /// episodes are numbered from 1, while the origin files them `S02E01..13`.
+    #[test]
+    fn season_from_title_reads_the_markers_addons_use() {
+        assert_eq!(season_from_title("Black Clover Season 2 2026"), 2);
+        assert_eq!(season_from_title("Black Clover Second Season 2026"), 2);
+        assert_eq!(season_from_title("Foo 3rd Season"), 3);
+        assert_eq!(season_from_title("Foo Season 02"), 2);
+        // No marker: the caller keeps whatever the id said.
+        assert_eq!(season_from_title("Black Clover 2017"), 0);
+        assert_eq!(season_from_title("The 100"), 0);
+        assert_eq!(season_from_title("Oswald"), 0);
     }
 
     #[test]

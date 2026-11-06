@@ -1613,7 +1613,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 let a = ctx.qs("q");
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
-            let tracks = eclipse_search(&q, 30).await;
+            let tracks = local_artwork(&ctx.base_url, eclipse_search(&q, 30).await);
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/catalog/") {
@@ -1621,7 +1621,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // origin indexes tracks, not rows, so "latest" is a plain search.
             let cat = rest.trim_end_matches(".json").trim();
             let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = eclipse_search(q, 50).await;
+            let tracks = local_artwork(&ctx.base_url, eclipse_search(q, 50).await);
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
@@ -7398,7 +7398,6 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
 
     let tracks: Vec<Value> = body.as_array().cloned().unwrap_or_default();
     if !tracks.is_empty() {
-        music_prewarm(&tracks);
         return tracks;
     }
     // Same stale fallback the stream path has: a known album beats a blank screen.
@@ -7409,55 +7408,73 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
                     "music search served stale",
                     &serde_json::json!({"q": query, "tracks": arr.len()}),
                 );
-                let out = arr.clone();
-                music_prewarm(&out);
-                return out;
+                return arr.clone();
             }
         }
     }
     tracks
 }
 
-/// How many of a search's top tracks to warm.
+/// Music prewarm used to live here. Deleted on measurement, not taste.
 ///
-/// A viewer plays one track at a time and almost always one of the first few, so
-/// this is deliberately small: the origin's prewarm queue is shared with video and
-/// capped at 40, and a 120-track "latest" listing must not own it.
-const MUSIC_PREWARM_LIMIT: usize = 8;
+/// 2026-11-06, cold cache, eight first plays per query, three queries:
+///
+/// | burst | playable | answered 503 | first-play latency |
+/// | ----- | -------- | ------------ | ------------------ |
+/// | 8     | 3/8      | 5            | 1.2 s free, ~12 s dead on 503 |
+/// | 2     | 7/8      | 1            | ~1.2 s |
+/// | none  | **8/8**  | **0**        | 1.1–1.7 s |
+///
+/// The cause is the origin's shape, not ours: `/resolve-files` only QUEUES
+/// (`prewarm streams batch finished {"queued":8,"resolved":0}` on every single
+/// search), its drain relays one code at a time per bot, and a play that arrives
+/// while one of our own queued codes holds that relay is refused with
+/// `503 Track temporarily busy` for the whole resolve ladder. Warming the top of a
+/// list was therefore blocking the plays it was meant to speed up, and a cold play
+/// costs only ~1.3 s when nothing is queued — cheaper than the 12 s dead end it
+/// was buying.
+///
+/// If a warmer is ever wanted back, it must go through `prewarm_streams_batch_limited`
+/// ONLY while no play has run recently, and it must be measured with this table's
+/// method, not assumed.
 
-/// Warm the ids of the tracks at the top of a music search — the SAME cheap batch
-/// the stream path uses.
+/// What `music_prewarm()` did, and why nothing replaced it.
 ///
-/// [`eclipse_stream`] consults `resolve_shortcode_cached` before doing anything, so
-/// a warmed track plays **without ever touching `/resolve-file`**. That is the whole
-/// point: when the origin's relay subsystem is saturated it answers `503 Server busy
-/// resolving file` to every cold resolve, and a cold track is then simply skipped by
-/// the player. Measured in this session: `ZMIPWf` took five consecutive 503s and a
-/// 20 s budget exhaustion because nothing had ever warmed it, while `l13Asn` — which
-/// had a cached id — played straight through the same outage.
+/// It warmed the top of every search through `prewarm_streams_batch_limited`. That
+/// looked free because the batch endpoint is cheap — but cheap is not the same as
+/// non-blocking on the ORIGIN: `/resolve-files` only queues, and the drain that
+/// follows relays one code at a time per bot. Warming eight codes therefore parked
+/// eight relay turns in front of the user, and any play that landed in that window
+/// was refused with `503 Track temporarily busy`. The measurement that decided it is
+/// in the doc comment above this line: 3/8 playable with a burst of 8, 8/8 with no
+/// burst at all, and a cold play only costs ~1.3 s.
 ///
-/// Never blocks and never fails the search: `prewarm_streams_batch_limited` skips
-/// itself while a stream is playing or the origin cooldown is armed.
-fn music_prewarm(tracks: &[Value]) {
-    let bot = get_bot_id();
-    if bot.is_empty() {
-        return;
+/// `prewarm_streams_batch_limited` is still used by the video/episode paths, where a
+/// play and a queue entry are not adjacent in time.
+
+/// Music artwork, rewritten the way video posters already are.
+///
+/// `format_track()` runs INSIDE the music-search cache, and that cache is keyed
+/// without the request's base URL — so the rewrite has to happen here, after it.
+/// The same cached answer is then correct for whichever address the client
+/// installed the addon from.
+///
+/// Only the retired `…/tgthumb/<n>.jpg` route is rewritten; see
+/// [`crate::thumb::poster_url_music`] for why the shared placeholder is kept
+/// (audio files usually have no Telegram thumb, and `/thumb/<code>` answers 404
+/// for them, which would be worse than the placeholder).
+fn local_artwork(base: &str, mut tracks: Vec<Value>) -> Vec<Value> {
+    for t in &mut tracks {
+        let art = str_at(t, "artworkURL");
+        if art.is_empty() {
+            continue;
+        }
+        let local = crate::thumb::poster_url_music(base, &art, &str_at(t, "id"));
+        if local != art && !local.is_empty() {
+            t["artworkURL"] = serde_json::json!(local);
+        }
     }
-    let codes: Vec<String> = tracks
-        .iter()
-        .take(MUSIC_PREWARM_LIMIT)
-        .map(|t| str_at(t, "id"))
-        .filter(|c| !c.is_empty())
-        .collect();
-    if codes.is_empty() {
-        return;
-    }
-    crate::resolve::prewarm_streams_batch_limited(
-        codes,
-        &bot,
-        "music",
-        MUSIC_PREWARM_LIMIT,
-    );
+    tracks
 }
 
 fn str_at(v: &Value, key: &str) -> String {

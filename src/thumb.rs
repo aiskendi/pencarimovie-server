@@ -135,6 +135,27 @@ async fn entry_for(state: &Arc<AppState>) -> Option<(String, Arc<telegram::BotEn
     Some((bot, entry))
 }
 
+/// The MUSIC variant of [`poster_url`]: only the retired `/tgthumb/` route is
+/// rewritten, the shared placeholder is kept.
+///
+/// Measured on `search-music` (2026-11-06), three tracks in one answer:
+///
+/// * `…/tgthumb/2863479626640247468.jpg` → `/thumb/F7L35B` answers a **7913-byte
+///   JPEG**, so rewriting it costs nothing and drops the origin host;
+/// * `…/tg-placeholder/document-bl.png` ×2 → `/thumb/<code>` answers **404**,
+///   because an audio document usually carries no Telegram thumb at all.
+///
+/// A blanket `poster_url()` would therefore turn two working covers into broken
+/// images. The placeholder is already the honest answer ("no cover for this
+/// file"), so it stays — and the dashboard keeps its own `onerror`.
+pub fn poster_url_music(base_url: &str, origin_thumb: &str, short_code: &str) -> String {
+    let origin = origin_thumb.trim();
+    if !origin.to_ascii_lowercase().contains(ORIGIN_THUMB_ROUTE) {
+        return origin.to_string();
+    }
+    poster_url(base_url, origin, short_code)
+}
+
 pub fn poster_url(base_url: &str, origin_thumb: &str, short_code: &str) -> String {
     let origin = origin_thumb.trim();
     if !needs_local(origin) {
@@ -382,6 +403,26 @@ mod tests {
             poster_url("https://pm.example.com", origin, "yhlYlW"),
             "https://pm.example.com/thumb/yhlYlW"
         );
+    }
+
+    /// Music: the retired `/tgthumb/` route becomes local, the shared placeholder
+    /// does not (there is no audio thumb behind it — measured 404).
+    #[test]
+    fn music_keeps_the_placeholder_but_drops_the_origin_thumb_route() {
+        let placeholder = "https://pencarimovie.com/wp-content/uploads/tg-placeholder/document-bl.png?v=1";
+        assert_eq!(
+            poster_url_music("http://host:8088", placeholder, "2NIQv4"),
+            placeholder
+        );
+        assert_eq!(
+            poster_url_music(
+                "http://host:8088",
+                "https://pencarimovie.com/tgthumb/2863479626640247468.jpg",
+                "F7L35B"
+            ),
+            "http://host:8088/thumb/F7L35B"
+        );
+        assert_eq!(poster_url_music("http://host:8088", "", "F7L35B"), "");
     }
 
     #[test]

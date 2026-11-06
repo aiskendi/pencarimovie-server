@@ -3294,6 +3294,18 @@ fn origin_resolves_by_id(prefix: &str) -> bool {
     prefix == "imdb" || prefix == "tmdb"
 }
 
+/// Providers whose addon ids are EPISODE-numbered: one trailing number is the
+/// EPISODE (season 1), not the season.
+///
+/// AIOMetadata answers `kitsu:13209` with 170 videos whose ids are
+/// `kitsu:13209:1` … `kitsu:13209:170` — the whole show in season 1 — so a
+/// client click on episode 16 arrives as `kitsu:13209:16`. `tt` / `tmdb` /
+/// `tvdb` / `tvmaze` are season-based and keep the Stremio `id:season:episode`
+/// reading for a two-number tail.
+fn is_episode_numbered_prefix(prefix: &str) -> bool {
+    matches!(prefix, "kitsu" | "mal" | "anilist" | "anidb")
+}
+
 /// The id an origin probe may send: BARE. Never the item id — it carries the
 /// `:S:E` suffix, which the origin rejects outright — `imdb` already holds
 /// `tt0944947`, a bare `tt…` value is accepted as-is by the origin, and every
@@ -3335,8 +3347,27 @@ fn parse_external_id(item_id: &str) -> Option<(&'static str, String, i32, i32)> 
             if value.is_empty() {
                 return None;
             }
-            let season: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let episode: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let first = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let second = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let (season, episode) = match (first, second) {
+                // `kitsu:13209:1:16` — the Stremio `id:season:episode` shape.
+                (Some(s), Some(e)) => (s, e),
+                // ONE trailing number. For an EPISODE-numbered provider that is
+                // the EPISODE, not the season: AIOMetadata publishes Black Clover
+                // as `kitsu:13209:1` … `:170` (all season 1), so a client click on
+                // episode 16 arrives as `kitsu:13209:16`. Reading it as season 16
+                // sent the search to S16E1, matched nothing, and every episode of
+                // the show answered "No Streams Found" (measured in the log:
+                // `kitsu:13209:16` and `kitsu:13209:43`, both `matched:0`).
+                (Some(n), None) => {
+                    if is_episode_numbered_prefix(name) && n > 0 {
+                        (1, n)
+                    } else {
+                        (n, 0)
+                    }
+                }
+                (None, _) => (0, 0),
+            };
             return Some((name, value, season, episode));
         }
     }
@@ -8636,6 +8667,36 @@ mod tests {
         assert_eq!(
             parse_external_id("tt11540908:1:1"),
             Some(("imdb", "tt11540908".to_string(), 1, 1))
+        );
+        // ANIME IDS ARE EPISODE-NUMBERED. AIOMetadata publishes Black Clover as
+        // `kitsu:13209:1` … `:170`, so a click on episode 16 is `kitsu:13209:16`.
+        // Reading the trailing number as a SEASON sent the search to S16E1 and the
+        // whole show answered "No Streams Found".
+        assert_eq!(
+            parse_external_id("kitsu:13209:16"),
+            Some(("kitsu", "13209".to_string(), 1, 16))
+        );
+        assert_eq!(
+            parse_external_id("kitsu:13209:43"),
+            Some(("kitsu", "13209".to_string(), 1, 43))
+        );
+        // The 4-segment form is still season:episode.
+        assert_eq!(
+            parse_external_id("kitsu:13209:1:16"),
+            Some(("kitsu", "13209".to_string(), 1, 16))
+        );
+        assert_eq!(
+            parse_external_id("mal:54492:5"),
+            Some(("mal", "54492".to_string(), 1, 5))
+        );
+        // Season-based providers keep the old reading, and a series ROOT is a root.
+        assert_eq!(
+            parse_external_id("tvdb:81797:2"),
+            Some(("tvdb", "81797".to_string(), 2, 0))
+        );
+        assert_eq!(
+            parse_external_id("kitsu:13209"),
+            Some(("kitsu", "13209".to_string(), 0, 0))
         );
         // An `tt` id shorter than 6 digits is not an IMDb id.
         assert_eq!(parse_external_id("tt123"), None);

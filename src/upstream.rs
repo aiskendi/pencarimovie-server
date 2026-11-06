@@ -1105,6 +1105,120 @@ pub async fn episode_item_season(
     0
 }
 
+/// The ABSOLUTE episode number of `(season, episode)`, or `0` when the meta
+/// cannot say.
+///
+/// Plenty of long-running shows are uploaded as ONE continuous run
+/// (`Naruto.E84.mkv`, no season marker) while the addon splits them into
+/// theTVDB seasons — Naruto is S1 35, S2 48, S3 48 … so S03E01 is absolute
+/// episode 84. Read literally, S03E01 matches nothing: the file parses as
+/// season 1 episode 84, and every season past the first answered "No Streams
+/// Found" while the origin held all 220 episodes.
+///
+/// Only a show whose earlier seasons are present in the meta can be mapped, and
+/// a season whose episodes already start at 1 maps to `sum(previous) + episode`.
+pub fn absolute_episode_from_videos(meta: &Value, season: i32, episode: i32) -> i32 {
+    if season < 1 || episode < 1 {
+        return 0;
+    }
+    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return 0;
+    };
+    let mut before: i32 = 0;
+    let mut this_min: i32 = i32::MAX;
+    let mut seen_season = false;
+    for video in videos {
+        let s = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let e = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        // Specials (season 0) are not part of the continuous run.
+        if s < 1 || e < 1 {
+            continue;
+        }
+        if s == season {
+            seen_season = true;
+            if e < this_min {
+                this_min = e;
+            }
+        }
+        if s < season {
+            before += 1;
+        }
+    }
+    if !seen_season || before == 0 {
+        return 0;
+    }
+    let offset = if this_min == i32::MAX || this_min <= 1 {
+        episode
+    } else {
+        episode - this_min + 1
+    };
+    if offset < 1 {
+        return 0;
+    }
+    before + offset
+}
+
+/// [`absolute_episode_from_videos()`] for a live item (same meta fetch/cache as
+/// [`episode_names()`]).
+pub async fn absolute_episode(
+    settings: &Value,
+    media_id: &str,
+    season: i32,
+    episode: i32,
+    expected_title: &str,
+    expected_year: &str,
+) -> i32 {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty() || season < 2 || episode < 1 {
+        return 0;
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for up in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push(format!(
+            "{}/meta/series/{}.json",
+            base_of(manifest),
+            rawurlencode(&media_id)
+        ));
+    }
+    if urls.is_empty() {
+        return 0;
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|url| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object()
+            || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year)
+        {
+            continue;
+        }
+        let abs = absolute_episode_from_videos(meta, season, episode);
+        if abs > 0 {
+            return abs;
+        }
+    }
+    0
+}
+
 /// Every episode title of `season` EXCEPT the requested episode, normalised and
 /// de-duplicated. Same field rules as [`extract_episode_names()`].
 pub fn extract_sibling_names(meta: &Value, season: i32, episode: i32) -> Vec<String> {
@@ -1369,6 +1483,33 @@ mod tests {
         // A season-0 special must never answer a season-1 request.
         assert!(extract_episode_names(&meta, 1, 3).is_empty());
         assert!(extract_episode_names(&meta, 2, 1).is_empty());
+    }
+
+    /// Reported: Naruto **season 3** answered "No Streams Found" while the origin
+    /// held `Naruto.E84.mkv` — one continuous run, no season markers, against
+    /// theTVDB's 5-way split (S1 35, S2 48, S3 48 …).
+    #[test]
+    fn absolute_episode_counts_the_earlier_seasons() {
+        let mut videos: Vec<serde_json::Value> = Vec::new();
+        for e in 1..=35 {
+            videos.push(serde_json::json!({"season": 1, "episode": e}));
+        }
+        for e in 1..=48 {
+            videos.push(serde_json::json!({"season": 2, "episode": e}));
+        }
+        for e in 1..=48 {
+            videos.push(serde_json::json!({"season": 3, "episode": e}));
+        }
+        // A special must not shift the run.
+        videos.push(serde_json::json!({"season": 0, "episode": 1}));
+        let meta = serde_json::json!({"videos": videos});
+        assert_eq!(absolute_episode_from_videos(&meta, 3, 1), 84);
+        assert_eq!(absolute_episode_from_videos(&meta, 3, 48), 131);
+        assert_eq!(absolute_episode_from_videos(&meta, 2, 1), 36);
+        // Season 1 needs no mapping; a season the meta does not list is unmappable.
+        assert_eq!(absolute_episode_from_videos(&meta, 1, 5), 0);
+        assert_eq!(absolute_episode_from_videos(&meta, 4, 1), 0);
+        assert_eq!(absolute_episode_from_videos(&serde_json::json!({}), 3, 1), 0);
     }
 
     /// Reported: opening Black Clover season 2 listed season 1's files. The

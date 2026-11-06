@@ -3239,7 +3239,8 @@ async fn handle_external_stream(
     // episode's other releases (another group's copy, other qualities). The PHP
     // enters that ladder with postId 0 on this branch (backend.php:17093), which
     // is exactly what `resolve_external_episode_files()` is for.
-    let (eff_season, eff_episode) = effective_season_episode(kind == "series", season, episode);
+    let (mut eff_season, mut eff_episode) =
+        effective_season_episode(kind == "series", season, episode);
     if kind == "series" {
         let r = resolve_external_episode_files(
             item_id,
@@ -3254,6 +3255,56 @@ async fn handle_external_stream(
         title = r.title;
         year = r.year;
         files = r.files;
+
+        // ABSOLUTE-NUMBERING FALLBACK.
+        //
+        // Long-running shows are uploaded as one continuous run
+        // (`Naruto.E84.mkv` — no season marker) while the addon splits them into
+        // theTVDB seasons (Naruto: S1 35, S2 48, S3 48 …), so S03E01 is absolute
+        // episode 84. Read literally, S03E01 matches nothing and every season
+        // past the first answered "No Streams Found" with all 220 episodes
+        // sitting in the origin.
+        //
+        // Only runs when the season-relative pass found NOTHING, so a show that
+        // really is laid out per season costs nothing and cannot be widened.
+        if files.is_empty() && eff_season > 1 {
+            let settings = load_catalog_settings_merged();
+            let absolute = upstream::absolute_episode(
+                &settings,
+                &episode_media_id,
+                eff_season,
+                eff_episode,
+                &title,
+                &year,
+            )
+            .await;
+            if absolute > 0 && absolute != eff_episode {
+                log(
+                    "stream: retrying with an absolute episode number",
+                    &serde_json::json!({
+                        "item_id": item_id, "season": eff_season, "episode": eff_episode,
+                        "absolute": absolute, "title": title,
+                    }),
+                );
+                let r2 = resolve_external_episode_files(
+                    item_id,
+                    &title,
+                    &year,
+                    &episode_media_id,
+                    1,
+                    absolute,
+                    Vec::new(),
+                )
+                .await;
+                if !r2.files.is_empty() {
+                    title = r2.title;
+                    year = r2.year;
+                    files = r2.files;
+                    eff_season = 1;
+                    eff_episode = absolute;
+                }
+            }
+        }
     }
 
     Some(

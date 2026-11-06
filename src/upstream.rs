@@ -900,6 +900,156 @@ pub async fn episode_names(
     names
 }
 
+/// Titles of the OTHER episodes of the same season.
+///
+/// These exist to keep the episode-title guard strict in the RIGHT direction.
+/// A file whose post-marker text names a DIFFERENT known episode is that other
+/// episode and must stay out; a file whose text matches nothing we know is
+/// simply named differently and must NOT be dropped.
+///
+/// Measured, and the reason this exists: Disney's "Oswald" is numbered 1..52 by
+/// theTVDB, while the uploader ships TWO segments per file — TVDB calls S01E02
+/// "The Camping Trip" and the file says "S01E02 Sleepover & Big Banana". The
+/// guard read that as "another episode's title" and rejected every Oswald file
+/// but the combined packs, so every episode answered "No Streams Found" while
+/// the origin held 50 of them.
+///
+/// Same cache discipline as [`episode_names()`]: 7 d for names, 1 h for
+/// "verified but no names", 5 min for a transport failure.
+pub async fn sibling_episode_names(
+    settings: &Value,
+    media_id: &str,
+    season: i32,
+    episode: i32,
+    expected_title: &str,
+    expected_year: &str,
+) -> Vec<String> {
+    let media_id = strip_episode_suffix(media_id);
+    if media_id.is_empty()
+        || !episode_id_re().is_match(&media_id).unwrap_or(false)
+        || season < 1
+        || episode < 1
+    {
+        return Vec::new();
+    }
+    let mut urls: Vec<(String, String)> = Vec::new();
+    for (i, up) in resolver_manifests(settings)
+        .await
+        .into_iter()
+        .take(MAX_NAME_PROVIDERS)
+        .enumerate()
+    {
+        let manifest = up.url.trim();
+        if manifest.is_empty() || !(manifest.starts_with("http://") || manifest.starts_with("https://")) {
+            continue;
+        }
+        urls.push((
+            format!("up_{}", i),
+            format!("{}/meta/series/{}.json", base_of(manifest), rawurlencode(&media_id)),
+        ));
+    }
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let cache_key = crate::fileid::md5_hex(
+        json!([
+            "v1-siblings",
+            media_id.to_lowercase(),
+            season,
+            episode,
+            crate::matcher::norm_title_for_match(expected_title),
+            expected_year.trim(),
+            urls.iter().map(|(_, u)| u.clone()).collect::<Vec<_>>(),
+        ])
+        .to_string()
+        .as_bytes(),
+    );
+    if let Some(hit) = crate::cache::get("episode_siblings", &cache_key) {
+        if let Some(list) = hit.get("names").and_then(|v| v.as_array()) {
+            return list
+                .iter()
+                .filter_map(|v| v.as_str().map(|x| x.to_string()))
+                .collect();
+        }
+    }
+    let bodies = futures_util::future::join_all(urls.iter().map(|(_, url)| {
+        let url = url.clone();
+        async move { crate::httpc::get_contents(&url, NAME_FETCH_TIMEOUT_SECS, HashMap::new()).await }
+    }))
+    .await;
+    let mut verified = false;
+    let mut names: Vec<String> = Vec::new();
+    for body in bodies.iter() {
+        let Some(text) = body else { continue };
+        let Ok(doc) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let meta = doc.get("meta").unwrap_or(&Value::Null);
+        if !meta.is_object() || !episode_meta_identity_matches(meta, &media_id, expected_title, expected_year) {
+            continue;
+        }
+        verified = true;
+        let candidate = extract_sibling_names(meta, season, episode);
+        if !candidate.is_empty() {
+            names = candidate;
+            break;
+        }
+    }
+    let ttl = if !names.is_empty() {
+        TTL_NAMES
+    } else if verified {
+        TTL_VERIFIED_EMPTY
+    } else {
+        TTL_TRANSPORT
+    };
+    crate::cache::put(
+        "episode_siblings",
+        &cache_key,
+        &json!({"names": names, "ttl": ttl}),
+        ttl,
+        0,
+    );
+    names
+}
+
+/// Every episode title of `season` EXCEPT the requested episode, normalised and
+/// de-duplicated. Same field rules as [`extract_episode_names()`].
+pub fn extract_sibling_names(meta: &Value, season: i32, episode: i32) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return names;
+    };
+    for video in videos {
+        if !video.is_object() {
+            continue;
+        }
+        let v_season = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        if v_season != season {
+            continue;
+        }
+        let v_episode = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        if v_episode == episode {
+            continue;
+        }
+        for field in ["name", "title"] {
+            let name = crate::matcher::normalize_episode_name(&s(video, field));
+            if !name.is_empty() && !placeholder_re().is_match(&name).unwrap_or(false) {
+                if !names.iter().any(|n| n == &name) {
+                    names.push(name);
+                }
+            }
+        }
+        if names.len() >= 80 {
+            break;
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

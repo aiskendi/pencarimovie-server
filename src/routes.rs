@@ -2461,6 +2461,7 @@ fn add_episode_files(
     season: i32,
     episode: i32,
     names: &[String],
+    siblings: &[String],
     max: usize,
 ) {
     let series_title = if title.trim().is_empty() { keyword } else { title };
@@ -2480,7 +2481,7 @@ fn add_episode_files(
         if !crate::matcher::file_matches_episode(parsed, season, episode) {
             continue;
         }
-        if !crate::matcher::series_file_matches_title(
+        if !crate::matcher::series_file_matches_title_with_siblings(
             &f.title,
             series_title,
             season,
@@ -2488,6 +2489,7 @@ fn add_episode_files(
             year,
             &f.caption,
             names,
+            siblings,
         ) {
             continue;
         }
@@ -2658,6 +2660,18 @@ async fn resolve_episode_files_with(
             upstream::episode_names(&settings, imdb_id, season, episode, &title, &year).await
         }
     };
+    // The OTHER episodes' titles, for the `$add()` guard below. They make the
+    // guard stricter (a file naming a different known episode is rejected) and
+    // stop it from rejecting a file that is merely named in the uploader's own
+    // ordering — see `episode_subtitle_matches_with_siblings()`.
+    let sibling_names_future = async {
+        if imdb_id.trim().is_empty() {
+            Vec::new()
+        } else {
+            let settings = load_catalog_settings_merged();
+            upstream::sibling_episode_names(&settings, imdb_id, season, episode, &title, &year).await
+        }
+    };
     let post_files_future = async {
         if has_post {
             crate::wp_data::fetch_post_files_paged(post_id, 200, 600, 3).await
@@ -2684,8 +2698,9 @@ async fn resolve_episode_files_with(
             None
         }
     };
-    let (episode_names, post_files, more) = tokio::join!(
+    let (episode_names, sibling_names, post_files, more) = tokio::join!(
         episode_names_future,
+        sibling_names_future,
         post_files_future,
         episode_index_future,
     );
@@ -2704,6 +2719,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         log(
@@ -2739,6 +2755,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         log(
@@ -2783,6 +2800,7 @@ async fn resolve_episode_files_with(
             season,
             episode,
             &episode_names,
+            &sibling_names,
             MAX_FILES,
         );
         if all.len() > before {
@@ -2846,6 +2864,7 @@ async fn resolve_episode_files_with(
                     season,
                     episode,
                     &episode_names,
+                    &sibling_names,
                     MAX_FILES,
                 );
             }
@@ -3061,7 +3080,15 @@ async fn handle_external_stream(
         // nothing to search and the item answered "No Streams Found". Measured
         // on a real phone: tt6751668, tt21952924, tt34809853, tt34991493.
         let settings = load_catalog_settings_merged();
-        if let Some(body) = upstream::forward_meta(&settings, item_type, item_id).await {
+        // The addon is asked for the BARE id. A meta endpoint does not know the
+        // `:S:E` suffix: measured on the live origin,
+        // `/meta/series/tt10603444.json` answers 200 with the whole series while
+        // `/meta/series/tt10603444:1:1.json` answers **404** — and because this
+        // call used the raw `item_id`, every series whose id was not already in
+        // `media_ids_idx` resolved to "no title" and answered "No Streams
+        // Found" for every episode (reported for "Oswald the Lucky Rabbit").
+        let bare_meta_id = crate::upstream::strip_episode_suffix(item_id);
+        if let Some(body) = upstream::forward_meta(&settings, item_type, &bare_meta_id).await {
             let meta = body.get("meta").cloned().unwrap_or(Value::Null);
             let name = jstr(&meta, "name");
             if !name.is_empty() {

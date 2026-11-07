@@ -1576,10 +1576,23 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // the alias every already-installed addon URL uses.
             //
             // The descriptor itself is pinned to backend.php:14315-14346: same
-            // `types`, the `latest` catalog row and the `quality` setting, since
-            // clients render their catalog list and Settings sheet straight from
-            // it. The icon stays the SHIPPED logo (the PHP points at a WordPress
-            // upload; operator choice here is to never depend on that host).
+            // `types` and the `latest` catalog row, since clients render their
+            // catalog list straight from it. The icon stays the SHIPPED logo (the
+            // PHP points at a WordPress upload; operator choice here is to never
+            // depend on that host).
+            //
+            // NO `settings` block, and that is a deletion with a reason: this
+            // engine serves the ONE rendition Telegram holds for a short code, so
+            // a quality picker could not change what plays. Eclipse only shows a
+            // settings cog for addons that list "settings" in `resources` (we do
+            // not), but BitChord renders a picker for any `key: "quality"` — a
+            // listener would pick "Normal Quality" and get the original file.
+            //
+            // The same document is the BitChord manifest: `id`, `name`,
+            // `version` and `resources` are all it requires, and "search" is in
+            // `resources`. It only lacks `bitchordAuth`, which would claim this
+            // server verifies BitChord's hardware-backed proof; without it the
+            // addon works and BitChord just labels the source "outdated".
             return stremio_json(
                 200,
                 &serde_json::json!({
@@ -1593,17 +1606,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                     "icon": format!("{}/logo.png", rtrim(&ctx.base_url)),
                     "catalogs": [
                         {"id": "latest", "type": "track", "name": "Latest Telegram Tracks"}
-                    ],
-                    "settings": [{
-                        "key": "quality",
-                        "type": "select",
-                        "label": "Audio quality",
-                        "default": "high",
-                        "options": [
-                            {"value": "high", "label": "Original / High Quality"},
-                            {"value": "normal", "label": "Normal Quality"}
-                        ]
-                    }]
+                    ]
                 }),
                 "max-age=3600",
             );
@@ -1613,7 +1616,10 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 let a = ctx.qs("q");
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
-            let tracks = local_artwork(&ctx.base_url, eclipse_search(&q, 30).await);
+            let tracks = rank_for_tier(
+                add_audio_quality(local_artwork(&ctx.base_url, eclipse_search(&q, 30).await)),
+                &ctx.qs("quality"),
+            );
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/catalog/") {
@@ -1621,7 +1627,10 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // origin indexes tracks, not rows, so "latest" is a plain search.
             let cat = rest.trim_end_matches(".json").trim();
             let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = local_artwork(&ctx.base_url, eclipse_search(q, 50).await);
+            let tracks = add_audio_quality(local_artwork(
+                &ctx.base_url,
+                eclipse_search(q, 50).await,
+            ));
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
@@ -7556,16 +7565,25 @@ fn str_at(v: &Value, key: &str) -> String {
 }
 
 /// `/eclipse/stream/<short_code>` and `/eclipse/play/<short_code>` — resolve and
-/// hand back a downloadable URL. The URL extension must match the ADVERTISED
-/// format (`.wav` for an ALAC `.m4a`, which [`crate::download`] decodes to PCM
-/// behind a WAV header), or the client skips the track.
+/// hand back a downloadable URL. The URL extension is the FILE'S OWN and the
+/// bytes go out untouched: there is no ALAC→WAV transcode (deleted, see
+/// `download.rs`), so an ALAC `.m4a` is served as `audio/mp4` under its real
+/// name and plays only where an ALAC decoder exists.
+///
+/// ONE envelope, TWO clients. Eclipse reads `url`/`format`/`mimeType`; BitChord
+/// installs this SAME `/music` addon and reads `url`/`codec`/`container`/
+/// `manifest`/`encrypted` out of the same answer. Both ignore unknown keys, so
+/// there is no second addon and no second route.
 async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
-    let code = short_code
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    // BitChord percent-encodes the id it was handed back to us.
+    let code = crate::download::percent_decode(
+        short_code
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(".json"),
+    );
     if code.is_empty() {
         return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
     }
@@ -7646,15 +7664,192 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     });
     let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
     let url = build_stream_url(&ctx.base_url, &b64, &file_name);
-    stremio_json(
-        200,
-        &serde_json::json!({
-            "url": url,
-            "format": ext,
-            "mimeType": served_mime,
-        }),
-        "no-store",
+    let mut body = serde_json::json!({
+        "url": url,
+        "format": ext,
+        "mimeType": served_mime,
+        // BitChord's rendition fields. `manifest` is explicit because it cannot
+        // tell an extensionless URL apart — ours always end in the file's own
+        // extension, so "none" is the truth rather than a default.
+        "container": container_of(&ext),
+        "manifest": "none",
+        "encrypted": false,
+    });
+    // Omitted when unknown, never guessed: a wrong codec is worse than none.
+    let codec = codec_of(&ext);
+    if !codec.is_empty() {
+        body["codec"] = serde_json::json!(codec);
+    }
+    stremio_json(200, &body, "no-store")
+}
+
+/// The codec both addon protocols name for a rendition, empty when the extension
+/// does not identify one — and `.m4a` deliberately does NOT identify one.
+///
+/// MEASURED 2026-11-07 against this catalogue: of four sampled `.m4a` tracks,
+/// three carried an `alac` sample-entry box and NOT ONE carried `mp4a`. They are
+/// ALAC, not AAC. So `"m4a" => "aac"` was a guess that steered Eclipse and
+/// BitChord into an AAC playback engine for a lossless file — the exact failure
+/// both docs warn about ("do not overstate the stream"; the apps use these
+/// fields "to pick a playback engine before the first byte arrives").
+///
+/// Claiming NOTHING makes the client probe instead, which is what lets a player
+/// that has an ALAC decoder (macOS AVFoundation, VLC) play it, and a player that
+/// has none (Android's ExoPlayer) fail honestly rather than inside the wrong
+/// decoder.
+///
+/// Reading the sample-entry box here would cost a Telegram range fetch on every
+/// stream request, and the deleted transcoder already proved the trap: a short
+/// read cannot tell "AAC" from "could not reach the header" — `tWZMk0` has
+/// neither box in its first 64 KB.
+fn codec_of(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "flac" => "flac",
+        "wav" => "pcm",
+        "aac" => "aac",
+        "mp3" => "mp3",
+        "opus" => "opus",
+        "ogg" | "oga" => "vorbis",
+        _ => "",
+    }
+}
+
+/// `.m4a` is a container ALIAS; the container itself is MP4.
+fn container_of(ext: &str) -> &str {
+    if ext.eq_ignore_ascii_case("m4a") { "mp4" } else { ext }
+}
+
+/// BitChord's search row is `format_track()`'s row plus a quality tier — the
+/// fields it matches on (`id`, `title`, `artist`, `album`, `duration`,
+/// `artworkURL`, `format`) are already the ones the music addon emits.
+fn add_audio_quality(tracks: Vec<Value>) -> Vec<Value> {
+    tracks
+        .into_iter()
+        .map(|mut t| {
+            let lossless = is_lossless_format(&str_at(&t, "format"));
+            t["audioQuality"] = serde_json::json!(if lossless { "LOSSLESS" } else { "HIGH" });
+            t
+        })
+        .collect()
+}
+
+/// FLAC, WAV and ALAC are bit-exact; `m4a` is NOT in this list on purpose — the
+/// extension is a container, and the `.m4a` files here are ALAC *and* AAC, which
+/// cannot be told apart without reading the sample-entry box. An ALAC `.m4a`
+/// therefore reports HIGH: it understates a lossless file, which is the safe
+/// direction (see [`codec_of`] for the measured split).
+fn is_lossless_format(format: &str) -> bool {
+    matches!(
+        format.to_ascii_lowercase().as_str(),
+        "flac" | "wav" | "alac"
     )
+}
+
+/// Put the rendition the client ASKED for first, because BitChord matches a
+/// recording in the order we return and then plays that one row.
+///
+/// MEASURED 2026-11-07, "two years" by ROSÉ: BitChord requested
+/// `quality=LOSSLESS` twice for `d931Ow` (a 2.8 MB mp3, the FIRST row) and twice
+/// for `lyYtHg` (an m4a), and never once requested `Tap9pP` — the FLAC of the
+/// same recording sitting third in the same answer. It then fetched neither
+/// returned URL, because a 128 kbps mp3 is not a bit-exact rendition: the song
+/// simply did not play while the lossless copy was in the list.
+///
+/// ONLY `lossless` reorders, and only by moving lossless rows ahead of lossy ones
+/// (stable, so the origin's ranking survives inside each group). Everything else
+/// — no `quality`, `high`, `low`, an addon option we do not publish — keeps the
+/// origin's order untouched, which is what the video-era bug ("do not re-sort,
+/// the origin's order IS the ranking") was about. Rows are never DROPPED: hiding
+/// every lossy file would hide most of the catalogue from a client that asks for
+/// lossless on every request.
+fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
+    if !quality.trim().eq_ignore_ascii_case("lossless") {
+        return tracks;
+    }
+    let mut rows: Vec<(bool, Value)> = tracks
+        .into_iter()
+        .map(|t| (is_lossless_format(&str_at(&t, "format")), t))
+        .collect();
+    // `false` sorts first, so `!lossless` puts the bit-exact rows on top.
+    rows.sort_by_key(|(lossless, _)| !*lossless);
+    rows.into_iter().map(|(_, t)| t).collect()
+}
+
+#[cfg(test)]
+mod bitchord_tests {
+    use super::*;
+
+    #[test]
+    fn a_row_keeps_the_id_and_title_bit_chord_matches_on() {
+        let rows = add_audio_quality(vec![serde_json::json!({
+            "id": "wULLeI",
+            "title": "Be Her",
+            "artist": "Ella Langley",
+            "format": "flac"
+        })]);
+        assert_eq!(rows[0]["id"], "wULLeI");
+        assert_eq!(rows[0]["title"], "Be Her");
+        assert_eq!(rows[0]["audioQuality"], "LOSSLESS");
+    }
+
+    #[test]
+    fn a_lossy_row_is_never_labelled_lossless() {
+        let rows = add_audio_quality(vec![
+            serde_json::json!({"id": "a", "title": "t", "format": "mp3"}),
+            serde_json::json!({"id": "b", "title": "t", "format": "M4A"}),
+        ]);
+        assert_eq!(rows[0]["audioQuality"], "HIGH");
+        assert_eq!(rows[1]["audioQuality"], "HIGH");
+    }
+
+    /// The measured failure, as a test: a LOSSLESS request must reach the FLAC
+    /// before the mp3 of the same song, and must not lose a single row doing it.
+    #[test]
+    fn a_lossless_request_puts_the_flac_first_and_drops_nothing() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "mp3", "format": "mp3"}),
+                serde_json::json!({"id": "flac", "format": "flac"}),
+                serde_json::json!({"id": "m4a", "format": "m4a"}),
+                serde_json::json!({"id": "wav", "format": "wav"}),
+            ],
+            "LOSSLESS",
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["id"], "flac");
+        assert_eq!(rows[1]["id"], "wav");
+        assert_eq!(rows[2]["id"], "mp3");
+        assert_eq!(rows[3]["id"], "m4a");
+    }
+
+    /// Every other value — and the no-quality case Eclipse takes now that we
+    /// publish no settings — leaves the origin's ranking exactly as it was.
+    #[test]
+    fn only_a_lossless_request_reorders() {
+        for q in ["", "HIGH", "high", "LOW", "max"] {
+            let rows = rank_for_tier(
+                vec![
+                    serde_json::json!({"id": "mp3", "format": "mp3"}),
+                    serde_json::json!({"id": "flac", "format": "flac"}),
+                ],
+                q,
+            );
+            assert_eq!(rows[0]["id"], "mp3", "quality={q} must keep the origin order");
+        }
+    }
+
+    #[test]
+    fn the_rendition_names_a_real_codec_and_container() {
+        assert_eq!(codec_of("flac"), "flac");
+        assert_eq!(codec_of("mp3"), "mp3");
+        assert_eq!(codec_of("WAV"), "pcm");
+        assert_eq!(codec_of("sbin"), "");
+        // `.m4a` is ALAC in this catalogue, not AAC — never claim a codec for it
+        // (see `codec_of`). The container is still MP4, which is true for both.
+        assert_eq!(codec_of("m4a"), "");
+        assert_eq!(container_of("m4a"), "mp4");
+        assert_eq!(container_of("flac"), "flac");
+    }
 }
 
 /* ── subtitles (backend.php:13789 + fd_get_item_subtitles) ────────────────── */

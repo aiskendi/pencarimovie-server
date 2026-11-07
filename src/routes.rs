@@ -2908,7 +2908,7 @@ async fn handle_external_stream(
     item_id: &str,
     upstream: Option<tokio::task::JoinHandle<Vec<Value>>>,
 ) -> Option<Response> {
-    let (prefix, value, mut season, episode) = parse_external_id(item_id)?;
+    let (prefix, value, mut season, mut episode) = parse_external_id(item_id)?;
     // LOCAL IDENTITY MEMORY, before ANY origin call (`ext_meta_<id>.json`,
     // backend.php:3062). A hit replaces both the `media_ids_idx` index read and
     // the upstream meta call, so an id this server already self-discovered opens
@@ -3142,28 +3142,47 @@ async fn handle_external_stream(
     //      season 2 (the meta's `name` is just "Black Clover" for both ids, so
     //      only the video entry can tell them apart);
     //   2. a season marker in the resolved title ("… Season 2").
+    //
+    // The trailing number of a 3-segment episode-numbered id is the ABSOLUTE
+    // episode, and the addon's own video entry knows where it belongs:
+    // `kitsu:11:84` is Naruto S03E01, `kitsu:11:132` is S04E01, `kitsu:50024:2` is
+    // Black Clover S02E02. Only the season was adopted before, so the episode
+    // number stayed 84 and the search asked for S03E84 — an episode that cannot
+    // exist (season 3 has 48) — and the item answered "No Streams Found"
+    // (`kitsu:11:84`, `:132`, `:180` in the log).
     if is_episode_numbered_prefix(prefix)
+        && item_id.split(':').count() == 3
         && (item_type.contains("series") || season > 0 || episode > 0)
-        && season <= 1
         && episode > 0
     {
         let bare_media = format!("{}:{}", prefix, value);
         let settings = load_catalog_settings_merged();
-        let mut named = upstream::episode_item_season(&settings, &bare_media, item_id, &title, &year)
-            .await;
-        let source = if named > 1 { "video entry" } else { "" };
-        if named <= 1 {
-            named = crate::matcher::season_from_title(&title);
-        }
-        if named > 1 {
-            log(
-                "stream: season adopted for an episode-numbered item",
-                &serde_json::json!({
-                    "item_id": item_id, "title": title, "season": named,
-                    "source": if source.is_empty() { "title" } else { source },
-                }),
-            );
-            season = named;
+        match upstream::episode_item_position(&settings, &bare_media, item_id, &title, &year).await {
+            Some((s, e)) => {
+                log(
+                    "stream: episode position adopted from the addon video entry",
+                    &serde_json::json!({
+                        "item_id": item_id, "title": title, "season": s, "episode": e,
+                        "requested_episode": episode,
+                    }),
+                );
+                season = s;
+                episode = e;
+            }
+            None => {
+                // No video entry for this id: fall back to a season marker in the
+                // title (an item that IS one season, numbered from 1).
+                if season <= 1 {
+                    let named = crate::matcher::season_from_title(&title);
+                    if named > 1 {
+                        log(
+                            "stream: season adopted from the title",
+                            &serde_json::json!({"item_id": item_id, "title": title, "season": named}),
+                        );
+                        season = named;
+                    }
+                }
+            }
         }
     }
 

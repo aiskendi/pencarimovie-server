@@ -1021,14 +1021,12 @@ pub async fn sibling_episode_names(
 /// belongs to — measured: `kitsu:50024:2` carries `season: 2` while
 /// `kitsu:13209:16` carries `season: 1` — which is the only thing that tells the
 /// two apart, because the metadata's `name` is just "Black Clover" for both.
-pub fn video_season_for_item(meta: &Value, item_id: &str) -> i32 {
+pub fn video_season_episode_for_item(meta: &Value, item_id: &str) -> Option<(i32, i32)> {
     let want = item_id.trim().to_ascii_lowercase();
     if want.is_empty() {
-        return 0;
+        return None;
     }
-    let Some(videos) = meta.get("videos").and_then(|v| v.as_array()) else {
-        return 0;
-    };
+    let videos = meta.get("videos").and_then(|v| v.as_array())?;
     for video in videos {
         let id = video
             .get("id")
@@ -1036,31 +1034,36 @@ pub fn video_season_for_item(meta: &Value, item_id: &str) -> i32 {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        if id == want {
-            if let Some(s) = video.get("season").and_then(|v| v.as_i64()) {
-                if s > 0 {
-                    return s as i32;
-                }
-            }
+        if id != want {
+            continue;
+        }
+        let season = video.get("season").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let episode = video
+            .get("episode")
+            .or_else(|| video.get("number"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        if season > 0 && episode > 0 {
+            return Some((season, episode));
         }
     }
-    0
+    None
 }
 
 /// [`video_season_for_item()`] for a live item: fetches the same meta
 /// [`episode_names()`] does (so the second call is a cache hit) and reports the
 /// season the item's own video entry belongs to.
 #[allow(clippy::too_many_arguments)]
-pub async fn episode_item_season(
+pub async fn episode_item_position(
     settings: &Value,
     media_id: &str,
     item_id: &str,
     expected_title: &str,
     expected_year: &str,
-) -> i32 {
+) -> Option<(i32, i32)> {
     let media_id = strip_episode_suffix(media_id);
     if media_id.is_empty() || item_id.trim().is_empty() {
-        return 0;
+        return None;
     }
     let mut urls: Vec<String> = Vec::new();
     for up in resolver_manifests(settings)
@@ -1079,7 +1082,7 @@ pub async fn episode_item_season(
         ));
     }
     if urls.is_empty() {
-        return 0;
+        return None;
     }
     let bodies = futures_util::future::join_all(urls.iter().map(|url| {
         let url = url.clone();
@@ -1097,12 +1100,11 @@ pub async fn episode_item_season(
         {
             continue;
         }
-        let season = video_season_for_item(meta, item_id);
-        if season > 0 {
-            return season;
+        if let Some(pos) = video_season_episode_for_item(meta, item_id) {
+            return Some(pos);
         }
     }
-    0
+    None
 }
 
 /// The ABSOLUTE episode number of `(season, episode)`, or `0` when the meta
@@ -1512,23 +1514,28 @@ mod tests {
         assert_eq!(absolute_episode_from_videos(&serde_json::json!({}), 3, 1), 0);
     }
 
-    /// Reported: opening Black Clover season 2 listed season 1's files. The
-    /// addon's `name` is the same ("Black Clover") for the parent id and the
-    /// season id, so the ONLY evidence is the video entry's own `season`.
+    /// Reported: Black Clover season 2 listed season 1's files, and Naruto's
+    /// `kitsu:11:84` (S03E01) answered "No Streams Found". The addon's `name` is
+    /// the same ("Black Clover", "Naruto") whichever id you ask about, so the
+    /// ONLY evidence is the video entry: it carries both the season AND the
+    /// season-relative episode number.
     #[test]
     fn a_video_entry_knows_its_own_season() {
         let meta = serde_json::json!({"videos": [
             {"id": "kitsu:13209:16", "season": 1, "episode": 16, "title": "The Diamond Mage"},
             {"id": "kitsu:50024:2", "season": 2, "episode": 2, "title": "The Door to Hell"},
+            {"id": "kitsu:11:84", "season": 3, "episode": 1, "title": "Roar, Chidori! Brother vs. Brother!"},
         ]});
-        assert_eq!(video_season_for_item(&meta, "kitsu:13209:16"), 1);
-        assert_eq!(video_season_for_item(&meta, "kitsu:50024:2"), 2);
+        // An anime id's trailing number is ABSOLUTE; the entry says where it goes.
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:11:84"), Some((3, 1)));
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:50024:2"), Some((2, 2)));
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:13209:16"), Some((1, 16)));
         // Case and whitespace are not identity.
-        assert_eq!(video_season_for_item(&meta, " KITSU:50024:2 "), 2);
+        assert_eq!(video_season_episode_for_item(&meta, " KITSU:50024:2 "), Some((2, 2)));
         // An id the meta does not publish is not evidence.
-        assert_eq!(video_season_for_item(&meta, "kitsu:50024:9"), 0);
-        assert_eq!(video_season_for_item(&serde_json::json!({}), "kitsu:1"), 0);
-        assert_eq!(video_season_for_item(&meta, ""), 0);
+        assert_eq!(video_season_episode_for_item(&meta, "kitsu:50024:9"), None);
+        assert_eq!(video_season_episode_for_item(&serde_json::json!({}), "kitsu:1"), None);
+        assert_eq!(video_season_episode_for_item(&meta, ""), None);
     }
 
     #[test]

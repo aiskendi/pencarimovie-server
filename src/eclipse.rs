@@ -81,6 +81,49 @@ fn strip_artist(name: &str, artist: &str) -> String {
     ))
 }
 
+/// The bitrate floor that separates a lossless `.m4a` from a lossy one.
+///
+/// MEASURED 2026-11-07, "Sial" by Mahalini, same 243 s, both `.m4a`, both
+/// `mime_type = audio/mp4`:
+///
+/// | file | bytes | kbps | what it is |
+/// | ---- | ----- | ---- | ---------- |
+/// | `07.Sial.m4a` (`Xt8C7v`) | 8,187,833 | 269 | AAC 256k |
+/// | `07.Sial.m4a` (`J2YkvY`) | 26,704,889 | 879 | ALAC (Qobuz serves the same master at 886) |
+///
+/// AAC tops out around 320 kbps and HE-AAC well below that, while ALAC at 16/44.1
+/// is ~900 and 24/48 higher still, so 600 sits in empty space between the two:
+/// nothing legitimate encodes AAC there, and no ALAC lands under it.
+pub const LOSSLESS_KBPS: u64 = 600;
+
+/// Bits per second ÷ 1000 for a row, or 0 when the row does not say.
+pub fn kbps(file_size: u64, duration_secs: i64) -> u64 {
+    if file_size == 0 || duration_secs <= 0 {
+        return 0;
+    }
+    (u128::from(file_size) * 8 / duration_secs as u128 / 1000) as u64
+}
+
+/// `flac`/`wav`/`alac` are bit-exact on their own; `m4a` is a CONTAINER, so it
+/// needs the bitrate test above before it may be called lossless.
+pub fn is_lossless(ext: &str, file_size: u64, duration_secs: i64) -> bool {
+    match ext.to_ascii_lowercase().as_str() {
+        "flac" | "wav" | "alac" => true,
+        "m4a" => kbps(file_size, duration_secs) >= LOSSLESS_KBPS,
+        _ => false,
+    }
+}
+
+/// The tier both addon protocols display and rank on. One place decides it,
+/// because only here are `file_size` and `duration` both in hand.
+pub fn tier(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
+    if is_lossless(ext, file_size, duration_secs) {
+        "LOSSLESS"
+    } else {
+        "HIGH"
+    }
+}
+
 /// `fd_eclipse_audio_quality_score()` — higher is better.
 pub fn quality_score(ext: &str, size_bytes: u64) -> i64 {
     let weight = match ext.to_lowercase().as_str() {
@@ -136,6 +179,9 @@ pub fn format_track(item: &Value) -> Value {
         .and_then(|v| v.as_i64())
         .or_else(|| item.get("duration").and_then(|v| v.as_i64()))
         .unwrap_or(0);
+    // `/search-music` sends `file_size` on every row (main.php:2565); it is the
+    // only free way to tell an ALAC `.m4a` from an AAC one.
+    let file_size = item.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let mut track = serde_json::json!({
         "id": str_at(item, "short_code"),
@@ -147,6 +193,8 @@ pub fn format_track(item: &Value) -> Value {
         // legacy trick that made the download path skip the ALAC transcode and
         // answer `audio/wav` with raw MP4 bytes.
         "format": ext,
+        // BitChord reads this to pick a rendition; Eclipse ignores it.
+        "audioQuality": tier(&ext, file_size, duration),
     });
     for (key, value) in [("album", tag(item, "album")), ("isrc", tag(item, "isrc"))] {
         if !value.is_empty() {
@@ -242,6 +290,41 @@ mod tests {
         }));
         assert_eq!(track["title"], "Hello");
         assert_eq!(track["format"], "m4a");
+    }
+
+    /// The measured pair from `Sial`: same 243 s, both `.m4a`, 269 vs 879 kbps.
+    #[test]
+    fn a_lossless_m4a_is_labelled_lossless_and_a_lossy_one_is_not() {
+        let alac = format_track(&serde_json::json!({
+            "short_code": "J2YkvY",
+            "title": "07.Sial.m4a",
+            "performer": "Mahalini",
+            "extension": "m4a",
+            "duration": 243,
+            "file_size": 26_704_889_u64
+        }));
+        assert_eq!(alac["audioQuality"], "LOSSLESS");
+        assert_eq!(alac["format"], "m4a");
+
+        let aac = format_track(&serde_json::json!({
+            "short_code": "Xt8C7v",
+            "title": "07.Sial.m4a",
+            "performer": "Mahalini",
+            "extension": "m4a",
+            "duration": 243,
+            "file_size": 8_187_833_u64
+        }));
+        assert_eq!(aac["audioQuality"], "HIGH");
+    }
+
+    /// No size or no duration means no bitrate, and no bitrate means no claim.
+    #[test]
+    fn an_m4a_without_a_size_is_not_called_lossless() {
+        assert_eq!(tier("m4a", 0, 243), "HIGH");
+        assert_eq!(tier("m4a", 26_704_889, 0), "HIGH");
+        assert_eq!(tier("flac", 0, 243), "LOSSLESS");
+        assert_eq!(kbps(26_704_889, 243), 879);
+        assert_eq!(kbps(8_187_833, 243), 269);
     }
 
     #[test]

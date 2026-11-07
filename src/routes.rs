@@ -1617,7 +1617,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
             let tracks = rank_for_tier(
-                add_audio_quality(local_artwork(&ctx.base_url, eclipse_search(&q, 30).await)),
+                local_artwork(&ctx.base_url, eclipse_search(&q, 30).await),
                 &ctx.qs("quality"),
             );
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
@@ -1627,10 +1627,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // origin indexes tracks, not rows, so "latest" is a plain search.
             let cat = rest.trim_end_matches(".json").trim();
             let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = add_audio_quality(local_artwork(
-                &ctx.base_url,
-                eclipse_search(q, 50).await,
-            ));
+            let tracks = local_artwork(&ctx.base_url, eclipse_search(q, 50).await);
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
@@ -7633,12 +7630,11 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
         }
         return stremio_json(404, &serde_json::json!({"error": "Track not found"}), "no-store");
     }
-    let mime = {
-        let m = jstr(&resolved, "mime");
-        let m = if m.is_empty() { jstr(&resolved, "file_type") } else { m };
-        m
-    };
     let size = resolved.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ext = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_lowercase())
+        .unwrap_or_else(|| "mp3".to_string());
     // NO renaming. The advertised `format` and `mimeType` are the file's own, and
     // the payload names the file `/api/download` will actually read. The old
     // `.wav` alias (inherited from backend.php) lied about the container: the
@@ -7647,19 +7643,20 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // (measured: magic `/isom`, not `RIFF/WAVE`) — the player's "Playback error
     // - stream unavailable". When the bytes ARE transcoded, the download
     // response says so itself (`content-type: audio/wav`, `.wav` disposition).
-    let served_mime = if mime.is_empty() {
-        "audio/mpeg".to_string()
-    } else {
-        mime.clone()
-    };
-    let ext = file_name
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_lowercase())
-        .unwrap_or_else(|| "mp3".to_string());
+    //
+    // The ORIGIN sometimes sends the bare word `audio` as the MIME — measured on
+    // `07.Sial.m4a` (26.7 MB, ALAC) — and that string reaches the player as
+    // `content-type`, because it travels in the payload below. A player that
+    // trusts the header will refuse it, so a slash-less value is replaced.
+    let served_mime = audio_mime(
+        &ext,
+        &jstr(&resolved, "mime"),
+        &jstr(&resolved, "file_type"),
+    );
     let payload = serde_json::json!({
         "file_size": size,
         "file_name": file_name,
-        "mime": mime,
+        "mime": served_mime,
         "short_code": code,
     });
     let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
@@ -7675,34 +7672,49 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
         "manifest": "none",
         "encrypted": false,
     });
-    // Omitted when unknown, never guessed: a wrong codec is worse than none.
-    let codec = codec_of(&ext);
+    // Omitted when unknown, never guessed: a wrong codec is worse than none. The
+    // bitrate needs the length, which the resolve carries as `duration` — as a
+    // number on some rows and a numeric string on others.
+    let as_int = |v: Option<&Value>| -> Option<i64> {
+        v.and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    let duration = as_int(resolved.get("duration"))
+        .or_else(|| as_int(resolved.get("audio").and_then(|a| a.get("duration"))))
+        .unwrap_or(0);
+    let codec = codec_of(&ext, size, duration);
     if !codec.is_empty() {
         body["codec"] = serde_json::json!(codec);
     }
     stremio_json(200, &body, "no-store")
 }
 
-/// The codec both addon protocols name for a rendition, empty when the extension
-/// does not identify one — and `.m4a` deliberately does NOT identify one.
+/// The codec both addon protocols name for a rendition, empty when nothing we
+/// hold identifies one.
 ///
-/// MEASURED 2026-11-07 against this catalogue: of four sampled `.m4a` tracks,
-/// three carried an `alac` sample-entry box and NOT ONE carried `mp4a`. They are
-/// ALAC, not AAC. So `"m4a" => "aac"` was a guess that steered Eclipse and
-/// BitChord into an AAC playback engine for a lossless file — the exact failure
-/// both docs warn about ("do not overstate the stream"; the apps use these
-/// fields "to pick a playback engine before the first byte arrives").
+/// `.m4a` is the interesting case: it is a CONTAINER, and this catalogue really
+/// does carry both inside it — MEASURED 2026-11-07, `33xqYK` has an `alac`
+/// sample-entry box, `lyYtHg` has `mp4a`, and both are "Sial"-era `.m4a`. So the
+/// extension alone must not decide the codec; `file_size ÷ duration` does, via
+/// [`crate::eclipse::is_lossless`] (879 kbps = ALAC, 269 kbps = AAC for the same
+/// 243 s track).
 ///
-/// Claiming NOTHING makes the client probe instead, which is what lets a player
-/// that has an ALAC decoder (macOS AVFoundation, VLC) play it, and a player that
-/// has none (Android's ExoPlayer) fail honestly rather than inside the wrong
-/// decoder.
-///
-/// Reading the sample-entry box here would cost a Telegram range fetch on every
-/// stream request, and the deleted transcoder already proved the trap: a short
-/// read cannot tell "AAC" from "could not reach the header" — `tWZMk0` has
-/// neither box in its first 64 KB.
-fn codec_of(ext: &str) -> &'static str {
+/// The asymmetry is deliberate: a lossless-class bitrate is claimed as `alac`,
+/// and anything below it is left UNKNOWN rather than guessed as `aac`. A wrong
+/// codec makes the client pick the wrong engine before the first byte arrives
+/// (Eclipse's "routing fields", BitChord's "do not overstate the stream"), while
+/// an absent one makes it probe — which is what lets a player with an ALAC
+/// decoder play the file and one without fail honestly.
+fn codec_of(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
+    if ext.eq_ignore_ascii_case("m4a") {
+        return if crate::eclipse::is_lossless(ext, file_size, duration_secs) {
+            "alac"
+        } else {
+            ""
+        };
+    }
     match ext.to_ascii_lowercase().as_str() {
         "flac" => "flac",
         "wav" => "pcm",
@@ -7719,30 +7731,33 @@ fn container_of(ext: &str) -> &str {
     if ext.eq_ignore_ascii_case("m4a") { "mp4" } else { ext }
 }
 
-/// BitChord's search row is `format_track()`'s row plus a quality tier — the
-/// fields it matches on (`id`, `title`, `artist`, `album`, `duration`,
-/// `artworkURL`, `format`) are already the ones the music addon emits.
-fn add_audio_quality(tracks: Vec<Value>) -> Vec<Value> {
-    tracks
-        .into_iter()
-        .map(|mut t| {
-            let lossless = is_lossless_format(&str_at(&t, "format"));
-            t["audioQuality"] = serde_json::json!(if lossless { "LOSSLESS" } else { "HIGH" });
-            t
-        })
-        .collect()
-}
-
-/// FLAC, WAV and ALAC are bit-exact; `m4a` is NOT in this list on purpose — the
-/// extension is a container, and the `.m4a` files here are ALAC *and* AAC, which
-/// cannot be told apart without reading the sample-entry box. An ALAC `.m4a`
-/// therefore reports HIGH: it understates a lossless file, which is the safe
-/// direction (see [`codec_of`] for the measured split).
-fn is_lossless_format(format: &str) -> bool {
-    matches!(
-        format.to_ascii_lowercase().as_str(),
-        "flac" | "wav" | "alac"
-    )
+/// The MIME a music file is served as, given the origin's own value.
+///
+/// `mime` is sometimes the bare word `audio` at the origin (measured: the 26.7 MB
+/// ALAC `07.Sial.m4a` answered `"mime":"audio"`), while `file_type` is the
+/// Telegram kind (`audio`, `document`). Neither is a MIME, and this string ends
+/// up as the media `content-type` through the download payload, so a value with
+/// no `/` falls back to the extension's real type.
+fn audio_mime(ext: &str, mime: &str, file_type: &str) -> String {
+    let best = if mime.contains('/') {
+        mime.trim()
+    } else if file_type.contains('/') {
+        file_type.trim()
+    } else {
+        ""
+    };
+    if !best.is_empty() {
+        return best.to_string();
+    }
+    match ext {
+        "flac" => "audio/x-flac",
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" => "audio/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => "audio/mpeg",
+    }
+    .to_string()
 }
 
 /// Put the rendition the client ASKED for first, because BitChord matches a
@@ -7754,6 +7769,13 @@ fn is_lossless_format(format: &str) -> bool {
 /// same recording sitting third in the same answer. It then fetched neither
 /// returned URL, because a 128 kbps mp3 is not a bit-exact rendition: the song
 /// simply did not play while the lossless copy was in the list.
+///
+/// The tier is NOT recomputed here: [`crate::eclipse::format_track`] already
+/// stamped `audioQuality`, and it is the only place with both `file_size` and
+/// `duration`. That is what lets an ALAC `.m4a` (879 kbps) outrank an AAC `.m4a`
+/// (269 kbps) of the same song when the catalogue holds no FLAC at all — the
+/// Indonesian titles are exactly that case: 30 rows, zero flac, and the lossless
+/// master sitting in Telegram as an `.m4a`.
 ///
 /// ONLY `lossless` reorders, and only by moving lossless rows ahead of lossy ones
 /// (stable, so the origin's ranking survives inside each group). Everything else
@@ -7768,7 +7790,7 @@ fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
     }
     let mut rows: Vec<(bool, Value)> = tracks
         .into_iter()
-        .map(|t| (is_lossless_format(&str_at(&t, "format")), t))
+        .map(|t| (str_at(&t, "audioQuality") == "LOSSLESS", t))
         .collect();
     // `false` sorts first, so `!lossless` puts the bit-exact rows on top.
     rows.sort_by_key(|(lossless, _)| !*lossless);
@@ -7803,23 +7825,26 @@ mod bitchord_tests {
     }
 
     /// The measured failure, as a test: a LOSSLESS request must reach the FLAC
-    /// before the mp3 of the same song, and must not lose a single row doing it.
+    /// before the mp3 of the same song, must not lose a row doing it, and — the
+    /// Indonesian case — must prefer an ALAC `.m4a` over an AAC one when there is
+    /// no FLAC in the answer at all.
     #[test]
-    fn a_lossless_request_puts_the_flac_first_and_drops_nothing() {
+    fn a_lossless_request_puts_the_lossless_rows_first_and_drops_nothing() {
         let rows = rank_for_tier(
             vec![
-                serde_json::json!({"id": "mp3", "format": "mp3"}),
-                serde_json::json!({"id": "flac", "format": "flac"}),
-                serde_json::json!({"id": "m4a", "format": "m4a"}),
-                serde_json::json!({"id": "wav", "format": "wav"}),
+                serde_json::json!({"id": "aac", "format": "m4a", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "alac", "format": "m4a", "audioQuality": "LOSSLESS"}),
+                serde_json::json!({"id": "mp3", "format": "mp3", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "flac", "format": "flac", "audioQuality": "LOSSLESS"}),
             ],
             "LOSSLESS",
         );
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0]["id"], "flac");
-        assert_eq!(rows[1]["id"], "wav");
-        assert_eq!(rows[2]["id"], "mp3");
-        assert_eq!(rows[3]["id"], "m4a");
+        // Stable: the two lossless rows keep their relative order, then the lossy.
+        assert_eq!(rows[0]["id"], "alac");
+        assert_eq!(rows[1]["id"], "flac");
+        assert_eq!(rows[2]["id"], "aac");
+        assert_eq!(rows[3]["id"], "mp3");
     }
 
     /// Every other value — and the no-quality case Eclipse takes now that we
@@ -7829,24 +7854,36 @@ mod bitchord_tests {
         for q in ["", "HIGH", "high", "LOW", "max"] {
             let rows = rank_for_tier(
                 vec![
-                    serde_json::json!({"id": "mp3", "format": "mp3"}),
-                    serde_json::json!({"id": "flac", "format": "flac"}),
+                    serde_json::json!({"id": "aac", "format": "m4a", "audioQuality": "HIGH"}),
+                    serde_json::json!({"id": "flac", "format": "flac", "audioQuality": "LOSSLESS"}),
                 ],
                 q,
             );
-            assert_eq!(rows[0]["id"], "mp3", "quality={q} must keep the origin order");
+            assert_eq!(rows[0]["id"], "aac", "quality={q} must keep the origin order");
         }
     }
 
     #[test]
+    fn a_slashless_origin_mime_is_replaced_by_the_extension() {
+        // Measured: the origin answered `mime: "audio"` for a 26.7 MB ALAC `.m4a`.
+        assert_eq!(audio_mime("m4a", "audio", "audio"), "audio/mp4");
+        assert_eq!(audio_mime("flac", "audio/x-flac", "audio"), "audio/x-flac");
+        assert_eq!(audio_mime("mp3", "", "audio"), "audio/mpeg");
+        assert_eq!(audio_mime("wav", "", ""), "audio/wav");
+    }
+
+    #[test]
     fn the_rendition_names_a_real_codec_and_container() {
-        assert_eq!(codec_of("flac"), "flac");
-        assert_eq!(codec_of("mp3"), "mp3");
-        assert_eq!(codec_of("WAV"), "pcm");
-        assert_eq!(codec_of("sbin"), "");
-        // `.m4a` is ALAC in this catalogue, not AAC — never claim a codec for it
-        // (see `codec_of`). The container is still MP4, which is true for both.
-        assert_eq!(codec_of("m4a"), "");
+        assert_eq!(codec_of("flac", 0, 0), "flac");
+        assert_eq!(codec_of("mp3", 0, 0), "mp3");
+        assert_eq!(codec_of("WAV", 0, 0), "pcm");
+        assert_eq!(codec_of("sbin", 0, 0), "");
+        // `.m4a` is a container: 26.7 MB over 243 s is ALAC (Qobuz serves the
+        // same master at 886 kbps), 8.2 MB is AAC 256k. Only the lossless class
+        // is claimed; the lossy one stays unknown rather than a guess.
+        assert_eq!(codec_of("m4a", 26_704_889, 243), "alac");
+        assert_eq!(codec_of("m4a", 8_187_833, 243), "");
+        assert_eq!(codec_of("m4a", 0, 0), "");
         assert_eq!(container_of("m4a"), "mp4");
         assert_eq!(container_of("flac"), "flac");
     }

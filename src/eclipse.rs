@@ -124,6 +124,22 @@ pub fn tier(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
     }
 }
 
+/// CD's ceiling. 16-bit / 44.1 kHz stereo is ~1411 kbps even uncompressed, so a
+/// lossless file with MORE bits per second than that cannot be a CD copy.
+pub const CD_KBPS: u64 = 1411;
+
+/// Lossless AND above CD bitrate — i.e. a genuine hi-res master.
+///
+/// MEASURED 2026-11-07: `Guns N' Roses Sweet Child O' Mine` came back with 30
+/// rows and the backfill stayed silent, because a `LOSSLESS` row already existed.
+/// But the catalogue cannot say WHETHER that row is a CD copy or a 24/96 master:
+/// `tier()` only distinguishes `LOSSLESS` from `HIGH`, and a 16/44.1 FLAC and a
+/// 24/96 FLAC both read `LOSSLESS`. Bitrate is the one signal that separates them,
+/// which is why `format_track()` now emits `size` for the trigger to read.
+pub fn is_hi_res(ext: &str, file_size: u64, duration_secs: i64) -> bool {
+    is_lossless(ext, file_size, duration_secs) && kbps(file_size, duration_secs) > CD_KBPS
+}
+
 /// `fd_eclipse_audio_quality_score()` — higher is better.
 pub fn quality_score(ext: &str, size_bytes: u64) -> i64 {
     let weight = match ext.to_lowercase().as_str() {
@@ -189,6 +205,9 @@ pub fn format_track(item: &Value) -> Value {
         "artist": artist,
         "duration": duration,
         "durationMs": if duration > 0 { duration * 1000 } else { 180000 },
+        // The byte count, so a caller can tell a CD FLAC from a hi-res master
+        // (`is_hi_res`). Addons ignore keys they do not know.
+        "size": file_size,
         // The file's real container. No `.wav` alias: that rename is the
         // legacy trick that made the download path skip the ALAC transcode and
         // answer `audio/wav` with raw MP4 bytes.
@@ -332,5 +351,43 @@ mod tests {
         assert!(quality_score("flac", 10_000_000) > quality_score("m4a", 10_000_000));
         assert!(quality_score("m4a", 10_000_000) > quality_score("mp3", 10_000_000));
         assert!(quality_score("mp3", 100 * 1024) > quality_score("mp3", 0));
+    }
+
+    /// CD versus hi-res is a bitrate question, and it is the whole reason the
+    /// trigger exists: both read `LOSSLESS`, only one is worth a 40 MB upload.
+    /// 240 s: a CD FLAC lands near 900 kbps, a 24/96 master near 4600.
+    #[test]
+    fn only_above_cd_bitrate_counts_as_hi_res() {
+        let cd = 27_000_000u64;
+        let hi = 138_000_000u64;
+        assert_eq!(kbps(cd, 240), 900);
+        assert_eq!(kbps(hi, 240), 4600);
+        assert!(is_lossless("flac", cd, 240), "a CD FLAC is still lossless");
+        assert!(!is_hi_res("flac", cd, 240), "…but it is not hi-res");
+        assert!(is_hi_res("flac", hi, 240));
+        assert!(!is_hi_res("mp3", hi, 240), "a big mp3 is never hi-res");
+        assert!(!is_hi_res("flac", 0, 240), "no size, no claim");
+    }
+
+    /// The row carries the byte count the trigger reads; without it every song
+    /// looks like it has no hi-res master.
+    #[test]
+    fn a_track_row_carries_the_size_the_trigger_needs() {
+        let t = format_track(&serde_json::json!({
+            "short_code": "abc123",
+            "title": "Guns N' Roses - Sweet Child O' Mine.flac",
+            "performer": "Guns N' Roses",
+            "song_title": "Sweet Child O' Mine",
+            "extension": "flac",
+            "duration": 356,
+            "file_size": 138_000_000_u64
+        }));
+        assert_eq!(t["size"], 138_000_000u64);
+        assert_eq!(t["title"], "Sweet Child O' Mine");
+        assert!(is_hi_res(
+            t["format"].as_str().unwrap_or(""),
+            t["size"].as_u64().unwrap_or(0),
+            t["duration"].as_i64().unwrap_or(0)
+        ));
     }
 }

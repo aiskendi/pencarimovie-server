@@ -1635,18 +1635,28 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // edition + title keys), so a browse burst cannot queue the same upload
             // ten times. The empty query is excluded because a blank search would
             // ask the source for nothing and could fill an unrelated recording.
-            if !q.trim().is_empty()
-                && !rows
-                    .iter()
-                    .any(|t| str_at(t, "audioQuality") == "LOSSLESS")
-            {
+            // HI-RES, not merely "lossless".
+            //
+            // MEASURED 2026-11-07: `Guns N' Roses Sweet Child O' Mine` answered
+            // with 30 rows and never triggered, because a `LOSSLESS` row already
+            // existed — a CD copy. `eclipse::tier()` cannot tell a 16/44.1 FLAC
+            // from a 24/96 master (both read `LOSSLESS`); bitrate can, and
+            // `format_track()` now emits `size` for exactly this test.
+            let has_hi_res = rows.iter().any(|t| {
+                crate::eclipse::is_hi_res(
+                    &str_at(t, "format"),
+                    t.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                    t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            });
+            if !q.trim().is_empty() && !has_hi_res {
                 // Logged BEFORE anything can fail: a trigger that leaves no trail
                 // is indistinguishable from a trigger that never ran, which is
                 // exactly the confusion this line removes. `asked` records what the
                 // client requested, so a fill on a non-lossless browse is visible
                 // as such rather than looking like a stray upload.
                 log(
-                    "backfill: catalogue has no lossless row",
+                    "backfill: catalogue has no hi-res lossless",
                     &serde_json::json!({
                         "q": q,
                         "rows": rows.len(),

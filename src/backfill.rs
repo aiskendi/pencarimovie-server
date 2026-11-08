@@ -340,6 +340,21 @@ async fn resolve_relay(
 
 /* ── the on-demand trigger ──────────────────────────────────────────────── */
 
+/// At most ONE fill runs in a process at a time.
+///
+/// MEASURED 2026-11-08 19:14–19:15 UTC — the first window after the source
+/// started serving real masters again: five fills landed inside 25 s
+/// (17–45 MB each) and the fleet logged `Error R14 (Memory quota exceeded)`
+/// **eleven times in forty seconds on all five dynos**, while the router's 5xx
+/// count went from 0 to 19. A fill streams a whole master through
+/// `upload_stream` while up to eight user streams are live in the same 512 MB
+/// process, so two of them cannot be allowed to overlap.
+///
+/// The gate is per process, not per fleet: each dyno decides for itself, which
+/// is the right scope because the memory it protects is per dyno.
+static FILL_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
 /// The whole point of the backfill: a client asked for LOSSLESS and the
 /// catalogue had nothing lossless for that query.
 ///
@@ -368,7 +383,19 @@ pub fn spawn_for_query(q: &str, client: grammers_client::Client) {
         0,
     );
     let query = q.to_string();
+    let throttle_key = key.clone();
     tokio::spawn(async move {
+        let Ok(_permit) = FILL_GATE.try_acquire() else {
+            log(
+                "backfill: a fill is already running in this process - deferred",
+                &json!({"q": query}),
+            );
+            // The 10-minute per-query throttle was written before this task
+            // started; drop it so the next browse of this query can try again
+            // instead of the track staying unfilled for ten minutes.
+            crate::cache::invalidate("backfill_q", &throttle_key);
+            return;
+        };
         match backfill_for_query(&client, &query).await {
             Ok(()) => log("backfill: on-demand fill done", &json!({"q": query})),
             Err(e) => log(

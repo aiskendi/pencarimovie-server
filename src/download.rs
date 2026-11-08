@@ -238,6 +238,43 @@ async fn fetch_prime_gated(
     pos: u64,
     want: u64,
 ) -> Result<Vec<u8>, crate::telegram::GramErr> {
+    // BOUNDED, because this gate is shared with every other stream on the
+    // connection and `fetch_range_core` waits for a permit FOREVER ("requests
+    // queue, they never fail").
+    //
+    // MEASURED 2026-11-08 19:33–19:34 UTC on v31: 31 of 100 `/api/download`
+    // requests were killed by Heroku's router at 30 s (`H12`) and **8 of those
+    // 31 were music** — `The.Weeknd.Out.of.Time.flac` (49 MB),
+    // `04.BIRDS.OF.A.FEATHER.Explicit.flac` (41 MB), `PinkPantheress.Illegal.flac`
+    // and others — while the dyno's 32 parts were all streaming something else.
+    // A queued first byte has to become a fast, retryable answer instead of a
+    // 30 s hang the router turns into a 503 the player cannot retry.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PRIME_GATE_WAIT_SECS),
+        prime_parts(client, gate, target, pos, want),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(crate::telegram::GramErr {
+            message: format!(
+                "{GATE_BUSY_PREFIX}: {}s waiting for a part permit",
+                PRIME_GATE_WAIT_SECS
+            ),
+            ..Default::default()
+        }),
+    }
+}
+
+/// The prime itself, with no timeout: two parts in parallel when the head spans
+/// more than one Telegram part, one otherwise.
+async fn prime_parts(
+    client: &grammers_client::Client,
+    gate: &tokio::sync::Semaphore,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, crate::telegram::GramErr> {
     let (want, split) = prime_split(want);
     let Some((first_want, second_want)) = split else {
         return crate::telegram::fetch_range_gated(client, gate, target, pos, want).await;
@@ -267,6 +304,19 @@ async fn fetch_prime_gated(
 /// permit: no error, no log, and the latency this function exists to remove is
 /// back. `PRIME_BYTES` is the knob that would do it, so the guard sits next to
 /// the arithmetic instead of riding on `prime_window()`'s `.min(MB)`.
+/// How long a first byte may queue for a part permit before the request is
+/// answered "busy, retry" ([`GATE_BUSY_PREFIX`]) instead of hanging into the
+/// platform router's 30 s timeout. A 1 MB part is fetched in well under a
+/// second at the measured rates, so a longer wait means the connection is
+/// saturated, not slow.
+pub const PRIME_GATE_WAIT_SECS: u64 = 6;
+
+/// Prefix of the error that means "every part on this connection is busy". The
+/// pre-flight loop stops retrying on it (four retries would spend four wait
+/// budgets on the same saturation) and the handler answers `503` +
+/// `Retry-After`, which a player can act on.
+pub const GATE_BUSY_PREFIX: &str = "parts busy";
+
 fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
     let want = want.min(crate::telegram::MB);
     if want <= crate::telegram::MAX_CHUNK {
@@ -1636,6 +1686,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         "short_code": short_code,
                     }),
                 );
+                // Saturation is not a dead file: four attempts would each spend
+                // their own wait budget on the same full connection. Stop and let
+                // the handler answer a retryable 503.
+                if e.message.starts_with(GATE_BUSY_PREFIX) {
+                    last_err = Some(e);
+                    break;
+                }
                 let file_ref = e.file_reference;
                 last_err = Some(e);
                 if file_ref && !short_code.is_empty() {
@@ -1835,6 +1892,44 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 "flood_wait": err.flood_wait,
             }),
         );
+        // EVERY PART ON THIS CONNECTION IS BUSY. 503 + `Retry-After` is the one
+        // answer a player can act on: a 500 reads as "this track is broken" and
+        // the platform router's own 30 s `H12` gives the client nothing at all.
+        if err.message.starts_with(GATE_BUSY_PREFIX) {
+            let retry_after = 3;
+            record_refusal(
+                ctx,
+                started,
+                503,
+                "PARTS_BUSY",
+                &err.message,
+                &short_code,
+                serde_json::json!({"retry_after": retry_after, "bot_id": bot_id}),
+            );
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, retry_after.to_string())
+                .body(Body::from(
+                    serde_json::json!({
+                        "ok": 0,
+                        "message": "Every streaming slot is busy, please retry shortly.",
+                        "retry_after": retry_after,
+                        "short_code": short_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| {
+                    json_response(
+                        503,
+                        &serde_json::json!({
+                            "ok": 0,
+                            "message": "Every streaming slot is busy, please retry shortly.",
+                            "retry_after": retry_after,
+                        }),
+                    )
+                });
+        }
         // A rate limit is a 429, never a 5xx/404: a client reads those as fatal
         // and never retries (root AGENTS.md: "A rate limit must answer 429").
         if let Some(secs) = err.flood_wait {

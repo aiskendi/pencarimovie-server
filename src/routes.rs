@@ -7923,23 +7923,86 @@ fn audio_mime(ext: &str, mime: &str, file_type: &str) -> String {
 /// Indonesian titles are exactly that case: 30 rows, zero flac, and the lossless
 /// master sitting in Telegram as an `.m4a`.
 ///
-/// ONLY `lossless` reorders, and only by moving lossless rows ahead of lossy ones
-/// (stable, so the origin's ranking survives inside each group). Everything else
-/// — no `quality`, `high`, `low`, an addon option we do not publish — keeps the
-/// origin's order untouched, which is what the video-era bug ("do not re-sort,
-/// the origin's order IS the ranking") was about. Rows are never DROPPED: hiding
-/// every lossy file would hide most of the catalogue from a client that asks for
-/// lossless on every request.
-fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
-    if !quality.trim().eq_ignore_ascii_case("lossless") {
-        return tracks;
+/// FOUR tiers now, because the client sends four: `hi_res`, `lossless`, `medium`
+/// and `low` (measured 2026-11-07 on Heroku: `asked:"hi_res"` on the search,
+/// `quality=LOSSLESS` on the stream).
+///
+/// - `hi_res` puts a genuine master first — lossless AND above CD bitrate — then
+///   any other lossless, then lossy. Without this a `hi_res` request was answered
+///   in the origin's order, so the CD copy we were about to replace could still
+///   outrank the 24-bit master we had just fetched.
+/// - `lossless` puts any bit-exact row first (the original measured failure).
+/// - `medium` prefers a normal lossy file, the one nearest 256 kbps.
+/// - `low` prefers the SMALLEST lossy file that still plays.
+///
+/// Sorting is stable, so the origin's ranking survives inside each group, and
+/// every other value — no `quality`, `high`, an option we do not publish — keeps
+/// the origin's order untouched, which is what the video-era rule ("do not
+/// re-sort, the origin's order IS the ranking") was about. Rows are never
+/// DROPPED: hiding every lossy file would hide most of the catalogue from a
+/// client that asks for lossless on every request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Want {
+    HiRes,
+    Lossless,
+    Medium,
+    Low,
+}
+
+fn want_of(quality: &str) -> Option<Want> {
+    match quality.trim().to_ascii_lowercase().as_str() {
+        "hi_res" | "hi-res" | "hires" => Some(Want::HiRes),
+        "lossless" => Some(Want::Lossless),
+        "medium" | "mid" => Some(Want::Medium),
+        "low" | "datasaver" | "data_saver" => Some(Want::Low),
+        _ => None,
     }
-    let mut rows: Vec<(bool, Value)> = tracks
+}
+
+fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
+    let Some(want) = want_of(quality) else {
+        return tracks;
+    };
+    let mut rows: Vec<((u8, u64), Value)> = tracks
         .into_iter()
-        .map(|t| (str_at(&t, "audioQuality") == "LOSSLESS", t))
+        .map(|t| {
+            let format = str_at(&t, "format");
+            let size = t.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let duration = t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+            let lossless = str_at(&t, "audioQuality") == "LOSSLESS";
+            let hi_res = crate::eclipse::is_hi_res(&format, size, duration);
+            // An unknown bitrate must never win a "smallest file" race.
+            let kbps = match crate::eclipse::kbps(size, duration) {
+                0 => u64::MAX,
+                k => k,
+            };
+            // Inside the hi-res/lossless groups the HIGHEST bitrate wins, not the
+            // origin's order: a 5122 kbps master must beat a 1832 kbps one, and
+            // `u64::MAX - kbps` sorts ascending with unknown (0) last.
+            let best_first = u64::MAX - kbps.min(u64::MAX - 1);
+            let key = match want {
+                Want::HiRes => (
+                    if hi_res { 0 } else if lossless { 1 } else { 2 },
+                    best_first,
+                ),
+                Want::Lossless => (if lossless { 0 } else { 1 }, best_first),
+                Want::Medium => (
+                    if lossless { 1 } else { 0 },
+                    kbps.abs_diff(256),
+                ),
+                // SIZE, not bitrate: the smallest files in this catalogue are
+                // YouTube rips with `duration: 0`, so their bitrate is unknown —
+                // ranking by bitrate pushed exactly the data-saver rows to the
+                // bottom (measured: `low` returned the same order as `medium`).
+                Want::Low => (
+                    if lossless { 1 } else { 0 },
+                    if size == 0 { u64::MAX } else { size },
+                ),
+            };
+            (key, t)
+        })
         .collect();
-    // `false` sorts first, so `!lossless` puts the bit-exact rows on top.
-    rows.sort_by_key(|(lossless, _)| !*lossless);
+    rows.sort_by_key(|(key, _)| *key);
     rows.into_iter().map(|(_, t)| t).collect()
 }
 
@@ -8010,11 +8073,11 @@ mod bitchord_tests {
         assert_eq!(rows[3]["id"], "mp3");
     }
 
-    /// Every other value — and the no-quality case Eclipse takes now that we
-    /// publish no settings — leaves the origin's ranking exactly as it was.
+    /// A quality we do not publish — and the no-quality case Eclipse takes —
+    /// leaves the origin's ranking exactly as it was.
     #[test]
-    fn only_a_lossless_request_reorders() {
-        for q in ["", "HIGH", "high", "LOW", "max"] {
+    fn only_a_published_quality_reorders() {
+        for q in ["", "HIGH", "high", "max"] {
             let rows = rank_for_tier(
                 vec![
                     serde_json::json!({"id": "aac", "format": "m4a", "audioQuality": "HIGH"}),
@@ -8024,6 +8087,88 @@ mod bitchord_tests {
             );
             assert_eq!(rows[0]["id"], "aac", "quality={q} must keep the origin order");
         }
+    }
+
+    /// Four rows that are the same 240 s song at four qualities: a 24/96 master
+    /// (4600 kbps), a CD FLAC (900), a 320k mp3 and a 128k mp3.
+    fn four_qualities() -> Vec<Value> {
+        vec![
+            serde_json::json!({"id": "cd", "format": "flac", "audioQuality": "LOSSLESS",
+                               "size": 27_000_000u64, "duration": 240}),
+            serde_json::json!({"id": "mp3low", "format": "mp3", "audioQuality": "HIGH",
+                               "size": 3_840_000u64, "duration": 240}),
+            serde_json::json!({"id": "hi", "format": "flac", "audioQuality": "LOSSLESS",
+                               "size": 138_000_000u64, "duration": 240}),
+            serde_json::json!({"id": "mp3high", "format": "mp3", "audioQuality": "HIGH",
+                               "size": 9_600_000u64, "duration": 240}),
+        ]
+    }
+
+    /// `hi_res` is what BitChord actually asks for, and the master has to come
+    /// first even when a CD copy of the same recording is already in the answer —
+    /// which is exactly the copy we are about to replace.
+    #[test]
+    fn a_hi_res_request_puts_the_master_above_the_cd_copy() {
+        let rows = rank_for_tier(four_qualities(), "hi_res");
+        assert_eq!(rows.len(), 4, "nothing is ever dropped");
+        assert_eq!(rows[0]["id"], "hi");
+        assert_eq!(rows[1]["id"], "cd", "CD lossless beats any lossy");
+    }
+
+    /// Inside the hi-res group the highest bitrate wins, not the origin's order:
+    /// measured on `Sweet Child O' Mine`, the 1832 kbps copy was listed before the
+    /// 5122 kbps master and outranked it.
+    #[test]
+    fn the_best_master_wins_inside_the_hi_res_group() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "hi1832", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 81_504_144u64, "duration": 356}),
+                serde_json::json!({"id": "hi5122", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 227_928_900u64, "duration": 356}),
+            ],
+            "hi_res",
+        );
+        assert_eq!(rows[0]["id"], "hi5122", "the bigger master wins despite the order");
+    }
+
+    /// `medium` is a normal lossy file, and the one nearest 256 kbps wins.
+    #[test]
+    fn a_medium_request_prefers_lossy_near_256k() {
+        let rows = rank_for_tier(four_qualities(), "medium");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["id"], "mp3high", "320k is nearer 256k than 128k");
+        assert_eq!(rows[1]["id"], "mp3low");
+        assert_eq!(rows[2]["id"], "cd", "lossless is kept, but last");
+    }
+
+    /// `low` is data saver: the smallest file that still plays comes first.
+    #[test]
+    fn a_low_request_prefers_the_smallest_lossy_file() {
+        let rows = rank_for_tier(four_qualities(), "low");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["id"], "mp3low");
+        assert_eq!(rows[1]["id"], "mp3high");
+        assert_eq!(rows[3]["id"], "hi");
+    }
+
+    /// A row with no SIZE cannot be the smallest file; one with a size but no
+    /// duration CAN, and must — those are the YouTube rips a data-saver wants.
+    #[test]
+    fn low_ranks_by_size_not_by_bitrate() {
+        let rows = rank_for_tier(
+            vec![
+                serde_json::json!({"id": "nosize", "format": "mp3", "audioQuality": "HIGH"}),
+                serde_json::json!({"id": "big", "format": "mp3", "audioQuality": "HIGH",
+                                   "size": 14_256_960u64, "duration": 356}),
+                serde_json::json!({"id": "tiny_no_duration", "format": "mp3",
+                                   "audioQuality": "HIGH", "size": 4_848_044u64}),
+            ],
+            "low",
+        );
+        assert_eq!(rows[0]["id"], "tiny_no_duration", "smallest by size wins");
+        assert_eq!(rows[1]["id"], "big");
+        assert_eq!(rows[2]["id"], "nosize", "no size is never the smallest");
     }
 
     #[test]

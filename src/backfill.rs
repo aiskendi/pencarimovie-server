@@ -148,6 +148,24 @@ fn enc(s: &str) -> String {
     out
 }
 
+/// Delete apostrophes instead of leaving them for the origin to space out.
+///
+/// MEASURED 2026-11-08, and it cost seven duplicate uploads: the origin's
+/// `filter_filename()` replaces every character outside `[letter, digit, &, space]`
+/// with a SPACE, so the file we named `What I've Done` is stored as
+/// `What I ve Done` and its search tokens become `what i ve done`. Every client
+/// types `what ive done` — one token — so Manticore can never match the row and
+/// the song looks unindexed forever. Deleting the apostrophe here leaves
+/// `What Ive Done` → tokens `what ive done`, which is what people search, and the
+/// origin's filter then has no punctuation left to break.
+///
+/// Curly forms included: a phone keyboard sends `’`, not `'`.
+fn drop_apostrophes(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, '\'' | '\u{2019}' | '\u{2018}' | '`' | '\u{00B4}'))
+        .collect()
+}
+
 /// A file name Telegram will accept: no path separators, no characters that
 /// break a caption.
 fn safe_name(artist: &str, title: &str, ext: &str) -> String {
@@ -156,6 +174,7 @@ fn safe_name(artist: &str, title: &str, ext: &str) -> String {
     } else {
         format!("{artist} - {title}")
     };
+    let raw = drop_apostrophes(&raw);
     let cleaned: String = raw
         .chars()
         .map(|c| match c {
@@ -221,10 +240,40 @@ fn ledger_del(key: &str) {
 /// "the origin refused to answer" — which must not block a backfill, so the
 /// caller still has the local ledger as the real gate.
 async fn already_indexed(title: &str, artist: &str, size: u64) -> Option<String> {
-    let q = format!("{title} {artist}").trim().to_string();
-    if q.is_empty() {
-        return None;
+    // Two spellings, because the catalogue holds both: rows sent before this fix
+    // carry the origin's spaced form (`What I ve Done`), rows sent after carry the
+    // deleted form (`What Ive Done`). Searching only one of them is exactly how
+    // seven copies of the same 45.9 MB master got uploaded.
+    for q in search_spellings(title, artist) {
+        if let Some(code) = already_indexed_once(&q, size).await {
+            return Some(code);
+        }
     }
+    None
+}
+
+/// Every query the duplicate gate should try, deduped, empty ones dropped.
+fn search_spellings(title: &str, artist: &str) -> Vec<String> {
+    let raw = format!("{title} {artist}");
+    let joined = drop_apostrophes(&raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let spaced = raw
+        .replace(['\'', '\u{2019}', '\u{2018}', '`', '\u{00B4}'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out: Vec<String> = Vec::new();
+    for q in [joined, spaced] {
+        if !q.is_empty() && !out.contains(&q) {
+            out.push(q);
+        }
+    }
+    out
+}
+
+async fn already_indexed_once(q: &str, size: u64) -> Option<String> {
     let url = format!(
         "{}/search-music?search={}&limit=25",
         crate::config::wp_api_base().trim_end_matches('/'),
@@ -893,5 +942,43 @@ mod tests {
         assert_eq!(reduced_query("namumula maki"), None);
         assert_eq!(reduced_query("(live)"), None);
         assert_eq!(reduced_query("   "), None);
+    }
+
+    /// The measured failure, 2026-11-08: an apostrophe in the title must be
+    /// DELETED from the file name. Left in, the origin spaces it out, the stored
+    /// tokens become `what i ve done`, and the client's `what ive done` matches
+    /// nothing — seven copies of one 45.9 MB master, none findable.
+    #[test]
+    fn an_apostrophe_is_deleted_from_the_file_name_not_spaced() {
+        assert_eq!(
+            safe_name("Linkin Park", "What I've Done", "flac"),
+            "Linkin Park - What Ive Done.flac"
+        );
+        assert_eq!(
+            safe_name("Guns N' Roses", "Sweet Child O' Mine", "flac"),
+            "Guns N Roses - Sweet Child O Mine.flac"
+        );
+        // A phone keyboard sends the curly form.
+        assert_eq!(
+            safe_name("Aliyah\u{2019}s Interlude", "It\u{2019}s", "flac"),
+            "Aliyahs Interlude - Its.flac"
+        );
+        // A hyphenated title keeps its hyphen; only apostrophes go.
+        assert_eq!(
+            safe_name("Kyle Raphael", "Libu-Libong Buwan (Uuwian)", "flac"),
+            "Kyle Raphael - Libu-Libong Buwan (Uuwian).flac"
+        );
+    }
+
+    /// The duplicate gate has to try both spellings, because the catalogue holds
+    /// rows from before the fix (`What I ve Done`) and after it (`What Ive Done`).
+    #[test]
+    fn the_duplicate_gate_tries_both_spellings() {
+        let q = search_spellings("What I've Done", "Linkin Park");
+        assert!(q.contains(&"What Ive Done Linkin Park".to_string()), "got {q:?}");
+        assert!(q.contains(&"What I ve Done Linkin Park".to_string()), "got {q:?}");
+        // No apostrophe means one query, not two.
+        assert_eq!(search_spellings("Namumula", "Maki"), vec!["Namumula Maki"]);
+        assert!(search_spellings("", "").is_empty());
     }
 }

@@ -1650,6 +1650,10 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 )
             });
             if !q.trim().is_empty() && !has_hi_res {
+                // A pool pick, not the primary bot: uploads are rate-limited per
+                // ACCOUNT, and a fleet all uploading through one bot floods
+                // (`upload.saveBigFilePart` 420). See `upload_bot`.
+                let bot = upload_bot();
                 // Logged BEFORE anything can fail: a trigger that leaves no trail
                 // is indistinguishable from a trigger that never ran, which is
                 // exactly the confusion this line removes. `asked` records what the
@@ -1661,9 +1665,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                         "q": q,
                         "rows": rows.len(),
                         "asked": ctx.qs("quality"),
+                        "bot": bot,
                     }),
                 );
-                let bot = get_bot_id();
                 if bot.is_empty() {
                     log("backfill: no bot session, cannot fill", &serde_json::json!({"q": q}));
                 } else {
@@ -1736,7 +1740,8 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 &serde_json::json!({"ok": 0, "error": "track_id must be the source's numeric id"}),
             );
         }
-        let bot = get_bot_id();
+        // A pool pick, not the primary bot — the upload budget is per account.
+        let bot = upload_bot();
         if bot.is_empty() {
             return json_response(
                 503,
@@ -7904,6 +7909,28 @@ fn audio_mime(ext: &str, mime: &str, file_type: &str) -> String {
         _ => "audio/mpeg",
     }
     .to_string()
+}
+
+/// The bot that will PERFORM an upload — a pool pick, not always the primary.
+///
+/// MEASURED 2026-11-08 on Heroku (v26): every dyno started its own fill the moment
+/// a search arrived, all through the same primary bot, and Telegram answered ten
+/// uploads in ten seconds with
+/// `FLOOD_WAIT … caused by upload.saveBigFilePart` — every fill failed. The upload
+/// budget is per ACCOUNT, so a fill has to rotate through the pool exactly the way
+/// streaming already does ([`crate::session::pick_pool_bot`], which persists its
+/// round-robin index, so consecutive fills land on different bots).
+///
+/// Falls back to the primary when the pool has nothing usable.
+fn upload_bot() -> String {
+    crate::session::pick_pool_bot()
+        .and_then(|b| {
+            b.get("bot_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(get_bot_id)
 }
 
 /// Put the rendition the client ASKED for first, because BitChord matches a

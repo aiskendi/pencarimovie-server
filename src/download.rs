@@ -1781,11 +1781,41 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     }
                     continue;
                 }
-                // Not a reference error: re-boot the session and retry.
+                // Not a reference error: a TRANSPORT reset. grammers reports it
+                // as `request error: read 0 bytes` / `reset by peer` /
+                // `broken pipe` — the TCP connection to the datacentre went away
+                // mid-read, which the file itself has nothing to do with.
+                //
+                // MEASURED 2026-11-08 from the live log: one music short_code
+                // (`o7miXT`) failed attempts 1, 2 and 3 inside six seconds with
+                // that same message and the player stalled, because the old code
+                // here called `boot()` and `boot()` hands back the pooled entry
+                // UNCHANGED when no token is given ([`crate::telegram`] line 462),
+                // so the retry ran instantly on the worker slot that had just
+                // died. Rotate the slot and let the reconnect breathe.
                 if let Ok(e) = state.telegram.boot(&bot_id, None).await {
                     let (c, g) = e.pick_slot();
                     client = c;
                     client_gate = g;
+                }
+                if attempt < max_attempts {
+                    let ms = 250u64 * attempt as u64;
+                    log(
+                        "transport reset - rotating the worker before the next attempt",
+                        &serde_json::json!({
+                            "short_code": short_code,
+                            "attempt": attempt,
+                            "wait_ms": ms,
+                            "transport": last_err.as_ref().map(|e| e.transport).unwrap_or(false),
+                        }),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    // A retry that survived a dead connection is progress, so it
+                    // gets its own window (bounded by the hard cap) — same rule as
+                    // the reference-expiry path above.
+                    preflight_deadline = (std::time::Instant::now()
+                        + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+                        .min(hard_deadline);
                 }
             }
         }

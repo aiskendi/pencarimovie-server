@@ -817,6 +817,17 @@ pub fn plan_download_candidates(
     (chosen_bot, candidates)
 }
 
+/// Wall-clock second this process started.
+///
+/// A Telegram `file_reference` is bound to the session that minted it, so an id
+/// stamped before this instant cannot be used by this process at all — the
+/// session that owned it is gone. Lazily fixed at the first download, which is
+/// also the first moment the value matters.
+fn boot_at() -> i64 {
+    static BOOT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(now)
+}
+
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let started = std::time::Instant::now();
     if !is_authenticated(ctx) {
@@ -949,8 +960,30 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // gets 20 minutes; one that was never fetched yet (prewarm output)
             // gets 10, because nobody has checked it.
             let stamped = if verified > 0 { verified } else { resolved };
-            let window = if verified > 0 { 1200 } else { 600 };
-            let fresh_enough = stamped > 0 && now() - stamped < window;
+            // An id stamped by a PREVIOUS process is dead no matter how young it
+            // looks: a `file_reference` is bound to the session that minted it, and
+            // a restart opens a new one. MEASURED 2026-11-07 after the fix above:
+            // the only remaining `FILE_REFERENCE_EXPIRED` in the log was `ONtzzQ`,
+            // a bare `range:""` request fired immediately after
+            // `telegram session resumed`. 18 bodies served, that one failure.
+            let from_this_process = stamped >= boot_at();
+            // MEASURED 2026-11-07 on the production build, from the live log: 7 of
+            // 7 Eclipse plays started from an UNVERIFIED cached id and every one of
+            // them died with `FILE_REFERENCE_EXPIRED (400)` before the first byte,
+            // then recovered on a forced re-resolve — and the client had already
+            // moved to the next song by then. That failure IS the "it skips the
+            // song" symptom, so the 600 s trust window for an unverified id was
+            // 600 s too generous: a `file_reference` is minted per send and is
+            // dead long before the resolve answer is 10 minutes old.
+            //
+            // An unverified id is therefore NEVER fresh enough. It is dropped here
+            // and the normal resolve mints a live reference: one origin call
+            // (~0.4 s measured) instead of a guaranteed 400 plus a recovery the
+            // player does not wait for. A PROVEN id (verified_at > 0) keeps its
+            // 20-minute window — those are the ones that actually stream.
+            let window = if verified > 0 { 1200 } else { 0 };
+            let fresh_enough =
+                stamped > 0 && from_this_process && now() - stamped < window;
             if !cached_id.is_empty() && !(fresh_enough && same_bot) {
                 // Drop it, or the resolve below hands the same dead reference
                 // straight back and the Play fails on the first byte.

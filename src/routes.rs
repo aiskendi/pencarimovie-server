@@ -1616,10 +1616,68 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 let a = ctx.qs("q");
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
-            let tracks = rank_for_tier(
-                local_artwork(&ctx.base_url, eclipse_search(&q, 30).await),
-                &ctx.qs("quality"),
-            );
+            let rows = eclipse_search(&q, 30).await;
+            // A song the catalogue holds no LOSSLESS copy of is what the backfill
+            // EXISTS for — and the trigger is now the CATALOGUE, not the client's
+            // request.
+            //
+            // The old condition also required `quality=lossless` from the caller.
+            // That is wrong for a hi-res catalogue: `eclipse::tier()` can only say
+            // `LOSSLESS` or `HIGH` (there is no hi-res-versus-CD-lossless field to
+            // read), so "this song has no hi-res lossless" can only be answered by
+            // "this song has no lossless row at all" — and a client browsing
+            // without asking for lossless would never have triggered it.
+            //
+            // Nothing is awaited here: the client gets its answer immediately from
+            // what the catalogue holds, and the fill happens in the background so
+            // the NEXT request for this song has a real lossless row. Deduped per
+            // query (10 min, `spawn_for_query`) and per recording (the ledger's
+            // edition + title keys), so a browse burst cannot queue the same upload
+            // ten times. The empty query is excluded because a blank search would
+            // ask the source for nothing and could fill an unrelated recording.
+            if !q.trim().is_empty()
+                && !rows
+                    .iter()
+                    .any(|t| str_at(t, "audioQuality") == "LOSSLESS")
+            {
+                // Logged BEFORE anything can fail: a trigger that leaves no trail
+                // is indistinguishable from a trigger that never ran, which is
+                // exactly the confusion this line removes. `asked` records what the
+                // client requested, so a fill on a non-lossless browse is visible
+                // as such rather than looking like a stray upload.
+                log(
+                    "backfill: catalogue has no lossless row",
+                    &serde_json::json!({
+                        "q": q,
+                        "rows": rows.len(),
+                        "asked": ctx.qs("quality"),
+                    }),
+                );
+                let bot = get_bot_id();
+                if bot.is_empty() {
+                    log("backfill: no bot session, cannot fill", &serde_json::json!({"q": q}));
+                } else {
+                    // The client is resolved INSIDE the task: a freshly booted
+                    // server has not necessarily put the bot in the pool yet, and a
+                    // search arriving in that window must still schedule the fill.
+                    let st = state.clone();
+                    let query = q.clone();
+                    tokio::spawn(async move {
+                        let entry = match st.telegram.get(&bot).await {
+                            Some(e) => Some(e),
+                            None => st.telegram.boot(&bot, None).await.ok(),
+                        };
+                        match entry {
+                            Some(e) => crate::backfill::spawn_for_query(&query, e.pick()),
+                            None => log(
+                                "backfill: bot could not be booted",
+                                &serde_json::json!({"q": query, "bot_id": bot}),
+                            ),
+                        }
+                    });
+                }
+            }
+            let tracks = rank_for_tier(local_artwork(&ctx.base_url, rows), &ctx.qs("quality"));
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/catalog/") {
@@ -1637,6 +1695,84 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             return eclipse_stream(&ctx, rest.trim_end_matches(".json")).await;
         }
         return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
+    }
+
+    /* ── /api/backfill ────────────────────────────────────────────────────── */
+    // POST {track_id, title, artist, duration} → fetch that master from the
+    // hi-res source, send it to a relay account, and answer with the handle that
+    // plays it back. Deliberately synchronous: an operator wants the reason when
+    // it refuses (already indexed, no usable relay, source down), and a 25 MB
+    // upload is a one-off, not a hot path.
+    if p == "/api/backfill" && m == "POST" {
+        if let Some(resp) = require_trusted_device(&ctx) {
+            return resp;
+        }
+        let body: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let param = |name: &str| -> String {
+            let q = ctx.qs(name);
+            if !q.is_empty() {
+                return q.trim().to_string();
+            }
+            body.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let track_id = param("track_id");
+        if track_id.is_empty() || !track_id.chars().all(|c| c.is_ascii_digit()) {
+            return json_response(
+                400,
+                &serde_json::json!({"ok": 0, "error": "track_id must be the source's numeric id"}),
+            );
+        }
+        let bot = get_bot_id();
+        if bot.is_empty() {
+            return json_response(
+                503,
+                &serde_json::json!({"ok": 0, "error": "no bot session — a send needs a logged-in bot"}),
+            );
+        }
+        let entry = match state.telegram.get(&bot).await {
+            Some(e) => e,
+            None => match state.telegram.boot(&bot, None).await {
+                Ok(e) => e,
+                Err(e) => {
+                    return json_response(
+                        503,
+                        &serde_json::json!({"ok": 0, "error": format!("bot boot: {e}")}),
+                    )
+                }
+            },
+        };
+        let client = entry.pick();
+        let duration = body
+            .get("duration")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        return match crate::backfill::backfill(
+            &client,
+            &track_id,
+            &param("title"),
+            &param("artist"),
+            duration,
+            &param("relay"),
+        )
+        .await
+        {
+            Ok(b) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "file_name": b.file_name,
+                    "size": b.size,
+                    "message_id": b.message_id,
+                    "dc_id": b.target.dc_id,
+                    "playable": true,
+                }),
+            ),
+            Err(e) => json_response(409, &serde_json::json!({"ok": 0, "error": e})),
+        }
     }
 
     /* ── /api/resolve-shortcode, /api/warmup-resolve ──────────────────────── */
@@ -7800,6 +7936,23 @@ fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
 #[cfg(test)]
 mod bitchord_tests {
     use super::*;
+
+    /// Test-only: stamp `audioQuality` on already-formatted rows.
+    ///
+    /// The tier itself is NEVER decided here — [`crate::eclipse::tier()`] decides
+    /// it, and these tests only check that a row keeps its identity and that a
+    /// lossy container is never promoted. Called with no size/duration, which is
+    /// the honest worst case: anything not inherently bit-exact must stay HIGH.
+    fn add_audio_quality(rows: Vec<Value>) -> Vec<Value> {
+        rows.into_iter()
+            .map(|mut r| {
+                let format = str_at(&r, "format");
+                r["audioQuality"] =
+                    serde_json::json!(crate::eclipse::tier(&format, 0, 0));
+                r
+            })
+            .collect()
+    }
 
     #[test]
     fn a_row_keeps_the_id_and_title_bit_chord_matches_on() {

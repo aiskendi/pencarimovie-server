@@ -28,6 +28,7 @@ mod auth;
 mod cache;
 mod config;
 mod credentials;
+mod backfill;
 mod diagnostics;
 mod download;
 mod eclipse;

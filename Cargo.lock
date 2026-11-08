@@ -1828,6 +1828,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "unicode-normalization",
  "url",
  "x25519-dalek",

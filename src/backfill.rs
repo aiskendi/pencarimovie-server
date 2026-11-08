@@ -1,0 +1,897 @@
+//! Backfill: put a recording Telegram does not hold into Telegram, then play it
+//! from OUR OWN send result.
+//!
+//! The order matters and each gate is cheaper than the next step:
+//!
+//! 1. the local ledger — did *this engine* already backfill this track?
+//! 2. the origin's `search-music` — is a row of exactly this byte size already
+//!    indexed? (best effort: if the origin refuses, we continue and rely on 1)
+//! 3. fetch the master as a STREAM, never a buffer: `bytes_stream()` feeds
+//!    `upload_stream()` directly, so a 24.8 MB FLAC costs no temp file and no
+//!    full-size allocation.
+//! 4. send it to a relay account (a USERBOT, not a bot — Telegram does not
+//!    deliver bot-to-bot messages) and keep the `DocTarget` out of the send
+//!    result. That handle is what makes the file playable immediately, without
+//!    waiting for the origin to index it.
+//!
+//! The origin's webhook writes `tg_file_new` afterwards, which is what makes the
+//! track show up in search for every client; step 4 is what makes it play now.
+
+use futures_util::TryStreamExt;
+use grammers_client::Client;
+use serde_json::{json, Value};
+use tokio_util::io::StreamReader;
+
+use crate::log::log;
+
+/// Where a hi-res/lossless master can be fetched from: the SAME source Phase 1's
+/// fallback reads. Env-overridable, so §10 of `plans/music-hires-fallback.md` (the
+/// third-party-host exception) is configuration rather than a patch.
+pub const HIRES_BASE: &str = "https://heisenbergbackaaahh.de.deplexo.com/a";
+
+/// The second source, tried only when the first one refuses.
+///
+/// MEASURED 2026-11-07: this host declares `bitchordAuth: true` and answers every
+/// path — `/a/search` and `/a/stream/{id}` alike — with
+/// `{"error":"bitchord_auth","code":"missing","message":"This addon only works in
+/// the official BitChord app"}`. An arbitrary `Authorization: Bearer …` does not
+/// change it: the code stays `missing`, so it wants its own credential, not a
+/// bearer. It stays in the chain because trying it costs one request ONLY after
+/// the primary has already failed, and the log then names exactly why it
+/// declined. The day a BitChord credential exists, this is a header, not a rewrite.
+pub const HIRES_FALLBACK: &str = "https://bitchord-hires-addon.de.deplexo.com/a";
+
+/// The caption put on the send: a bare mention of the indexer bot.
+///
+/// MEASURED 2026-11-07 — this is the only way this engine can get a file INDEXED:
+///
+/// - the catalogue's rows come from `saving_do_action()`, and
+///   `parse2.php:55` calls it for ONE bot id, `1422930632`;
+/// - our sender is a bot, and Telegram refuses bot → bot outright:
+///   `400 USER_BOT_TO_BOT_DISABLED caused by messages.sendMedia` (sent one
+///   throwaway 15 MB track to prove it — the upload completed, the send did not);
+/// - a bot → USER send works, and `tgfile_userbot_file_request_fallback()` shows
+///   the origin's own convention: media handed to a relay account with a caption
+///   naming a bot, which that account's userbot automation then delivers to the
+///   bot. That is a user → bot hop, which Telegram allows.
+///
+/// So the file goes to the relay account with this mention and the origin's
+/// userbot does the hop. Verified end-to-end by watching for the row, not assumed.
+pub const REQUEST_CAPTION: &str = "File Request By @inputfilebot";
+
+/// Source bases in order. `PM_HIRES_BASE` / `PM_HIRES_FALLBACK` override either
+/// slot; setting one to empty removes it.
+fn hires_bases() -> Vec<String> {
+    let pick = |var: &str, default: &str| match std::env::var(var) {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().trim_end_matches('/').to_string()),
+        Err(_) => Some(default.to_string()),
+    };
+    [
+        pick("PM_HIRES_BASE", HIRES_BASE),
+        pick("PM_HIRES_FALLBACK", HIRES_FALLBACK),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// GET `path` from the first source that answers 200.
+///
+/// The failure string names EVERY base tried, in order, and is deterministic —
+/// `tools/probe_lease_release.mjs` asserts that two consecutive failed attempts
+/// fail IDENTICALLY, and that equality is the proof that a lease was released
+/// rather than held.
+///
+/// MEASURED 2026-11-07, why every attempt is kept: with the primary throttling,
+/// naming only the last failure reported `bitchord… /stream/1 -> 401` and threw
+/// away the one fact that explained it (`heisenberg… /stream/1 -> 503`). The
+/// first cause is the useful one; the fallback is usually the refusal.
+async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
+    let bases = hires_bases();
+    if bases.is_empty() {
+        return Err(
+            "no hi-res source configured (PM_HIRES_BASE and PM_HIRES_FALLBACK are both empty)"
+                .to_string(),
+        );
+    }
+    let mut tried: Vec<String> = Vec::new();
+    for base in &bases {
+        let url = format!("{base}{path}");
+        let (body, status) =
+            crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
+        if status == 200 {
+            return Ok(body);
+        }
+        // A source that names its own refusal is worth the log line: `bitchord_auth`
+        // is the difference between "down right now" and "will never answer us".
+        let why = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        log(
+            "backfill: source refused",
+            &json!({"url": url, "status": status, "why": why}),
+        );
+        tried.push(format!("{url} -> {status}"));
+    }
+    Err(tried.join(" ; "))
+}
+
+/// A file we sent and can serve, described the way the byte path wants it.
+pub struct Backfilled {
+    pub target: crate::telegram::DocTarget,
+    pub message_id: i32,
+    pub size: u64,
+    pub file_name: String,
+}
+
+/* ── small helpers ───────────────────────────────────────────────────────── */
+
+fn jstr(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// RFC 3986 percent-encoding for one query value. Two lines of real work, so it
+/// does not justify a dependency for the single call site.
+fn enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// A file name Telegram will accept: no path separators, no characters that
+/// break a caption.
+fn safe_name(artist: &str, title: &str, ext: &str) -> String {
+    let raw = if artist.is_empty() {
+        title.to_string()
+    } else {
+        format!("{artist} - {title}")
+    };
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => ' ',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        format!("track.{ext}")
+    } else {
+        format!("{cleaned}.{ext}")
+    }
+}
+
+/* ── ledger (the reliable duplicate gate) ────────────────────────────────── */
+
+fn ledger_path() -> std::path::PathBuf {
+    crate::storage::storage_path("backfill.json")
+}
+
+fn ledger_load() -> Value {
+    std::fs::read_to_string(ledger_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn ledger_get(key: &str) -> Option<Value> {
+    ledger_load().get(key).cloned()
+}
+
+fn ledger_put(key: &str, entry: Value) {
+    let mut doc = ledger_load();
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert(key.to_string(), entry);
+        if let Ok(text) = serde_json::to_string(&doc) {
+            let _ = std::fs::write(ledger_path(), text);
+        }
+    }
+}
+
+fn ledger_del(key: &str) {
+    let mut doc = ledger_load();
+    if let Some(obj) = doc.as_object_mut() {
+        if obj.remove(key).is_some() {
+            if let Ok(text) = serde_json::to_string(&doc) {
+                let _ = std::fs::write(ledger_path(), text);
+            }
+        }
+    }
+}
+
+/* ── the origin's own duplicate check, best effort ───────────────────────── */
+
+/// `Some(short_code)` when the catalogue already holds a row of EXACTLY this
+/// byte size for this query.
+///
+/// Byte size is the key on purpose: a lossy export of the same song never lands
+/// on the same size as the lossless master, and the lossless master is one
+/// byte-for-byte file no matter which addon handed it over. `None` also means
+/// "the origin refused to answer" — which must not block a backfill, so the
+/// caller still has the local ledger as the real gate.
+async fn already_indexed(title: &str, artist: &str, size: u64) -> Option<String> {
+    let q = format!("{title} {artist}").trim().to_string();
+    if q.is_empty() {
+        return None;
+    }
+    let url = format!(
+        "{}/search-music?search={}&limit=25",
+        crate::config::wp_api_base().trim_end_matches('/'),
+        enc(&q)
+    );
+    let (body, status) = crate::httpc::http_json_h_status(&url, &[], "GET", 15, &[]).await;
+    if status != 200 {
+        log(
+            "backfill: origin duplicate check unavailable",
+            &json!({"q": q, "status": status}),
+        );
+        return None;
+    }
+    let rows = body
+        .get("tracks")
+        .or_else(|| body.get("items"))
+        .or_else(|| body.get("files"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for row in rows {
+        if row.get("file_size").and_then(|v| v.as_u64()) == Some(size) {
+            return Some(jstr(&row, "short_code"));
+        }
+    }
+    None
+}
+
+/* ── relay peer ─────────────────────────────────────────────────────────── */
+
+/// The relay accounts a backfill sends through.
+///
+/// The file goes to one of these, the account auto-forwards it to `@inputfilebot`
+/// (1422930632), and that bot's webhook is the one wired to index inbound media.
+///
+/// By USERNAME, not id: `messages.sendMedia` needs a peer reference carrying an
+/// `access_hash`, and the pool manifest publishes ids only — a bot cannot call
+/// `messages.getDialogs` (BOT_METHOD_INVALID) to find one, so an id is not an
+/// address at all.
+const RELAY_USERNAMES: [&str; 2] = ["BannedMany", "Matalipmy"];
+
+/// The first relay account this bot can actually reach.
+///
+/// Resolving is cheap; sending 25 MB is not. So every candidate is resolved
+/// first and the upload happens once, to whichever one answered.
+async fn resolve_relay(
+    client: &Client,
+    explicit: &str,
+) -> Result<(grammers_session::types::PeerRef, String), String> {
+    let mut tried = String::new();
+    let mut candidates: Vec<&str> = Vec::new();
+    if !explicit.trim().is_empty() {
+        candidates.push(explicit.trim());
+    }
+    candidates.extend(RELAY_USERNAMES);
+    for name in candidates {
+        match crate::telegram::resolve_peer(client, name).await {
+            Ok(peer) => return Ok((peer, name.to_string())),
+            Err(e) => tried.push_str(&format!(" {name}: {e};")),
+        }
+    }
+    Err(format!("no reachable relay account —{tried}"))
+}
+
+/* ── the on-demand trigger ──────────────────────────────────────────────── */
+
+/// The whole point of the backfill: a client asked for LOSSLESS and the
+/// catalogue had nothing lossless for that query.
+///
+/// Fire-and-forget on purpose. The search answer is served from what the
+/// catalogue already holds — a user staring at a spinner is worse than a lossy
+/// row — and the lossless copy lands for the next request. Measured need, from
+/// the live log: `paraluman adie`, `mahika`, `DAISIES`, `Done For Me (feat.
+/// Kehlani)` were all searched at `quality:"LOSSLESS"` with 1–7 rows and no
+/// improvement, because nothing was listening for that.
+///
+/// One attempt per query per 10 minutes: a browse burst must not queue ten
+/// uploads of the same song, and the ledger stops the same recording twice.
+pub fn spawn_for_query(q: &str, client: grammers_client::Client) {
+    let key = q.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if crate::cache::get("backfill_q", &key).is_some() {
+        return;
+    }
+    crate::cache::put(
+        "backfill_q",
+        &key,
+        &json!({"at": crate::storage::now()}),
+        600,
+        0,
+    );
+    let query = q.to_string();
+    tokio::spawn(async move {
+        match backfill_for_query(&client, &query).await {
+            Ok(()) => log("backfill: on-demand fill done", &json!({"q": query})),
+            Err(e) => log(
+                "backfill: on-demand fill skipped",
+                &json!({"q": query, "reason": e}),
+            ),
+        }
+    });
+}
+
+/// Words that mean "this is not the recording that was asked for".
+///
+/// MEASURED 2026-11-07 from live BitChord traffic: `q=Billie Eilish & Khalid
+/// lovely` had no real result on the source at all — its top bit-exact row was
+/// `DJ Moodz - Lovely - Tribute to Billie Eilish and Khalid`, next a remix, an
+/// instrumental and piano covers — and we uploaded the tribute. It cost 16 MB and
+/// put a cover in the archive under a title nobody asked for.
+///
+/// That was survivable while the trigger required `quality=lossless` from the
+/// client. It is not survivable now that any song without a lossless row triggers
+/// a fill: a query the source cannot actually satisfy must end in "no", not in a
+/// stand-in. A row that says what it is gets believed.
+const NOT_THE_RECORDING: [&str; 19] = [
+    "tribute",
+    "originally performed",
+    "made famous",
+    "in the style of",
+    "cover version",
+    "karaoke",
+    "instrumental",
+    "lullaby version",
+    "piano version",
+    "8-bit",
+    "8 bit",
+    "string quartet",
+    "backing track",
+    // A remix is a DIFFERENT recording, so it is not the song that was asked for
+    // either. Without these, the `lovely` case above would have fallen straight
+    // through the tribute to `Samy Jebari - Lovely (Samy Jebari Remix)`.
+    "remix",
+    "rework",
+    "sped up",
+    "slowed",
+    "nightcore",
+    "acoustic version",
+];
+
+fn is_a_stand_in(title: &str, artist: &str, album: &str) -> bool {
+    let hay = format!("{title} {artist} {album}").to_lowercase();
+    NOT_THE_RECORDING.iter().any(|marker| hay.contains(marker))
+}
+
+/// Strip the parts of a client query that steer the source away from the real
+/// recording.
+///
+/// MEASURED 2026-11-07 from live traffic: `LSD Genius (feat. Sia, Diplo &
+/// Labrinth)` answers with only `album: "LABRINTH, SIA, DIPLO PRESENT... LSD
+/// (REMIXES)"` rows (176 s and 194 s), while `LSD Genius` answers with the 213 s
+/// 24-bit original. The stand-in guard refused the remixes — correctly — and the
+/// fill then gave up, so a song the source HAD was reported as missing.
+///
+/// `None` when there is nothing to strip.
+fn reduced_query(q: &str) -> Option<String> {
+    let mut out = String::with_capacity(q.len());
+    let mut depth = 0usize;
+    for c in q.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    // `to_ascii_lowercase` keeps byte offsets identical, so a `find` on the
+    // lowercased copy is a safe index into the original.
+    let lower = out.to_ascii_lowercase();
+    let mut cut = out.len();
+    for marker in [" feat. ", " feat ", " ft. ", " ft ", " featuring "] {
+        if let Some(i) = lower.find(marker) {
+            cut = cut.min(i);
+        }
+    }
+    let trimmed = out[..cut]
+        .trim()
+        .trim_end_matches(['-', ',', '&', ':'])
+        .trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(q.trim()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// The source's rows for one query.
+async fn source_rows(q: &str) -> Result<Vec<Value>, String> {
+    let body = source_get(&format!("/search?q={}&limit=5", enc(q)), 10).await?;
+    Ok(body
+        .get("tracks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Upload the first acceptable row, or say nothing was usable.
+///
+/// `Ok(false)` is not an error: it means every row was rejected (no bit depth, or
+/// a stand-in), which is the caller's cue to try a reduced query.
+async fn fill_from_rows(client: &Client, q: &str, rows: &[Value]) -> Result<bool, String> {
+    for row in rows {
+        let id = jstr(row, "id");
+        let quality = jstr(row, "audioQuality").to_ascii_lowercase();
+        if id.is_empty() || !quality.contains("bit") {
+            continue;
+        }
+        let title = jstr(row, "title");
+        let artist = jstr(row, "artist");
+        let album = jstr(row, "album");
+        if is_a_stand_in(&title, &artist, &album) {
+            log(
+                "backfill: skipped a stand-in (cover/tribute/karaoke)",
+                &json!({"q": q, "title": title, "artist": artist}),
+            );
+            continue;
+        }
+        let duration = row.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        backfill(client, &id, &title, &artist, duration, "").await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Ask the source what it has for this query and upload the first row it calls
+/// bit-exact — unless that row announces itself as a stand-in.
+///
+/// The row's own `audioQuality` is the gate: only a source answer carrying a
+/// bit-depth claim (`"16-bit / 44.1 kHz"`, `"24-bit / 48 kHz"`) is trusted.
+/// An empty or `format`-only row is skipped — that is the same rule the search
+/// fallback uses, so the two cannot disagree about what counts as lossless.
+///
+/// If nothing in the answer is usable, the query is retried ONCE with the
+/// parenthetical and feature credits removed: those are what push the source
+/// towards remixes, and the plain title is what finds the original.
+async fn backfill_for_query(client: &Client, q: &str) -> Result<(), String> {
+    if fill_from_rows(client, q, &source_rows(q).await?).await? {
+        return Ok(());
+    }
+    let Some(reduced) = reduced_query(q) else {
+        return Err("source had no lossless row for this query".to_string());
+    };
+    log(
+        "backfill: retrying the source with a reduced query",
+        &json!({"q": q, "reduced": reduced}),
+    );
+    if fill_from_rows(client, &reduced, &source_rows(&reduced).await?).await? {
+        return Ok(());
+    }
+    Err(format!(
+        "source had no lossless row for this query (also tried \"{reduced}\")"
+    ))
+}
+
+/* ── the backfill itself ────────────────────────────────────────────────── */
+
+/// Total bytes of a signed CDN URL.
+///
+/// MEASURED: this CDN answers `HEAD` with no `Content-Length` at all, so the
+/// first version of this file refused every track with "master has no
+/// content-length". A one-byte `Range` request always carries the real total in
+/// `Content-Range: bytes 0-0/<total>`, which is the same header the probe used to
+/// report 24,805,746 B for the Sial master.
+async fn master_size(http: &reqwest::Client, url: &str) -> Result<u64, String> {
+    let resp = http
+        .get(url)
+        .header("Range", "bytes=0-0")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("size probe: {e}"))?;
+    if let Some(range) = resp.headers().get("content-range") {
+        if let Ok(text) = range.to_str() {
+            if let Some(total) = text.rsplit('/').next() {
+                if let Ok(n) = total.trim().parse::<u64>() {
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                }
+            }
+        }
+    }
+    // No `Content-Range` (a server that ignored the Range header) — then a plain
+    // length is the whole file and is trustworthy.
+    match resp.content_length() {
+        Some(n) if n > 1 => Ok(n),
+        _ => Err("master size unknown: no content-range and no content-length".to_string()),
+    }
+}
+
+/// Fetch `track_id` from the hi-res source and send it to a relay account,
+/// returning the handle that plays it back.
+///
+/// Fails (never panics) on: an already-known track, a source that cannot name a
+/// stream, a source that will not say its size, no usable relay account, and any
+/// send error. Every failure is a log line plus a message — a backfill runs on a
+/// user's request, so "no" has to be explainable.
+pub async fn backfill(
+    client: &Client,
+    track_id: &str,
+    title: &str,
+    artist: &str,
+    duration: i64,
+    relay: &str,
+) -> Result<Backfilled, String> {
+    let key = format!("qobuz:{track_id}");
+
+    // RESERVE THE RECORDING BEFORE THE UPLOAD, not after it.
+    //
+    // MEASURED 2026-11-07 from the live log: two different queries raced into the
+    // same recording and each uploaded it — `Zack Tabudlo - Pano` twice
+    // (messages 1629 and 1630) and `Mariah Deborah - Na Para Bang` (85 MB) twice
+    // (1632 and 1634), ~113 MB duplicated in under a minute. The per-query guard
+    // cannot see that, because `pano` and `pano zack tabudlo` are different keys,
+    // and the ledger was only written once the upload had finished, so both tasks
+    // read "not backfilled yet".
+    //
+    // A reservation with a 5-minute lease closes that window and self-clears: a
+    // crashed or failed attempt does not block the recording forever, and a large
+    // upload in progress is not restarted by a second query's trigger.
+    // TWO keys, because the same recording has two identities:
+    //
+    //   `qobuz:<track_id>` — the source's id for this edition. Two queries that
+    //   both resolve to it are already covered by this one.
+    //
+    //   `title:<title>|<artist>` — the SONG. The same recording reaches us under
+    //   a different Qobuz id (a remaster, a re-issue) and under a different
+    //   query, and the id key cannot see that. This is the "same title" gate.
+    //
+    // Both are reserved in one decision — see `reserve()` for why that has to be
+    // under a lock and not two separate reads.
+    let mut keys = vec![key.clone()];
+    if let Some(tk) = title_key(title, artist) {
+        keys.push(tk);
+    }
+    let stamp = crate::storage::now();
+    reserve(&keys, stamp)?;
+
+    // A FAILED ATTEMPT MUST COST NOTHING.
+    //
+    // MEASURED 2026-11-07 from `storage\_server_lease.out`: the source answers
+    // `503` with `retry-after: 15` when it throttles, and the first version of
+    // this file wrote the reservation and then returned on every error path —
+    // so a track the source paused for 15 seconds stayed unfillable for the
+    // whole 300-second lease. The retry here is the next client request, which
+    // is free, so release the reservation and let it happen.
+    let result = backfill_body(client, track_id, title, artist, duration, relay).await;
+    match &result {
+        // Carry the completed entry onto the title key as well, so the NEXT
+        // edition of the same song (a different source id) is refused by the
+        // title gate instead of being uploaded a second time.
+        Ok(_) => {
+            if let Some(done) = ledger_get(&key) {
+                for k in keys.iter().filter(|k| **k != key) {
+                    ledger_put(k, done.clone());
+                }
+            }
+        }
+        Err(_) => {
+            for k in &keys {
+                release_lease(k, stamp);
+            }
+        }
+    }
+    result
+}
+
+/// The same recording reaches us under more than one source id, so the song —
+/// not the edition id — has to be one of the gate keys. Alphanumerics only, so
+/// case, punctuation, accents-as-separators and stray spacing all fold together.
+fn title_key(title: &str, artist: &str) -> Option<String> {
+    let slug = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let t = slug(title);
+    if t.is_empty() {
+        return None;
+    }
+    Some(format!("title:{}|{}", t, slug(artist)))
+}
+
+/// One process owns the ledger file, so a mutex around the decision is what makes
+/// the gate real.
+///
+/// MEASURED 2026-11-07: the old code read the ledger, decided, and *then* wrote
+/// the reservation — three steps. Two queries arriving in the same millisecond
+/// both read "not backfilled yet" and both uploaded, which is exactly how
+/// `Zack Tabudlo - Pano` (27 MB, messages 1629/1630) and
+/// `Mariah Deborah - Na Para Bang` (85 MB, 1632/1634) each went out twice.
+static RESERVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reserve every key at once, or refuse with the reason.
+///
+/// A refusal names the key that blocked it: "already backfilled" from the id key
+/// and from the title key mean different things to whoever reads the log.
+fn reserve(keys: &[String], stamp: i64) -> Result<(), String> {
+    let _guard = RESERVE.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::storage::now();
+    for key in keys {
+        let Some(prev) = ledger_get(key) else {
+            continue;
+        };
+        let in_flight = prev.get("status").and_then(|v| v.as_str()) == Some("in_flight");
+        let at = prev.get("at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let lease_live = at > 0 && now - at < 300;
+        if !in_flight {
+            // A catalogue hit is the only non-upload terminal state, and it
+            // already carries the short code the origin minted.
+            let code = prev.get("short_code").and_then(|v| v.as_str()).unwrap_or("");
+            if !code.is_empty() {
+                return Err(format!("already in the catalogue: short_code={code}"));
+            }
+            return Err(format!(
+                "already backfilled: message_id={} size={} ({key})",
+                prev.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0),
+                prev.get("size").and_then(|v| v.as_u64()).unwrap_or(0)
+            ));
+        }
+        if lease_live {
+            return Err(format!("backfill already running for this recording ({key})"));
+        }
+        // Stale lease: take it over rather than leaving the track unfillable.
+    }
+    let entry = json!({"status": "in_flight", "at": stamp});
+    for key in keys {
+        ledger_put(key, entry.clone());
+    }
+    Ok(())
+}
+
+/// Delete the reservation WE made, and only if it is still ours.
+///
+/// The `stamp` check is the whole point: a stale lease can be taken over by
+/// another task, and the entry that task completes must never be deleted by the
+/// attempt that lost the race.
+fn release_lease(key: &str, stamp: i64) {
+    let ours = ledger_get(key)
+        .map(|cur| {
+            cur.get("status").and_then(|v| v.as_str()) == Some("in_flight")
+                && cur.get("at").and_then(|v| v.as_i64()) == Some(stamp)
+        })
+        .unwrap_or(false);
+    if ours {
+        ledger_del(key);
+    }
+}
+
+async fn backfill_body(
+    client: &Client,
+    track_id: &str,
+    title: &str,
+    artist: &str,
+    duration: i64,
+    relay: &str,
+) -> Result<Backfilled, String> {
+    let key = format!("qobuz:{track_id}");
+
+    // 1. the source's signed URL — the first base that answers
+    let info = source_get(&format!("/stream/{track_id}"), 8).await?;
+    let media_url = jstr(&info, "url");
+    if media_url.is_empty() {
+        return Err(format!("source /stream/{track_id} carried no url"));
+    }
+
+    // 2. how big is it — needed BOTH to plan the upload and to key the dedupe
+    // CONNECT timeout only. A total `timeout()` here kills the upload mid-stream:
+    // a 25 MB body piped into `upload_stream` takes minutes, and reqwest aborts
+    // the whole request — measured as
+    // `upload_stream …: error decoding response body` 32 s in.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let size = master_size(&http, &media_url).await?;
+
+    // 3. duplicate gates
+    match already_indexed(title, artist, size).await {
+        Some(code) => {
+            // Terminal, not transient: this exact byte size is in the
+            // catalogue, so no future request should upload it again. Written
+            // as a COMPLETED entry, so `release_lease` leaves it in place.
+            ledger_put(
+                &key,
+                json!({
+                    "status": "catalogue",
+                    "short_code": code,
+                    "size": size,
+                    "at": crate::storage::now(),
+                }),
+            );
+            return Err(format!(
+                "already in the catalogue: short_code={code} size={size}"
+            ));
+        }
+        None => {}
+    }
+
+    // 4. relay peer
+    let (peer, username) = resolve_relay(client, relay).await?;
+
+    // 5. stream the body STRAIGHT into the upload. No temp file, no buffer: the
+    //    `StreamReader` is the whole reason this can run on a phone.
+    let body = http
+        .get(&media_url)
+        .send()
+        .await
+        .map_err(|e| format!("GET master: {e}"))?;
+    if !body.status().is_success() {
+        return Err(format!("GET master -> {}", body.status()));
+    }
+    let mut reader = StreamReader::new(body.bytes_stream().map_err(std::io::Error::other));
+
+    let ext = jstr(&info, "format");
+    let ext = if ext.is_empty() { "flac".to_string() } else { ext };
+    let mime = jstr(&info, "mimeType");
+    let mime = if mime.is_empty() {
+        "audio/flac".to_string()
+    } else {
+        mime
+    };
+    let file_name = safe_name(artist, title, &ext);
+
+    let sent = crate::telegram::upload_and_send_audio(
+        client,
+        peer,
+        &mut reader,
+        size,
+        &file_name,
+        &mime,
+        title,
+        artist,
+        duration,
+        REQUEST_CAPTION,
+    )
+    .await
+    .map_err(|e| format!("upload+send: {e}"))?;
+
+    // Read the size ONCE, before the target is moved into the return value:
+    // `DocTarget` is not `Copy`, and three reads of `sent.target.size` around a
+    // move is exactly how a working build becomes a borrow error later.
+    let sent_size = sent.target.size;
+
+    // NO short_code here, deliberately. The short code is the API backend's to
+    // mint: its webhook writes the row, generates the code and owns the identity.
+    // This side only has to be able to PLAY the file it just sent, and that needs
+    // the send result — `dc_id` + the `(id, access_hash, file_reference)` triple —
+    // never a short code. Ledgered under the SOURCE id (`qobuz:<id>`) so a
+    // `pmq_` request can be answered before the backend has indexed anything.
+    ledger_put(
+        &key,
+        json!({
+            "message_id": sent.message_id,
+            "key": sent.key,
+            "size": sent_size,
+            "dc_id": sent.target.dc_id,
+            "doc_id": sent.target.doc_id(),
+            "access_hash": sent.target.access_hash(),
+            "file_ref": crate::fileid::base64url_encode(&sent.target.file_ref()),
+            "file_name": file_name,
+            "relay": username,
+        }),
+    );
+    log(
+        "backfill done",
+        &json!({
+            "track_id": track_id,
+            "file_name": file_name,
+            "bytes": sent_size,
+            "message_id": sent.message_id,
+            "relay": username,
+        }),
+    );
+
+    Ok(Backfilled {
+        target: sent.target,
+        message_id: sent.message_id,
+        size: sent_size,
+        file_name,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact rows the source returned for `Billie Eilish & Khalid lovely` on
+    /// 2026-11-07 — the query the real song simply does not exist for. Each one
+    /// was, or would have been, uploaded as "the song" before this guard.
+    #[test]
+    fn a_stand_in_is_never_mistaken_for_the_song() {
+        assert!(is_a_stand_in(
+            "Lovely - Tribute to Billie Eilish and Khalid",
+            "DJ Moodz",
+            "Lovely - Tribute to Billie Eilish and Khalid",
+        ));
+        assert!(is_a_stand_in(
+            "Billie Eilish, Khalid - Lovely (Samy Jebari Remix)",
+            "Samy Jebari",
+            "Billie Eilish, Khalid - Lovely (Samy Jebari Remix)",
+        ));
+        assert!(is_a_stand_in(
+            "Lovely (Originally Performed by Billie Eilish & Khalid)",
+            "Sing2Piano",
+            "Lovely",
+        ));
+        assert!(is_a_stand_in(
+            "Lovely - Tribute to Billie Eilish and Khalid (Instrumental Version)",
+            "DJ Moodz",
+            "Lovely - Tribute to Billie Eilish and Khalid",
+        ));
+    }
+
+    /// The guard must never eat a real recording — these are the songs the live
+    /// traffic actually filled, and several carry words a sloppy matcher catches.
+    #[test]
+    fn a_real_recording_is_never_called_a_stand_in() {
+        assert!(!is_a_stand_in("Namumula", "Maki", "KOLORCOASTER"));
+        assert!(!is_a_stand_in("Tingin", "Cup of Joe", "Silakbo"));
+        assert!(!is_a_stand_in("Genius", "LSD", "Labrinth, Sia & Diplo"));
+        assert!(!is_a_stand_in(
+            "when the party's over",
+            "Billie Eilish",
+            "WHEN WE ALL FALL ASLEEP, WHERE DO WE GO?",
+        ));
+        assert!(!is_a_stand_in("Libu-Libong Buwan (Uuwian)", "Kyle Raphael", ""));
+    }
+
+    /// Two editions of one song must fold to one title key, and a genuinely
+    /// different title must not.
+    #[test]
+    fn the_title_key_folds_one_song_and_not_two() {
+        assert_eq!(
+            title_key("Namumula", "Maki"),
+            title_key("NAMUMULA!", "  maki ")
+        );
+        assert_ne!(title_key("Namumula", "Maki"), title_key("Namumula", "HeartSilence"));
+        assert_eq!(title_key("", "Maki"), None);
+    }
+
+    /// The retry query. Measured case: the parenthetical is what sent the source
+    /// to the `(REMIXES)` album and lost the 24-bit original.
+    #[test]
+    fn a_parenthetical_and_a_feature_credit_are_stripped_for_the_retry() {
+        assert_eq!(
+            reduced_query("LSD Genius (feat. Sia, Diplo & Labrinth)").as_deref(),
+            Some("LSD Genius")
+        );
+        assert_eq!(
+            reduced_query("Song Title feat. Somebody").as_deref(),
+            Some("Song Title")
+        );
+        assert_eq!(
+            reduced_query("Tingin [Remastered]").as_deref(),
+            Some("Tingin")
+        );
+    }
+
+    /// Nothing to strip means no second source call.
+    #[test]
+    fn a_plain_query_is_not_retried() {
+        assert_eq!(reduced_query("Namumula"), None);
+        assert_eq!(reduced_query("namumula maki"), None);
+        assert_eq!(reduced_query("(live)"), None);
+        assert_eq!(reduced_query("   "), None);
+    }
+}

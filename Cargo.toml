@@ -65,6 +65,10 @@ ed25519-dalek = "2"
 # FLAC, which streams raw and plays natively. Dropping it also drops its whole
 # codec/container tree from the binary (see README for the measured size).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+# `StreamReader` turns a reqwest `bytes_stream()` into an `AsyncRead`, which is
+# what lets a backfill pipe the CDN body STRAIGHT into `upload_stream` with no
+# temp file and no full-size buffer. Already in the tree (0.7.20 via reqwest).
+tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 url = "2"
 # fd_fold_latin_accents() is Unicode NFD + strip-combining-marks. `iconv` is not

@@ -531,6 +531,51 @@ async fn backfill_for_query(client: &Client, q: &str) -> Result<(), String> {
 
 /* ── the backfill itself ────────────────────────────────────────────────── */
 
+/// A source-signed URL that fetches a SLICE of the recording, not the recording.
+///
+/// MEASURED 2026-11-08 on `heisenberg…` — the whole of "the upload is broke, only
+/// 1 MB". Every `/stream/{id}` answer, for every track including a 24-bit/192 kHz
+/// edition, came back as
+/// `…/file?eid=…&fmt=5&profile=raw&range=20-30&app_id=…&etsp=…&hmac=…` with
+/// `"format":"mp3"` and `"quality":"Qobuz MP3 · 16-bit · 44.1 kHz"`: the host had
+/// lost its full-quality credential and fell back to signing Qobuz's 30-second
+/// PREVIEW. Nothing in the payload says "preview", and `quality` still contains
+/// "bit", so the old gate (`quality.contains("bit")`) waved it through and a
+/// 1,200,588-byte clip was uploaded and indexed as a 283-second song.
+///
+/// The signed URL is the tell: a full master is signed with no `range` parameter
+/// at all, a preview with `range=20-30`.
+fn is_preview_url(url: &str) -> bool {
+    let Some((_, query)) = url.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        k.eq_ignore_ascii_case("range") && !v.trim().is_empty()
+    })
+}
+
+/// Formats that can hold a bit-exact master.
+///
+/// `m4a` is a CONTAINER, not proof — that one is settled by bitrate in
+/// [`crate::eclipse::is_lossless`]. An empty `format` is allowed through here and
+/// decided by the size check below, because a source that names no format must
+/// not be trusted either way on the name alone.
+fn may_hold_a_master(fmt: &str) -> bool {
+    matches!(
+        fmt.to_ascii_lowercase().as_str(),
+        "" | "flac" | "wav" | "alac" | "aiff" | "aif" | "ape" | "dsf" | "dff" | "m4a"
+    )
+}
+
+/// Bits per second below which a "master" is a clip, not a recording.
+///
+/// No lossless master encodes under this: CD 16/44.1 is 1411 kbps and even a
+/// quiet mono FLAC stays well above 600. The 2026-11-08 preview measured 34 kbps
+/// over a 283-second track (1,200,588 B), so this catches a clip even if a future
+/// source signs one without a `range` marker.
+const MIN_MASTER_KBPS: u64 = 128;
+
 /// Total bytes of a signed CDN URL.
 ///
 /// MEASURED: this CDN answers `HEAD` with no `Content-Length` at all, so the
@@ -742,6 +787,36 @@ async fn backfill_body(
         return Err(format!("source /stream/{track_id} carried no url"));
     }
 
+    // 1b. NOTHING THAT IS NOT THE RECORDING MAY BE UPLOADED.
+    //
+    // Both checks are free and happen before a byte is fetched, so a degraded
+    // source costs one API call per attempt instead of a garbage 1 MB upload.
+    // Every refusal below returns `Err`, which releases the lease, so the track
+    // is retried the moment the source can serve a real master again.
+    if is_preview_url(&media_url) {
+        log(
+            "backfill: refused a preview slice",
+            &json!({"track_id": track_id, "url": media_url}),
+        );
+        return Err(format!(
+            "source /stream/{track_id} signed a preview slice (range=), not the master"
+        ));
+    }
+    let signed_format = jstr(&info, "format").to_ascii_lowercase();
+    if !may_hold_a_master(&signed_format) {
+        log(
+            "backfill: refused a lossy format",
+            &json!({
+                "track_id": track_id,
+                "format": signed_format,
+                "quality": jstr(&info, "quality"),
+            }),
+        );
+        return Err(format!(
+            "source /stream/{track_id} is {signed_format}, which cannot hold a master"
+        ));
+    }
+
     // 2. how big is it — needed BOTH to plan the upload and to key the dedupe
     // CONNECT timeout only. A total `timeout()` here kills the upload mid-stream:
     // a 25 MB body piped into `upload_stream` takes minutes, and reqwest aborts
@@ -752,6 +827,26 @@ async fn backfill_body(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let size = master_size(&http, &media_url).await?;
+
+    // 2b. A master is never this thin. Backstop for a source that signs a slice
+    //     without saying `range=` and without naming a lossy format.
+    if duration > 0 && size > 0 {
+        let kbps = crate::eclipse::kbps(size, duration);
+        if kbps < MIN_MASTER_KBPS {
+            log(
+                "backfill: refused a clip",
+                &json!({
+                    "track_id": track_id,
+                    "bytes": size,
+                    "duration": duration,
+                    "kbps": kbps,
+                }),
+            );
+            return Err(format!(
+                "source master is {kbps} kbps over {duration}s — a clip, not the track"
+            ));
+        }
+    }
 
     // 3. duplicate gates
     match already_indexed(title, artist, size).await {
@@ -980,5 +1075,43 @@ mod tests {
         // No apostrophe means one query, not two.
         assert_eq!(search_spellings("Namumula", "Maki"), vec!["Namumula Maki"]);
         assert!(search_spellings("", "").is_empty());
+    }
+
+    /// The 2026-11-08 outage, byte for byte: the source signed a 10-second slice
+    /// (`range=20-30`) of a 283-second track for EVERY id, and only this marker —
+    /// absent from a real master's URL — separates the preview from the master.
+    #[test]
+    fn a_signed_slice_is_a_preview_and_a_signed_master_is_not() {
+        // verbatim from `/a/stream/368761249`, a 24-bit/192 kHz edition
+        let preview = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=5&profile=raw&range=20-30&app_id=312369995&etsp=1794226011&hmac=X5cgWkmKdGfKVIlvWdkIFCq6XUI";
+        // the same host's master shape: fmt=7 (24-bit FLAC), no slice
+        let master = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=7&profile=raw&app_id=312369995&etsp=1794226011&hmac=X5cgWkmKdGfKVIlvWdkIFCq6XUI";
+        assert!(is_preview_url(preview));
+        assert!(!is_preview_url(master));
+        assert!(!is_preview_url("https://example.test/file?orange=3"));
+        assert!(!is_preview_url("https://example.test/file?range="));
+        assert!(!is_preview_url("https://example.test/file"));
+    }
+
+    /// A lossy name is refused before a byte is fetched; a container that can hold
+    /// a master is let through and settled by bitrate.
+    #[test]
+    fn a_lossy_format_is_never_waved_through() {
+        for ok in ["flac", "FLAC", "wav", "alac", "m4a", "aiff", "ape", ""] {
+            assert!(may_hold_a_master(ok), "{ok} should pass");
+        }
+        for no in ["mp3", "aac", "opus", "ogg", "MP3", "webm"] {
+            assert!(!may_hold_a_master(no), "{no} should be refused");
+        }
+    }
+
+    /// The 1,200,588-byte clip the preview bug uploaded for a 283-second song is
+    /// 34 kbps; the real master the same id produced earlier that day is not.
+    #[test]
+    fn a_one_megabyte_clip_is_not_a_master() {
+        assert!(crate::eclipse::kbps(1_200_588, 283) < MIN_MASTER_KBPS);
+        assert!(crate::eclipse::kbps(32_059_583, 283) > MIN_MASTER_KBPS);
+        // An unknown duration cannot be judged, and must not be refused.
+        assert_eq!(crate::eclipse::kbps(1_200_588, 0), 0);
     }
 }

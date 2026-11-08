@@ -23,9 +23,9 @@ cbc = "0.1"
 # filename patterns that need it.
 fancy-regex = "0.14"
 futures-util = "0.3"
-grammers-client = "0.11.0"
-grammers-session = { version = "0.11.0", default-features = false, features = ["serde"] }
-grammers-tl-types = "0.11.0"
+grammers-client = "0.12.0"
+grammers-session = { version = "0.12.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "0.12.0"
 hex = "0.4"
 # The dashboard is EMBEDDED into the binary (`include_dir!`), so the whole server
 # is one `pencarimovie-server.exe` — no `public/` folder beside it, no PHP.

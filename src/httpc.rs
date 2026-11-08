@@ -194,6 +194,40 @@ pub(crate) fn pm_auth_headers(method: &str, url: &str) -> Vec<(String, String)> 
     ]
 }
 
+/// True only for the ORIGIN's REST API — never for a third-party host.
+///
+/// MEASURED 2026-11-07 from `heroku logs -n 1500` on the live app, and it was
+/// self-inflicted: the hi-res fallback host answers EVERY request with 401
+/// (`bitchord_auth`, by its own design), and the 401 branch below did not look at
+/// the host. So each fallback attempt ran `clear_auth_token()`:
+///
+/// ```text
+/// wp 401 with a token, re-enrolling {"url":"https://bitchord-hires-addon…/a/stream/28210785"}
+/// pm-auth enrol skipped {"reason":"another attempt is in flight"}
+/// ```
+///
+/// — the engine logged ITSELF out of the origin every time the source fell
+/// through to the fallback, `ensure_enrolled_throttled()` then refused to recover
+/// faster than once a minute, and dynos left holding no token answered
+/// `/resolve-file` and `/search-music` with 401 (`web.3` did exactly that for
+/// minutes: `unreadable /data/storage/auth_token.json`).
+///
+/// The same predicate stops the WORSE half, which the logs cannot show: the
+/// install's `X-PM-Auth` token, signing pubkey and proof were being chained onto
+/// every outgoing request, including the third-party source hosts. An install
+/// credential has no business leaving for a host that is not the origin.
+fn is_origin_api(url: &str) -> bool {
+    let host_of = |u: &str| {
+        url::Url::parse(u)
+            .ok()
+            .and_then(|p| p.host_str().map(|h| h.to_ascii_lowercase()))
+    };
+    match (host_of(url), host_of(&crate::config::wp_api_base())) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `fd_http_json()`: GET (query string) or POST (JSON body) with X-API-Secret.
 pub async fn http_json(url: &str, params: &[(String, String)], method: &str, timeout_secs: u64) -> Value {
     http_json_h(url, params, method, timeout_secs, &[]).await
@@ -237,18 +271,21 @@ pub async fn http_json_h_status(
     // expires after 60 minutes anyway. Measured on a CPH2581: /api/resolve-shortcode
     // answered `{"ok":0}` forever because the resolve call carried no credential at
     // all. This makes every origin call enrol first when it has nothing to send.
-    if crate::credentials::auth_token().is_empty() {
+    let mut target = url.to_string();
+    // Origin call? Only then is a credential even meaningful. Sending it to a
+    // third-party host leaks an install token for nothing, and asking to enrol
+    // because a SOURCE answered 401 is what took the dynos offline on Heroku.
+    let origin_call = is_origin_api(&target);
+    if origin_call && crate::credentials::auth_token().is_empty() {
         crate::credentials::ensure_enrolled_throttled().await;
     }
 
-    let mut target = url.to_string();
     let secret = get_api_secret();
-    let mut extra: Vec<(String, String)> = headers
-        .iter()
-        .cloned()
-        .chain(crate::credentials::ticket_headers())
-        .chain(pm_auth_headers(method, &target))
-        .collect();
+    let mut extra: Vec<(String, String)> = headers.iter().cloned().collect();
+    if origin_call {
+        extra.extend(crate::credentials::ticket_headers());
+        extra.extend(pm_auth_headers(method, &target));
+    }
 
     let mut body: Option<String> = None;
     if method.eq_ignore_ascii_case("GET") {
@@ -336,7 +373,7 @@ pub async fn http_json_h_status(
     // cannot drift meaningfully in 10 minutes, so this is free.
     static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(0);
-    if status == 401 {
+    if status == 401 && origin_call {
         // Re-learn the clock BEFORE re-signing, in BOTH cases.
         //
         // A skewed clock is the one fault that makes an install look tokenless: a
@@ -712,5 +749,30 @@ mod tests {
             WP_DOWN_SECS > 20,
             "must outlive resolve::RESOLVE_BUDGET (20 s), or the caller reads 0"
         );
+    }
+
+    /// The Heroku regression (2026-11-07): a 401 from the hi-res fallback host
+    /// cleared the origin token and started an enrolment the throttle then refused,
+    /// so dynos ran with no credential and 401'd every origin call.
+    #[test]
+    fn only_the_origin_host_may_touch_the_install_credential() {
+        let base = crate::config::wp_api_base();
+        assert!(
+            is_origin_api(&format!("{}/resolve-file?short_code=x", base)),
+            "the origin's own API must be recognised"
+        );
+        assert!(
+            is_origin_api(&format!("{}/search-music?search=x", base.trim_end_matches('/'))),
+            "a query string must not change the verdict"
+        );
+        assert!(
+            !is_origin_api("https://bitchord-hires-addon.de.deplexo.com/a/stream/28210785"),
+            "a third-party source host is never the origin"
+        );
+        assert!(
+            !is_origin_api("https://heisenbergbackaaahh.de.deplexo.com/a/search?q=x"),
+            "nor is the primary source host"
+        );
+        assert!(!is_origin_api("not a url"), "garbage is not the origin");
     }
 }

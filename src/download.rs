@@ -362,15 +362,6 @@ fn prime_gate_wait_secs() -> u64 {
     }
 }
 
-/// How many saturations the pre-flight waits out before refusing. One on a PaaS,
-/// where a second 6 s wait on top of a resolve ladder can pass the router's 30 s.
-fn prime_busy_attempts() -> u32 {
-    if crate::paas_env_present() {
-        1
-    } else {
-        2
-    }
-}
 
 /// Prefix of the error that means "every part on this connection is busy". The
 /// pre-flight loop stops retrying on it (four retries would spend four wait
@@ -398,9 +389,15 @@ pub const GATE_BUSY_PREFIX: &str = "parts busy";
 /// waiting for before it can start at all, and it costs one or two parts, once
 /// per request. So it draws from this pool instead of the streaming one. The
 /// ceiling this raises is bounded and known: `inflight x workers` (32) body
-/// parts plus at most `PRIME_PARTS` (6) pre-flights, each of which lives for one
+/// parts plus at most `PRIME_PARTS` (12) pre-flights, each of which lives for one
 /// part fetch.
-pub const PRIME_PARTS: usize = 6;
+///
+/// 12, not 6, after MEASURED 2026-11-09 on the five-dyno fleet: `download
+/// refused {"stage":"PARTS_BUSY"}` for four different players (libmpv, okhttp,
+/// Chrome on a TV, BitChord) inside 25 s, every one at `attempt:1` — the pool was
+/// empty before the request arrived, and a cold dyno's part takes longer than the
+/// 6 s window to come back.
+pub const PRIME_PARTS: usize = 12;
 
 fn prime_gate() -> &'static tokio::sync::Semaphore {
     static GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
@@ -2031,7 +2028,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 if e.message.starts_with(GATE_BUSY_PREFIX) {
                     prime_busy += 1;
                     last_err = Some(e);
-                    if prime_busy >= prime_busy_attempts() {
+                    if prime_busy >= 2 {
                         break;
                     }
                     log(
@@ -3056,8 +3053,7 @@ mod tests {
             PRIME_GATE_WAIT_SECS_PAAS < PRIME_GATE_WAIT_SECS,
             "the router-aware wait must be narrower than the desktop one"
         );
-        let worst = PRIME_GATE_WAIT_SECS_PAAS * prime_busy_attempts() as u64
-            + PREFLIGHT_RESOLVE_SECS;
+        let worst = PRIME_GATE_WAIT_SECS_PAAS * 2 + PREFLIGHT_RESOLVE_SECS;
         assert!(
             worst < 30,
             "worst-case first byte is {worst}s, which the 30s router would kill"

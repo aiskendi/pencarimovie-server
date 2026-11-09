@@ -306,10 +306,16 @@ async fn prime_parts(
 /// the arithmetic instead of riding on `prime_window()`'s `.min(MB)`.
 /// How long a first byte may queue for a part permit before the request is
 /// answered "busy, retry" ([`GATE_BUSY_PREFIX`]) instead of hanging into the
-/// platform router's 30 s timeout. A 1 MB part is fetched in well under a
-/// second at the measured rates, so a longer wait means the connection is
-/// saturated, not slow.
-pub const PRIME_GATE_WAIT_SECS: u64 = 6;
+/// platform router's 30 s timeout.
+///
+/// A 1 MB part is fetched in well under a second at the measured rates, so a
+/// wait this long means the connection is saturated — but waiting is still the
+/// better answer than refusing: MEASURED 2026-11-09 at 6 s, the fleet turned 17
+/// streams in 34 s into `parts busy` 503s (4 of 22 music files got nothing else),
+/// and a player that does not retry reads that as "this song will not play".
+/// 12 s halves that queue, and the router only kills the request at 30 s, which
+/// still leaves room for the part fetch and the headers after the wait.
+pub const PRIME_GATE_WAIT_SECS: u64 = 12;
 
 /// Prefix of the error that means "every part on this connection is busy". The
 /// pre-flight loop stops retrying on it (four retries would spend four wait

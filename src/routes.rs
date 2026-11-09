@@ -7921,6 +7921,35 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     if !codec.is_empty() {
         body["codec"] = serde_json::json!(codec);
     }
+    // THE RENDITION FIELDS A QUALITY-AWARE CLIENT READS.
+    //
+    // MEASURED 2026-11-09: BitChord sat on "upgrading quality" for tracks whose
+    // bytes were streaming fine, and its stream requests are the only ones that
+    // ask `?quality=LOSSLESS&atmos=auto` — it checks whether the rendition it was
+    // handed matches the quality it requested. Our body named the container and
+    // the codec but never the QUALITY, the size or the bitrate, so a client that
+    // cannot see "this one is lossless / this one is hi-res" keeps trying to
+    // upgrade to one that it can see. The source addon this bridge replaces sends
+    // exactly these fields, so send them too.
+    //
+    // Only what we can defend: the size is the real byte count and the bitrate is
+    // derived from it. No invented `bitDepth`/`sampleRate` — see `codec_of` on why
+    // overstating a rendition is worse than saying nothing.
+    body["size"] = serde_json::json!(size);
+    let kbps = crate::eclipse::kbps(size, duration);
+    if kbps > 0 {
+        body["bitrate"] = serde_json::json!(kbps);
+        body["kbps"] = serde_json::json!(kbps);
+    }
+    let quality = if crate::eclipse::is_hi_res(&ext, size, duration) {
+        "hi_res_lossless"
+    } else if crate::eclipse::is_lossless(&ext, size, duration) {
+        "lossless"
+    } else {
+        "high"
+    };
+    body["quality"] = serde_json::json!(quality);
+    body["audioQuality"] = serde_json::json!(if quality == "high" { "HIGH" } else { "LOSSLESS" });
     stremio_json(200, &body, "no-store")
 }
 

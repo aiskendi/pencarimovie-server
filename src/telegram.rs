@@ -1041,7 +1041,25 @@ pub fn map_invocation_error(e: InvocationError) -> GramErr {
                     || rpc.name.contains("FILE_MIGRATE")
                     || rpc.name.contains("AUTH_BYTES"),
                 flood_wait,
-                transport: false,
+                // `-503 Timeout` is Telegram answering "ask again", not a dead
+                // file — and it must be retried by the LIVE BODY, which only
+                // retries what is marked transient.
+                //
+                // MEASURED 2026-11-09, BitChord on `R1kYa6` (TUIDE · SUN KISS):
+                //
+                //   download served by bot            {"range":"bytes=1048576-"}
+                //   download stream aborted mid-body  {"bytes_sent":3145728,
+                //                                      "error":"Timeout (-503)"}
+                //
+                // — and NO `download stream retrying a window` line in between,
+                // because `is_transport_reset()` looks for TCP phrasings
+                // (`reset by peer`, `broken pipe`) and this message is a plain
+                // RPC name. So the body died at 3 MB and the player restarted the
+                // whole track, which is what the user saw as it looping. It is a
+                // transient answer on `upload.getFile` and is classified as one
+                // here so every existing retry path (body window, pre-flight
+                // rotation) handles it.
+                transport: rpc.code == -503,
             }
         }
         other => {

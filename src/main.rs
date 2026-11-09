@@ -509,6 +509,145 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // `--file-id-lifetime <file_id_mt|short_code> [bot_id] [interval_s] [horizon_min]`:
+    // how long a `file_reference` REALLY lives.
+    //
+    // Every timing decision in `download.rs` about re-resolving — the 60 s window
+    // for an unverified id, `verified_at`, the mid-body refresh — is a guess about a
+    // number Telegram never publishes. Its documentation says only that a
+    // `file_reference` "can change at any moment", and MadelineProto is built on
+    // that assumption rather than on a lifetime: it keeps the last reference per
+    // file in a `ReferenceDatabase`, and on `FILE_REFERENCE_EXPIRED` re-fetches the
+    // message that owns the media and repeats the same `upload.getFile`.
+    //
+    // This probe measures the number instead of assuming one: one 4 KB
+    // `upload.getFile` at offset 0, repeated on a fixed interval with the SAME
+    // `file_id`, printing `ok` until Telegram refuses it, then the elapsed time.
+    // Run it with a `short_code` (the id comes from a real resolve, exactly as
+    // `/api/download` gets it) or with a `file_id_mt` plus `--size <bytes>`.
+    //
+    // Exit codes: 0 = still alive at the horizon, 3 = it died (elapsed printed),
+    // 1 = the probe could not start.
+    if let Some(i) = arg_pos("--file-id-lifetime") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(raw) = args.get(i + 1) else {
+            eprintln!(
+                "usage: pencarimovie-server --file-id-lifetime <file_id_mt|short_code> [bot_id] [interval_s] [horizon_min] [--size <bytes>]"
+            );
+            std::process::exit(2);
+        };
+        let bot = args
+            .get(i + 2)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(session::get_bot_id);
+        if bot.is_empty() {
+            eprintln!("no bot_id: pass one as the second argument");
+            std::process::exit(2);
+        }
+        let interval = args
+            .get(i + 3)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(5);
+        let horizon_min = args
+            .get(i + 4)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(180)
+            .max(1);
+
+        let mut file_id = raw.trim().to_string();
+        let mut file_size = 0u64;
+        if fileid::decode_file_id(&file_id).is_err() {
+            let res = resolve::resolve_shortcode(&file_id, &bot, false).await;
+            let id = {
+                let a = res.get("file_id_mt").and_then(|v| v.as_str()).unwrap_or("");
+                if a.is_empty() {
+                    res.get("file_id").and_then(|v| v.as_str()).unwrap_or("")
+                } else {
+                    a
+                }
+            }
+            .trim()
+            .to_string();
+            file_size = res
+                .get("file_size")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0);
+            if id.is_empty() {
+                eprintln!("resolve returned no file_id_mt for {}", raw.trim());
+                std::process::exit(1);
+            }
+            file_id = id;
+        }
+        if let Some(sz) = arg_value("--size").and_then(|s| s.trim().parse::<u64>().ok()) {
+            file_size = sz;
+        }
+        if file_size == 0 {
+            eprintln!("no file_size: pass a short code, or a file_id with --size <bytes>");
+            std::process::exit(2);
+        }
+
+        let pool = telegram::TelegramPool::new(1, 8);
+        let entry = match pool.boot(&bot, None).await {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("bot boot failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let client = entry.pick();
+        if let Ok(d) = fileid::decode_file_id(&file_id) {
+            println!(
+                "file_id id={} dc={} type={} reference={} bytes size={} -> probing every {}s up to {} min",
+                d.id,
+                d.dc_id,
+                d.type_name,
+                d.file_reference.as_ref().map(|r| r.len()).unwrap_or(0),
+                file_size,
+                interval,
+                horizon_min
+            );
+        }
+        let start = std::time::Instant::now();
+        let horizon = std::time::Duration::from_secs(horizon_min * 60);
+        loop {
+            let target = match probe_target(&file_id, file_size, "") {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("bad file_id: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let elapsed = start.elapsed().as_secs();
+            match telegram::fetch_one_chunk(&client, &target, 0, 4096).await {
+                Ok(n) => println!("t={:>5}s ok bytes={}", elapsed, n),
+                Err(e) => {
+                    println!("t={:>5}s DEAD {}", elapsed, e.message);
+                    println!(
+                        "file_id lived {}s ({} min) - reference={} bytes, bot {}",
+                        elapsed,
+                        elapsed / 60,
+                        fileid::decode_file_id(&file_id)
+                            .map(|d| d.file_reference.as_ref().map(|r| r.len()).unwrap_or(0))
+                            .unwrap_or(0),
+                        bot
+                    );
+                    std::process::exit(3);
+                }
+            }
+            if start.elapsed() >= horizon {
+                println!(
+                    "file_id still alive after {}s ({} min) - horizon reached",
+                    start.elapsed().as_secs(),
+                    horizon_min
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    }
+
     // `--audio-probe` was REMOVED with the ALAC decoder (`src/audio.rs` and the
     // `symphonia` dependency). It existed only to diagnose that decoder's log
     // lines; nothing decodes audio in this binary any more, so the flag would
@@ -973,7 +1112,7 @@ pub fn paas_env_predicate(get: impl Fn(&str) -> bool) -> bool {
     PAAS_MARKERS.iter().any(|k| get(k))
 }
 
-fn paas_env_present() -> bool {
+pub fn paas_env_present() -> bool {
     paas_env_predicate(|k| storage::env(k).is_some())
 }
 

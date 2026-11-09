@@ -197,20 +197,21 @@ pub(crate) fn pm_auth_headers(method: &str, url: &str) -> Vec<(String, String)> 
 /// True only for the ORIGIN's REST API — never for a third-party host.
 ///
 /// MEASURED 2026-11-07 from `heroku logs -n 1500` on the live app, and it was
-/// self-inflicted: the hi-res fallback host answers EVERY request with 401
-/// (`bitchord_auth`, by its own design), and the 401 branch below did not look at
-/// the host. So each fallback attempt ran `clear_auth_token()`:
+/// self-inflicted: the backfill SOURCE hosts answer 401 by design (the removed
+/// fallback did it on every path with `bitchord_auth`), and the 401 branch below
+/// did not look at the host. So each source attempt ran `clear_auth_token()`:
 ///
 /// ```text
-/// wp 401 with a token, re-enrolling {"url":"https://bitchord-hires-addon…/a/stream/28210785"}
+/// wp 401 with a token, re-enrolling {"url":"…/a/stream/28210785"}
 /// pm-auth enrol skipped {"reason":"another attempt is in flight"}
 /// ```
 ///
-/// — the engine logged ITSELF out of the origin every time the source fell
-/// through to the fallback, `ensure_enrolled_throttled()` then refused to recover
-/// faster than once a minute, and dynos left holding no token answered
-/// `/resolve-file` and `/search-music` with 401 (`web.3` did exactly that for
-/// minutes: `unreadable /data/storage/auth_token.json`).
+/// — the engine logged ITSELF out of the origin every time the source answered
+/// 401, `ensure_enrolled_throttled()` then refused to recover faster than once a
+/// minute, and dynos left holding no token answered `/resolve-file` and
+/// `/search-music` with 401 (`web.3` did exactly that for minutes:
+/// `unreadable /data/storage/auth_token.json`). The 401-by-design host is gone,
+/// but the remaining source is third-party too, so the host check stays.
 ///
 /// The same predicate stops the WORSE half, which the logs cannot show: the
 /// install's `X-PM-Auth` token, signing pubkey and proof were being chained onto
@@ -766,12 +767,12 @@ mod tests {
             "a query string must not change the verdict"
         );
         assert!(
-            !is_origin_api("https://bitchord-hires-addon.de.deplexo.com/a/stream/28210785"),
+            !is_origin_api("https://heisenbergbackaaahh.de.deplexo.com/a/search?q=x"),
             "a third-party source host is never the origin"
         );
         assert!(
-            !is_origin_api("https://heisenbergbackaaahh.de.deplexo.com/a/search?q=x"),
-            "nor is the primary source host"
+            !is_origin_api("https://streaming-qobuz-std.akamaized.net/file?eid=1"),
+            "nor is the CDN the signed master comes from"
         );
         assert!(!is_origin_api("not a url"), "garbage is not the origin");
     }

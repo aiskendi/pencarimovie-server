@@ -24,22 +24,26 @@ use tokio_util::io::StreamReader;
 
 use crate::log::log;
 
-/// Where a hi-res/lossless master can be fetched from: the SAME source Phase 1's
-/// fallback reads. Env-overridable, so §10 of `plans/music-hires-fallback.md` (the
-/// third-party-host exception) is configuration rather than a patch.
-pub const HIRES_BASE: &str = "https://heisenbergbackaaahh.de.deplexo.com/a";
-
-/// The second source, tried only when the first one refuses.
+/// Where a hi-res/lossless master can be fetched from — the ONE usable source.
 ///
-/// MEASURED 2026-11-07: this host declares `bitchordAuth: true` and answers every
-/// path — `/a/search` and `/a/stream/{id}` alike — with
-/// `{"error":"bitchord_auth","code":"missing","message":"This addon only works in
-/// the official BitChord app"}`. An arbitrary `Authorization: Bearer …` does not
-/// change it: the code stays `missing`, so it wants its own credential, not a
-/// bearer. It stays in the chain because trying it costs one request ONLY after
-/// the primary has already failed, and the log then names exactly why it
-/// declined. The day a BitChord credential exists, this is a header, not a rewrite.
-pub const HIRES_FALLBACK: &str = "https://bitchord-hires-addon.de.deplexo.com/a";
+/// There is no fallback list any more, and the removed candidates are named here
+/// so nobody re-adds one on a hunch. Measured 2026-11-07 → 2026-11-09:
+///
+/// | Candidate                                        | Answer                                                                                     |
+/// | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+/// | `heisenbergbackaaahh.de.deplexo.com/a`           | the only one that serves masters (`/search`, `/stream/{id}`, `fmt=6` FLAC)                  |
+/// | `bitchord-hires-addon.de.deplexo.com/a`          | `{"error":"bitchord_auth","code":"missing"}` on every path — it wants the official app's credential, not a bearer |
+/// | `bitchord-monochrome-addon.onrender.com`         | live manifest, `{"tracks":[]}` for every query                                              |
+/// | `bit-chord-addon.vercel.app/a`, `/b`, `/e`       | `{"error":"upstream service unavailable"}` / `{"error":"request failed"}`                   |
+///
+/// A fallback that can only ever refuse does real damage: it spends a request on
+/// every failure AND makes the log name a second cause that is not why anything
+/// broke (that is how `bitchord… -> 401` once hid `heisenberg… -> 503`).
+///
+/// Env-overridable (`PM_HIRES_BASE`) so §10 of `plans/music-hires-fallback.md` is
+/// configuration rather than a patch; setting it EMPTY disables backfill, which is
+/// the honest state when the source is degraded.
+pub const HIRES_BASE: &str = "https://heisenbergbackaaahh.de.deplexo.com/a";
 
 /// The caption put on the send: a bare mention of the indexer bot.
 ///
@@ -59,60 +63,39 @@ pub const HIRES_FALLBACK: &str = "https://bitchord-hires-addon.de.deplexo.com/a"
 /// userbot does the hop. Verified end-to-end by watching for the row, not assumed.
 pub const REQUEST_CAPTION: &str = "File Request By @inputfilebot";
 
-/// Source bases in order. `PM_HIRES_BASE` / `PM_HIRES_FALLBACK` override either
-/// slot; setting one to empty removes it.
-fn hires_bases() -> Vec<String> {
-    let pick = |var: &str, default: &str| match std::env::var(var) {
+/// The source base, or `None` when `PM_HIRES_BASE` was set empty.
+fn hires_base() -> Option<String> {
+    match std::env::var("PM_HIRES_BASE") {
         Ok(v) if v.trim().is_empty() => None,
         Ok(v) => Some(v.trim().trim_end_matches('/').to_string()),
-        Err(_) => Some(default.to_string()),
-    };
-    [
-        pick("PM_HIRES_BASE", HIRES_BASE),
-        pick("PM_HIRES_FALLBACK", HIRES_FALLBACK),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+        Err(_) => Some(HIRES_BASE.to_string()),
+    }
 }
 
-/// GET `path` from the first source that answers 200.
+/// GET `path` from the source.
 ///
-/// The failure string names EVERY base tried, in order, and is deterministic —
-/// `tools/probe_lease_release.mjs` asserts that two consecutive failed attempts
-/// fail IDENTICALLY, and that equality is the proof that a lease was released
-/// rather than held.
-///
-/// MEASURED 2026-11-07, why every attempt is kept: with the primary throttling,
-/// naming only the last failure reported `bitchord… /stream/1 -> 401` and threw
-/// away the one fact that explained it (`heisenberg… /stream/1 -> 503`). The
-/// first cause is the useful one; the fallback is usually the refusal.
+/// The failure string stays deterministic — `tools/probe_lease_release.mjs` asserts
+/// that two consecutive failed attempts fail IDENTICALLY, and that equality is the
+/// proof that a lease was released rather than held. One base means one cause in
+/// the message, which is the one thing the old joined string got wrong.
 async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
-    let bases = hires_bases();
-    if bases.is_empty() {
-        return Err(
-            "no hi-res source configured (PM_HIRES_BASE and PM_HIRES_FALLBACK are both empty)"
-                .to_string(),
-        );
+    let Some(base) = hires_base() else {
+        return Err("no hi-res source configured (PM_HIRES_BASE is empty)".to_string());
+    };
+    let url = format!("{base}{path}");
+    let (body, status) =
+        crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
+    if status == 200 {
+        return Ok(body);
     }
-    let mut tried: Vec<String> = Vec::new();
-    for base in &bases {
-        let url = format!("{base}{path}");
-        let (body, status) =
-            crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
-        if status == 200 {
-            return Ok(body);
-        }
-        // A source that names its own refusal is worth the log line: `bitchord_auth`
-        // is the difference between "down right now" and "will never answer us".
-        let why = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        log(
-            "backfill: source refused",
-            &json!({"url": url, "status": status, "why": why}),
-        );
-        tried.push(format!("{url} -> {status}"));
-    }
-    Err(tried.join(" ; "))
+    // A source that names its own refusal is worth the log line: the `code` field
+    // is the difference between "down right now" and "will never answer us".
+    let why = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    log(
+        "backfill: source refused",
+        &json!({"url": url, "status": status, "why": why}),
+    );
+    Err(format!("{url} -> {status}"))
 }
 
 /// A file we sent and can serve, described the way the byte path wants it.

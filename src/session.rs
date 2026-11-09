@@ -1642,6 +1642,9 @@ pub async fn auto_provision_guest(
     // in pool bots it did not add itself, and one expired token must not take the
     // whole pool down.
     let mut env_err: Option<String> = None;
+    // Every bot id this instance is configured with, so the block below can tell
+    // "this token is bad" from "Telegram is rate-limiting the whole fleet".
+    let mut env_ids: Vec<String> = Vec::new();
     for token in env_bot_tokens() {
         let id_part = token.split(':').next().unwrap_or("").trim().to_string();
         let target = if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
@@ -1649,6 +1652,7 @@ pub async fn auto_provision_guest(
         } else {
             format!("env_{}", random_suffix())
         };
+        env_ids.push(target.clone());
         match tg.boot(&target, Some(&token)).await {
             Ok(entry) => {
                 remember_env_identity(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
@@ -1684,7 +1688,35 @@ pub async fn auto_provision_guest(
     // fresh `auth.ImportBotAuthorization` — the measured shape of the 55-minute
     // lockout (10 dynos x 7 env bots logging in at boot). A deploy with tokens
     // either signs one of them in or reports why it could not.
-    if !env_bot_tokens().is_empty() {
+    //
+    // UNLESS THE REASON IS A RATE LIMIT.
+    //
+    // That refusal is right for a bad token and wrong for a flood wait, and the
+    // difference is not academic — MEASURED 2026-11-09 on the live fleet, after a
+    // deploy that restarted five dynos at once:
+    //
+    //   env bot token failed to boot {"bot_id":"8469916399","error":"bot sign-in
+    //     paused: Telegram rate limit for this bot for another 684s (FLOOD_WAIT)"}
+    //   guest bot lease skipped: BOT_TOKENS supplies the pool {"env_bots":6, ...}
+    //
+    // Six bots, all waiting on Telegram, no guest lease allowed: the instance had
+    // ZERO usable bots and every stream stopped — music and video alike, because
+    // both need a logged-in bot before a single byte moves. Refusing a *temporary*
+    // condition with a permanent answer is the bug; the guest pool exists exactly
+    // for this, and one lease is one call to the origin's own pool rather than six
+    // logins, so it cannot repeat the storm it is there to survive.
+    let all_rate_limited = !env_ids.is_empty()
+        && env_ids.iter().all(|id| flood_remaining_for(id) > 0);
+    if all_rate_limited {
+        log(
+            "every BOT_TOKENS bot is rate-limited - leasing a guest bot instead",
+            &serde_json::json!({
+                "bots": env_ids.len(),
+                "wait_s": env_ids.iter().map(|id| flood_remaining_for(id)).max().unwrap_or(0),
+            }),
+        );
+    }
+    if !env_bot_tokens().is_empty() && !all_rate_limited {
         let env_bots = env_bot_tokens().len();
         log(
             "guest bot lease skipped: BOT_TOKENS supplies the pool",

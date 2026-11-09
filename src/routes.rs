@@ -7771,6 +7771,84 @@ fn str_at(v: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// The resolve ladder every stream shares, whatever the media is.
+///
+/// There is no reason for music to resolve differently from a movie, and there
+/// never was: the difference was an accident of history. The video path walks a
+/// candidate list and steps over a bot that cannot answer; this route asked ONE
+/// bot — the one named in `session_meta` — and gave up. MEASURED 2026-11-09 on the
+/// live fleet, and it is exactly the "video plays, music does not" report:
+///
+/// ```text
+/// music stream requested {"code":"96MgM7"}
+/// env bot token failed to boot {"bot_id":"8848916386","error":"bot sign-in paused:
+///   Telegram rate limit for this bot for another 157s (FLOOD_WAIT)"}
+/// ```
+///
+/// while the pool held five other bots and a leased guest. So: ask the pinned bot
+/// first (it is the one whose caches are warm), then every READY pool bot, and skip
+/// any that are still inside a FloodWait — all inside one 12 s budget, because a
+/// cold ladder that takes 90 s is refused by the player anyway.
+///
+/// The answer carries the bot that actually resolved it, so the payload built below
+/// names that bot and `handle_download` never has to rotate across bots — a
+/// `file_reference` belongs to the bot that minted it.
+pub(crate) async fn resolve_stream_target(short_code: &str) -> (Value, u16) {
+    let mut candidates: Vec<String> = Vec::new();
+    let pinned = get_bot_id();
+    if !pinned.is_empty() {
+        candidates.push(pinned);
+    }
+    for row in crate::session::pool_ready() {
+        let id = row
+            .get("bot_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !id.is_empty() && !candidates.contains(&id) {
+            candidates.push(id);
+        }
+    }
+    if candidates.is_empty() {
+        return (resolve_shortcode_concurrent(short_code, &[]).await, 0);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut last = (Value::Null, 0u16);
+    for (i, bot) in candidates.iter().enumerate() {
+        if std::time::Instant::now() >= deadline {
+            log(
+                "stream resolve ladder ran out of budget",
+                &serde_json::json!({"short_code": short_code, "tried": i, "of": candidates.len()}),
+            );
+            break;
+        }
+        if crate::session::flood_remaining_for(bot) > 0 {
+            continue;
+        }
+        let (v, status) = crate::resolve::resolve_shortcode_status(short_code, bot, false).await;
+        let name = {
+            let t = jstr(&v, "title");
+            if t.is_empty() {
+                jstr(&v, "file_name")
+            } else {
+                t
+            }
+        };
+        if !name.is_empty() {
+            if i > 0 {
+                log(
+                    "stream resolved by a pool bot, not the pinned one",
+                    &serde_json::json!({"short_code": short_code, "bot_id": bot, "tried": i + 1}),
+                );
+            }
+            return (v, status);
+        }
+        last = (v, status);
+    }
+    last
+}
+
 /// `/eclipse/stream/<short_code>` and `/eclipse/play/<short_code>` — resolve and
 /// hand back a downloadable URL. The URL extension is the FILE'S OWN and the
 /// bytes go out untouched: there is no ALAC→WAV transcode (deleted, see
@@ -7802,11 +7880,10 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // The STATUS matters here: a busy origin (503 "Server busy resolving file",
     // retry_after 5) is not a missing track. Before this, every origin hiccup
     // reached the music client as `404 Track not found` and the track was skipped.
-    let (resolved, resolve_status) = if bot.is_empty() {
-        (resolve_shortcode_concurrent(&code, &[]).await, 0u16)
-    } else {
-        crate::resolve::resolve_shortcode_status(&code, &bot, false).await
-    };
+    //
+    // AND THE BOT LADDER IS THE SHARED ONE — see [`resolve_stream_target`] for why
+    // a single pinned bot was the difference between music and video.
+    let (resolved, resolve_status) = resolve_stream_target(&code).await;
     let file_name = {
         let t = jstr(&resolved, "title");
         if t.is_empty() {

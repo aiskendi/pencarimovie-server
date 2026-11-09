@@ -2031,11 +2031,24 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     if prime_busy >= 2 {
                         break;
                     }
+                    // ROTATE THE CONNECTION, not just the wait.
+                    //
+                    // A prime that has not come back in the whole window is not
+                    // waiting for a permit — `PRIME_PARTS` is 12 and it holds at
+                    // most two — it is waiting for a PART on a connection that is
+                    // not answering. MEASURED 2026-11-09 on the fleet with
+                    // `PM_PIPELINE=4`: 39 refusals in 32 s, each having timed out
+                    // twice, which no permit arithmetic explains. Asking the same
+                    // slot again asks the same stalled pipe; `pick_slot()` advances
+                    // to the next worker, which is what the transport-reset branch
+                    // below already does for a different symptom.
+                    let (next_client, _next_gate) = entry.pick_slot();
+                    client = next_client;
                     log(
-                        "pre-flight saturated - waiting for the queue to drain instead of refusing",
+                        "pre-flight stalled - rotating the worker before the retry",
                         &serde_json::json!({"short_code": short_code, "attempt": attempt}),
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     preflight_deadline = (std::time::Instant::now()
                         + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
                         .min(hard_deadline);

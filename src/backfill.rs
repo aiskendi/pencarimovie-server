@@ -503,7 +503,19 @@ async fn fill_from_rows(client: &Client, q: &str, rows: &[Value]) -> Result<bool
             continue;
         }
         let duration = row.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
-        backfill(client, &id, &title, &artist, duration, "").await?;
+        // `artworkURL` is the row's own cover — that is what gives the indexed
+        // row a thumbnail, so it travels with the fill instead of being guessed
+        // from the title later.
+        backfill(
+            client,
+            &id,
+            &title,
+            &artist,
+            duration,
+            "",
+            &jstr(row, "artworkURL"),
+        )
+        .await?;
         return Ok(true);
     }
     Ok(false)
@@ -653,6 +665,7 @@ pub async fn backfill(
     artist: &str,
     duration: i64,
     relay: &str,
+    artwork: &str,
 ) -> Result<Backfilled, String> {
     let key = format!("qobuz:{track_id}");
 
@@ -695,7 +708,7 @@ pub async fn backfill(
     // so a track the source paused for 15 seconds stayed unfillable for the
     // whole 300-second lease. The retry here is the next client request, which
     // is free, so release the reservation and let it happen.
-    let result = backfill_body(client, track_id, title, artist, duration, relay).await;
+    let result = backfill_body(client, track_id, title, artist, duration, relay, artwork).await;
     match &result {
         // Carry the completed entry onto the title key as well, so the NEXT
         // edition of the same song (a different source id) is refused by the
@@ -799,6 +812,74 @@ fn release_lease(key: &str, stamp: i64) {
     }
 }
 
+/// The largest thumbnail Telegram accepts for a document, in bytes.
+///
+/// Its documented ceiling is 200 KB for a document thumb; anything bigger is
+/// rejected outright, which would fail the SEND, not just the picture.
+const THUMB_MAX_BYTES: usize = 200_000;
+
+/// A cover at thumb size: `…_600.jpg` → `…_230.jpg`.
+///
+/// MEASURED on the source's own artwork URLs
+/// (`static.qobuz.com/images/covers/jb/ev/eicwm9xtqevjb_600.jpg`): the size is part
+/// of the file name, so the same cover exists at `_230` (230x230, well under the
+/// byte cap and inside Telegram's recommended 320 px). No image crate, no
+/// resampling — the CDN already has the size we need.
+fn shrink_artwork(url: &str) -> String {
+    let Some((head, tail)) = url.rsplit_once('_') else {
+        return url.to_string();
+    };
+    let size = tail
+        .trim_end_matches(".jpeg")
+        .trim_end_matches(".jpg")
+        .trim_end_matches(".png");
+    if size.is_empty() || !size.chars().all(|c| c.is_ascii_digit()) {
+        return url.to_string();
+    }
+    format!("{head}_230.jpg")
+}
+
+/// The cover image for a row, as bytes Telegram will accept as a thumb.
+///
+/// Tries the `_230` variant first and the original URL only if that fails, and
+/// only returns something that is really a JPEG under [`THUMB_MAX_BYTES`] —
+/// Telegram rejects a non-JPEG or oversized thumb, and a rejection there fails the
+/// whole send. `None` means "send it without artwork", never "fail the fill".
+async fn fetch_thumb(http: &reqwest::Client, artwork: &str) -> Option<Vec<u8>> {
+    let artwork = artwork.trim();
+    if !(artwork.starts_with("http://") || artwork.starts_with("https://")) {
+        return None;
+    }
+    let small = shrink_artwork(artwork);
+    let mut urls = vec![small];
+    if urls[0] != artwork {
+        urls.push(artwork.to_string());
+    }
+    for url in urls {
+        let Ok(resp) = http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(bytes) = resp.bytes().await else {
+            continue;
+        };
+        if bytes.len() > THUMB_MAX_BYTES || bytes.len() < 100 {
+            continue;
+        }
+        if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            return Some(bytes.to_vec());
+        }
+    }
+    None
+}
+
 async fn backfill_body(
     client: &Client,
     track_id: &str,
@@ -806,6 +887,7 @@ async fn backfill_body(
     artist: &str,
     duration: i64,
     relay: &str,
+    artwork: &str,
 ) -> Result<Backfilled, String> {
     let key = format!("qobuz:{track_id}");
 
@@ -902,6 +984,20 @@ async fn backfill_body(
     // 4. relay peer
     let (peer, username) = resolve_relay(client, relay).await?;
 
+    // 4b. the cover, so the indexed row HAS a thumbnail.
+    //
+    // A fill was landing with no artwork at all: `/thumb/{code}` reads the
+    // document's own thumbs back out of Telegram, and a send that carried none
+    // has nothing to read, so the track showed a blank square. Best effort — a
+    // missing cover must never cost the fill.
+    let thumb = fetch_thumb(&http, artwork).await;
+    if thumb.is_none() && !artwork.trim().is_empty() {
+        log(
+            "backfill: no usable cover",
+            &json!({"artwork": redact_query(artwork)}),
+        );
+    }
+
     // 5. stream the body STRAIGHT into the upload. No temp file, no buffer: the
     //    `StreamReader` is the whole reason this can run on a phone.
     let body = http
@@ -934,6 +1030,7 @@ async fn backfill_body(
         title,
         artist,
         duration,
+        thumb,
         REQUEST_CAPTION,
     )
     .await
@@ -1143,6 +1240,31 @@ mod tests {
         assert!(crate::eclipse::kbps(32_059_583, 283) > MIN_MASTER_KBPS);
         // An unknown duration cannot be judged, and must not be refused.
         assert_eq!(crate::eclipse::kbps(1_200_588, 0), 0);
+    }
+
+    /// The cover is asked for at thumb size, because Telegram rejects a document
+    /// thumb over 200 KB — and a rejected thumb fails the whole send.
+    #[test]
+    fn a_cover_is_asked_for_at_thumb_size() {
+        assert_eq!(
+            shrink_artwork("https://static.qobuz.com/images/covers/jb/ev/eicwm9xtqevjb_600.jpg"),
+            "https://static.qobuz.com/images/covers/jb/ev/eicwm9xtqevjb_230.jpg"
+        );
+        assert_eq!(
+            shrink_artwork("https://static.qobuz.com/images/covers/jb/ev/eicwm9xtqevjb_1400.jpg"),
+            "https://static.qobuz.com/images/covers/jb/ev/eicwm9xtqevjb_230.jpg"
+        );
+        // No numeric size suffix: left alone, and `fetch_thumb` then tries the
+        // original unchanged.
+        assert_eq!(
+            shrink_artwork("https://cdn.test/covers/album.jpg"),
+            "https://cdn.test/covers/album.jpg"
+        );
+        assert_eq!(
+            shrink_artwork("https://cdn.test/covers/abc_def.jpg"),
+            "https://cdn.test/covers/abc_def.jpg"
+        );
+        assert_eq!(shrink_artwork(""), "");
     }
 
     /// A signature must never reach a log line, including through a reqwest error

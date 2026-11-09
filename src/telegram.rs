@@ -835,6 +835,13 @@ pub async fn upload_and_send_audio<S>(
     title: &str,
     performer: &str,
     duration_secs: i64,
+    // A cover image to attach as the document's thumbnail, already fetched and
+    // already validated as a small JPEG (see `backfill::fetch_thumb`). Without
+    // one the file lands with NO thumb, which is why a filled track showed a
+    // blank square in the player and in `/thumb/{code}`: that route reads the
+    // document's own thumbs from Telegram, so if the send carried none there is
+    // nothing to read.
+    thumb: Option<Vec<u8>>,
     caption: &str,
 ) -> Result<SentDoc, GramErr>
 where
@@ -857,6 +864,24 @@ where
         })?;
 
     let mut media = InputAudio::new(uploaded).mime_type(mime.to_string());
+    // Upload the cover as a document thumb. Failure is not fatal: a track with no
+    // artwork still plays, and losing the whole fill over a 404 on a JPEG would be
+    // the wrong trade.
+    if let Some(bytes) = thumb {
+        if !bytes.is_empty() {
+            let mut cursor = &bytes[..];
+            match client
+                .upload_stream(&mut cursor, bytes.len(), "thumb.jpg".to_string())
+                .await
+            {
+                Ok(up) => media = media.thumb(Some(up)),
+                Err(e) => log(
+                    "backfill thumb upload failed",
+                    &serde_json::json!({"error": e.to_string(), "bytes": bytes.len()}),
+                ),
+            }
+        }
+    }
     if duration_secs > 0 {
         media = media.duration(std::time::Duration::from_secs(duration_secs as u64));
     }

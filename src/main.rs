@@ -31,7 +31,7 @@ mod credentials;
 mod backfill;
 mod diagnostics;
 mod download;
-mod eclipse;
+mod music;
 mod fileid;
 mod httpc;
 mod log;

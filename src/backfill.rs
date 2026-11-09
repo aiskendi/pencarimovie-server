@@ -595,7 +595,7 @@ fn is_preview_url(url: &str) -> bool {
 /// Formats that can hold a bit-exact master.
 ///
 /// `m4a` is a CONTAINER, not proof — that one is settled by bitrate in
-/// [`crate::eclipse::is_lossless`]. An empty `format` is allowed through here and
+/// [`crate::music::is_lossless`]. An empty `format` is allowed through here and
 /// decided by the size check below, because a source that names no format must
 /// not be trusted either way on the name alone.
 fn may_hold_a_master(fmt: &str) -> bool {
@@ -942,7 +942,7 @@ async fn backfill_body(
     // 2b. A master is never this thin. Backstop for a source that signs a slice
     //     without saying `range=` and without naming a lossy format.
     if duration > 0 && size > 0 {
-        let kbps = crate::eclipse::kbps(size, duration);
+        let kbps = crate::music::kbps(size, duration);
         if kbps < MIN_MASTER_KBPS {
             log(
                 "backfill: refused a clip",
@@ -1240,10 +1240,10 @@ mod tests {
     /// 34 kbps; the real master the same id produced earlier that day is not.
     #[test]
     fn a_one_megabyte_clip_is_not_a_master() {
-        assert!(crate::eclipse::kbps(1_200_588, 283) < MIN_MASTER_KBPS);
-        assert!(crate::eclipse::kbps(32_059_583, 283) > MIN_MASTER_KBPS);
+        assert!(crate::music::kbps(1_200_588, 283) < MIN_MASTER_KBPS);
+        assert!(crate::music::kbps(32_059_583, 283) > MIN_MASTER_KBPS);
         // An unknown duration cannot be judged, and must not be refused.
-        assert_eq!(crate::eclipse::kbps(1_200_588, 0), 0);
+        assert_eq!(crate::music::kbps(1_200_588, 0), 0);
     }
 
     /// The cover is asked for at thumb size, because Telegram rejects a document

@@ -47,7 +47,7 @@ use crate::resolve::{
     resolve_shortcode, resolve_shortcode_concurrent, warmup_resolve_batch,
 };
 use crate::respond::{
-    allow_private_network, eclipse_locked_response, json_response, not_found_json, redirect, rtrim,
+    allow_private_network, music_locked, json_response, not_found_json, redirect, rtrim,
     stremio_json, stremio_locked_stream, text_response,
 };
 use crate::session::{
@@ -1567,7 +1567,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     };
     if p.starts_with("/eclipse") {
         if !is_authenticated(&ctx) {
-            return eclipse_locked_response(&ctx.base_url);
+            return music_locked(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {
             // A UNIVERSAL music addon, not an Eclipse-branded one: the id no
@@ -1616,7 +1616,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 let a = ctx.qs("q");
                 if a.is_empty() { ctx.qs("query") } else { a }
             };
-            let rows = eclipse_search(&q, 30).await;
+            let rows = music_search(&q, 30).await;
             // A song the catalogue holds no LOSSLESS copy of is what the backfill
             // EXISTS for — and the trigger is now the CATALOGUE, not the client's
             // request.
@@ -1704,14 +1704,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // origin indexes tracks, not rows, so "latest" is a plain search.
             let cat = rest.trim_end_matches(".json").trim();
             let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = local_artwork(&ctx.base_url, eclipse_search(q, 50).await);
+            let tracks = local_artwork(&ctx.base_url, music_search(q, 50).await);
             return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
-            return eclipse_stream(&ctx, rest.trim_end_matches(".json")).await;
+            return music_stream(&ctx, rest.trim_end_matches(".json")).await;
         }
         if let Some(rest) = p.strip_prefix("/eclipse/play/") {
-            return eclipse_stream(&ctx, rest.trim_end_matches(".json")).await;
+            return music_stream(&ctx, rest.trim_end_matches(".json")).await;
         }
         return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
     }
@@ -7584,7 +7584,7 @@ const MUSIC_STALE_GRACE: i64 = 21_600;
 /// Observed live with the origin failing: `search-music` returned `rows:0` on every
 /// query, so the music browser showed nothing at all — while `/stream` on the same
 /// origin still answered from its stale copy. That asymmetry is what this fixes.
-async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
+async fn music_search(query: &str, limit: usize) -> Vec<Value> {
     // Key WITHOUT the cache-buster: same query + limit = same answer.
     let key = format!("{}|{}", limit, query.trim().to_ascii_lowercase());
     let q_owned = query.to_string();
@@ -7653,7 +7653,7 @@ async fn eclipse_search(query: &str, limit: usize) -> Vec<Value> {
             let tracks: Vec<Value> = rows
                 .iter()
                 .filter(|r| !str_at(r, "short_code").is_empty())
-                .map(crate::eclipse::format_track)
+                .map(crate::music::format_track)
                 .collect();
             // The ORIGIN'S ORDER IS THE RANKING — do not re-sort here.
             //
@@ -7859,7 +7859,7 @@ pub(crate) async fn resolve_stream_target(short_code: &str) -> (Value, u16) {
 /// installs this SAME `/music` addon and reads `url`/`codec`/`container`/
 /// `manifest`/`encrypted` out of the same answer. Both ignore unknown keys, so
 /// there is no second addon and no second route.
-async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
+async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // BitChord percent-encodes the id it was handed back to us.
     let code = crate::download::percent_decode(
         short_code
@@ -8013,14 +8013,14 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     // derived from it. No invented `bitDepth`/`sampleRate` — see `codec_of` on why
     // overstating a rendition is worse than saying nothing.
     body["size"] = serde_json::json!(size);
-    let kbps = crate::eclipse::kbps(size, duration);
+    let kbps = crate::music::kbps(size, duration);
     if kbps > 0 {
         body["bitrate"] = serde_json::json!(kbps);
         body["kbps"] = serde_json::json!(kbps);
     }
-    let quality = if crate::eclipse::is_hi_res(&ext, size, duration) {
+    let quality = if crate::music::is_hi_res(&ext, size, duration) {
         "hi_res_lossless"
-    } else if crate::eclipse::is_lossless(&ext, size, duration) {
+    } else if crate::music::is_lossless(&ext, size, duration) {
         "lossless"
     } else {
         "high"
@@ -8037,7 +8037,7 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
 /// does carry both inside it — MEASURED 2026-11-07, `33xqYK` has an `alac`
 /// sample-entry box, `lyYtHg` has `mp4a`, and both are "Sial"-era `.m4a`. So the
 /// extension alone must not decide the codec; `file_size ÷ duration` does, via
-/// [`crate::eclipse::is_lossless`] (879 kbps = ALAC, 269 kbps = AAC for the same
+/// [`crate::music::is_lossless`] (879 kbps = ALAC, 269 kbps = AAC for the same
 /// 243 s track).
 ///
 /// The asymmetry is deliberate: a lossless-class bitrate is claimed as `alac`,
@@ -8048,7 +8048,7 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
 /// decoder play the file and one without fail honestly.
 fn codec_of(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
     if ext.eq_ignore_ascii_case("m4a") {
-        return if crate::eclipse::is_lossless(ext, file_size, duration_secs) {
+        return if crate::music::is_lossless(ext, file_size, duration_secs) {
             "alac"
         } else {
             ""
@@ -8131,7 +8131,7 @@ fn upload_bot() -> String {
 /// returned URL, because a 128 kbps mp3 is not a bit-exact rendition: the song
 /// simply did not play while the lossless copy was in the list.
 ///
-/// The tier is NOT recomputed here: [`crate::eclipse::format_track`] already
+/// The tier is NOT recomputed here: [`crate::music::format_track`] already
 /// stamped `audioQuality`, and it is the only place with both `file_size` and
 /// `duration`. That is what lets an ALAC `.m4a` (879 kbps) outrank an AAC `.m4a`
 /// (269 kbps) of the same song when the catalogue holds no FLAC at all — the
@@ -8193,10 +8193,10 @@ fn tier_satisfied(rows: &[Value], quality: &str) -> bool {
     match want_of(quality) {
         Some(Want::HiRes) => rows
             .iter()
-            .any(|t| crate::eclipse::is_hi_res(&str_at(t, "format"), size(t), duration(t))),
+            .any(|t| crate::music::is_hi_res(&str_at(t, "format"), size(t), duration(t))),
         Some(Want::Lossless) => rows
             .iter()
-            .any(|t| crate::eclipse::is_lossless(&str_at(t, "format"), size(t), duration(t))),
+            .any(|t| crate::music::is_lossless(&str_at(t, "format"), size(t), duration(t))),
         _ => true,
     }
 }
@@ -8212,9 +8212,9 @@ fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
             let size = t.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
             let duration = t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
             let lossless = str_at(&t, "audioQuality") == "LOSSLESS";
-            let hi_res = crate::eclipse::is_hi_res(&format, size, duration);
+            let hi_res = crate::music::is_hi_res(&format, size, duration);
             // An unknown bitrate must never win a "smallest file" race.
-            let kbps = match crate::eclipse::kbps(size, duration) {
+            let kbps = match crate::music::kbps(size, duration) {
                 0 => u64::MAX,
                 k => k,
             };
@@ -8254,7 +8254,7 @@ mod bitchord_tests {
 
     /// Test-only: stamp `audioQuality` on already-formatted rows.
     ///
-    /// The tier itself is NEVER decided here — [`crate::eclipse::tier()`] decides
+    /// The tier itself is NEVER decided here — [`crate::music::tier()`] decides
     /// it, and these tests only check that a row keeps its identity and that a
     /// lossy container is never promoted. Called with no size/duration, which is
     /// the honest worst case: anything not inherently bit-exact must stay HIGH.
@@ -8263,7 +8263,7 @@ mod bitchord_tests {
             .map(|mut r| {
                 let format = str_at(&r, "format");
                 r["audioQuality"] =
-                    serde_json::json!(crate::eclipse::tier(&format, 0, 0));
+                    serde_json::json!(crate::music::tier(&format, 0, 0));
                 r
             })
             .collect()

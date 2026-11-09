@@ -178,8 +178,8 @@ pub fn stremio_locked_stream(base_url: &str, sponsor: Option<serde_json::Value>)
     )
 }
 
-/// PHP `fd_eclipse_locked_response()` (backend.php:1807).
-pub fn eclipse_locked_response(base_url: &str) -> Response {
+/// PHP `fd_music_locked()` (backend.php:1807).
+pub fn music_locked(base_url: &str) -> Response {
     stremio_json(
         200,
         &serde_json::json!({

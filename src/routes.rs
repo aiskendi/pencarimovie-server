@@ -7810,12 +7810,39 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
         &jstr(&resolved, "mime"),
         &jstr(&resolved, "file_type"),
     );
-    let payload = serde_json::json!({
+    // THE SAME PAYLOAD A MOVIE STREAM CARRIES.
+    //
+    // MEASURED 2026-11-09 from the live log, and it was the real asymmetry between
+    // music and video: every movie request arrives with `"file_id_present":true`
+    // ("download using the cached file_id (no re-resolve)"), while EVERY music
+    // request arrived with `false` — this route resolved the code to learn the
+    // file's name and size and then THREW THE ID AWAY. So a music seek re-entered
+    // the origin resolve, paid the cold-start gate and queued for the same part
+    // budget as a first play, where a movie seek costs one `upload.getFile`.
+    //
+    // `file_id_mt` and `bot_id` travel together on purpose: the `file_reference`
+    // inside a file id belongs to the bot that minted it, which is why
+    // `handle_download` refuses to rotate bots for a request that carries one.
+    let file_id_mt = {
+        let a = jstr(&resolved, "file_id_mt");
+        if a.is_empty() { jstr(&resolved, "file_id") } else { a }
+    };
+    let bot_for_payload = {
+        let b = jstr(&resolved, "bot_id");
+        if b.is_empty() { bot.clone() } else { b }
+    };
+    let mut payload = serde_json::json!({
         "file_size": size,
         "file_name": file_name,
         "mime": served_mime,
         "short_code": code,
     });
+    // Omitted when the origin gave no id, so a resolve-only install behaves
+    // exactly as before instead of carrying an empty `file_id_mt`.
+    if !file_id_mt.is_empty() && !bot_for_payload.is_empty() {
+        payload["file_id_mt"] = serde_json::json!(file_id_mt);
+        payload["bot_id"] = serde_json::json!(bot_for_payload);
+    }
     let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
     let url = build_stream_url(&ctx.base_url, &b64, &file_name);
     let mut body = serde_json::json!({

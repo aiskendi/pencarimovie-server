@@ -2281,16 +2281,8 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             let b = jstr(&resolved, "bot_id");
             if b.is_empty() { active_bot.clone() } else { b }
         };
-        let payload = serde_json::json!({
-            "file_id_mt": file_id,
-            "file_size": size,
-            "file_name": file_name,
-            "mime": mime,
-            "short_code": code,
-            "bot_id": bot_for_payload,
-        });
-        let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-        let url = build_stream_url(&ctx.base_url, &b64, &file_name);
+        let payload = stream_payload(&code, &file_name, &mime, size, &file_id, &bot_for_payload);
+        let url = stream_url(&ctx.base_url, &payload, &file_name);
         // A direct `pm_file_` item keeps its file_id in the payload (no
         // resolution at download time) and still gets the sponsored message on
         // top, exactly like every other stream list.
@@ -4520,14 +4512,30 @@ fn stream_item(
         )),
     );
 
-    let payload = serde_json::json!({
-        "file_size": size,
-        "file_name": file_name,
-        "mime": mime,
-        "short_code": short_code,
-    });
-    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-    let url = build_stream_url(&ctx.base_url, &b64, &file_name);
+    // The same id a movie stream already had, taken from the resolve cache the
+    // two calls above (`cached_duration`, `cached_part`) read anyway. Without it
+    // every Range on a catalog row re-entered `/resolve-file`; with it the
+    // download path reuses the id and only re-resolves when the reference is
+    // stale, which it already detects.
+    let (payload_id, payload_bot) = {
+        let bot = get_bot_id();
+        let cached = if short_code.is_empty() || bot.is_empty() {
+            None
+        } else {
+            crate::resolve::resolve_shortcode_cached(&short_code, &bot)
+        };
+        match cached {
+            Some(c) => {
+                let a = jstr(&c, "file_id_mt");
+                let id = if a.is_empty() { jstr(&c, "file_id") } else { a };
+                let b = jstr(&c, "bot_id");
+                (id, if b.is_empty() { bot } else { b })
+            }
+            None => (String::new(), String::new()),
+        }
+    };
+    let payload = stream_payload(&short_code, &file_name, &mime, size, &payload_id, &payload_bot);
+    let url = stream_url(&ctx.base_url, &payload, &file_name);
     // NO `title`. stremio-core (web AND Android) parses a stream into
     // `{ name, description, url|externalUrl|infoHash, behaviorHints }` — `title`
     // is not part of that model, and a row carrying it was dropped while the
@@ -4741,6 +4749,51 @@ async fn handle_thumb_api(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // 404, never a 5xx: an `<img>` treats 5xx as retryable and hammers it.
         None => not_found_json(),
     }
+}
+
+/// The ONE payload a `/api/download` stream URL carries, for movies and music
+/// alike.
+///
+/// MEASURED 2026-11-09 from the live log, and the drift was invisible until then:
+/// the external/movie path carried `file_id_mt` + `bot_id`, so every Range there
+/// logged `"file_id_present":true` and never re-resolved, while the catalog and
+/// music paths left them out and every Range went back through `/resolve-file`.
+/// Same endpoint, same body — so one builder is the only way they stay the same.
+///
+/// `file_id_mt` and `bot_id` are omitted ONLY when there is no id; they always
+/// travel together, because the `file_reference` inside a file id belongs to the
+/// bot that minted it (`handle_download` will not rotate bots for a request that
+/// already carries one).
+fn stream_payload(
+    short_code: &str,
+    file_name: &str,
+    mime: &str,
+    file_size: u64,
+    file_id_mt: &str,
+    bot_id: &str,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "file_size": file_size,
+        "file_name": file_name,
+        "mime": mime,
+        "short_code": short_code,
+    });
+    let id = file_id_mt.trim();
+    let bot = bot_id.trim();
+    if !id.is_empty() && !bot.is_empty() {
+        payload["file_id_mt"] = serde_json::json!(id);
+        payload["bot_id"] = serde_json::json!(bot);
+        // The name `/api/download` also accepts directly, so the payload has one
+        // shape whatever produced it.
+        payload["file_id"] = serde_json::json!(id);
+    }
+    payload
+}
+
+/// The `/api/download` URL for a payload — one encoder, one call shape.
+fn stream_url(base_url: &str, payload: &Value, file_name: &str) -> String {
+    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
+    build_stream_url(base_url, &b64, file_name)
 }
 
 fn build_stream_url(base_url: &str, payload_b64: &str, file_name: &str) -> String {
@@ -7831,20 +7884,16 @@ async fn eclipse_stream(ctx: &ReqCtx, short_code: &str) -> Response {
         let b = jstr(&resolved, "bot_id");
         if b.is_empty() { bot.clone() } else { b }
     };
-    let mut payload = serde_json::json!({
-        "file_size": size,
-        "file_name": file_name,
-        "mime": served_mime,
-        "short_code": code,
-    });
-    // Omitted when the origin gave no id, so a resolve-only install behaves
-    // exactly as before instead of carrying an empty `file_id_mt`.
-    if !file_id_mt.is_empty() && !bot_for_payload.is_empty() {
-        payload["file_id_mt"] = serde_json::json!(file_id_mt);
-        payload["bot_id"] = serde_json::json!(bot_for_payload);
-    }
-    let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
-    let url = build_stream_url(&ctx.base_url, &b64, &file_name);
+    // The ONE payload builder, shared with the movie paths — see `stream_payload`.
+    let payload = stream_payload(
+        &code,
+        &file_name,
+        &served_mime,
+        size,
+        &file_id_mt,
+        &bot_for_payload,
+    );
+    let url = stream_url(&ctx.base_url, &payload, &file_name);
     let mut body = serde_json::json!({
         "url": url,
         "format": ext,
@@ -9681,6 +9730,55 @@ mod tests {
     /// Do NOT re-add it "because issue #9 asked for a title": that text already
     /// lives on line 1 of `description`, which every client renders, plus the
     /// pill line. If a future client needs a second line, extend `description`.
+    /// One payload shape for music AND video, with `file_id_mt` + `bot_id`
+    /// travelling together or not at all — the drift this function exists to stop
+    /// was music resolving on every Range while video never did.
+    #[test]
+    fn a_stream_payload_has_one_shape_for_music_and_video() {
+        let with_id = stream_payload("abc123", "Song.flac", "audio/flac", 1234, "IDMT", "bot-1");
+        assert_eq!(jstr(&with_id, "short_code"), "abc123");
+        assert_eq!(jstr(&with_id, "file_name"), "Song.flac");
+        assert_eq!(jstr(&with_id, "mime"), "audio/flac");
+        assert_eq!(with_id.get("file_size").and_then(|v| v.as_u64()), Some(1234));
+        assert_eq!(jstr(&with_id, "file_id_mt"), "IDMT");
+        assert_eq!(jstr(&with_id, "file_id"), "IDMT");
+        assert_eq!(jstr(&with_id, "bot_id"), "bot-1");
+
+        // Same keys whichever media type asks for it.
+        let video = stream_payload("xyz", "Film.mkv", "video/x-matroska", 9, "", "");
+        let mut music_keys: Vec<&str> = with_id
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !matches!(*k, "file_id_mt" | "file_id" | "bot_id"))
+            .collect();
+        let mut video_keys: Vec<&str> =
+            video.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        music_keys.sort();
+        video_keys.sort();
+        assert_eq!(music_keys, video_keys, "music and video must share one shape");
+
+        // No id, or no bot: neither is written — an id without its bot would 410.
+        assert!(video.get("file_id_mt").is_none());
+        assert!(video.get("bot_id").is_none());
+        let orphan = stream_payload("abc", "Film.mkv", "video/x-matroska", 9, "IDMT", "  ");
+        assert!(
+            orphan.get("file_id_mt").is_none(),
+            "an id must never travel without its bot"
+        );
+
+        // The URL is the same endpoint for both, and the payload round-trips.
+        let url = stream_url("https://host", &with_id, "Song.flac");
+        assert!(url.contains("/api/download/"), "{url}");
+        assert!(url.ends_with("Song.flac"), "{url}");
+        let b64 = crate::fileid::base64url_encode(with_id.to_string().as_bytes());
+        let round = crate::download::decode_download_payload(&b64);
+        assert_eq!(jstr(&round, "short_code"), "abc123");
+        assert_eq!(jstr(&round, "file_id_mt"), "IDMT");
+        assert_eq!(jstr(&round, "bot_id"), "bot-1");
+    }
+
     #[test]
     fn a_stream_item_never_carries_a_title_field() {
         let item = crate::matcher::FileItem {

@@ -328,6 +328,11 @@ fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
 /// One fetch window, clamped so it never asks past the last byte. A window that
 /// over-runs EOF makes Telegram error and the body dies short of the
 /// `Content-Length` already sent.
+///
+/// How many times one window inside a LIVE BODY is retried before the body is
+/// given up. Small on purpose: this covers a blip, not a dead file.
+pub const BODY_WINDOW_ATTEMPTS: u32 = 3;
+
 fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
     let avail = file_size.saturating_sub(p);
     let w = want.min(avail);
@@ -2164,10 +2169,50 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let entry = entry_for_task.clone();
             let target = target_for_task.clone();
             async move {
-                let (client, gate) = entry.pick_slot();
-                let res =
-                    crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w).await;
-                (i, res)
+                // ONE BLINK MUST NOT KILL THE TRACK.
+                //
+                // MEASURED 2026-11-09 from the live log: in 42 s, 27 distinct
+                // audio files were requested and EVERY one answered 200/206, yet
+                // nine bodies died mid-stream (`download stream aborted mid-body`)
+                // — which a player sees as "this song is broken" even though it
+                // had the right rows and the right bytes started arriving.
+                //
+                // The pre-flight gives up fast on purpose (the router kills the
+                // request at 30 s), but a window INSIDE a body is different: the
+                // client already holds the headers and the `Content-Length`, so a
+                // short pause is recoverable and aborting is not. Retry only what
+                // means "busy" or "the connection blinked"; a dead file reference
+                // is still final.
+                let mut attempt = 0u32;
+                loop {
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w)
+                        .await
+                    {
+                        Ok(v) => return (i, Ok(v)),
+                        Err(e) => {
+                            attempt += 1;
+                            let retryable =
+                                e.transport || e.message.starts_with(GATE_BUSY_PREFIX);
+                            if !retryable || attempt >= BODY_WINDOW_ATTEMPTS {
+                                return (i, Err(e));
+                            }
+                            log(
+                                "download stream retrying a window",
+                                &serde_json::json!({
+                                    "attempt": attempt,
+                                    "error": e.message,
+                                    "pos": p,
+                                    "wait_ms": 150 * attempt as u64,
+                                }),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                150 * attempt as u64,
+                            ))
+                            .await;
+                        }
+                    }
+                }
             }
         }))
         .buffered(pipeline);

@@ -2020,6 +2020,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // A rate limit is a 429, never a 5xx/404: a client reads those as fatal
         // and never retries (root AGENTS.md: "A rate limit must answer 429").
         if let Some(secs) = err.flood_wait {
+            // Record it against THIS bot, so the next resolve picks another one
+            // instead of walking into the same 429 again (see
+            // `session::note_flood_seconds`).
+            crate::session::note_flood_seconds(&bot_id, secs as i64, &err.message);
             let retry_after = secs.max(1);
             record_refusal(
                 ctx,
@@ -2057,6 +2061,56 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
         if is_auth_failure(&err.message) {
             mark_session_bad(&bot_id, &err.message);
+        }
+        // THE ORIGIN IS UNREACHABLE — say so, and say it ONCE.
+        //
+        // MEASURED 2026-11-09, local log while BitChord walked a track in 32 KB
+        // ranges: one `/resolve-file` timeout armed the origin gate, and every
+        // ladder inside its window then ended in
+        //
+        //   resolve skipped - origin down, answering unreachable {"for_secs":45}
+        //   download failed {"error":"FILE_REFERENCE_EXPIRED (400)"}
+        //   download refused {"http_status":503,"stage":"FILE_REFERENCE_EXPIRED"}
+        //
+        // — a DEAD REFERENCE reported for a file that is perfectly fine, because
+        // the reference could not be refreshed. Meanwhile four attempts burned
+        // 1 + 2 + 3 s inside the blackout. The honest answer is the wait itself:
+        // `Retry-After` equal to what is left of the gate, which a player obeys.
+        let origin_down = crate::httpc::wp_origin_down_secs();
+        if origin_down > 0 {
+            let retry_after = origin_down.clamp(1, 30) as u64;
+            log(
+                "download deferred - the origin cannot mint a fresh reference yet",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "origin_down_secs": origin_down,
+                    "retry_after": retry_after,
+                }),
+            );
+            record_refusal(
+                ctx,
+                started,
+                503,
+                "ORIGIN_UNREACHABLE",
+                "The origin is not answering, so a fresh file reference cannot be minted.",
+                &short_code,
+                serde_json::json!({"bot_id": bot_id, "retry_after": retry_after}),
+            );
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, retry_after.to_string())
+                .body(Body::from(
+                    serde_json::json!({
+                        "ok": 0,
+                        "message": "The origin is not answering. Retry shortly.",
+                        "retry_after": retry_after,
+                        "short_code": short_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| json_response(503, &serde_json::json!({"ok": 0, "message": "origin unreachable"})));
         }
         let (status, reason, retry_after) = giveup_status(&err);
         record_refusal(
@@ -2348,6 +2402,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         // of at the end of a ladder that cannot help.
                         if is_auth_failure(&e.message) {
                             mark_session_bad(&bot_for_task, &e.message);
+                        }
+                        // Same reasoning for a flood: record the wait on THIS bot
+                        // so the next resolve leaves it alone for the duration.
+                        if let Some(secs) = e.flood_wait {
+                            crate::session::note_flood_seconds(&bot_for_task, secs as i64, &e.message);
                         }
                         crate::diagnostics::record_throttled(
                             "playback_incident",

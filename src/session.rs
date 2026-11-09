@@ -693,6 +693,28 @@ pub fn note_flood_for(bot_id: &str, error: &str) -> i64 {
     if secs <= 0 {
         return 0;
     }
+    note_flood_seconds(id, secs, error)
+}
+
+/// Record a flood wait whose seconds are ALREADY KNOWN — a `GramErr.flood_wait`
+/// — instead of parsing them back out of a message.
+///
+/// MEASURED 2026-11-09 from the live log: `upload.getFile` answered `FLOOD_WAIT
+/// (420)` on bots whose LOGIN was perfectly healthy, and nothing recorded it —
+/// only the sign-in path called `note_flood_for`. So `usable()` kept offering
+/// those bots, every resolve picked them again, the payload bound them, and the
+/// fleet answered `429 RATE_LIMITED` to BitChord, VLC, Chrome and libmpv alike
+/// (21 refusals in 20 seconds) — which is what "the app will not play lossless"
+/// looks like from the client side.
+///
+/// Recording it here makes the flood behave like the login flood it already is:
+/// that bot is skipped for the duration, the next resolve picks a healthy one,
+/// and the client's own retry lands somewhere that works.
+pub fn note_flood_seconds(bot_id: &str, secs: i64, why: &str) -> i64 {
+    let id = bot_id.trim();
+    if id.is_empty() || secs <= 0 {
+        return 0;
+    }
     if secs <= flood_remaining_for(id) {
         return secs;
     }
@@ -701,10 +723,10 @@ pub fn note_flood_for(bot_id: &str, error: &str) -> i64 {
         "seconds": secs,
         "recorded_at": now(),
         "bot_id": id,
-        "error": error,
+        "error": why,
     });
     crate::cache::put(FLOOD_NS, &format!("bot:{}", id), &body, secs, secs);
-    log("telegram login flood wait recorded (per bot)", &body);
+    log("telegram flood wait recorded (per bot)", &body);
     secs
 }
 

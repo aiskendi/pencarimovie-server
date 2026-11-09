@@ -1642,14 +1642,19 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             // existed — a CD copy. `eclipse::tier()` cannot tell a 16/44.1 FLAC
             // from a 24/96 master (both read `LOSSLESS`); bitrate can, and
             // `format_track()` now emits `size` for exactly this test.
-            let has_hi_res = rows.iter().any(|t| {
-                crate::eclipse::is_hi_res(
-                    &str_at(t, "format"),
-                    t.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-                    t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0),
-                )
-            });
-            if !q.trim().is_empty() && !has_hi_res {
+            // LAZY: fill only what was ASKED FOR and is genuinely absent.
+            //
+            // "No hi-res row" is NOT a reason to fill when the caller asked for
+            // plain lossless and a good 16/44.1 FLAC is already in the catalogue —
+            // that spends a source search plus a 20–45 MB upload on something
+            // nobody asked for. MEASURED 2026-11-09: ordinary `quality=LOSSLESS`
+            // browsing produced 19 fills inside one minute, every one of them
+            // while the client already had a lossless row to play.
+            //
+            // medium/low/unpublished never fill: a fill uploads a MASTER, so it can
+            // never be the thing those tiers were missing. `tier_satisfied` holds
+            // that rule, and its test names it.
+            if !q.trim().is_empty() && !tier_satisfied(&rows, &ctx.qs("quality")) {
                 // A pool pick, not the primary bot: uploads are rate-limited per
                 // ACCOUNT, and a fleet all uploading through one bot floods
                 // (`upload.saveBigFilePart` 420). See `upload_bot`.
@@ -1772,6 +1777,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             &param("artist"),
             duration,
             &param("relay"),
+            &param("artwork"),
         )
         .await
         {
@@ -7986,6 +7992,33 @@ fn want_of(quality: &str) -> Option<Want> {
     }
 }
 
+/// Does the catalogue ALREADY answer the tier the client asked for?
+///
+/// This is the backfill's whole gate. A fill costs one source search and a
+/// 20–45 MB upload, so it must only happen when the answer the client wanted is
+/// genuinely absent from `rows`:
+///
+/// - `hi_res` → needs a row above CD bitrate, not merely a lossless one;
+/// - `lossless` → any bit-exact row is enough, hi-res or CD;
+/// - `medium` / `low` / unpublished → always satisfied, because a fill uploads a
+///   MASTER and can never be the thing those tiers were missing.
+///
+/// MEASURED 2026-11-09: the previous rule ("fill whenever there is no hi-res row")
+/// fired 19 times in one minute off ordinary lossless browsing.
+fn tier_satisfied(rows: &[Value], quality: &str) -> bool {
+    let size = |t: &Value| t.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let duration = |t: &Value| t.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+    match want_of(quality) {
+        Some(Want::HiRes) => rows
+            .iter()
+            .any(|t| crate::eclipse::is_hi_res(&str_at(t, "format"), size(t), duration(t))),
+        Some(Want::Lossless) => rows
+            .iter()
+            .any(|t| crate::eclipse::is_lossless(&str_at(t, "format"), size(t), duration(t))),
+        _ => true,
+    }
+}
+
 fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
     let Some(want) = want_of(quality) else {
         return tracks;
@@ -8160,6 +8193,44 @@ mod bitchord_tests {
     }
 
     /// `medium` is a normal lossy file, and the one nearest 256 kbps wins.
+    /// The gate that decides whether a fill is worth a source call at all.
+    ///
+    /// The measured flood (2026-11-09): 23 lossless rows, no hi-res row, the
+    /// client asking `LOSSLESS` — and the old rule filled anyway.
+    #[test]
+    fn only_a_missing_tier_triggers_a_fill() {
+        let cd_flac = serde_json::json!({
+            "format": "flac", "size": 32_000_000u64, "duration": 283, "audioQuality": "LOSSLESS"
+        });
+        let master = serde_json::json!({
+            "format": "flac", "size": 90_000_000u64, "duration": 283, "audioQuality": "LOSSLESS"
+        });
+        let lossy = serde_json::json!({
+            "format": "mp3", "size": 9_000_000u64, "duration": 283, "audioQuality": "HIGH"
+        });
+
+        // A hi-res request is answered by a master, and only by a master.
+        assert!(tier_satisfied(&[master.clone()], "hi_res"));
+        assert!(!tier_satisfied(&[cd_flac.clone()], "hi_res"));
+        // A lossless request is answered by a CD FLAC — no fill on that browse.
+        assert!(tier_satisfied(&[cd_flac.clone()], "LOSSLESS"));
+        assert!(!tier_satisfied(&[lossy.clone()], "lossless"));
+        // medium/low (and an unpublished quality) are never a reason to upload.
+        assert!(tier_satisfied(&[], "medium"));
+        assert!(tier_satisfied(&[], "low"));
+        assert!(tier_satisfied(&[], ""));
+
+        let rows: Vec<Value> = (0..23).map(|_| cd_flac.clone()).collect();
+        assert!(
+            tier_satisfied(&rows, "LOSSLESS"),
+            "a CD FLAC must never trigger a fill"
+        );
+        assert!(
+            !tier_satisfied(&rows, "hi_res"),
+            "a hi-res request still fills"
+        );
+    }
+
     #[test]
     fn a_medium_request_prefers_lossy_near_256k() {
         let rows = rank_for_tier(four_qualities(), "medium");

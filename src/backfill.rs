@@ -1019,6 +1019,9 @@ async fn backfill_body(
         mime
     };
     let file_name = safe_name(artist, title, &ext);
+    // Read BEFORE the send: `thumb` moves into it, and whether the file carries
+    // artwork is the only way to tell a covered fill from a blank one in the log.
+    let has_thumb = thumb.as_ref().is_some_and(|b| !b.is_empty());
 
     let sent = crate::telegram::upload_and_send_audio(
         client,
@@ -1069,6 +1072,7 @@ async fn backfill_body(
             "bytes": sent_size,
             "message_id": sent.message_id,
             "relay": username,
+            "thumb": has_thumb,
         }),
     );
 

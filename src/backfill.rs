@@ -541,6 +541,21 @@ async fn backfill_for_query(client: &Client, q: &str) -> Result<(), String> {
 
 /* ── the backfill itself ────────────────────────────────────────────────── */
 
+/// A string with its query removed, for logs.
+///
+/// MEASURED 2026-11-09 from our own Heroku log: the signed CDN links carry `hmac`
+/// and `etsp`, a short-lived signature, and reqwest puts the whole url into its
+/// error text — so `size probe: error sending request for url (https://…&hmac=…)`
+/// wrote one into the log. A signature in a log file is a credential in a log
+/// file, and Heroku logs are readable by anyone with dashboard access. Everything
+/// from the first `?` goes.
+fn redact_query(s: &str) -> String {
+    match s.split_once('?') {
+        Some((head, _)) => format!("{head}?…"),
+        None => s.to_string(),
+    }
+}
+
 /// A source-signed URL that fetches a SLICE of the recording, not the recording.
 ///
 /// MEASURED 2026-11-08 on `heisenberg…` — the whole of "the upload is broke, only
@@ -600,7 +615,11 @@ async fn master_size(http: &reqwest::Client, url: &str) -> Result<u64, String> {
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| format!("size probe: {e}"))?;
+        // SECURITY: a signature never reaches the log. reqwest embeds the WHOLE
+        // url in its error text, and the source's CDN links carry `hmac` + `etsp`
+        // — so this line once wrote a live signature into the Heroku log
+        // (`size probe: error sending request for url (https://…&hmac=…)`).
+        .map_err(|e| format!("size probe: {}", redact_query(&e.to_string())))?;
     if let Some(range) = resp.headers().get("content-range") {
         if let Ok(text) = range.to_str() {
             if let Some(total) = text.rsplit('/').next() {
@@ -806,7 +825,7 @@ async fn backfill_body(
     if is_preview_url(&media_url) {
         log(
             "backfill: refused a preview slice",
-            &json!({"track_id": track_id, "url": media_url}),
+            &json!({"track_id": track_id, "url": redact_query(&media_url)}),
         );
         return Err(format!(
             "source /stream/{track_id} signed a preview slice (range=), not the master"
@@ -1093,9 +1112,10 @@ mod tests {
     #[test]
     fn a_signed_slice_is_a_preview_and_a_signed_master_is_not() {
         // verbatim from `/a/stream/368761249`, a 24-bit/192 kHz edition
-        let preview = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=5&profile=raw&range=20-30&app_id=312369995&etsp=1794226011&hmac=X5cgWkmKdGfKVIlvWdkIFCq6XUI";
+        // (the signature is replaced: a live `hmac` has no business in a repo)
+        let preview = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=5&profile=raw&range=20-30&app_id=312369995&etsp=1&hmac=TEST";
         // the same host's master shape: fmt=7 (24-bit FLAC), no slice
-        let master = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=7&profile=raw&app_id=312369995&etsp=1794226011&hmac=X5cgWkmKdGfKVIlvWdkIFCq6XUI";
+        let master = "https://streaming-qobuz-std.akamaized.net/file?eid=368761249&fmt=7&profile=raw&app_id=312369995&etsp=1&hmac=TEST";
         assert!(is_preview_url(preview));
         assert!(!is_preview_url(master));
         assert!(!is_preview_url("https://example.test/file?orange=3"));
@@ -1123,5 +1143,22 @@ mod tests {
         assert!(crate::eclipse::kbps(32_059_583, 283) > MIN_MASTER_KBPS);
         // An unknown duration cannot be judged, and must not be refused.
         assert_eq!(crate::eclipse::kbps(1_200_588, 0), 0);
+    }
+
+    /// A signature must never reach a log line, including through a reqwest error
+    /// string, which is how `hmac` got into the Heroku log on 2026-11-09.
+    #[test]
+    fn a_signed_url_is_never_written_to_the_log() {
+        assert_eq!(
+            redact_query("https://cdn.test/file?eid=1&fmt=7&hmac=SECRET"),
+            "https://cdn.test/file?…"
+        );
+        assert!(!redact_query("https://cdn.test/file?hmac=SECRET").contains("SECRET"));
+        // The exact shape reqwest produces in an error's Display.
+        let err = "error sending request for url (https://cdn.test/file?hmac=SECRET)";
+        assert!(!redact_query(err).contains("SECRET"));
+        // A url with no query is left whole — the path is what makes it useful.
+        assert_eq!(redact_query("https://cdn.test/file"), "https://cdn.test/file");
+        assert_eq!(redact_query("no url here"), "no url here");
     }
 }

@@ -347,11 +347,18 @@ pub const PRIME_GATE_WAIT_SECS: u64 = 12;
 ///
 /// Heroku's router kills a request that has produced nothing in **30 s** (`H12`),
 /// and a first byte on a saturated connection has to fit inside that together
-/// with the resolve ladder and the part fetch. 12 s of waiting plus a retry does
-/// not; 6 s plus one retry does. A desktop has no router and waiting is still
-/// better than refusing there, so the wide value stands unless a PaaS marker is
-/// present — see [`crate::paas_env_present`].
-pub const PRIME_GATE_WAIT_SECS_PAAS: u64 = 6;
+/// with the resolve ladder and the part fetch: 8 s + 8 s of waiting + a 6 s
+/// bounded resolve is 22 s, which fits and is checked by
+/// `a_paas_first_byte_fits_inside_the_router_timeout`. A desktop has no router and
+/// waiting is still better than refusing there, so the wide value stands unless a
+/// PaaS marker is present — see [`crate::paas_env_present`].
+///
+/// 8, not 6, after MEASURED 2026-11-09 on the fleet: with `PRIME_PARTS` at 12 and
+/// the worker rotating on a stall, ~20 refusals per 40 s still had a part that
+/// had not landed inside two 6 s windows while dozens of bodies shared the same
+/// four connections. The part arrives; the window was simply shorter than a
+/// contended fetch.
+pub const PRIME_GATE_WAIT_SECS_PAAS: u64 = 8;
 
 /// [`PRIME_GATE_WAIT_SECS`], narrowed when a platform router is in front of us.
 fn prime_gate_wait_secs() -> u64 {

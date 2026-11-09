@@ -339,6 +339,51 @@ fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
 /// given up. Small on purpose: this covers a blip, not a dead file.
 pub const BODY_WINDOW_ATTEMPTS: u32 = 3;
 
+/// Does this error mean the bot's SESSION is broken rather than its network?
+///
+/// MEASURED 2026-11-09 from the live log, `web.3`: `download stream aborted
+/// mid-body {"error":"AUTH_BYTES_INVALID (400)","short_code":"XPkhD3"}` twice for
+/// the same track. Telegram is saying the auth key itself is bad — a retry, a
+/// reconnect and a worker rotation all change nothing, and the bot then poisons
+/// every stream it is picked for.
+fn is_auth_failure(message: &str) -> bool {
+    const NEEDLES: [&str; 5] = [
+        "AUTH_BYTES_INVALID",
+        "AUTH_KEY_UNREGISTERED",
+        "AUTH_KEY_INVALID",
+        "SESSION_REVOKED",
+        "USER_DEACTIVATED",
+    ];
+    NEEDLES.iter().any(|n| message.contains(n))
+}
+
+/// Is this bot's session known to be broken? (`bad_session` cache, 30 min.)
+fn session_is_bad(bot: &str) -> bool {
+    !bot.is_empty() && crate::cache::get("bad_session", bot).is_some()
+}
+
+/// Quarantine a bot whose auth key Telegram rejected.
+///
+/// The window is long because a bad key only heals by logging in again, and
+/// 30 minutes is the same order as the resolve cache: a stream that lands on it
+/// meanwhile would fail for no reason the user can see.
+fn mark_session_bad(bot: &str, why: &str) {
+    if bot.is_empty() {
+        return;
+    }
+    crate::cache::put(
+        "bad_session",
+        bot,
+        &serde_json::json!({"at": now(), "why": why}),
+        1800,
+        0,
+    );
+    log(
+        "bot session marked bad - it will not be picked again for 30 min",
+        &serde_json::json!({"bot_id": bot, "why": why}),
+    );
+}
+
 /// The answer for a pre-flight that ran out of attempts: `(status, reason,
 /// Retry-After)`.
 ///
@@ -1288,6 +1333,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // a candidate. Judging every bot by one bot's wait is what took the healthy
     // ones offline with the sick ones.
     let usable = |id: &str| {
+        // A bot whose SESSION is broken is not usable, however healthy its
+        // network is: Telegram answered `AUTH_BYTES_INVALID`, and no number of
+        // retries fixes an auth key. Skipped for 30 minutes (see
+        // `mark_session_bad`) so a stream stops being routed to it.
+        if session_is_bad(id) {
+            return false;
+        }
         has_local_session(id)
             || (crate::session::flood_remaining_for(id) == 0
                 && crate::session::env_token_for(id).is_some())
@@ -2003,6 +2055,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     )
                 });
         }
+        if is_auth_failure(&err.message) {
+            mark_session_bad(&bot_id, &err.message);
+        }
         let (status, reason, retry_after) = giveup_status(&err);
         record_refusal(
             ctx,
@@ -2288,6 +2343,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                 "bytes_sent": total.saturating_sub(remaining),
                             }),
                         );
+                        // A rejected auth key kills THIS body and would kill every
+                        // later one from the same bot, so quarantine it now instead
+                        // of at the end of a ladder that cannot help.
+                        if is_auth_failure(&e.message) {
+                            mark_session_bad(&bot_for_task, &e.message);
+                        }
                         crate::diagnostics::record_throttled(
                             "playback_incident",
                             "stream aborted",
@@ -2558,6 +2619,30 @@ mod tests {
 
     /// The one behaviour this change exists for: an outage must not be reported as a
     /// client error, because the player does not retry a 400.
+    /// Only a broken auth KEY quarantines a bot. A dead `file_reference` is
+    /// per-send and a transport reset is per-connection — neither should cost the
+    /// bot 30 minutes of work.
+    #[test]
+    fn only_an_auth_key_failure_quarantines_a_bot() {
+        for m in [
+            "AUTH_BYTES_INVALID (400)",
+            "AUTH_KEY_UNREGISTERED",
+            "AUTH_KEY_INVALID",
+            "SESSION_REVOKED",
+            "USER_DEACTIVATED",
+        ] {
+            assert!(is_auth_failure(m), "{m} must quarantine");
+        }
+        for m in [
+            "request error: read 0 bytes",
+            "FILE_REFERENCE_EXPIRED (400)",
+            "parts busy: 12s waiting for a part permit",
+            "FLOOD_WAIT (420)",
+        ] {
+            assert!(!is_auth_failure(m), "{m} must not quarantine");
+        }
+    }
+
     /// 410 tells a player "deleted, never ask again"; a dead `file_reference` only
     /// means "ask again", so it must be 503 + `Retry-After`.
     #[test]

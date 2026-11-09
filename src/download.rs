@@ -339,6 +339,30 @@ fn prime_split(want: u64) -> (u64, Option<(u64, u64)>) {
 /// given up. Small on purpose: this covers a blip, not a dead file.
 pub const BODY_WINDOW_ATTEMPTS: u32 = 3;
 
+/// The answer for a pre-flight that ran out of attempts: `(status, reason,
+/// Retry-After)`.
+///
+/// A DEAD REFERENCE IS NOT A DEAD FILE. `file_reference` values are minted per
+/// send and expire; when every attempt in the ladder still ends in
+/// `FILE_REFERENCE_EXPIRED (400)` the ROW IS FINE and a resolve seconds later
+/// returns a working reference. MEASURED 2026-11-09 from the live log, after the
+/// part-budget work landed: two music files (`Bring Me The Horizon LosT.flac`,
+/// `02.Jangan.Pernah.Berubah.flac`) reached the client as **410** in one window —
+/// and a player treats 410 as "deleted" and never asks again, which is the last
+/// way a healthy lossless row still looked unplayable.
+///
+/// So a dead reference answers `503` + `Retry-After: 2`: retryable, and short
+/// enough that the player's own retry lands inside the resolve's wake-up. A bare
+/// transport/unknown failure stays `500` with no `Retry-After` — that one is not
+/// a promise that a retry will help.
+fn giveup_status(err: &crate::telegram::GramErr) -> (u16, &'static str, Option<u64>) {
+    if err.file_reference {
+        (503, "FILE_REFERENCE_EXPIRED", Some(2))
+    } else {
+        (500, "DOWNLOAD_FAILED", None)
+    }
+}
+
 fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
     let avail = file_size.saturating_sub(p);
     let w = want.min(avail);
@@ -1979,8 +2003,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     )
                 });
         }
-        let status = if err.file_reference { 410 } else { 500 };
-        let reason = if err.file_reference { "FILE_REFERENCE_EXPIRED" } else { "DOWNLOAD_FAILED" };
+        let (status, reason, retry_after) = giveup_status(&err);
         record_refusal(
             ctx,
             started,
@@ -1988,17 +2011,28 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             reason,
             &err.message,
             &short_code,
-            serde_json::json!({"bot_id": bot_id, "flood_wait": err.flood_wait}),
-        );
-        return json_response(
-            status,
-            &serde_json::json!({
-                "ok": 0,
-                "message": err.message,
-                "short_code": short_code,
+            serde_json::json!({
                 "bot_id": bot_id,
+                "flood_wait": err.flood_wait,
+                "retry_after": retry_after,
             }),
         );
+        let payload = serde_json::json!({
+            "ok": 0,
+            "message": err.message,
+            "short_code": short_code,
+            "bot_id": bot_id,
+            "retry_after": retry_after,
+        });
+        if let Some(secs) = retry_after {
+            return Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, secs.to_string())
+                .body(Body::from(payload.to_string()))
+                .unwrap_or_else(|_| json_response(status, &payload));
+        }
+        return json_response(status, &payload);
     };
 
     if start == 0 && is_disguised_executable(&first_buf, &file_name, &file_mime) {
@@ -2524,6 +2558,27 @@ mod tests {
 
     /// The one behaviour this change exists for: an outage must not be reported as a
     /// client error, because the player does not retry a 400.
+    /// 410 tells a player "deleted, never ask again"; a dead `file_reference` only
+    /// means "ask again", so it must be 503 + `Retry-After`.
+    #[test]
+    fn a_dead_reference_is_retryable_and_a_dead_file_is_not() {
+        let dead_ref = crate::telegram::GramErr {
+            message: "FILE_REFERENCE_EXPIRED (400)".to_string(),
+            file_reference: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            giveup_status(&dead_ref),
+            (503, "FILE_REFERENCE_EXPIRED", Some(2))
+        );
+        let other = crate::telegram::GramErr {
+            message: "request error: read 0 bytes".to_string(),
+            transport: true,
+            ..Default::default()
+        };
+        assert_eq!(giveup_status(&other), (500, "DOWNLOAD_FAILED", None));
+    }
+
     #[test]
     fn an_unreachable_origin_is_a_503_not_a_missing_file_id() {
         let (status, stage, _) = empty_resolve_refusal(20);

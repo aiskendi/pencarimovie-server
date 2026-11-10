@@ -36,6 +36,7 @@ mod fileid;
 mod httpc;
 mod log;
 mod matcher;
+mod music_upstreams;
 mod proc;
 mod ratelimit;
 mod resolve;

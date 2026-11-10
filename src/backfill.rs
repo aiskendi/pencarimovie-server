@@ -40,8 +40,8 @@ use crate::log::log;
 /// every failure AND makes the log name a second cause that is not why anything
 /// broke (that is how `bitchord… -> 401` once hid `heisenberg… -> 503`).
 ///
-/// THERE IS NO COMPILED-IN SOURCE ANY MORE. `PM_HIRES_BASE` is the only thing that
-/// turns a fill on, and leaving it unset or blank means backfill is DISABLED.
+/// THERE IS NO COMPILED-IN SOURCE ANY MORE. A fill is turned on by a source the
+/// operator configured — never by a host baked into the binary.
 ///
 /// A default host in the binary is a default somebody else's server pays for: a
 /// fresh clone backfills against an address nobody chose, and when that address
@@ -54,11 +54,30 @@ use crate::log::log;
 /// `bit-chord-addon.vercel.app/a|/b|/d|/e|/f` answered 502/500/502/400/502 while
 /// `/` and `/c` answered 200 with full-length FLAC masters. Each entry is tried in
 /// order and the first answer wins, so one dead host is not a dead feature.
+///
+/// TWO LAYERS, and the precedence is deliberate:
+///
+/// 1. the dashboard's `music_sources` — ENABLED entries only, in the order the
+///    operator listed them. These were validated on entry by
+///    [`crate::music_upstreams::probe`], so they are the ones that actually work;
+/// 2. `PM_HIRES_BASE`, appended AFTER them, deduped.
+///
+/// So the env var stays supported exactly as it was, as the BASE LAYER and the
+/// fallback: an install that saved no source (or disabled them all) behaves as
+/// before, and a source added in the dashboard is tried FIRST because it is the
+/// one the operator can see and just tested. A URL present in both is one entry,
+/// not two — a doubled entry would spend the same request twice per fill.
 fn hires_bases() -> Vec<String> {
-    match std::env::var("PM_HIRES_BASE") {
-        Ok(v) => parse_bases(&v),
-        Err(_) => Vec::new(),
+    let settings = crate::routes::load_catalog_settings_merged();
+    let mut out = crate::music_upstreams::enabled_bases(&settings);
+    if let Ok(raw) = std::env::var("PM_HIRES_BASE") {
+        for base in parse_bases(&raw) {
+            if !out.iter().any(|seen| seen == &base) {
+                out.push(base);
+            }
+        }
     }
+    out
 }
 
 /// The list inside `PM_HIRES_BASE`, split and normalised. Pure, so it is testable
@@ -161,7 +180,10 @@ fn source_cool_off(secs: i64) {
 async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
     let bases = hires_bases();
     if bases.is_empty() {
-        return Err("backfill is disabled (PM_HIRES_BASE is not set)".to_string());
+        return Err(
+            "backfill is disabled (no music upstream: add one in the dashboard, or set PM_HIRES_BASE)"
+                .to_string(),
+        );
     }
     let mut tried: Vec<String> = Vec::new();
     for base in &bases {
@@ -456,8 +478,111 @@ async fn resolve_relay(
 ///
 /// The gate is per process, not per fleet: each dyno decides for itself, which
 /// is the right scope because the memory it protects is per dyno.
-static FILL_GATE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+///
+/// IT IS A LEASE, NOT A SEMAPHORE, and that is the whole fix for 2026-11-10.
+///
+/// The semaphore version held its permit inside the spawned task, so the permit
+/// was released when the task ENDED — which is exactly what a hung upload never
+/// does. Live evidence from the five-dyno fleet, 17:15 UTC, for over an hour on
+/// three unrelated tracks:
+///
+/// ```text
+/// backfill: catalogue has no hi-res lossless {"q":"geisha reverb slowed","rows":3}
+/// backfill: a fill is already running in this process - deferred {"q":"geisha reverb slowed"}
+/// ```
+///
+/// …repeated for every query on that dyno, while `source master sized` /
+/// `streaming the master` stayed at 0: one hung `upload_stream` owned the gate
+/// forever and only a restart cleared it. A timestamp lease cannot be held by a
+/// corpse, and it is the same TTL rule [`reserve()`] already applies to the
+/// ledger (300 s there, because that lease covers one short API round trip; this
+/// one covers a whole upload, so it is longer).
+///
+/// [`FILL_LEASE_SECS`] must therefore exceed the slowest legitimate fill, or a
+/// live fill would be stolen and the memory this gate protects would be doubled.
+const FILL_LEASE_SECS: i64 = 1800;
+
+/// When the fill that currently owns the gate started, in unix seconds. `0` =
+/// free. Compare-and-swap on this one value is what makes takeover safe: two
+/// tasks deciding at the same instant both CAS against the value they read, and
+/// only one wins.
+static FILL_OWNER_SINCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// What the gate says about the lease on record. Pure, so the rules below are
+/// testable without spawning a fill or sleeping for five minutes.
+#[derive(Debug, PartialEq, Eq)]
+enum FillGateState {
+    /// Nobody holds it.
+    Free,
+    /// Held, but for longer than any fill can legitimately run — the owner is
+    /// dead and the next fill may take it over.
+    Expired { held_s: i64 },
+    /// Held by a live fill; come back later.
+    Busy { left_s: i64 },
+}
+
+fn fill_gate_state(owner: i64, now: i64) -> FillGateState {
+    if owner <= 0 {
+        return FillGateState::Free;
+    }
+    let held_s = now.saturating_sub(owner);
+    if held_s >= FILL_LEASE_SECS {
+        FillGateState::Expired { held_s }
+    } else {
+        FillGateState::Busy {
+            left_s: FILL_LEASE_SECS - held_s,
+        }
+    }
+}
+
+/// The lease itself: releasing it is dropping it, so every early return, panic
+/// and cancelled task frees the gate without a `release()` anyone can forget.
+struct FillLease(i64);
+
+impl Drop for FillLease {
+    fn drop(&mut self) {
+        // Only if the lease is still OURS: a fill that was taken over as expired
+        // must never clear the gate the new owner now holds.
+        let _ = FILL_OWNER_SINCE.compare_exchange(
+            self.0,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+/// Take the fill gate, or say who holds it and for how much longer.
+fn acquire_fill_lease() -> Result<FillLease, String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let stamp = crate::storage::now();
+    loop {
+        let owner = FILL_OWNER_SINCE.load(SeqCst);
+        match fill_gate_state(owner, stamp) {
+            FillGateState::Free => {
+                if FILL_OWNER_SINCE.compare_exchange(0, stamp, SeqCst, SeqCst).is_ok() {
+                    return Ok(FillLease(stamp));
+                }
+            }
+            FillGateState::Expired { held_s } => {
+                if FILL_OWNER_SINCE
+                    .compare_exchange(owner, stamp, SeqCst, SeqCst)
+                    .is_ok()
+                {
+                    log(
+                        "backfill: fill lease expired",
+                        &json!({"held_s": held_s, "lease_s": FILL_LEASE_SECS}),
+                    );
+                    return Ok(FillLease(stamp));
+                }
+            }
+            FillGateState::Busy { left_s } => {
+                return Err(format!("its lease has {left_s}s left"));
+            }
+        }
+        // Lost the race against another task; re-read and decide again.
+    }
+}
 
 /// The whole point of the backfill: a client asked for LOSSLESS and the
 /// catalogue had nothing lossless for that query.
@@ -489,16 +614,23 @@ pub fn spawn_for_query(q: &str, client: grammers_client::Client) {
     let query = q.to_string();
     let throttle_key = key.clone();
     tokio::spawn(async move {
-        let Ok(_permit) = FILL_GATE.try_acquire() else {
-            log(
-                "backfill: a fill is already running in this process - deferred",
-                &json!({"q": query}),
-            );
-            // The 10-minute per-query throttle was written before this task
-            // started; drop it so the next browse of this query can try again
-            // instead of the track staying unfilled for ten minutes.
-            crate::cache::invalidate("backfill_q", &throttle_key);
-            return;
+        // The lease lives until this task ends, however it ends: `_lease` is
+        // dropped on the early returns below, on a panic, and after a successful
+        // fill. A fill that never returns cannot hold the gate past
+        // [`FILL_LEASE_SECS`], which is the bug this replaced.
+        let _lease = match acquire_fill_lease() {
+            Ok(lease) => lease,
+            Err(why) => {
+                log(
+                    "backfill: a fill is already running in this process - deferred",
+                    &json!({"q": query, "reason": why}),
+                );
+                // The 10-minute per-query throttle was written before this task
+                // started; drop it so the next browse of this query can try again
+                // instead of the track staying unfilled for ten minutes.
+                crate::cache::invalidate("backfill_q", &throttle_key);
+                return;
+            }
         };
         match backfill_for_query(&client, &query).await {
             Ok(()) => log("backfill: on-demand fill done", &json!({"q": query})),
@@ -615,7 +747,7 @@ async fn source_rows(q: &str) -> Result<Vec<Value>, String> {
 /// A row is only a HINT. `may_hold_a_master()` on the signed answer and
 /// `master_size()` on the actual bytes are what gate an upload, so accepting a
 /// wider vocabulary here cannot let a 30-second preview through.
-fn row_says_lossless(row: &Value) -> bool {
+pub(crate) fn row_says_lossless(row: &Value) -> bool {
     const LOSSLESS_CONTAINERS: [&str; 8] =
         ["flac", "alac", "wav", "aiff", "ape", "wv", "dsf", "dff"];
     let quality = jstr(row, "audioQuality").to_ascii_lowercase();
@@ -1584,5 +1716,79 @@ mod tests {
         // A url with no query is left whole — the path is what makes it useful.
         assert_eq!(redact_query("https://cdn.test/file"), "https://cdn.test/file");
         assert_eq!(redact_query("no url here"), "no url here");
+    }
+
+    /// THE 2026-11-10 BUG, as arithmetic: a fill that hung is not a fill that is
+    /// running. One hung `upload_stream` held the process-wide gate for over an
+    /// hour, so every later search answered `a fill is already running in this
+    /// process - deferred` while nothing was streaming.
+    #[test]
+    fn a_fill_lease_expires_so_a_hung_owner_cannot_hold_the_gate() {
+        let start = 1_700_000_000i64;
+        assert_eq!(fill_gate_state(0, start), FillGateState::Free);
+        assert_eq!(fill_gate_state(-5, start), FillGateState::Free);
+
+        // A live fill is protected: a second one must not start on top of it.
+        assert_eq!(
+            fill_gate_state(start, start + 60),
+            FillGateState::Busy {
+                left_s: FILL_LEASE_SECS - 60
+            }
+        );
+        // The measured hour of silence is past any legitimate fill.
+        assert_eq!(
+            fill_gate_state(start, start + 3600),
+            FillGateState::Expired { held_s: 3600 }
+        );
+        // Exactly at the TTL it is dead, not "one second more of waiting".
+        assert_eq!(
+            fill_gate_state(start, start + FILL_LEASE_SECS),
+            FillGateState::Expired {
+                held_s: FILL_LEASE_SECS
+            }
+        );
+        // ... one second before it, the owner still counts as alive.
+        assert_eq!(
+            fill_gate_state(start, start + FILL_LEASE_SECS - 1),
+            FillGateState::Busy { left_s: 1 }
+        );
+    }
+
+    /// Two consecutive fills in ONE process must both start: the second is
+    /// refused while the first holds the lease, and free the instant it ends —
+    /// no `a fill is already running` left behind (the fleet's symptom). A dead
+    /// owner is taken over, and ITS drop must not clear the new owner's gate.
+    ///
+    /// One test, not two: `FILL_OWNER_SINCE` is process-wide and cargo runs tests
+    /// on threads, so two tests mutating it would race.
+    #[test]
+    fn the_gate_is_free_again_the_moment_its_owner_ends() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let first = acquire_fill_lease().expect("a fresh process has the gate free");
+        assert!(
+            acquire_fill_lease().is_err(),
+            "a second fill must not run alongside the first"
+        );
+        drop(first);
+        let second = acquire_fill_lease().expect("the gate must be free after the first fill ends");
+        drop(second);
+        assert!(acquire_fill_lease().is_ok(), "and free again after that one");
+
+        // A fill that hung two hours ago: its lease is dead, so the next fill runs.
+        let dead = crate::storage::now() - 7200;
+        FILL_OWNER_SINCE.store(dead, SeqCst);
+        let fresh = acquire_fill_lease().expect("an expired lease is taken over");
+        // …and when that hung future eventually ends, it must not free the gate
+        // the new owner now holds.
+        drop(FillLease(dead));
+        assert!(
+            acquire_fill_lease().is_err(),
+            "the dead owner's release must not clear a live lease"
+        );
+        drop(fresh);
+        assert!(acquire_fill_lease().is_ok(), "the live owner's own drop does free it");
+        // Leave the static clean for any later test in this binary.
+        FILL_OWNER_SINCE.store(0, SeqCst);
     }
 }

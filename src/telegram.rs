@@ -825,6 +825,30 @@ pub async fn resolve_peer_by_id(client: &Client, user_id: i64) -> Result<PeerRef
 /// `size` must be the exact byte count of what the reader will yield: it is sent
 /// to Telegram as the document size and used to plan every `upload.getFile`
 /// part on playback.
+/// How long a master upload may stay silent before it is declared hung.
+///
+/// MEASURED 2026-11-10 on the deployed fleet: an upload inside `upload_stream`
+/// never returned. There is no timeout on that future, so the task lived forever
+/// — and with it the process-wide backfill gate (`backfill::FILL_OWNER_SINCE`),
+/// which is why every later query on that dyno answered `a fill is already
+/// running in this process - deferred` for over an hour while nothing streamed.
+///
+/// A floor is required because the first byte of a 50 MB FLAC can take minutes on
+/// a phone link, and a ceiling because a wedged connection must not outlive the
+/// turn. The allowance is deliberately generous (256 KB/s, floor of ten minutes):
+/// this is a liveness backstop against a hang, NOT a bandwidth policy — killing a
+/// slow but working upload would trade a stuck fill for a failed one.
+const UPLOAD_FLOOR_SECS: u64 = 600;
+const UPLOAD_CEILING_SECS: u64 = 1500;
+const UPLOAD_ASSUMED_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// The wall-clock budget for uploading `size` bytes. Pure, so the shape of the
+/// rule is testable without a Telegram connection.
+pub(crate) fn upload_deadline_secs(size: u64) -> u64 {
+    let allowance = size / UPLOAD_ASSUMED_BYTES_PER_SEC;
+    (UPLOAD_FLOOR_SECS + allowance).min(UPLOAD_CEILING_SECS)
+}
+
 pub async fn upload_and_send_audio<S>(
     client: &Client,
     peer: PeerRef,
@@ -854,14 +878,37 @@ where
         });
     }
 
-    let uploaded = client
-        .upload_stream(source, size as usize, file_name.to_string())
-        .await
-        .map_err(|e| GramErr {
+    // BOUNDED, and the bound is the point: `upload_stream` has no timeout of its
+    // own, so a send that stops making progress parks this task — and the caller's
+    // fill gate — for the life of the process. On the deadline the future is
+    // dropped and the caller gets an error, which releases its lease and lets the
+    // NEXT query try again.
+    let deadline = upload_deadline_secs(size);
+    let uploaded = match tokio::time::timeout(
+        std::time::Duration::from_secs(deadline),
+        client.upload_stream(source, size as usize, file_name.to_string()),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| GramErr {
             message: format!("upload_stream {file_name}: {e}"),
             transport: true,
             ..Default::default()
-        })?;
+        })?,
+        Err(_) => {
+            log(
+                "backfill upload deadline exceeded",
+                &serde_json::json!({"file_name": file_name, "bytes": size, "secs": deadline}),
+            );
+            return Err(GramErr {
+                message: format!(
+                    "upload_stream {file_name}: no completion in {deadline}s — upload abandoned as hung"
+                ),
+                transport: true,
+                ..Default::default()
+            });
+        }
+    };
 
     let mut media = InputAudio::new(uploaded).mime_type(mime.to_string());
     // Upload the cover as a document thumb. Failure is not fatal: a track with no
@@ -870,14 +917,22 @@ where
     if let Some(bytes) = thumb {
         if !bytes.is_empty() {
             let mut cursor = &bytes[..];
-            match client
-                .upload_stream(&mut cursor, bytes.len(), "thumb.jpg".to_string())
-                .await
-            {
-                Ok(up) => media = media.thumb(Some(up)),
-                Err(e) => log(
+            // A thumbnail is a few hundred KB; 60 s is already absurdly generous
+            // and a hang here must cost the cover, not the whole fill.
+            let thumb_upload = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                client.upload_stream(&mut cursor, bytes.len(), "thumb.jpg".to_string()),
+            )
+            .await;
+            match thumb_upload {
+                Ok(Ok(up)) => media = media.thumb(Some(up)),
+                Ok(Err(e)) => log(
                     "backfill thumb upload failed",
                     &serde_json::json!({"error": e.to_string(), "bytes": bytes.len()}),
+                ),
+                Err(_) => log(
+                    "backfill thumb upload failed",
+                    &serde_json::json!({"error": "no completion in 60s", "bytes": bytes.len()}),
                 ),
             }
         }
@@ -900,13 +955,25 @@ where
         outgoing = outgoing.text(caption.to_string());
     }
 
-    let msg = client
-        .send_message(peer, outgoing)
-        .await
-        .map_err(|e| GramErr {
+    // The send itself is bounded too: a media message is a single round trip once
+    // the file is uploaded, so two minutes is a hang, not a slow network.
+    let msg = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        client.send_message(peer, outgoing),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|e| GramErr {
             message: format!("send_audio {file_name}: {e}"),
             ..Default::default()
-        })?;
+        })?,
+        Err(_) => {
+            return Err(GramErr {
+                message: format!("send_audio {file_name}: no completion in 120s — send abandoned as hung"),
+                ..Default::default()
+            })
+        }
+    };
     let message_id = msg.id();
 
     // The document triple the byte path needs. Taken from the SEND RESULT, never
@@ -1389,6 +1456,26 @@ mod tests {
         // A signed-in DC is never rotated: that is the caller's guard, pinned here
         // so nobody "simplifies" it back into the candidate scan.
         assert!(!DC_FALLBACK_IPV4.contains(&own));
+    }
+
+    /// The upload deadline is a LIVENESS backstop, not a bandwidth policy: a
+    /// small file gets the floor (a phone link is slow to start), a large one
+    /// gets a larger allowance, and nothing can exceed the ceiling — a wedged
+    /// connection must not outlive the process like the 2026-11-10 one did.
+    #[test]
+    fn an_upload_deadline_has_a_floor_a_slope_and_a_ceiling() {
+        assert_eq!(upload_deadline_secs(0), UPLOAD_FLOOR_SECS);
+        assert_eq!(upload_deadline_secs(24_805_746), UPLOAD_FLOOR_SECS + 94);
+        assert_eq!(upload_deadline_secs(53_975_130), UPLOAD_FLOOR_SECS + 205);
+        // Bigger never means shorter.
+        let mut last = 0;
+        for mb in [0u64, 1, 10, 25, 50, 100, 400, 4096] {
+            let d = upload_deadline_secs(mb * 1024 * 1024);
+            assert!(d >= last, "{mb} MB got {d}s after {last}s");
+            assert!(d <= UPLOAD_CEILING_SECS, "{mb} MB exceeded the ceiling");
+            last = d;
+        }
+        assert_eq!(upload_deadline_secs(4096 * 1024 * 1024), UPLOAD_CEILING_SECS);
     }
 
     #[test]

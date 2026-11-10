@@ -4,8 +4,9 @@
 //! PHP one-for-one, and the ORDER is the PHP's:
 //! `/api/sub-proxy` -> `/api/auth/*` -> `/api/version` -> `/api/lan-ip` ->
 //! `/api/tunnel/*` -> `/api/catalog-settings` -> `/api/media-ids` ->
-//! `/api/validate-manifest` -> `/api/country` -> `/api/session` ->
-//! `/api/clock-check` -> `/api/provision` -> `/api/bots*` -> [version gate] ->
+//! `/api/validate-manifest` -> `/api/music-sources/test` -> `/api/country` ->
+//! `/api/session` -> `/api/clock-check` -> `/api/provision` -> `/api/bots*` ->
+//! [version gate] ->
 //! `/api/diagnostics*` -> `/api/reports` -> `/api/debug-mode` -> `/api/logs` ->
 //! `/api/botlogin` -> `/api/botlogout` -> `/api/proxy-stream` -> `/api/download`
 //! -> `/api/resolve-shortcode` -> `/api/warmup-resolve` -> manifest/catalog/meta/
@@ -609,6 +610,19 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 current["upstream_manifests"] = Value::Array(cleaned);
             }
         }
+        // Music upstreams: validated structurally before anything is written. The
+        // NETWORK check is `/api/music-sources/test` (the dashboard's Test
+        // button); this path only refuses a row that can never work, and refuses
+        // the WHOLE save rather than dropping it — "Saved!" while quietly
+        // discarding an entry is how a URL typo becomes a mystery a week later.
+        if let Some(list) = input.get("music_sources").and_then(|v| v.as_array()) {
+            match clean_music_sources(list) {
+                Ok(cleaned) => current["music_sources"] = Value::Array(cleaned),
+                Err(why) => {
+                    return json_response(400, &serde_json::json!({"ok": 0, "error": why}))
+                }
+            }
+        }
         if let Some(sc_in) = input.get("stream_config").and_then(|v| v.as_object()) {
             if current.get("stream_config").map(|v| v.is_object()).unwrap_or(false) == false {
                 current["stream_config"] = serde_json::json!({});
@@ -779,6 +793,33 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "message": "Manifest validated successfully.",
             }),
         );
+    }
+
+    /* ── music upstreams (the fill source a backfill fetches masters from) ─── */
+    if p == "/api/music-sources/test" && m == "POST" {
+        // SECURITY — this route makes the SERVER fetch a URL the caller typed, so
+        // it must not be reachable from the internet: same gate as `/api/provision`
+        // (loopback or the token). `music_upstreams::probe` refuses a host that
+        // does not resolve to a PUBLIC address on top of that, which is what stops
+        // a form here from being used to poke at the LAN or at loopback.
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
+        let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let url = jstr(&input, "url");
+        if url.is_empty() {
+            return json_response(
+                400,
+                &serde_json::json!({
+                    "ok": false,
+                    "reason": "Enter the addon base URL first.",
+                }),
+            );
+        }
+        // ALWAYS 200: the answer is a report the dashboard renders inline, and a
+        // 4xx/5xx here would read as "the server failed" rather than "this addon
+        // cannot be used". `ok` is the field to branch on.
+        return json_response(200, &crate::music_upstreams::probe(&url).await);
     }
 
     /* ── country (backend.php:18755-18802) ────────────────────────────────── */
@@ -5094,6 +5135,16 @@ fn default_catalog_settings() -> Value {
         // the single master switch; the stored list is kept when it is off, so
         // turning it back on restores everything without re-adding URLs.
         "upstream_manifests": upstream::default_manifests(),
+        // Operator-managed music upstreams: the addons `backfill` fills a missing
+        // track from. Each entry is `{id, name, url, enabled}`, and it is ALWAYS a
+        // list (never null) so the dashboard can `forEach` it on a fresh install.
+        //
+        // Starts EMPTY on purpose. A default host in the binary is a default
+        // somebody else's server pays for — the same rule the `PM_HIRES_BASE`
+        // doc comment in [`crate::backfill`] records, measured 2026-11-10 when a
+        // compiled-in default spent a request on every search of an install that
+        // had never configured a source.
+        "music_sources": [],
         "stream_config": {
             "resolutions": {"4k": true, "1080p": true, "720p": true, "sd": true, "unknown": true},
             "qualities": {"remux": true, "bluray": true, "webdl": true, "webrip": true, "hdtv": true, "cam": true},
@@ -5115,7 +5166,13 @@ fn default_catalog_settings() -> Value {
 
 /// Stored settings merged over the defaults (one level deep for `stream_config`,
 /// so a file written before a key existed still gains it).
-fn load_catalog_settings_merged() -> Value {
+///
+/// `music_sources` is merged like any other key: an EMPTY stored list means the
+/// operator removed every upstream, and that must stay empty. (It is the one list
+/// in this document where empty is a real answer — `upstream_manifests` keeps its
+/// built-in defaults because those are the app's own catalogs; a music source is
+/// always somebody's explicit choice.)
+pub(crate) fn load_catalog_settings_merged() -> Value {
     let mut base = default_catalog_settings();
     let stored = read_catalog_settings();
     let Some(stored_obj) = stored.as_object() else {
@@ -5213,6 +5270,43 @@ fn write_catalog_settings(data: &Value) -> bool {
             false
         }
     }
+}
+
+/// The dashboard's "Music upstreams" rows, cleaned into what gets written.
+///
+/// Each row becomes `{id, name, url, enabled}` with `url` NORMALISED (see
+/// [`crate::music_upstreams::normalize_base`]) so a pasted `…/manifest.json` and
+/// the bare base are the same source. The same base twice is one row: a duplicate
+/// would spend the same request twice on every fill.
+fn clean_music_sources(list: &[Value]) -> Result<Vec<Value>, String> {
+    let mut out: Vec<Value> = Vec::new();
+    for row in list {
+        let raw = row.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let url = crate::music_upstreams::normalize_base(raw)
+            .map_err(|why| format!("music source \"{raw}\": {why}"))?;
+        if out.iter().any(|seen| jstr(seen, "url") == url) {
+            continue;
+        }
+        let id = match row.get("id").and_then(|v| v.as_str()).map(|s| s.trim()) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => crate::music_upstreams::source_id(&url),
+        };
+        let name = {
+            let n = row.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if n.is_empty() { url.clone() } else { n.to_string() }
+        };
+        let enabled = row.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        out.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "url": url,
+            "enabled": enabled,
+        }));
+    }
+    Ok(out)
 }
 
 /// `fd_get_default_catalog_options()` (backend.php:11743) — an **id → info map**,
@@ -10421,6 +10515,47 @@ mod tests {
                 "{prefix} answers 400 `title or id required` on the origin"
             );
         }
+    }
+
+    /// A music source is operator input, so it is normalised on the way IN: the
+    /// same base pasted as `/c`, `/c/` and `/c/manifest.json` must be one row,
+    /// and a URL that is not an http(s) address must refuse the SAVE rather than
+    /// be silently dropped.
+    #[test]
+    fn a_music_source_is_normalised_deduped_and_never_saved_malformed() {
+        let cleaned = clean_music_sources(&[
+            serde_json::json!({"url": "https://host/c/manifest.json", "name": "BitChord", "enabled": true}),
+            serde_json::json!({"url": "https://host/c/", "name": "duplicate"}),
+            serde_json::json!({"url": "https://other/a", "enabled": false}),
+            serde_json::json!({"url": "   "}),
+        ])
+        .expect("well-formed rows are accepted");
+        assert_eq!(cleaned.len(), 2, "the duplicate base collapsed: {cleaned:?}");
+        assert_eq!(cleaned[0]["url"], "https://host/c");
+        assert_eq!(cleaned[0]["name"], "BitChord");
+        assert_eq!(cleaned[0]["enabled"], serde_json::json!(true));
+        assert_eq!(cleaned[0]["id"], "ms-host-c", "an id is minted when none is given");
+        assert_eq!(cleaned[1]["enabled"], serde_json::json!(false));
+        // `enabled` defaults ON: a row the dashboard wrote without the flag is a
+        // source the operator meant to use.
+        let default_on = clean_music_sources(&[serde_json::json!({"url": "https://h/x"})]).unwrap();
+        assert_eq!(default_on[0]["enabled"], serde_json::json!(true));
+
+        let err = clean_music_sources(&[
+            serde_json::json!({"url": "https://good/c"}),
+            serde_json::json!({"url": "not a url"}),
+        ])
+        .expect_err("one malformed row refuses the whole save");
+        assert!(err.contains("not a url"), "{err}");
+    }
+
+    /// A fresh install has NO music upstream: the fill path is off until the
+    /// operator adds one (or sets `PM_HIRES_BASE`).
+    #[test]
+    fn a_fresh_install_ships_no_music_source() {
+        let settings = default_catalog_settings();
+        assert_eq!(settings["music_sources"], serde_json::json!([]));
+        assert!(settings["music_sources"].is_array(), "the dashboard iterates it");
     }
 
     #[test]

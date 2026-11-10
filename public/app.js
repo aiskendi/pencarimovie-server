@@ -630,7 +630,11 @@ class PencariMovieApp {
         movie: true,
         series: true
       },
-      enabled_catalogs: {}
+      enabled_catalogs: {},
+      // Operator-managed fill sources (BitChord-protocol music addons). Each
+      // entry is { id, name, url, enabled }; the server normalises the url and
+      // refuses anything that is not an http(s) base.
+      music_sources: []
     };
     let catalogOptionsState = {};
     const renderCatalogOptions = () => {
@@ -763,6 +767,141 @@ class PencariMovieApp {
           upstreamAddonAddBtn.disabled = false;
           upstreamAddonAddBtn.textContent = origText;
         }
+      }));
+    }
+    /* ── Music upstreams ──────────────────────────────────────────────────
+       `backfill` fetches a master from one of these when the catalogue holds no
+       lossless row for a query. Every row is validated by the SERVER before it
+       is added: /api/music-sources/test probes the manifest, a `/search` and a
+       LOSSLESS count, and answers `{ ok, reason, name, version, ... }`. The
+       reason is shown verbatim — a refusal has to say why, because "invalid
+       URL" for `bitchord.confih.tech` would just be wrong. */
+    const musicSourcesList = this.$("#musicSourcesList");
+    const musicSourceInput = this.$("#musicSourceInput");
+    const musicSourceAddBtn = this.$("#musicSourceAddBtn");
+    const musicSourceStatus = this.$("#musicSourceStatus");
+    const showMusicSourceStatus = (msg, ok) => {
+      if (!musicSourceStatus) return;
+      musicSourceStatus.textContent = msg;
+      musicSourceStatus.classList.remove("hidden");
+      musicSourceStatus.style.color = ok ? "#00d26a" : "#ff5e57";
+    };
+    const testMusicSource = (url, btn) => __async(this, null, function* () {
+      const origText = btn ? btn.textContent : "";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Testing...";
+      }
+      showMusicSourceStatus("Testing ".concat(url, " \u2026"), true);
+      try {
+        const res = yield fetch("".concat(this.localApiBase, "/api/music-sources/test"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            url
+          })
+        });
+        const data = yield res.json().catch(() => null);
+        if (!data) throw new Error("The server did not answer a report.");
+        const label = String(data.name || url) + (data.version ? " " + data.version : "");
+        showMusicSourceStatus((data.ok ? "\u2713 " : "\u2715 ") + (data.ok ? label + " \u2014 " : "") + (data.reason || ""), !!data.ok);
+        return data;
+      } catch (err) {
+        showMusicSourceStatus("\u2715 ".concat(err.message || "Test failed."), false);
+        return null;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = origText;
+        }
+      }
+    });
+    const renderMusicSources = () => {
+      if (!musicSourcesList) return;
+      musicSourcesList.innerHTML = "";
+      const list = catalogSettingsState.music_sources || [];
+      if (list.length === 0) {
+        const emptyNotice = document.createElement("div");
+        emptyNotice.style.fontSize = "0.74rem";
+        emptyNotice.style.color = "#777";
+        emptyNotice.style.fontStyle = "italic";
+        emptyNotice.textContent = "No music upstreams configured - track backfill is off.";
+        musicSourcesList.appendChild(emptyNotice);
+        return;
+      }
+      list.forEach((item, idx) => {
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.05); padding: 5px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1);";
+        const textCol = document.createElement("div");
+        textCol.style.cssText = "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+        const nameEl = document.createElement("strong");
+        nameEl.style.cssText = "font-size: 0.8rem; color: #fff;";
+        nameEl.textContent = item.name || "Music addon";
+        const stateEl = document.createElement("span");
+        stateEl.style.cssText = "font-size: 0.72rem; color: #888;";
+        stateEl.textContent = item.enabled === false ? " (disabled)" : " (enabled)";
+        const urlEl = document.createElement("div");
+        urlEl.style.cssText = "font-size: 0.7rem; color: #aaa; font-family: monospace; overflow: hidden; text-overflow: ellipsis;";
+        urlEl.textContent = item.url || "";
+        textCol.appendChild(nameEl);
+        textCol.appendChild(stateEl);
+        textCol.appendChild(urlEl);
+        const toggle = document.createElement("input");
+        toggle.type = "checkbox";
+        toggle.checked = item.enabled !== false;
+        toggle.title = "Enable or disable this source";
+        toggle.style.cssText = "width: 15px; height: 15px; cursor: pointer; flex: 0 0 auto;";
+        toggle.addEventListener("change", () => {
+          item.enabled = toggle.checked;
+          stateEl.textContent = toggle.checked ? " (enabled)" : " (disabled)";
+        });
+        const testBtn = document.createElement("button");
+        testBtn.type = "button";
+        testBtn.textContent = "Test";
+        testBtn.title = "Re-run the validator for this source";
+        testBtn.style.cssText = "background: none; border: none; color: #4aa3ff; cursor: pointer; font-size: 0.74rem; padding: 4px; flex: 0 0 auto;";
+        testBtn.addEventListener("click", () => testMusicSource(item.url, testBtn));
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.style.cssText = "background: none; border: none; color: #ff5e57; cursor: pointer; font-size: 0.82rem; padding: 4px; flex: 0 0 auto;";
+        delBtn.innerHTML = '<i class="fas fa-trash"></i>';
+        delBtn.title = "Remove source";
+        delBtn.addEventListener("click", () => {
+          (catalogSettingsState.music_sources || []).splice(idx, 1);
+          renderMusicSources();
+        });
+        row.appendChild(textCol);
+        row.appendChild(toggle);
+        row.appendChild(testBtn);
+        row.appendChild(delBtn);
+        musicSourcesList.appendChild(row);
+      });
+    };
+    if (musicSourceAddBtn && musicSourceInput) {
+      musicSourceAddBtn.addEventListener("click", () => __async(this, null, function* () {
+        const url = musicSourceInput.value.trim();
+        if (!url) return;
+        const report = yield testMusicSource(url, musicSourceAddBtn);
+        // A refusal is final: the validator's reason is already on screen and
+        // the row is NOT added — that is the "validation before saving" rule.
+        if (!report || !report.ok) return;
+        if (!catalogSettingsState.music_sources) catalogSettingsState.music_sources = [];
+        const base = report.base || url;
+        if (catalogSettingsState.music_sources.some(existing => existing.url === base)) {
+          showMusicSourceStatus("\u2715 That source is already in the list.", false);
+          return;
+        }
+        catalogSettingsState.music_sources.push({
+          id: report.id || base,
+          name: report.name || base,
+          url: base,
+          enabled: true
+        });
+        musicSourceInput.value = "";
+        renderMusicSources();
+        showMusicSourceStatus('\u2713 Added '.concat(report.name || base, ' \u2014 click "Save Catalog Settings" to apply.'), true);
       }));
     }
     const updateUpstreamEnabledUI = () => {
@@ -955,6 +1094,7 @@ class PencariMovieApp {
           updateCatalogModeUI();
           renderCatalogOptions();
           renderUpstreamAddons();
+          renderMusicSources();
           fillSettingsJson();
         }
       } catch (err) {
@@ -1060,6 +1200,10 @@ class PencariMovieApp {
             // backend keeps the stored manifests (re-enabling restores them
             // without re-adding every URL).
             upstream_manifests: catalogSettingsState.upstream_enabled === false ? void 0 : catalogSettingsState.upstream_manifests || [],
+            // Always sent, even when empty: removing the last source must
+            // actually turn backfill off, and the server refuses a malformed
+            // url rather than dropping the row.
+            music_sources: catalogSettingsState.music_sources || [],
             stream_config: {
               resolutions: {
                 "4k": res4kEl ? res4kEl.checked : true,

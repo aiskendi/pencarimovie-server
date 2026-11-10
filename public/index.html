@@ -1304,6 +1304,85 @@
             ></div>
           </div>
 
+          <!-- Music Upstreams Section (the addons a backfill fills from) -->
+          <div
+            class="addon-catalog-section"
+            style="
+              margin-top: 14px;
+              border-top: 1px dashed var(--pm-bg-surface-hover);
+              padding-top: 12px;
+            "
+          >
+            <div
+              class="addon-catalog-section__label"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <span>Music Upstreams:</span>
+            </div>
+            <p
+              style="
+                font-size: 0.74rem;
+                color: var(--pm-text-secondary);
+                margin: 4px 0 8px 0;
+                line-height: 1.35;
+              "
+            >
+              BitChord-protocol addons this server fills a missing track from. A
+              source is tested before it is added: it must serve a manifest,
+              answer a search, and hold at least one lossless rendition.
+            </p>
+            <div
+              id="musicSourcesList"
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-bottom: 8px;
+              "
+            ></div>
+            <div style="display: flex; gap: 6px; align-items: center; width: 100%; box-sizing: border-box;">
+              <input
+                type="text"
+                id="musicSourceInput"
+                class="settings-gate__input"
+                style="
+                  flex: 1 1 0%;
+                  min-width: 0;
+                  font-size: 0.78rem;
+                  font-family: monospace;
+                  padding: 6px 10px;
+                  box-sizing: border-box;
+                "
+                placeholder="https://.../c"
+              />
+              <button
+                type="button"
+                id="musicSourceAddBtn"
+                class="settings-gate__btn"
+                style="
+                  flex: 0 0 auto;
+                  padding: 6px 10px;
+                  font-size: 0.78rem;
+                  white-space: nowrap;
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                "
+              >
+                + Test & Add
+              </button>
+            </div>
+            <div
+              id="musicSourceStatus"
+              style="font-size: 0.76rem; margin-top: 5px"
+              class="hidden"
+            ></div>
+          </div>
+
           <!-- ─── Streams Configuration Section (AIOStreams style) ─── -->
           <div
             class="addon-catalog-section"
@@ -1865,7 +1944,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261105ddltoken"></script>
+    <script defer src="app.js?v=20261110musicsrc"></script>
     <script defer src="dashboard.js?v=20261105livestats7"></script>
   </body>
 </html>

@@ -100,6 +100,57 @@ fn parse_bases(raw: &str) -> Vec<String> {
 /// userbot does the hop. Verified end-to-end by watching for the row, not assumed.
 pub const REQUEST_CAPTION: &str = "File Request By @inputfilebot";
 
+/// How many seconds this process waits between two fills it STARTS.
+///
+/// MEASURED 2026-11-10 on the deployed fleet: four fills on one dyno inside
+/// twenty seconds (four different searches, four different users) were enough for
+/// the CDN to answer every subsequent `size probe` with `429 Too Many Requests`,
+/// and from then on nothing filled at all — `on-demand fill skipped {"reason":
+/// "size probe: HTTP 429"}` ten times in one window. A fill costs several requests
+/// to that host, so the budget is fills-per-minute, not requests-per-fill.
+///
+/// Every SEARCH that finds no hi-res row triggers a fill, which is right for one
+/// listener and is a hammer for a busy fleet. This paces it.
+const FILL_GAP_SECS: i64 = 75;
+
+/// Seconds to stop asking after the source said 429.
+const FILL_COOL_OFF_SECS: i64 = 120;
+
+static NEXT_FILL_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static COOL_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Whether a fill may start now, and if not, why — in words a log line can carry.
+fn fill_gate() -> Result<(), String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let now = crate::storage::now();
+    let cool = COOL_UNTIL.load(SeqCst);
+    if now < cool {
+        return Err(format!(
+            "source cooling down after a rate limit ({}s left)",
+            cool - now
+        ));
+    }
+    let next = NEXT_FILL_AT.load(SeqCst);
+    if now < next {
+        return Err(format!("fill pacing: next one in {}s", next - now));
+    }
+    NEXT_FILL_AT.store(now + FILL_GAP_SECS, SeqCst);
+    Ok(())
+}
+
+/// Stop asking for a while. Called on 429, never on a plain refusal.
+fn source_cool_off(secs: i64) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let until = crate::storage::now() + secs.clamp(30, 600);
+    let prev = COOL_UNTIL.fetch_max(until, SeqCst);
+    if prev < until {
+        log(
+            "backfill: source asked us to slow down",
+            &json!({"cool_off_s": secs.clamp(30, 600)}),
+        );
+    }
+}
+
 /// GET `path` from the first source that answers it, in configured order.
 ///
 /// The failure string stays deterministic — `tools/probe_lease_release.mjs` asserts
@@ -156,6 +207,13 @@ async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
             "backfill: source refused",
             &json!({"url": url, "status": status, "why": why}),
         );
+        // 429 is the one status that is about US rather than about the track, so
+        // it cools the whole source off instead of falling through to the next
+        // base as if the track were missing.
+        if status == 429 {
+            source_cool_off(FILL_COOL_OFF_SECS);
+            return Err(format!("{url} -> 429 (rate limited, cooling off)"));
+        }
         tried.push(format!("{url} -> {status}"));
     }
     Err(tried.join(" | "))
@@ -629,6 +687,11 @@ async fn fill_from_rows(client: &Client, q: &str, rows: &[Value]) -> Result<bool
 /// parenthetical and feature credits removed: those are what push the source
 /// towards remixes, and the plain title is what finds the original.
 async fn backfill_for_query(client: &Client, q: &str) -> Result<(), String> {
+    // PACED, before the first request to the source: see [`FILL_GAP_SECS`] for the
+    // measurement. A refusal here is a normal outcome and is logged as a skip.
+    if let Err(why) = fill_gate() {
+        return Err(why);
+    }
     if fill_from_rows(client, q, &source_rows(q).await?).await? {
         return Ok(());
     }
@@ -736,6 +799,12 @@ async fn master_size(http: &reqwest::Client, url: &str) -> Result<u64, String> {
     // file size is worse than an error: it turns a retryable refusal into a
     // confident "this is not the track".
     if !resp.status().is_success() {
+        // 429 here is the source's own limiter — the status that actually showed up
+        // on the deployed fleet, ten skips in one window. Cooling the source off is
+        // the only useful answer to it; the gate below then keeps us quiet.
+        if resp.status().as_u16() == 429 {
+            source_cool_off(FILL_COOL_OFF_SECS);
+        }
         return Err(format!("size probe: HTTP {}", resp.status().as_u16()));
     }
     if let Some(range) = resp.headers().get("content-range") {

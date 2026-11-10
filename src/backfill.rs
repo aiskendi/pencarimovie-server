@@ -115,8 +115,30 @@ async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
     let mut tried: Vec<String> = Vec::new();
     for base in &bases {
         let url = format!("{base}{path}");
-        let (body, status) =
-            crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
+        // BOUNDED PER BASE, from the outside.
+        //
+        // `timeout_secs` is passed to the helper, but a server that accepts the
+        // connection and then dribbles (or never answers the body) is not a connect
+        // timeout — MEASURED 2026-11-10: a fill logged the trigger, booted the bot
+        // and then sat silent for minutes with NO `source refused` line, i.e. the
+        // first base never produced a status at all. With a list this matters twice
+        // over: N bases must cost at most N x this, never forever.
+        let (body, status) = match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]),
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(_) => {
+                log(
+                    "backfill: source timed out",
+                    &json!({"url": url, "secs": timeout_secs}),
+                );
+                tried.push(format!("{url} -> timeout after {timeout_secs}s"));
+                continue;
+            }
+        };
         if status == 200 {
             if tried.len() > 0 {
                 log(

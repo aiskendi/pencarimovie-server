@@ -40,10 +40,47 @@ use crate::log::log;
 /// every failure AND makes the log name a second cause that is not why anything
 /// broke (that is how `bitchord… -> 401` once hid `heisenberg… -> 503`).
 ///
-/// Env-overridable (`PM_HIRES_BASE`) so §10 of `plans/music-hires-fallback.md` is
-/// configuration rather than a patch; setting it EMPTY disables backfill, which is
-/// the honest state when the source is degraded.
-pub const HIRES_BASE: &str = "https://heisenbergbackaaahh.de.deplexo.com/a";
+/// THERE IS NO COMPILED-IN SOURCE ANY MORE. `PM_HIRES_BASE` is the only thing that
+/// turns a fill on, and leaving it unset or blank means backfill is DISABLED.
+///
+/// A default host in the binary is a default somebody else's server pays for: a
+/// fresh clone backfills against an address nobody chose, and when that address
+/// starts refusing, every single search pays a request for it and the log fills
+/// with `source refused {"status":503}`. MEASURED 2026-11-10: that ran all morning
+/// against the old default, on an install that had never configured a source.
+///
+/// It is a LIST — comma, semicolon or whitespace separated — because a single host
+/// is not a reliable thing in this ecosystem: in one minute,
+/// `bit-chord-addon.vercel.app/a|/b|/d|/e|/f` answered 502/500/502/400/502 while
+/// `/` and `/c` answered 200 with full-length FLAC masters. Each entry is tried in
+/// order and the first answer wins, so one dead host is not a dead feature.
+fn hires_bases() -> Vec<String> {
+    match std::env::var("PM_HIRES_BASE") {
+        Ok(v) => parse_bases(&v),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The list inside `PM_HIRES_BASE`, split and normalised. Pure, so it is testable
+/// without mutating the process environment.
+fn parse_bases(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+        let base = part.trim().trim_end_matches('/');
+        // A bare host is a configuration mistake worth skipping rather than
+        // probing: `http_json_h_status` would report a transport error and the
+        // reason would read as "the source is down".
+        if base.is_empty()
+            || !(base.starts_with("http://") || base.starts_with("https://"))
+        {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == base) {
+            out.push(base.to_string());
+        }
+    }
+    out
+}
 
 /// The caption put on the send: a bare mention of the indexer bot.
 ///
@@ -63,39 +100,43 @@ pub const HIRES_BASE: &str = "https://heisenbergbackaaahh.de.deplexo.com/a";
 /// userbot does the hop. Verified end-to-end by watching for the row, not assumed.
 pub const REQUEST_CAPTION: &str = "File Request By @inputfilebot";
 
-/// The source base, or `None` when `PM_HIRES_BASE` was set empty.
-fn hires_base() -> Option<String> {
-    match std::env::var("PM_HIRES_BASE") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v.trim().trim_end_matches('/').to_string()),
-        Err(_) => Some(HIRES_BASE.to_string()),
-    }
-}
-
-/// GET `path` from the source.
+/// GET `path` from the first source that answers it, in configured order.
 ///
 /// The failure string stays deterministic — `tools/probe_lease_release.mjs` asserts
 /// that two consecutive failed attempts fail IDENTICALLY, and that equality is the
-/// proof that a lease was released rather than held. One base means one cause in
-/// the message, which is the one thing the old joined string got wrong.
+/// proof that a lease was released rather than held. So the list is joined in
+/// CONFIGURED order, not in the order the requests happened to fail: two runs with
+/// the same dead hosts produce the same string.
 async fn source_get(path: &str, timeout_secs: u64) -> Result<Value, String> {
-    let Some(base) = hires_base() else {
-        return Err("no hi-res source configured (PM_HIRES_BASE is empty)".to_string());
-    };
-    let url = format!("{base}{path}");
-    let (body, status) =
-        crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
-    if status == 200 {
-        return Ok(body);
+    let bases = hires_bases();
+    if bases.is_empty() {
+        return Err("backfill is disabled (PM_HIRES_BASE is not set)".to_string());
     }
-    // A source that names its own refusal is worth the log line: the `code` field
-    // is the difference between "down right now" and "will never answer us".
-    let why = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
-    log(
-        "backfill: source refused",
-        &json!({"url": url, "status": status, "why": why}),
-    );
-    Err(format!("{url} -> {status}"))
+    let mut tried: Vec<String> = Vec::new();
+    for base in &bases {
+        let url = format!("{base}{path}");
+        let (body, status) =
+            crate::httpc::http_json_h_status(&url, &[], "GET", timeout_secs, &[]).await;
+        if status == 200 {
+            if tried.len() > 0 {
+                log(
+                    "backfill: source answered after a fallback",
+                    &json!({"url": url, "skipped": tried.len()}),
+                );
+            }
+            return Ok(body);
+        }
+        // A source that names its own refusal is worth the log line: the `code`
+        // field is the difference between "down right now" and "will never answer
+        // us".
+        let why = body.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        log(
+            "backfill: source refused",
+            &json!({"url": url, "status": status, "why": why}),
+        );
+        tried.push(format!("{url} -> {status}"));
+    }
+    Err(tried.join(" | "))
 }
 
 /// A file we sent and can serve, described the way the byte path wants it.
@@ -481,15 +522,47 @@ async fn source_rows(q: &str) -> Result<Vec<Value>, String> {
         .unwrap_or_default())
 }
 
+/// Whether a source row advertises a lossless rendition, in either vocabulary.
+///
+/// The gate used to be `audioQuality.contains("bit")`, which is Qobuz's wording
+/// (`"16-bit / 44.1 kHz"`). A BitChord-protocol addon answers
+/// `{"format":"flac","audioQuality":"LOSSLESS"}` — no "bit" anywhere — so EVERY
+/// row from one was refused and the fill never started. MEASURED 2026-11-10 on
+/// `bit-chord-addon.vercel.app/c`: its search returns full-length FLAC rows and
+/// its `/stream` hands back a 40 647 395-byte master with `accept-ranges: bytes`,
+/// and we called it "source had no lossless row for this query".
+///
+/// A row is only a HINT. `may_hold_a_master()` on the signed answer and
+/// `master_size()` on the actual bytes are what gate an upload, so accepting a
+/// wider vocabulary here cannot let a 30-second preview through.
+fn row_says_lossless(row: &Value) -> bool {
+    const LOSSLESS_CONTAINERS: [&str; 8] =
+        ["flac", "alac", "wav", "aiff", "ape", "wv", "dsf", "dff"];
+    let quality = jstr(row, "audioQuality").to_ascii_lowercase();
+    // `format` is a bare token (`flac`, `mp3`), so it is matched EXACTLY: a
+    // substring test would read "mixtape" as APE and "wave" as WAV.
+    let format = jstr(row, "format").to_ascii_lowercase();
+    let format_is_lossless = LOSSLESS_CONTAINERS.contains(&format.as_str());
+    // `quality` is free text on the Qobuz-style answer and may name the container
+    // inside a sentence, so it is matched as a substring there.
+    let label = jstr(row, "quality").to_ascii_lowercase();
+    let label_is_lossless = LOSSLESS_CONTAINERS.iter().any(|codec| label.contains(codec));
+    format_is_lossless
+        || label_is_lossless
+        || quality.contains("bit")
+        || quality.contains("lossless")
+        || quality.contains("hi-res")
+        || quality.contains("hires")
+}
+
 /// Upload the first acceptable row, or say nothing was usable.
 ///
-/// `Ok(false)` is not an error: it means every row was rejected (no bit depth, or
-/// a stand-in), which is the caller's cue to try a reduced query.
+/// `Ok(false)` is not an error: it means every row was rejected (no lossless
+/// claim, or a stand-in), which is the caller's cue to try a reduced query.
 async fn fill_from_rows(client: &Client, q: &str, rows: &[Value]) -> Result<bool, String> {
     for row in rows {
         let id = jstr(row, "id");
-        let quality = jstr(row, "audioQuality").to_ascii_lowercase();
-        if id.is_empty() || !quality.contains("bit") {
+        if id.is_empty() || !row_says_lossless(row) {
             continue;
         }
         let title = jstr(row, "title");
@@ -524,10 +597,11 @@ async fn fill_from_rows(client: &Client, q: &str, rows: &[Value]) -> Result<bool
 /// Ask the source what it has for this query and upload the first row it calls
 /// bit-exact — unless that row announces itself as a stand-in.
 ///
-/// The row's own `audioQuality` is the gate: only a source answer carrying a
-/// bit-depth claim (`"16-bit / 44.1 kHz"`, `"24-bit / 48 kHz"`) is trusted.
-/// An empty or `format`-only row is skipped — that is the same rule the search
-/// fallback uses, so the two cannot disagree about what counts as lossless.
+/// The row's own quality fields are the gate, read through
+/// [`row_says_lossless`] so both vocabularies work: a Qobuz-style bit-depth claim
+/// (`"24-bit / 48 kHz"`) and a BitChord-style tier (`"LOSSLESS"`) or container
+/// (`"flac"`). A row with none of them is skipped; the upload itself is still
+/// gated by `may_hold_a_master()` and the real byte count.
 ///
 /// If nothing in the answer is usable, the query is retried ONCE with the
 /// parenthetical and feature credits removed: those are what push the source
@@ -632,6 +706,16 @@ async fn master_size(http: &reqwest::Client, url: &str) -> Result<u64, String> {
         // — so this line once wrote a live signature into the Heroku log
         // (`size probe: error sending request for url (https://…&hmac=…)`).
         .map_err(|e| format!("size probe: {}", redact_query(&e.to_string())))?;
+    // A non-2xx is NOT a size. MEASURED 2026-11-10 against
+    // `tracks.monochrome.st`: one probe read the total from
+    // `content-range: bytes 0-0/53975130`, and a later one was answered with a
+    // 44-byte error body, which this function then reported as "the master is 44
+    // bytes" and the fill refused the track as a clip. A rate-limit page read as a
+    // file size is worse than an error: it turns a retryable refusal into a
+    // confident "this is not the track".
+    if !resp.status().is_success() {
+        return Err(format!("size probe: HTTP {}", resp.status().as_u16()));
+    }
     if let Some(range) = resp.headers().get("content-range") {
         if let Ok(text) = range.to_str() {
             if let Some(total) = text.rsplit('/').next() {
@@ -938,6 +1022,19 @@ async fn backfill_body(
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let size = master_size(&http, &media_url).await?;
+    // The path is silent from here to the finished send — a 50 MB fetch, a
+    // catalogue lookup and a Telegram upload — so a stall looks identical to a
+    // no-op in the log. MEASURED 2026-11-10: a fill sat for six minutes with
+    // nothing between `telegram session resumed` and the end, and there was no way
+    // to tell which step it was in.
+    log(
+        "backfill: source master sized",
+        &json!({
+            "track_id": track_id,
+            "bytes": size,
+            "kbps": if duration > 0 { crate::music::kbps(size, duration) } else { 0 },
+        }),
+    );
 
     // 2b. A master is never this thin. Backstop for a source that signs a slice
     //     without saying `range=` and without naming a lossy format.
@@ -998,17 +1095,78 @@ async fn backfill_body(
         );
     }
 
-    // 5. stream the body STRAIGHT into the upload. No temp file, no buffer: the
-    //    `StreamReader` is the whole reason this can run on a phone.
-    let body = http
-        .get(&media_url)
-        .send()
-        .await
-        .map_err(|e| format!("GET master: {e}"))?;
-    if !body.status().is_success() {
-        return Err(format!("GET master -> {}", body.status()));
-    }
-    let mut reader = StreamReader::new(body.bytes_stream().map_err(std::io::Error::other));
+    // Say where the silence starts. Everything above is bounded by a timeout;
+    // this step is a 50 MB fetch piped into a Telegram upload and logs nothing
+    // until it finishes, so without this line a stall and a no-op look the same.
+    log(
+        "backfill: streaming the master into the send",
+        &json!({"track_id": track_id, "bytes": size, "relay": username}),
+    );
+
+    // 5. stream the body into the upload, in BOUNDED RANGED CHUNKS.
+    //
+    // ONE LONG GET DOES NOT SURVIVE THE SEND. MEASURED 2026-11-10 on a 53 975 130
+    // byte FLAC through `tracks.monochrome.st`:
+    //
+    //   backfill: streaming the master into the send {"bytes":53975130}
+    //   on-demand fill skipped {"reason":"upload+send: upload_stream …:
+    //                            error decoding response body"}
+    //
+    // That error is reqwest decoding the SOURCE body, not the upload: the send
+    // consumes the reader at Telegram's pace, so a single GET holds a mostly idle
+    // connection for the whole upload and the CDN closes it. Asking for 8 MB at a
+    // time keeps every connection short — one chunk read into memory, handed to the
+    // reader, connection done — and the total is already known from `master_size`,
+    // with `Accept-Ranges: bytes` confirmed in the same answer.
+    //
+    // Still no temp file: the chunks feed the same `StreamReader` the upload reads.
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    let chunk_http = http.clone();
+    let chunk_url = media_url.clone();
+    // `Box::pin` because `unfold` is not `Unpin` and `StreamReader` requires it.
+    let chunks = Box::pin(futures_util::stream::unfold(0u64, move |pos| {
+        let http = chunk_http.clone();
+        let url = chunk_url.clone();
+        async move {
+            if pos >= size {
+                return None;
+            }
+            let end = (pos + CHUNK - 1).min(size - 1);
+            let resp = http
+                .get(&url)
+                .header("Range", format!("bytes={pos}-{end}"))
+                .send()
+                .await;
+            match resp {
+                Err(e) => {
+                    // SECURITY: a signature in the URL must never reach the log.
+                    let why = redact_query(&e.to_string());
+                    return Some((Err(std::io::Error::other(format!("chunk {pos}: {why}"))), pos));
+                }
+                Ok(r) if r.status().is_success() => match r.bytes().await {
+                    Err(e) => {
+                        let why = redact_query(&e.to_string());
+                        Some((Err(std::io::Error::other(format!("chunk {pos}: {why}"))), pos))
+                    }
+                    Ok(b) => {
+                        let n = b.len() as u64;
+                        if n == 0 {
+                            return None;
+                        }
+                        Some((Ok(b), pos + n))
+                    }
+                },
+                Ok(r) => Some((
+                    Err(std::io::Error::other(format!(
+                        "chunk {pos}: HTTP {}",
+                        r.status().as_u16()
+                    ))),
+                    pos,
+                )),
+            }
+        }
+    }));
+    let mut reader = StreamReader::new(chunks);
 
     let ext = jstr(&info, "format");
     let ext = if ext.is_empty() { "flac".to_string() } else { ext };
@@ -1227,6 +1385,55 @@ mod tests {
     /// A lossy name is refused before a byte is fetched; a container that can hold
     /// a master is let through and settled by bitrate.
     #[test]
+    /// `PM_HIRES_BASE` is a LIST, and unset or malformed means DISABLED.
+    #[test]
+    fn the_source_list_is_parsed_and_empty_means_disabled() {
+        assert!(parse_bases("").is_empty(), "unset/blank disables backfill");
+        assert!(parse_bases("   ").is_empty());
+        assert!(
+            parse_bases("example.com/c").is_empty(),
+            "a bare host is skipped, not probed"
+        );
+
+        assert_eq!(
+            parse_bases("https://h/c/"),
+            vec!["https://h/c".to_string()],
+            "trailing slash trimmed"
+        );
+
+        assert_eq!(
+            parse_bases("https://a/x, https://b/y;https://a/x\nhttps://c/z"),
+            vec![
+                "https://a/x".to_string(),
+                "https://b/y".to_string(),
+                "https://c/z".to_string()
+            ],
+            "comma, semicolon and newline split, and duplicates collapse"
+        );
+    }
+
+    /// The source row gate speaks both vocabularies and still refuses a lossy row.
+    ///
+    /// MEASURED 2026-11-10: `bit-chord-addon.vercel.app/c` answers
+    /// `{"format":"flac","audioQuality":"LOSSLESS"}`, so the old `contains("bit")`
+    /// gate rejected every row it had and the fill reported "no lossless row".
+    #[test]
+    fn a_row_without_a_bit_depth_can_still_be_lossless() {
+        let bit_chord = serde_json::json!({"format": "flac", "audioQuality": "LOSSLESS"});
+        assert!(row_says_lossless(&bit_chord), "a flac LOSSLESS row");
+
+        let qobuz = serde_json::json!({"format": "flac", "quality": "Qobuz FLAC · 24-bit · 96 kHz"});
+        assert!(row_says_lossless(&qobuz), "the Qobuz wording still works");
+
+        let mp3 = serde_json::json!({"format": "mp3", "audioQuality": "HIGH"});
+        assert!(!row_says_lossless(&mp3), "a lossy row is never waved through");
+
+        let mixtape = serde_json::json!({"format": "mixtape"});
+        assert!(!row_says_lossless(&mixtape), "\"mixtape\" is not APE");
+
+        assert!(!row_says_lossless(&serde_json::json!({})), "an empty row");
+    }
+
     fn a_lossy_format_is_never_waved_through() {
         for ok in ["flac", "FLAC", "wav", "alac", "m4a", "aiff", "ape", ""] {
             assert!(may_hold_a_master(ok), "{ok} should pass");

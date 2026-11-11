@@ -755,11 +755,20 @@ pub(crate) fn row_says_lossless(row: &Value) -> bool {
     // substring test would read "mixtape" as APE and "wave" as WAV.
     let format = jstr(row, "format").to_ascii_lowercase();
     let format_is_lossless = LOSSLESS_CONTAINERS.contains(&format.as_str());
+    // `codec` / `container` are the OTHER vocabulary. An addon built on a
+    // verified-probe shape names these and sends no `format` at all, so a row
+    // that is plainly a FLAC used to be filtered out before the fill ever saw it.
+    // Same EXACT-token rule as `format`, because they name a bare container too.
+    let codec = jstr(row, "codec").to_ascii_lowercase();
+    let container = jstr(row, "container").to_ascii_lowercase();
+    let named_is_lossless = LOSSLESS_CONTAINERS.contains(&codec.as_str())
+        || LOSSLESS_CONTAINERS.contains(&container.as_str());
     // `quality` is free text on the Qobuz-style answer and may name the container
     // inside a sentence, so it is matched as a substring there.
     let label = jstr(row, "quality").to_ascii_lowercase();
     let label_is_lossless = LOSSLESS_CONTAINERS.iter().any(|codec| label.contains(codec));
     format_is_lossless
+        || named_is_lossless
         || label_is_lossless
         || quality.contains("bit")
         || quality.contains("lossless")
@@ -894,6 +903,88 @@ fn may_hold_a_master(fmt: &str) -> bool {
         fmt.to_ascii_lowercase().as_str(),
         "" | "flac" | "wav" | "alac" | "aiff" | "aif" | "ape" | "dsf" | "dff" | "m4a"
     )
+}
+
+/// The container a `/stream` answer names, in the vocabulary this engine reads.
+///
+/// Addons disagree on the field name: the Qobuz-style answer says `format`, while
+/// a verified-probe answer says `codec` + `container` and no `format` at all.
+/// Reading ONLY `format` made such an answer arrive as `""`, and
+/// [`may_hold_a_master("")`](may_hold_a_master) is deliberately `true` — so the
+/// lossy-format refusal went DARK instead of firing. The order matters: `format`
+/// is the bare token this engine has always used, then `codec`, then `container`
+/// (`container` is the loosest, e.g. `mp4` for an `.m4a` that holds ALAC).
+fn container_of_answer(info: &Value) -> String {
+    for key in ["format", "codec", "container"] {
+        let value = jstr(info, key).to_ascii_lowercase();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
+
+/// Which upstream an answer came from, for a source-qualified ledger key.
+///
+/// Ids are PER SOURCE: `qb:123` means nothing to a different addon, so a key
+/// that assumes one source collides as soon as there are two.
+fn source_of_answer(info: &Value) -> String {
+    for key in ["source", "provider"] {
+        let value = jstr(info, key).to_ascii_lowercase();
+        if !value.is_empty() {
+            return value.split_whitespace().collect::<Vec<_>>().join("-");
+        }
+    }
+    "qobuz".to_string()
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    #[test]
+    fn an_answer_that_names_only_a_codec_still_names_a_container() {
+        let codec_only = json!({"codec": "flac", "container": "flac"});
+        assert_eq!(container_of_answer(&codec_only), "flac");
+        let qobuz_style = json!({"format": "FLAC", "quality": "Lossless"});
+        assert_eq!(container_of_answer(&qobuz_style), "flac");
+        assert_eq!(container_of_answer(&json!({})), "");
+        // A codec must win over a looser container word.
+        assert_eq!(
+            container_of_answer(&json!({"codec": "alac", "container": "mp4"})),
+            "alac"
+        );
+    }
+
+    #[test]
+    fn a_codec_only_row_is_recognised_as_lossless() {
+        assert!(row_says_lossless(&json!({"codec": "flac"})));
+        assert!(row_says_lossless(&json!({"container": "alac"})));
+        assert!(row_says_lossless(&json!({"format": "flac"})));
+        // The exact-token rule still holds: a substring must not pass.
+        assert!(!row_says_lossless(&json!({"format": "mixtape"})));
+        assert!(!row_says_lossless(&json!({"codec": "mp3", "container": "mp4"})));
+    }
+
+    #[test]
+    fn the_ledger_key_is_source_qualified() {
+        assert_eq!(source_of_answer(&json!({"provider": "Netease"})), "netease");
+        assert_eq!(source_of_answer(&json!({"source": "Internet Archive"})), "internet-archive");
+        // An answer that says nothing keeps the historical prefix.
+        assert_eq!(source_of_answer(&json!({})), "qobuz");
+    }
+
+    #[test]
+    fn a_codec_only_answer_cannot_slip_past_the_master_gate() {
+        // What the two helpers together must do: name the container, then refuse
+        // the lossy one. The empty string is still allowed through by design.
+        let lossy = json!({"codec": "mp3", "container": "mp3"});
+        assert!(!may_hold_a_master(&container_of_answer(&lossy)));
+        let lossless = json!({"codec": "flac"});
+        assert!(may_hold_a_master(&container_of_answer(&lossless)));
+        let silent = json!({});
+        assert!(may_hold_a_master(&container_of_answer(&silent)));
+    }
 }
 
 /// Bits per second below which a "master" is a clip, not a recording.
@@ -1196,10 +1287,13 @@ async fn backfill_body(
     relay: &str,
     artwork: &str,
 ) -> Result<Backfilled, String> {
-    let key = format!("qobuz:{track_id}");
-
     // 1. the source's signed URL — the first base that answers
     let info = source_get(&format!("/stream/{track_id}"), 8).await?;
+    // The ledger key is SOURCE-QUALIFIED, from the answer itself. It used to be
+    // the hardcoded `qobuz:{track_id}`, which is one source's id space: with a
+    // second source the same numeric id lands in the same slot, so a lease or a
+    // completed upload belonging to one provider blocks the other.
+    let key = format!("{}:{track_id}", source_of_answer(&info));
     let media_url = jstr(&info, "url");
     if media_url.is_empty() {
         return Err(format!("source /stream/{track_id} carried no url"));
@@ -1220,7 +1314,7 @@ async fn backfill_body(
             "source /stream/{track_id} signed a preview slice (range=), not the master"
         ));
     }
-    let signed_format = jstr(&info, "format").to_ascii_lowercase();
+    let signed_format = container_of_answer(&info);
     if !may_hold_a_master(&signed_format) {
         log(
             "backfill: refused a lossy format",

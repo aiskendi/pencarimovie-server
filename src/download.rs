@@ -2010,6 +2010,20 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // proven — see [`mark_reference_verified`] for the measured loop
                 // this breaks.
                 mark_reference_verified(&short_code, &bot_id, &file_id, file_size);
+                // THE FILE'S OWN HEADER, READ ONCE AND CACHED.
+                //
+                // A FLAC or ALAC sent as a Telegram `document` carries no Audio
+                // attribute, so nothing downstream knows how long it is — and
+                // every quality signal is derived from the length, so such a
+                // track could never present as hi-res. These bytes are already
+                // here (this is the 512 KB prime, for a FLAC header that ends at
+                // byte 42), so the cost is a slice, not a fetch.
+                //
+                // `aligned == 0` only: a seek primes from the middle of the file,
+                // where there is no header to read.
+                if aligned == 0 && !short_code.is_empty() {
+                    crate::music::remember_head(&short_code, file_size, &buf);
+                }
                 first = Some(buf);
                 break;
             }

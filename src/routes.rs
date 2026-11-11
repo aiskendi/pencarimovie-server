@@ -8085,12 +8085,47 @@ async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
     };
-    let duration = as_int(resolved.get("duration"))
+    let mut duration = as_int(resolved.get("duration"))
         .or_else(|| as_int(resolved.get("audio").and_then(|a| a.get("duration"))))
         .unwrap_or(0);
+    // THE FILE'S OWN HEADER, FOR A MISSING LENGTH *AND* FOR THE REAL RENDITION.
+    //
+    // A FLAC or ALAC sent as a Telegram `document` carries no Audio attribute,
+    // so the resolve has no duration — and every quality signal is derived from
+    // it, so such a track could never present as hi-res and a full-length file
+    // was eligible to be refused as a clip. The download prime reads the header
+    // once and caches it (`music::remember_head`); this path only reads.
+    //
+    // MEASURED 2026-11-11 — the lookup used to happen ONLY when `duration <= 0`,
+    // so the header of a track the catalogue already had a length for was read,
+    // cached and then never consulted: `V2U9fq` (a 3 271 kbps MCR master) answered
+    // `hi_res_lossless` with NO `sampleRate` and NO `bitDepth`, which is the one
+    // thing a hi-res file is supposed to be able to state. The length is still
+    // only taken over when the resolve had none; the rate and depth are the
+    // file's own facts and are published whenever its header has been read.
+    let probed: Option<Value> = crate::music::known_probe(&code);
+    if duration <= 0 {
+        if let Some(secs) = probed
+            .as_ref()
+            .and_then(|p| p.get("duration"))
+            .and_then(|v| v.as_i64())
+        {
+            duration = secs;
+        }
+    }
     let codec = codec_of(&ext, size, duration);
     if !codec.is_empty() {
         body["codec"] = serde_json::json!(codec);
+    }
+    // Only what the file itself stated, never inferred from the extension: this
+    // is the one place a `sampleRate` or `bitDepth` may reach a client, and both
+    // came out of the file's own STREAMINFO.
+    if let Some(p) = &probed {
+        for key in ["sampleRate", "bitDepth", "channels"] {
+            if let Some(v) = p.get(key) {
+                body[key] = v.clone();
+            }
+        }
     }
     // THE RENDITION FIELDS A QUALITY-AWARE CLIENT READS.
     //
@@ -8142,11 +8177,9 @@ async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
 /// decoder play the file and one without fail honestly.
 fn codec_of(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
     if ext.eq_ignore_ascii_case("m4a") {
-        return if crate::music::is_lossless(ext, file_size, duration_secs) {
-            "alac"
-        } else {
-            ""
-        };
+        // One rule, in `music`, where it is testable beside the duration it
+        // depends on: with no duration the bitrate is 0 and the answer is "".
+        return crate::music::alac_or_unknown(file_size, duration_secs);
     }
     match ext.to_ascii_lowercase().as_str() {
         "flac" => "flac",

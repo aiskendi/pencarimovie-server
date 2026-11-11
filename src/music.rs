@@ -140,6 +140,424 @@ pub fn is_hi_res(ext: &str, file_size: u64, duration_secs: i64) -> bool {
     is_lossless(ext, file_size, duration_secs) && kbps(file_size, duration_secs) > CD_KBPS
 }
 
+/* ── FLAC STREAMINFO ─────────────────────────────────────────────────────── */
+
+/// What a FLAC's STREAMINFO block states about the recording itself.
+///
+/// WHY THIS EXISTS. Some origins send a FLAC as a Telegram `document` with no
+/// Audio attribute, so the row has no `duration`. Every quality signal below
+/// reads the duration, and [`kbps()`] answers 0 without one, so [`is_hi_res()`]
+/// can never be true: a real 24/96 master ranks as a CD copy forever, and
+/// `tier_satisfied()` keeps triggering a fill for a file the catalogue already
+/// holds.
+///
+/// The numbers are in the file. STREAMINFO is the first metadata block — 34
+/// bytes at offset 8 — and the head of every stream is already fetched
+/// (`PRIME_BYTES` is 512 KB, for a block that ends at byte 42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlacInfo {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bit_depth: u8,
+    pub total_samples: u64,
+}
+
+impl FlacInfo {
+    /// Whole seconds, or `0` when the encoder wrote no total (a streaming encoder
+    /// may). Rounded DOWN, so `kbps` errs high — the safe direction for a clip
+    /// gate that exists to refuse slices.
+    pub fn duration_secs(&self) -> u32 {
+        if self.sample_rate == 0 {
+            return 0;
+        }
+        (self.total_samples / u64::from(self.sample_rate)) as u32
+    }
+}
+
+/// Parse STREAMINFO out of the first bytes of a FLAC file.
+///
+/// Layout (FLAC format specification, "STREAMINFO"): 2+2 bytes block sizes, 3+3
+/// bytes frame sizes, then a 20-bit sample rate, 3-bit `channels-1`, 5-bit
+/// `bitDepth-1` and a 36-bit total sample count.
+///
+/// Byte 4 is the metadata-block header: bit 7 is "last block", bits 0-6 the
+/// type. STREAMINFO is type 0 and always comes first. A set "last block" bit is
+/// ACCEPTED here — a FLAC whose only block is STREAMINFO (no tags, no seek
+/// table) sets it and plays perfectly; rejecting it hides a valid file.
+pub fn flac_info(head: &[u8]) -> Option<FlacInfo> {
+    if head.len() < 42 || &head[0..4] != b"fLaC" {
+        return None;
+    }
+    if head[4] & 0x7f != 0 {
+        return None;
+    }
+    let block_len =
+        (usize::from(head[5]) << 16) | (usize::from(head[6]) << 8) | usize::from(head[7]);
+    if block_len < 34 {
+        return None;
+    }
+    let si = &head[8..42];
+    let sample_rate =
+        (u32::from(si[10]) << 12) | (u32::from(si[11]) << 4) | (u32::from(si[12]) >> 4);
+    if sample_rate == 0 {
+        return None;
+    }
+    let channels = ((si[12] >> 1) & 0x7) + 1;
+    let bit_depth = (((si[12] & 0x1) << 4) | (si[13] >> 4)) + 1;
+    let total_samples = (u64::from(si[13] & 0x0f) << 32)
+        | (u64::from(si[14]) << 24)
+        | (u64::from(si[15]) << 16)
+        | (u64::from(si[16]) << 8)
+        | u64::from(si[17]);
+    Some(FlacInfo {
+        sample_rate,
+        channels,
+        bit_depth,
+        total_samples,
+    })
+}
+
+/// The length a FLAC's own header states, when it states one.
+pub fn flac_duration(head: &[u8]) -> Option<u32> {
+    flac_info(head)
+        .map(|i| i.duration_secs())
+        .filter(|secs| *secs > 0)
+}
+
+#[cfg(test)]
+mod flac_tests {
+    use super::*;
+
+    /// A `fLaC` head whose STREAMINFO states exactly these values.
+    fn head_with(
+        last_block: bool,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+        total: u64,
+    ) -> Vec<u8> {
+        let mut v = vec![0u8; 42];
+        v[0..4].copy_from_slice(b"fLaC");
+        v[4] = if last_block { 0x80 } else { 0x00 };
+        v[7] = 34;
+        let si = &mut v[8..42];
+        si[10] = (sample_rate >> 12) as u8;
+        si[11] = (sample_rate >> 4) as u8;
+        si[12] = (((sample_rate & 0x0f) as u8) << 4)
+            | ((channels - 1) << 1)
+            | ((bit_depth - 1) >> 4);
+        si[13] = (((bit_depth - 1) & 0x0f) << 4) | (((total >> 32) & 0x0f) as u8);
+        si[14] = (total >> 24) as u8;
+        si[15] = (total >> 16) as u8;
+        si[16] = (total >> 8) as u8;
+        si[17] = total as u8;
+        v
+    }
+
+    #[test]
+    fn a_hi_res_flac_states_its_own_length_and_depth() {
+        let h = head_with(false, 96_000, 2, 24, 96_000 * 300);
+        let info = flac_info(&h).expect("a valid STREAMINFO parses");
+        assert_eq!(info.sample_rate, 96_000);
+        assert_eq!(info.bit_depth, 24);
+        assert_eq!(info.channels, 2);
+        assert_eq!(info.duration_secs(), 300);
+    }
+
+    /// THE BUG THIS PARSER EXISTS FOR.
+    ///
+    /// A 90 MB FLAC whose row says nothing can never be hi-res, because `kbps()`
+    /// answers 0 without a duration. The same bytes, once the header is read,
+    /// clear CD's ceiling — and no other field had to change.
+    #[test]
+    fn an_unknown_length_hides_a_hi_res_master_until_the_header_is_read() {
+        let bytes = 90_000_000u64;
+        let h = head_with(false, 96_000, 2, 24, 96_000 * 300);
+        assert!(!is_hi_res("flac", bytes, 0), "duration 0 can never be hi-res");
+
+        let secs = flac_duration(&h).expect("the header states 300 s") as i64;
+        assert_eq!(secs, 300);
+        assert!(kbps(bytes, secs) > CD_KBPS, "{} kbps", kbps(bytes, secs));
+        assert!(is_hi_res("flac", bytes, secs));
+    }
+
+    /// Reading the header must not promote everything: a CD copy stays a CD copy.
+    #[test]
+    fn a_16_44_flac_is_not_promoted_by_reading_its_header() {
+        let bytes = 35_188_598u64;
+        let h = head_with(false, 44_100, 2, 16, 44_100 * 200);
+        let secs = flac_duration(&h).expect("the header states 200 s") as i64;
+        assert_eq!(secs, 200);
+        assert!(is_lossless("flac", bytes, secs));
+        assert!(!is_hi_res("flac", bytes, secs), "{} kbps", kbps(bytes, secs));
+    }
+
+    /// A file with no tags sets "last metadata block" on STREAMINFO itself. That
+    /// is a valid FLAC and must not be hidden.
+    #[test]
+    fn a_lone_streaminfo_block_is_still_a_flac() {
+        let h = head_with(true, 44_100, 2, 16, 44_100 * 12);
+        assert_eq!(flac_duration(&h), Some(12));
+    }
+
+    #[test]
+    fn a_streaming_flac_with_no_total_sample_count_reports_no_length() {
+        let h = head_with(false, 48_000, 2, 24, 0);
+        assert_eq!(flac_duration(&h), None, "0 samples means unknown, not zero");
+        assert!(flac_info(&h).is_some(), "rate and depth are still readable");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_flac_head_is_refused() {
+        assert_eq!(flac_info(b""), None);
+        assert_eq!(flac_info(b"ID3\x03\x00\x00\x00"), None);
+        assert_eq!(flac_info(&vec![0x00u8; 64]), None);
+        // Right magic, wrong first block: STREAMINFO is type 0 and always first.
+        let mut v = head_with(false, 44_100, 2, 16, 44_100);
+        v[4] = 0x04;
+        assert_eq!(flac_info(&v), None);
+        let mut html = b"<!DOCTYPE html>".to_vec();
+        html.resize(64, b' ');
+        assert_eq!(flac_info(&html), None);
+    }
+
+    /// THE WIRING, not just the arithmetic: a head read once by the download
+    /// prime must make the same track rank as hi-res on the next stream answer.
+    #[test]
+    fn a_head_read_once_makes_a_hi_res_master_rank_as_one() {
+        let code = "TESTFLACHEAD0001";
+        let bytes = 90_000_000u64;
+        let h = head_with(false, 96_000, 2, 24, 96_000 * 300);
+        assert!(!is_hi_res("flac", bytes, 0), "before: unknown length");
+
+        remember_head(code, bytes, &h);
+
+        let probe = known_probe(code).expect("the head is cached for this code");
+        let secs = probe.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        assert_eq!(secs, 300);
+        assert_eq!(probe["sampleRate"], serde_json::json!(96_000));
+        assert_eq!(probe["bitDepth"], serde_json::json!(24));
+        let size = probe["size"].as_u64().unwrap_or(0);
+        assert!(is_hi_res("flac", size, secs), "after: {} kbps", kbps(size, secs));
+    }
+}
+
+/* ── MP4 / M4A (the ALAC path) ───────────────────────────────────────────── */
+
+/// The length an MP4 `.m4a` states in `moov/mvhd`.
+///
+/// ALAC is the container that most needs this. `is_lossless("m4a", size, dur)` is
+/// a BITRATE test, because the extension genuinely cannot tell ALAC from AAC —
+/// and with no duration the bitrate is 0, so a real ALAC is classified lossy and
+/// `codec_of()` answers `""` instead of `alac`. Same root cause as the FLAC case,
+/// different box.
+///
+/// `moov` may sit at the END of the file (no faststart), where the head does not
+/// contain it. This then returns `None` on purpose: an unknown length is better
+/// than a guessed one, and the tail a player probes anyway is where `moov` lives.
+pub fn mp4_duration(head: &[u8]) -> Option<u32> {
+    let (moov_from, moov_to) = find_box(head, 0, head.len(), b"moov")?;
+    let (mvhd_from, mvhd_to) = find_box(head, moov_from, moov_to, b"mvhd")?;
+    let body = head.get(mvhd_from..mvhd_to)?;
+    if body.len() < 20 {
+        return None;
+    }
+    let (timescale, duration) = if body[0] == 1 {
+        // version 1: 64-bit creation, modification and duration.
+        if body.len() < 32 {
+            return None;
+        }
+        (
+            u32::from_be_bytes([body[20], body[21], body[22], body[23]]),
+            u64::from_be_bytes([
+                body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31],
+            ]),
+        )
+    } else {
+        (
+            u32::from_be_bytes([body[12], body[13], body[14], body[15]]),
+            u64::from(u32::from_be_bytes([
+                body[16], body[17], body[18], body[19],
+            ])),
+        )
+    };
+    if timescale == 0 {
+        return None;
+    }
+    let secs = duration / u64::from(timescale);
+    if secs == 0 || secs > u64::from(u32::MAX) {
+        return None;
+    }
+    Some(secs as u32)
+}
+
+/// `(payload_start, payload_end)` of the first box named `kind` in `head`, inside
+/// the byte range `[from, to)`. Payload starts after the box header.
+fn find_box(head: &[u8], from: usize, to: usize, kind: &[u8; 4]) -> Option<(usize, usize)> {
+    let to = to.min(head.len());
+    let mut p = from;
+    while p + 8 <= to {
+        let size = u32::from_be_bytes([head[p], head[p + 1], head[p + 2], head[p + 3]]) as usize;
+        let name = &head[p + 4..p + 8];
+        // size 1 = a 64-bit size follows the type; size 0 = to end of file.
+        let (header, box_size) = match size {
+            0 => (8usize, to - p),
+            1 => {
+                if p + 16 > to {
+                    return None;
+                }
+                let large = u64::from_be_bytes([
+                    head[p + 8],
+                    head[p + 9],
+                    head[p + 10],
+                    head[p + 11],
+                    head[p + 12],
+                    head[p + 13],
+                    head[p + 14],
+                    head[p + 15],
+                ]) as usize;
+                (16usize, large)
+            }
+            _ => (8usize, size),
+        };
+        if box_size < header {
+            return None;
+        }
+        let end = p.saturating_add(box_size).min(to);
+        if name == kind {
+            return Some((p + header, end));
+        }
+        p = p.saturating_add(box_size);
+    }
+    None
+}
+
+/// The codec an `.m4a` may be called, from its bitrate. The ONE rule for ALAC,
+/// because the extension cannot tell it from AAC: a lossless-class bitrate is
+/// claimed as `alac`, anything lower is left UNKNOWN rather than guessed as
+/// `aac` (a wrong codec makes the player pick the wrong engine before byte one).
+///
+/// `routes::codec_of()` calls this, so the rule is testable beside the duration
+/// it depends on.
+pub fn alac_or_unknown(file_size: u64, duration_secs: i64) -> &'static str {
+    if is_lossless("m4a", file_size, duration_secs) {
+        "alac"
+    } else {
+        ""
+    }
+}
+
+/// Cache namespace for what a file's header said about itself.
+const PROBE_PREFIX: &str = "audio_probe";
+/// A file's own header does not change, so this can live far longer than a
+/// resolve. The entry is three small numbers.
+const PROBE_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// Publish what the head of a file says about it, keyed by short code.
+///
+/// Called from the download prime, where the bytes are already in hand: the 512 KB
+/// prime exists for ranges, and a FLAC header ends at byte 42. Costs a slice.
+///
+/// Uses the engine's ONE cache ([`crate::cache`]) rather than a second one; the
+/// value is `{duration, sampleRate, bitDepth, channels}`, all of them read from
+/// the bytes, none of them inferred.
+pub fn remember_head(short_code: &str, file_size: u64, head: &[u8]) {
+    if short_code.is_empty() {
+        return;
+    }
+    let mut body = serde_json::json!({"size": file_size});
+    let mut found = false;
+    if let Some(info) = flac_info(head) {
+        found = true;
+        body["sampleRate"] = serde_json::json!(info.sample_rate);
+        body["bitDepth"] = serde_json::json!(info.bit_depth);
+        body["channels"] = serde_json::json!(info.channels);
+    }
+    if let Some(secs) = flac_duration(head) {
+        body["duration"] = serde_json::json!(secs);
+    }
+    if let Some(secs) = mp4_duration(head) {
+        found = true;
+        body["duration"] = serde_json::json!(secs);
+    }
+    if !found {
+        return;
+    }
+    crate::cache::put(PROBE_PREFIX, short_code, &body, PROBE_TTL_SECS, 0);
+}
+
+/// What a previously seen file head said about this short code.
+///
+/// The ONLY source of a `sampleRate`/`bitDepth` this engine is willing to state:
+/// both come from the file's own STREAMINFO, never from the extension.
+pub fn known_probe(short_code: &str) -> Option<Value> {
+    crate::cache::get(PROBE_PREFIX, short_code).map(|v| (*v).clone())
+}
+
+#[cfg(test)]
+mod mp4_tests {
+    use super::*;
+
+    fn box_of(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(kind);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn mvhd_v0(timescale: u32, duration: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 12]; // version + flags, creation, modification
+        p.extend_from_slice(&timescale.to_be_bytes());
+        p.extend_from_slice(&duration.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn an_alac_m4a_states_its_length_in_mvhd() {
+        let mut head = box_of(b"ftyp", b"M4A \0\0\0\0M4A mp42isom");
+        head.extend_from_slice(&box_of(b"moov", &box_of(b"mvhd", &mvhd_v0(44_100, 44_100 * 243))));
+        assert_eq!(mp4_duration(&head), Some(243));
+    }
+
+    /// The whole point: ALAC's verdict is a bitrate test, so the length decides.
+    #[test]
+    fn an_unknown_length_classes_alac_as_lossy_until_mvhd_is_read() {
+        let bytes = 26_704_889u64; // "Sial" ALAC, 243 s
+        assert!(!is_lossless("m4a", bytes, 0), "no length means no bitrate");
+        assert_eq!(alac_or_unknown(bytes, 0), "", "unknown, never guessed as aac");
+
+        let mut head = box_of(b"ftyp", b"M4A \0\0\0\0");
+        head.extend_from_slice(&box_of(b"moov", &box_of(b"mvhd", &mvhd_v0(44_100, 44_100 * 243))));
+        let secs = mp4_duration(&head).expect("243 s") as i64;
+        assert!(is_lossless("m4a", bytes, secs), "{} kbps", kbps(bytes, secs));
+        assert_eq!(alac_or_unknown(bytes, secs), "alac");
+    }
+
+    /// No faststart: `moov` is at the end, so the head cannot answer. Say so.
+    #[test]
+    fn a_file_whose_moov_is_at_the_end_reports_nothing() {
+        let mut head = box_of(b"ftyp", b"M4A \0\0\0\0");
+        head.extend_from_slice(&box_of(b"free", &[0u8; 32]));
+        assert_eq!(mp4_duration(&head), None);
+    }
+
+    #[test]
+    fn a_header_that_states_no_length_is_not_treated_as_one() {
+        // Right magic and a valid STREAMINFO, but the encoder wrote no total.
+        let mut flac = vec![0u8; 42];
+        flac[0..4].copy_from_slice(b"fLaC");
+        flac[7] = 34;
+        // STREAMINFO starts at file offset 8, so its byte 10 is file byte 18.
+        flac[18] = 0x0a; // 44_100 Hz across the top 20 bits
+        flac[19] = 0xc4;
+        flac[20] = 0x40;
+        assert!(flac_info(&flac).is_some(), "the rate is still readable");
+        assert_eq!(flac_duration(&flac), None, "0 samples means unknown");
+        // An MP3's tag is not an MP4 box.
+        assert_eq!(mp4_duration(b"ID3\x04\x00\x00\x00\x00\x00\x00\x00"), None);
+    }
+}
+
 /// `fd_eclipse_audio_quality_score()` — higher is better.
 pub fn quality_score(ext: &str, size_bytes: u64) -> i64 {
     let weight = match ext.to_lowercase().as_str() {

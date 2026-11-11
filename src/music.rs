@@ -204,7 +204,6 @@ pub fn format_track(item: &Value) -> Value {
         "title": title,
         "artist": artist,
         "duration": duration,
-        "durationMs": if duration > 0 { duration * 1000 } else { 180000 },
         // The byte count, so a caller can tell a CD FLAC from a hi-res master
         // (`is_hi_res`). Addons ignore keys they do not know.
         "size": file_size,
@@ -215,6 +214,17 @@ pub fn format_track(item: &Value) -> Value {
         // BitChord reads this to pick a rendition; Eclipse ignores it.
         "audioQuality": tier(&ext, file_size, duration),
     });
+    // An UNKNOWN length is omitted, never filled in.
+    //
+    // MEASURED 2026-11-11: this used to send `"durationMs": 180000` for every row
+    // the catalogue had no duration for. That is a fabricated 3:00 — a client that
+    // shows it gives the wrong length and a seek past the real end fails. The
+    // `duration: 0` beside it is the honest value, and it is the ONE field every
+    // quality signal is derived from (`is_lossless`, `is_hi_res`, `kbps`), so a
+    // milliseconds twin that is guessed buys nothing and lies.
+    if duration > 0 {
+        track["durationMs"] = serde_json::json!(duration * 1000);
+    }
     for (key, value) in [("album", tag(item, "album")), ("isrc", tag(item, "isrc"))] {
         if !value.is_empty() {
             track[key] = serde_json::json!(value);
@@ -294,7 +304,26 @@ mod tests {
         }));
         assert_eq!(track["artist"], "back to friends");
         assert_eq!(track["title"], "back to friends");
-        assert_eq!(track["durationMs"], 180000);
+    }
+
+    /// An unknown length is OMITTED, never invented.
+    ///
+    /// A `duration: 0` row is a file Telegram holds as a `document`, so it carries
+    /// no Audio attribute and the catalogue genuinely does not know its length.
+    /// MEASURED 2026-11-11: every such row was answered `durationMs: 180000`, a
+    /// fabricated 3:00 that a player displays and then cannot seek through.
+    #[test]
+    fn an_unknown_duration_is_omitted_never_invented() {
+        let track = format_track(&serde_json::json!({
+            "short_code": "dKnM62",
+            "title": "back.to.friends.wav",
+            "extension": "wav"
+        }));
+        assert_eq!(track["duration"], 0);
+        assert!(
+            track.get("durationMs").is_none(),
+            "an unknown duration must not be filled in with a placeholder"
+        );
     }
 
     /// No `.wav` alias: the advertised format is the container that is actually

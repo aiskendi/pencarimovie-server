@@ -8313,9 +8313,26 @@ fn rank_for_tier(tracks: Vec<Value>, quality: &str) -> Vec<Value> {
                 k => k,
             };
             // Inside the hi-res/lossless groups the HIGHEST bitrate wins, not the
-            // origin's order: a 5122 kbps master must beat a 1832 kbps one, and
-            // `u64::MAX - kbps` sorts ascending with unknown (0) last.
-            let best_first = u64::MAX - kbps.min(u64::MAX - 1);
+            // origin's order: a 5122 kbps master must beat a 1832 kbps one.
+            //
+            // The key ASCENDS, so a higher bitrate has to map to a SMALLER value
+            // (`u64::MAX - kbps`) and an UNKNOWN one to the largest value of all.
+            //
+            // MEASURED 2026-11-11 — this was inverted: `kbps` is ALREADY
+            // `u64::MAX` for an unknown row, so `u64::MAX - (u64::MAX - 1) == 1`
+            // handed every row whose length the catalogue does not know the
+            // SMALLEST key, i.e. it sorted FIRST — the opposite of what the
+            // comment here used to claim. `q=back to me&quality=LOSSLESS` put
+            // eight `duration: 0` FLACs at positions 1-8 and pushed a 2852 kbps
+            // master to position 9; the SAME rows ordered correctly under
+            // `quality=HI_RES`, because there the hi-res bit is a separate leading
+            // key. A row with no known bitrate is one we cannot call hi-res, so it
+            // must rank last.
+            let best_first = if kbps == u64::MAX {
+                u64::MAX
+            } else {
+                u64::MAX - kbps.min(u64::MAX - 1)
+            };
             let key = match want {
                 Want::HiRes => (
                     if hi_res { 0 } else if lossless { 1 } else { 2 },
@@ -8466,6 +8483,44 @@ mod bitchord_tests {
             "hi_res",
         );
         assert_eq!(rows[0]["id"], "hi5122", "the bigger master wins despite the order");
+    }
+
+    /// A row whose length the catalogue does not know has NO bitrate, so it can
+    /// never be the hi-res one — and it must not be ranked as though it were.
+    ///
+    /// MEASURED 2026-11-11 on `q=back to me&quality=LOSSLESS`: 30 FLAC rows, the
+    /// first EIGHT of them `duration: 0` (files Telegram holds as `document`, so
+    /// they carry no Audio attribute). `best_first` is `u64::MAX - kbps`, but
+    /// `kbps` had ALREADY been replaced by `u64::MAX` for an unknown row, so it
+    /// collapsed to `1` — the smallest key of all. The eight unknown rows took
+    /// positions 1-8 and a real 2852 kbps master was pushed to position 9, so the
+    /// client played a duration-less FLAC while the hi-res copy sat below the fold.
+    /// The same rows under `quality=HI_RES` ordered correctly, because there the
+    /// hi-res bit is a separate leading key — which is why the lossless branch
+    /// looked like a deliberate policy rather than an inverted sort.
+    #[test]
+    fn an_unknown_bitrate_ranks_last_not_first() {
+        let rows = rank_for_tier(
+            vec![
+                // 35 188 598 B over an UNKNOWN length — "05.Kanye.West.BACK.TO.ME.flac".
+                serde_json::json!({"id": "unknown", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 35_188_598u64, "duration": 0}),
+                // 52 969 141 B / 224 s = 1892 kbps.
+                serde_json::json!({"id": "cd", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 52_969_141u64, "duration": 224}),
+                // 90 202 285 B / 253 s = 2852 kbps.
+                serde_json::json!({"id": "master", "format": "flac", "audioQuality": "LOSSLESS",
+                                   "size": 90_202_285u64, "duration": 253}),
+            ],
+            "LOSSLESS",
+        );
+        assert_eq!(rows.len(), 3, "nothing is ever dropped");
+        assert_eq!(rows[0]["id"], "master", "2852 kbps ranks above 1892 kbps");
+        assert_eq!(rows[1]["id"], "cd", "among KNOWN bitrates the higher still wins");
+        assert_eq!(
+            rows[2]["id"], "unknown",
+            "a row with no known length must rank LAST, not first"
+        );
     }
 
     /// `medium` is a normal lossy file, and the one nearest 256 kbps wins.

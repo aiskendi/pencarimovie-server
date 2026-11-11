@@ -875,13 +875,16 @@
 
     // The ?token= flow finishes inside app.js after boot; it forwards the
     // result so the Bots section can show what happened instead of a modal.
-    window.addEventListener('pm:token-result', function (ev) {
-      var detail = (ev && ev.detail) || {};
+    function applyTokenResult(detail) {
+      detail = detail || {};
       switchTo('bots');
       var target = el('settingsConnectedStatus') || el('settingsStatus');
       if (!target) return;
       target.textContent = detail.message || '';
       target.style.color = detail.success ? 'var(--pm-status-online)' : 'var(--pm-status-danger)';
+    }
+    window.addEventListener('pm:token-result', function (ev) {
+      applyTokenResult(ev && ev.detail);
     });
 
     // Returning to a backgrounded tab shows stale numbers until the next tick.
@@ -895,6 +898,14 @@
     });
 
     applyRoute(readHash(), false);
+
+    // app.js can finish the ?token= flow before this listener exists. It
+    // stashes the result and rewrites the hash to #bots; replay the notice so
+    // the user always sees what the link did.
+    if (window.__pmTokenResult) {
+      applyTokenResult(window.__pmTokenResult);
+      window.__pmTokenResult = null;
+    }
 
     // Keep the legacy global adapters pointing at sections. app.js re-assigns
     // showSettingsGate internally, but that method now returns immediately

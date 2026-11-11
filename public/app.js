@@ -189,26 +189,36 @@ class PencariMovieApp {
       const tokenFromUrl = urlParams.get("token");
       let tokenAddResult = null;
       if (tokenFromUrl && tokenFromUrl.trim() !== "") {
+        // `?token=` takes ONE bot token or SEVERAL separated by commas or
+        // whitespace, e.g. ?token=111:AA…,222:BB… — the same list the Bots tab
+        // accepts in bulk. Sending the whole string as `bot_token` made it ONE
+        // invalid token, so a multi-token link never added anything.
         const cleanToken = tokenFromUrl.trim();
+        const tokens = cleanToken.split(/[\s,]+/).map(t => t.trim()).filter(Boolean);
         try {
           if (this.hasSession) {
             const addResp = yield this.requestJson("".concat(this.localApiBase, "/api/bots/add"), {
               method: "POST",
-              body: JSON.stringify({
-                bot_token: cleanToken
+              body: JSON.stringify(tokens.length > 1 ? {
+                tokens
+              } : {
+                bot_token: tokens[0]
               })
             });
-            if (addResp == null ? void 0 : addResp.ok) {
+            if (addResp && addResp.ok) {
               yield this.loadSessionStatus();
               yield this.loadBotPool();
-              const botInfo = (_c = addResp == null ? void 0 : addResp.results) == null ? void 0 : _c[0];
-              const botLabel = (botInfo == null ? void 0 : botInfo.bot_name) ? "".concat(botInfo.bot_name, " (@").concat(botInfo.bot_username || botInfo.bot_id, ")") : "Bot ".concat((botInfo == null ? void 0 : botInfo.bot_id) || "");
+              const added = addResp.added || addResp.results || [];
+              const labels = added.map(botInfo => (botInfo == null ? void 0 : botInfo.bot_name) ? "".concat(botInfo.bot_name, " (@").concat(botInfo.bot_username || botInfo.bot_id, ")") : "Bot ".concat((botInfo == null ? void 0 : botInfo.bot_id) || "")).filter(Boolean);
+              const missed = addResp.failed || [];
+              const why = missed.map(f => "".concat((f && f.token) || "token", ": ").concat((f && f.error) || "failed")).join("; ");
               tokenAddResult = {
                 success: true,
-                message: "\u2713 Successfully added ".concat(botLabel, " to Bot Pool!")
+                message: "\u2713 Added ".concat(labels.length ? labels.join(", ") : "".concat(added.length || tokens.length, " bot(s)"), " to Bot Pool!").concat(why ? " Skipped ".concat(why) : "")
               };
             } else {
-              const errDetail = ((_e = (_d = addResp == null ? void 0 : addResp.results) == null ? void 0 : _d[0]) == null ? void 0 : _e.error) || (addResp == null ? void 0 : addResp.message) || "Failed to connect bot.";
+              const failed = (addResp && addResp.failed) || [];
+              const errDetail = failed.map(f => "".concat((f && f.token) || "token", ": ").concat((f && f.error) || "failed")).join("; ") || (addResp && addResp.message) || "Failed to connect bot.";
               tokenAddResult = {
                 success: false,
                 message: "\u2715 Failed to add bot: ".concat(errDetail),
@@ -222,7 +232,7 @@ class PencariMovieApp {
             if (this.hasSession) {
               tokenAddResult = {
                 success: true,
-                message: "\u2713 Connected as ".concat(this.botName || "Primary Bot", " (@").concat(this.botUsername, ")")
+                message: "\u2713 Connected as ".concat(this.botName || "Primary Bot", " (@").concat(this.botUsername, ")").concat(tokens.length > 1 ? " +".concat(tokens.length - 1, " extra bot(s)") : "")
               };
             } else {
               tokenAddResult = {
@@ -252,9 +262,16 @@ class PencariMovieApp {
       // not apply. The ?token= result is forwarded so the Bots tab can show it.
       if (document.body.dataset.pmShell === "dashboard") {
         if (tokenAddResult) {
+          // dashboard.js may not have bound its listener yet, so stash the
+          // result for it AND route to #bots here: the token flow used to end
+          // on an empty hash, so the page stayed on Overview with no notice.
+          window.__pmTokenResult = tokenAddResult;
           window.dispatchEvent(new CustomEvent("pm:token-result", {
             detail: tokenAddResult
           }));
+          try {
+            window.history.replaceState({}, document.title, "".concat(window.location.pathname, window.location.search, "#bots"));
+          } catch (e) {}
         }
         this._startTunnelWatchdog();
         return;

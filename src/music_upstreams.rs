@@ -191,7 +191,7 @@ fn partial_info(manifest: &Value) -> ManifestInfo {
 pub fn read_manifest(manifest: &Value) -> Result<ManifestInfo, String> {
     if !manifest.is_object() {
         return Err(
-            "That URL did not answer a JSON manifest — check the base points at a BitChord-protocol addon."
+            "That URL did not answer a JSON manifest — check the base points at a music addon."
                 .to_string(),
         );
     }
@@ -203,7 +203,7 @@ pub fn read_manifest(manifest: &Value) -> Result<ManifestInfo, String> {
         .to_string();
     if id.is_empty() {
         return Err(
-            "The manifest has no `id`, so it is not a BitChord-protocol addon (this is what an error page looks like)."
+            "The manifest has no `id`, so it is not a music addon (this is what an error page looks like)."
                 .to_string(),
         );
     }
@@ -264,7 +264,7 @@ pub fn read_search(status: u16, body: &Value) -> Result<SearchInfo, String> {
     }
     let Some(tracks) = body.get("tracks").and_then(|v| v.as_array()) else {
         return Err(
-            "/search answered 200 without a `tracks` array — that is not a BitChord-protocol search endpoint."
+            "/search answered 200 without a `tracks` array — that is not a music addon search endpoint."
                 .to_string(),
         );
     };

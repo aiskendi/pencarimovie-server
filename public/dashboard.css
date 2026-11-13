@@ -926,8 +926,24 @@ body[data-pm-shell='dashboard'] {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* Two actions now share the row with the title; on a phone they drop
+     under it instead of squeezing the title to nothing. */
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 10px;
+}
+
+.settings-gate__bots-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* The pool links are text links, not buttons: 8px of block padding puts the
+   tap target near 34px without changing how the row looks. */
+.settings-gate__bots-actions > * {
+  padding-block: 8px;
 }
 
 .settings-gate__bots-title {

@@ -15,7 +15,7 @@
     <link rel="stylesheet" href="styles.css?v=20261024music2" />
     <!-- last on purpose: the Titanium tokens must win over the legacy
          media-shell stylesheets for the relocated settings markup -->
-    <link rel="stylesheet" href="dashboard.css?v=20261105livestats5" />
+    <link rel="stylesheet" href="dashboard.css?v=20261112botactions1" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -909,19 +909,34 @@
               <span class="settings-gate__bots-title"
                 >Bot Pool (<span id="botPoolCount">1</span>)</span
               >
-              <button
-                type="button"
-                id="toggleAddBotsBtn"
-                class="settings-gate__link"
-                style="
-                  font-size: 0.8rem;
-                  color: var(--pm-accent);
-                  cursor: pointer;
-                  white-space: nowrap;
-                "
-              >
-                + Add More Bots
-              </button>
+              <div class="settings-gate__bots-actions">
+                <!-- Lives here, not beside #settingsTokenSection's copy: that
+                     section is hidden as soon as a session exists
+                     (applyBotsVisibility), which took the only way to obtain a
+                     token with it, so the pool could only ever shrink. -->
+                <a
+                  class="settings-gate__link"
+                  id="createBotLink"
+                  href="https://t.me/CreateNewTelegramBot?start=localserver"
+                  target="_blank"
+                  rel="noopener"
+                  title="Opens @CreateNewTelegramBot on Telegram"
+                  >Create a bot</a
+                >
+                <button
+                  type="button"
+                  id="toggleAddBotsBtn"
+                  class="settings-gate__link"
+                  style="
+                    font-size: 0.8rem;
+                    color: var(--pm-accent);
+                    cursor: pointer;
+                    white-space: nowrap;
+                  "
+                >
+                  + Add More Bots
+                </button>
+              </div>
             </div>
 
             <div
@@ -1331,9 +1346,9 @@
                 line-height: 1.35;
               "
             >
-              BitChord-protocol addons this server fills a missing track from. A
-              source is tested before it is added: it must serve a manifest,
-              answer a search, and hold at least one lossless rendition.
+              Music addons this server fills a missing track from. A source is
+              tested before it is added: it must serve a manifest, answer a
+              search, and hold at least one lossless rendition.
             </p>
             <div
               id="musicSourcesList"

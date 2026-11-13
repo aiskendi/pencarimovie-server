@@ -260,11 +260,18 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
 /// Part-seconds are unchanged, so a neighbouring stream loses a slot for one RTT
 /// rather than two. Under `--inflight 1` the two futures simply queue, and the
 /// result is byte-identical to the serial fetch.
+/// Fetch the pre-flight range, spending at most `wait` seconds on a part permit.
+///
+/// The caller passes [`PRIME_GATE_WAIT_SECS`] for a first attempt and
+/// [`PRIME_GATE_RETRY_WAIT_SECS`] for the retry after a saturated one, so a
+/// connection that is not answering costs one window plus a short window before
+/// the refusal instead of two full ones.
 async fn fetch_prime_gated(
     client: &grammers_client::Client,
     target: &DocTarget,
     pos: u64,
     want: u64,
+    wait: u64,
 ) -> Result<Vec<u8>, crate::telegram::GramErr> {
     // BOUNDED, because this gate is shared with every other stream on the
     // connection and `fetch_range_core` waits for a permit FOREVER ("requests
@@ -277,7 +284,7 @@ async fn fetch_prime_gated(
     // and others — while the dyno's 32 parts were all streaming something else.
     // A queued first byte has to become a fast, retryable answer instead of a
     // 30 s hang the router turns into a 503 the player cannot retry.
-    let wait = prime_gate_wait_secs();
+    let started = std::time::Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(wait),
         prime_parts(client, prime_gate(), target, pos, want),
@@ -285,8 +292,23 @@ async fn fetch_prime_gated(
     .await
     {
         Ok(r) => r,
+        // THE MESSAGE NAMES THE WAIT THAT ACTUALLY HAPPENED, not the window.
+        //
+        // It used to print `{wait}`, so every failure read "12s waiting for a
+        // part permit" whether the part had hung for 20 ms or the whole window —
+        // and the two causes need opposite answers. An EMPTY POOL is contention
+        // (wait, then retry). A part that never comes back is a stalled
+        // connection (`PRIME_PARTS` is 12 and one pre-flight holds at most two,
+        // so arithmetic cannot explain it) and the answer is to rotate the
+        // worker. `free` is what tells them apart in a bug report, and it is the
+        // number the 2026-11-13 phone log could not show.
         Err(_) => Err(crate::telegram::GramErr {
-            message: format!("{GATE_BUSY_PREFIX}: {}s waiting for a part permit", wait),
+            message: format!(
+                "{GATE_BUSY_PREFIX}: waited {}ms of a {}s window for a part permit ({} free)",
+                started.elapsed().as_millis(),
+                wait,
+                prime_gate().available_permits(),
+            ),
             ..Default::default()
         }),
     }
@@ -302,6 +324,23 @@ async fn prime_parts(
     want: u64,
 ) -> Result<Vec<u8>, crate::telegram::GramErr> {
     let (want, split) = prime_split(want);
+    // A SPLIT COSTS TWO PERMITS AT ONCE, so under contention it is the wrong
+    // trade.
+    //
+    // The split buys first-byte latency when the pool is idle (measured 954 ms
+    // serial vs 723 ms split on a 406 MB 4K source). When the pool is nearly
+    // empty it does the opposite: two pre-flights per request empty a 12-permit
+    // pool, and every request behind them waits the full
+    // [`PRIME_GATE_WAIT_SECS`] window and then answers `parts busy` — the
+    // 2026-11-13 phone log, three stalls 80 s apart on ONE 552 MB file with a
+    // single bot. One permit, fetched serially by `fetch_range_core`, returns
+    // byte-identical data and leaves the pool depth for the requests already
+    // queued.
+    let split = if prime_split_allowed(gate.available_permits()) {
+        split
+    } else {
+        None
+    };
     let Some((first_want, second_want)) = split else {
         return crate::telegram::fetch_range_gated(client, gate, target, pos, want).await;
     };
@@ -343,6 +382,16 @@ async fn prime_parts(
 /// still leaves room for the part fetch and the headers after the wait.
 pub const PRIME_GATE_WAIT_SECS: u64 = 12;
 
+/// The window the RETRY gets after one saturated attempt.
+///
+/// Paying a second full window was measurably useless: in the 2026-11-13 phone
+/// log every stalled request spent 12 s, rotated the worker, spent another 12 s
+/// and then answered `503` — 24 s of silence, after which the player starts
+/// another body and queues behind its own abandoned request. The retry is worth
+/// trying (a rotated worker is a different TCP connection and often answers at
+/// once); it is not worth another twelve seconds.
+pub const PRIME_GATE_RETRY_WAIT_SECS: u64 = 3;
+
 /// The same wait, on a host with a request timeout in front of it.
 ///
 /// Heroku's router kills a request that has produced nothing in **30 s** (`H12`),
@@ -370,11 +419,25 @@ fn prime_gate_wait_secs() -> u64 {
 }
 
 
-/// Prefix of the error that means "every part on this connection is busy". The
+/// Prefix of the error that means "no part came back inside the window". The
 /// pre-flight loop stops retrying on it (four retries would spend four wait
 /// budgets on the same saturation) and the handler answers `503` +
 /// `Retry-After`, which a player can act on.
+///
+/// Two different faults land here, and the numbers in the message separate
+/// them: an EMPTY PRE-FLIGHT POOL (contention — see [`PRIME_PARTS`]) and a PART
+/// THAT NEVER CAME BACK on a connection that is not answering (a stalled pipe —
+/// see the rotate-worker arm in the pre-flight loop).
 pub const GATE_BUSY_PREFIX: &str = "parts busy";
+
+/// Is there room for the second permit a split prime needs while it runs?
+///
+/// Below two free permits the split would take the last one and then queue the
+/// part it needs behind itself; the caller fetches the same bytes through a
+/// single permit instead.
+fn prime_split_allowed(free: usize) -> bool {
+    free >= 2
+}
 
 /// How many parts the PRE-FLIGHT may hold, in its own pool, apart from the
 /// streaming budget.
@@ -1975,6 +2038,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // How many times a saturated connection has already been waited out — see
     // the `GATE_BUSY_PREFIX` arm below.
     let mut prime_busy = 0u32;
+    // The window the NEXT prime attempt may spend. The first attempt gets the
+    // full window; a retry after one saturation gets
+    // [`PRIME_GATE_RETRY_WAIT_SECS`], because a stalled pipe is not going to
+    // answer just because we waited longer.
+    let mut prime_wait = prime_gate_wait_secs();
     // The plugin's own `retry_after` when its relay refused to mint a fresh
     // reference. Carried to the give-up branch so the client gets a 503 it can
     // act on instead of a 500 that reads as "this track is broken".
@@ -2004,7 +2072,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             Ok(guard) => Some(guard),
             Err(_) => None,
         };
-        match fetch_prime_gated(&client, &target, aligned, prime_want).await {
+        match fetch_prime_gated(&client, &target, aligned, prime_want, prime_wait).await {
             Ok(buf) => {
                 // The reference is PROVEN here, which is the earliest it can be
                 // proven — see [`mark_reference_verified`] for the measured loop
@@ -2065,13 +2133,26 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     // below already does for a different symptom.
                     let (next_client, _next_gate) = entry.pick_slot();
                     client = next_client;
+                    // `gate_free` is the discriminator the old log lacked: 0 means
+                    // the pre-flight pool really was empty (contention), a healthy
+                    // count means the permits were free and the PART was the thing
+                    // that never arrived (stalled pipe).
+                    let next_wait = PRIME_GATE_RETRY_WAIT_SECS;
                     log(
                         "pre-flight stalled - rotating the worker before the retry",
-                        &serde_json::json!({"short_code": short_code, "attempt": attempt}),
+                        &serde_json::json!({
+                            "short_code": short_code,
+                            "attempt": attempt,
+                            "gate_free": prime_gate().available_permits(),
+                            "gate_parts": PRIME_PARTS,
+                            "next_wait_s": next_wait,
+                        }),
                     );
+                    // The retry gets a SHORT window instead of a second full one.
+                    prime_wait = next_wait;
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     preflight_deadline = (std::time::Instant::now()
-                        + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+                        + std::time::Duration::from_secs(next_wait))
                         .min(hard_deadline);
                     continue;
                 }
@@ -3152,6 +3233,25 @@ mod tests {
     /// Only a broken auth KEY quarantines a bot. A dead `file_reference` is
     /// per-send and a transport reset is per-connection — neither should cost the
     /// bot 30 minutes of work.
+    /// A split prime costs TWO permits while it runs, so it must not run when the
+    /// pool cannot afford both.
+    ///
+    /// 2026-11-13 phone log, one bot, one 552 MB episode: three stalls 80 s apart,
+    /// every one `parts busy` after the full window, while the player held several
+    /// ranges open on the same file. Under that pressure the split is what emptied
+    /// the pool — the bytes are byte-identical either way, only the latency trade
+    /// changes, so starvation has to win.
+    #[test]
+    fn a_split_prime_is_refused_when_the_pool_cannot_afford_two() {
+        assert!(prime_split_allowed(PRIME_PARTS), "an idle pool splits");
+        assert!(prime_split_allowed(2), "two free permits are exactly enough");
+        assert!(
+            !prime_split_allowed(1),
+            "one free permit must fetch serially — a split would queue its own second part"
+        );
+        assert!(!prime_split_allowed(0), "an empty pool must never split");
+    }
+
     #[test]
     fn only_an_auth_key_failure_quarantines_a_bot() {
         for m in [
@@ -3166,7 +3266,7 @@ mod tests {
         for m in [
             "request error: read 0 bytes",
             "FILE_REFERENCE_EXPIRED (400)",
-            "parts busy: 12s waiting for a part permit",
+            "parts busy: waited 12004ms of a 12s window for a part permit (0 free)",
             "FLOOD_WAIT (420)",
         ] {
             assert!(!is_auth_failure(m), "{m} must not quarantine");

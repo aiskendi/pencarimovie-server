@@ -1235,10 +1235,19 @@ pub fn plan_limit(pos: u64, want: u64) -> u64 {
     }
 }
 
-/// Attempts for one part: the first try plus two retries.
-const PART_MAX_ATTEMPTS: usize = 3;
-/// 100 / 300 / 700 ms between transport retries.
-const PART_BACKOFF_MS: [u64; 3] = [100, 300, 700];
+/// Attempts for one part: the first try plus three retries.
+///
+/// Three was too few for a mobile carrier. The 2026-11-13 phone log shows DC3
+/// answering `Connection reset by peer (os error 104)` and `Timeout (-503)` in
+/// bursts, with `dc candidate … step:` climbing past 10 while it happens — the
+/// wire is down for seconds, not milliseconds. With 3 attempts the part had
+/// 1.1 s of patience, died mid-blip, and the pre-flight above it reported "no
+/// part" — a fault that looked like a saturated permit pool and was blamed on
+/// one (`gate_free: 12` during the stall finally disproved it).
+const PART_MAX_ATTEMPTS: usize = 4;
+/// 150 / 500 / 1500 ms between transport retries: ~2.2 s of patience, and the
+/// last backoff is reused for any further attempt.
+const PART_BACKOFF_MS: [u64; 3] = [150, 500, 1500];
 /// A `FLOOD_WAIT` at or below this is slept and retried once (inside the same
 /// permit); above it the caller answers 429 so the client retries on its own
 /// schedule instead of holding a connection for minutes.
@@ -1334,6 +1343,45 @@ async fn fetch_range_core(
     }
 }
 
+/// SIMULATION ONLY — fail part fetches on demand, so the phone's failure can be
+/// reproduced on a healthy localhost.
+///
+/// The 2026-11-13 phone log is unambiguous: `upload.getFile` answers
+/// `Connection reset by peer (os error 104)` / `Timeout (-503)` for tens of
+/// seconds while `dc candidate … step:` climbs, and the pre-flight reports
+/// `gate_free: 12` (an idle permit pool) every time. A desktop cannot reproduce
+/// that — its Telegram path works — so the fault is injected instead:
+///
+///   PM_FAULT_STALL_MS=14000   sleep this long, then fail with `Timeout (-503)`
+///   PM_FAULT_HITS=3           fail this many fetches, then behave normally
+///
+/// Both unset (the default, and the only configuration any deployment uses) means
+/// no injection at all. Nothing is read unless `PM_FAULT_STALL_MS` is present.
+fn injected_part_fault() -> Option<u64> {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
+    let ms: u64 = crate::storage::env("PM_FAULT_STALL_MS")?.trim().parse().ok()?;
+    if ms == 0 {
+        return None;
+    }
+    // Armed ONCE per process, then `hits` faults and never again. An earlier
+    // version re-armed itself and fired on every other call forever, which made
+    // the "two stalls then recover" scenario untestable.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static LEFT: AtomicI64 = AtomicI64::new(0);
+    if !ARMED.swap(true, Relaxed) {
+        let hits: i64 = crate::storage::env("PM_FAULT_HITS")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        LEFT.store(hits.max(1), Relaxed);
+    }
+    let left = LEFT.load(Relaxed);
+    if left <= 0 {
+        return None;
+    }
+    LEFT.store(left - 1, Relaxed);
+    Some(ms)
+}
+
 async fn fetch_range_once(
     client: &Client,
     target: &DocTarget,
@@ -1341,6 +1389,19 @@ async fn fetch_range_once(
     skip: u64,
     want: u64,
 ) -> Result<Vec<u8>, GramErr> {
+    // Fault injection for local reproduction of a stalled/carrier-reset part.
+    if let Some(ms) = injected_part_fault() {
+        log(
+            "FAULT injected - part fetch will fail",
+            &serde_json::json!({"sleep_ms": ms, "pos": skip * limit, "want": want}),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        return Err(GramErr {
+            message: "Timeout (-503)".to_string(),
+            transport: true,
+            ..Default::default()
+        });
+    }
     let mut iter = client
         .iter_download(target)
         .chunk_size(limit as i32)

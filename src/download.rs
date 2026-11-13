@@ -292,25 +292,38 @@ async fn fetch_prime_gated(
     .await
     {
         Ok(r) => r,
-        // THE MESSAGE NAMES THE WAIT THAT ACTUALLY HAPPENED, not the window.
+        // WHICH FAULT? The permit count at the moment of failure is the only
+        // discriminator, and it has to be read there, not guessed afterwards.
         //
-        // It used to print `{wait}`, so every failure read "12s waiting for a
-        // part permit" whether the part had hung for 20 ms or the whole window —
-        // and the two causes need opposite answers. An EMPTY POOL is contention
-        // (wait, then retry). A part that never comes back is a stalled
-        // connection (`PRIME_PARTS` is 12 and one pre-flight holds at most two,
-        // so arithmetic cannot explain it) and the answer is to rotate the
-        // worker. `free` is what tells them apart in a bug report, and it is the
-        // number the 2026-11-13 phone log could not show.
-        Err(_) => Err(crate::telegram::GramErr {
-            message: format!(
-                "{GATE_BUSY_PREFIX}: waited {}ms of a {}s window for a part permit ({} free)",
-                started.elapsed().as_millis(),
-                wait,
-                prime_gate().available_permits(),
-            ),
-            ..Default::default()
-        }),
+        // `free == 0` is genuine contention: every permit is held, so the request
+        // really did queue for one. `free > 0` is the opposite — the pool was idle
+        // and some PART never came back. The 2026-11-13 phone log finally showed
+        // that directly: `gate_free: 12` printed next to `Connection reset by peer
+        // (os error 104)` and `Timeout (-503)` on DC3, i.e. the wire, not the pool.
+        //
+        // They need opposite answers (wait, versus abandon this connection now) so
+        // they get different names. Reporting both as "parts busy" is what kept a
+        // dead socket looking like a saturated pool.
+        Err(_) => {
+            let waited = started.elapsed().as_millis();
+            let free = prime_gate().available_permits();
+            let message = if free > 0 {
+                format!(
+                    "{PART_STALL_PREFIX}: no part in {waited}ms with {free} of {PRIME_PARTS} permits free"
+                )
+            } else {
+                format!(
+                    "{GATE_BUSY_PREFIX}: waited {waited}ms of a {wait}s window for a part permit (0 free)"
+                )
+            };
+            Err(crate::telegram::GramErr {
+                message,
+                // The part fetch failed on the wire, so the pre-flight and the
+                // body retry treat it as retryable rather than as a dead file.
+                transport: true,
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -392,6 +405,29 @@ pub const PRIME_GATE_WAIT_SECS: u64 = 12;
 /// once); it is not worth another twelve seconds.
 pub const PRIME_GATE_RETRY_WAIT_SECS: u64 = 3;
 
+/// Extra attempts granted when the fault was a STALLED PART (the wire) rather
+/// than a busy pool (the permits).
+///
+/// MadelineProto's `downloadPart()` has no attempt counter at all: it retries
+/// `upload.getFile` in place, `delay(1)` on `FLOOD_WAIT`, and exits only when the
+/// client disconnects. A first byte that has not been sent yet is in the same
+/// position — no bytes means nothing to corrupt — so instead of the pool's two
+/// tries it keeps rotating workers until [`PREFLIGHT_HARD_CAP_SECS`] runs out.
+/// Measured on the phone 2026-11-13: DC3 was reset continuously for ~60 s
+/// (`dc candidate … step:` 8 → 21) while the 4-attempt engine gave up inside the
+/// first blip and answered `503`.
+const PRIME_STALL_EXTRA_ATTEMPTS: u32 = 8;
+
+/// The attempt budget after a stall hit at `attempt`, given the current one.
+///
+/// Only ever GROWS. A saturated pool must not extend anything (two tries is the
+/// whole point of [`GATE_BUSY_PREFIX`]), while a stalled part always leaves
+/// [`PRIME_STALL_EXTRA_ATTEMPTS`] more tries on the table — which is the closest
+/// a bounded engine can come to MadelineProto retrying a part forever.
+fn stall_attempt_budget(attempt: u32, budget: u32) -> u32 {
+    budget.max(attempt.saturating_add(PRIME_STALL_EXTRA_ATTEMPTS))
+}
+
 /// The same wait, on a host with a request timeout in front of it.
 ///
 /// Heroku's router kills a request that has produced nothing in **30 s** (`H12`),
@@ -419,16 +455,23 @@ fn prime_gate_wait_secs() -> u64 {
 }
 
 
-/// Prefix of the error that means "no part came back inside the window". The
-/// pre-flight loop stops retrying on it (four retries would spend four wait
-/// budgets on the same saturation) and the handler answers `503` +
-/// `Retry-After`, which a player can act on.
+/// Prefix of the error that means "the pre-flight POOL is empty": every permit
+/// was held, so this request queued and never got one.
 ///
-/// Two different faults land here, and the numbers in the message separate
-/// them: an EMPTY PRE-FLIGHT POOL (contention — see [`PRIME_PARTS`]) and a PART
-/// THAT NEVER CAME BACK on a connection that is not answering (a stalled pipe —
-/// see the rotate-worker arm in the pre-flight loop).
+/// The pre-flight loop waits a saturated pool out once and refuses on the second
+/// (four retries would spend four wait budgets on the same saturation); the
+/// handler answers `503` + `Retry-After`, which a player can act on.
 pub const GATE_BUSY_PREFIX: &str = "parts busy";
+
+/// Prefix of the error that means "a PART never came back and the POOL was not
+/// the reason" — permits were free while the fetch failed.
+///
+/// This is the wire: `Connection reset by peer`, `Timeout (-503)`, a connection
+/// runner dropped mid-receive. Waiting cannot fix it, so the answer is to rotate
+/// to another worker immediately instead of spending another window, and the
+/// refusal says `UPSTREAM_STALL` rather than `PARTS_BUSY` so a report names the
+/// right fault.
+pub const PART_STALL_PREFIX: &str = "part stalled";
 
 /// Is there room for the second permit a split prime needs while it runs?
 ///
@@ -644,6 +687,11 @@ fn mark_session_bad(bot: &str, why: &str) {
 fn giveup_status(err: &crate::telegram::GramErr) -> (u16, &'static str, Option<u64>) {
     if err.file_reference {
         (503, "FILE_REFERENCE_EXPIRED", Some(2))
+    } else if err.message.starts_with(PART_STALL_PREFIX) {
+        // The wire dropped the part, the FILE is fine, and the next attempt lands
+        // on a different DC connection: retryable, with its own stage so a report
+        // does not read "deleted" or "busy" for a transport fault.
+        (503, "UPSTREAM_STALL", Some(2))
     } else {
         (500, "DOWNLOAD_FAILED", None)
     }
@@ -2003,7 +2051,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // first byte.
     let mut client = entry.pick_slot().0;
 
-    let max_attempts = if short_code.is_empty() { 1 } else { 4 };
+    // `mut`, because a STALLED PART earns extra attempts — see the
+    // `PART_STALL_PREFIX` arm: MadelineProto retries a part in place until the
+    // client disconnects (`downloadPart()` has no attempt counter), and the
+    // closest a bounded engine can get is "keep trying while the hard cap lasts".
+    let mut max_attempts: u32 = if short_code.is_empty() { 1 } else { 4 };
     let mut first: Option<Vec<u8>> = None;
     let mut last_err: Option<crate::telegram::GramErr> = None;
     // Counts as activity for the app's indicator/battery saver while we resolve
@@ -2047,7 +2099,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // reference. Carried to the give-up branch so the client gets a 503 it can
     // act on instead of a 500 that reads as "this track is broken".
     let mut origin_busy = 0i64;
-    for attempt in 1..=max_attempts {
+    let mut attempt: u32 = 0;
+    while attempt < max_attempts {
+        attempt += 1;
         if std::time::Instant::now() >= preflight_deadline {
             log(
                 "pre-flight budget exhausted - giving up before the client has data",
@@ -2114,45 +2168,72 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // deeper queue. So one saturation is waited out and retried, and
                 // only the second one is refused. The hard deadline still bounds
                 // this, so a genuinely stuck connection cannot hold a worker.
-                if e.message.starts_with(GATE_BUSY_PREFIX) {
-                    prime_busy += 1;
-                    last_err = Some(e);
-                    if prime_busy >= 2 {
-                        break;
+                if e.message.starts_with(GATE_BUSY_PREFIX)
+                    || e.message.starts_with(PART_STALL_PREFIX)
+                {
+                    // ONLY THE EMPTY POOL earns a budget. A stalled part is a dead
+                    // socket: waiting again cannot help, and spending the same two
+                    // tries on it would turn a carrier blip into a refused play
+                    // exactly like the pool case did.
+                    let stalled_part = e.message.starts_with(PART_STALL_PREFIX);
+                    if !stalled_part {
+                        prime_busy += 1;
+                        if prime_busy >= 2 {
+                            last_err = Some(e);
+                            break;
+                        }
+                    } else {
+                        // A STALLED PART IS NOT A BUSY POOL, so it does not spend
+                        // the pool budget (two tries) and it is not refused on the
+                        // second attempt. MadelineProto's `downloadPart()` retries
+                        // the same part in place with no counter at all, exiting
+                        // only on client cancellation; its whole answer to
+                        // `FloodWait`, `Timeout (-503)` and a reset socket is
+                        // "wait, then ask again". A request whose FIRST BYTE has
+                        // not been sent is in the same position — nothing can be
+                        // corrupted by another attempt — so the honest bound is the
+                        // hard cap, not a 12 s window. Measured on the phone: DC3
+                        // was reset for ~60 s (`dc candidate … step:` 8 → 21) and a
+                        // 4-attempt engine gave up inside the first blip.
+                        max_attempts = stall_attempt_budget(attempt, max_attempts);
                     }
+                    last_err = Some(e);
                     // ROTATE THE CONNECTION, not just the wait.
                     //
-                    // A prime that has not come back in the whole window is not
-                    // waiting for a permit — `PRIME_PARTS` is 12 and it holds at
-                    // most two — it is waiting for a PART on a connection that is
-                    // not answering. MEASURED 2026-11-09 on the fleet with
-                    // `PM_PIPELINE=4`: 39 refusals in 32 s, each having timed out
-                    // twice, which no permit arithmetic explains. Asking the same
-                    // slot again asks the same stalled pipe; `pick_slot()` advances
-                    // to the next worker, which is what the transport-reset branch
-                    // below already does for a different symptom.
+                    // `pick_slot()` advances to the next worker, which is the only
+                    // reaction that can help once the current socket has been reset
+                    // or has stopped answering. The pre-flight used to reach this
+                    // only after burning a whole window on the dead socket; a
+                    // stalled part now gets here in about 2 s.
                     let (next_client, _next_gate) = entry.pick_slot();
                     client = next_client;
-                    // `gate_free` is the discriminator the old log lacked: 0 means
-                    // the pre-flight pool really was empty (contention), a healthy
-                    // count means the permits were free and the PART was the thing
-                    // that never arrived (stalled pipe).
-                    let next_wait = PRIME_GATE_RETRY_WAIT_SECS;
+                    // A busy pool is retried with a SHORT window (waiting longer
+                    // cannot free a permit). A stalled part gets the FULL window
+                    // back: the part ladder inside already spends ~2.2 s, and a
+                    // silent wire is the one case where waiting longer is exactly
+                    // what MadelineProto does.
+                    let next_wait = if stalled_part {
+                        prime_gate_wait_secs()
+                    } else {
+                        PRIME_GATE_RETRY_WAIT_SECS
+                    };
                     log(
                         "pre-flight stalled - rotating the worker before the retry",
                         &serde_json::json!({
                             "short_code": short_code,
                             "attempt": attempt,
+                            "max_attempts": max_attempts,
                             "gate_free": prime_gate().available_permits(),
                             "gate_parts": PRIME_PARTS,
                             "next_wait_s": next_wait,
+                            "stalled_part": stalled_part,
+                            "error": last_err.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
                         }),
                     );
-                    // The retry gets a SHORT window instead of a second full one.
                     prime_wait = next_wait;
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     preflight_deadline = (std::time::Instant::now()
-                        + std::time::Duration::from_secs(next_wait))
+                        + std::time::Duration::from_secs(prime_wait))
                         .min(hard_deadline);
                     continue;
                 }
@@ -2415,6 +2496,39 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                             "message": "The origin is busy resolving this file. Retry in a few seconds.",
                             "retry_after": retry_after,
                         }),
+                    )
+                });
+        }
+        // A PART THAT NEVER CAME BACK while the pool was FREE: still retryable,
+        // but its own stage, so a report says "the wire" and not "busy".
+        if err.message.starts_with(PART_STALL_PREFIX) {
+            let retry_after = 2;
+            record_refusal(
+                ctx,
+                started,
+                503,
+                "UPSTREAM_STALL",
+                &err.message,
+                &short_code,
+                serde_json::json!({"retry_after": retry_after, "bot_id": bot_id}),
+            );
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, retry_after.to_string())
+                .body(Body::from(
+                    serde_json::json!({
+                        "ok": 0,
+                        "message": "Telegram did not return the data in time, please retry.",
+                        "retry_after": retry_after,
+                        "short_code": short_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| {
+                    json_response(
+                        503,
+                        &serde_json::json!({"ok": 0, "retry_after": retry_after}),
                     )
                 });
         }
@@ -3292,6 +3406,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(giveup_status(&other), (500, "DOWNLOAD_FAILED", None));
+        // A PART THAT NEVER CAME BACK is retryable and must not be reported as
+        // "busy": on the phone it happened with all 12 permits free, so calling
+        // it PARTS_BUSY sent every reader (and every bug report) at the pool.
+        let stalled = crate::telegram::GramErr {
+            message: format!("{PART_STALL_PREFIX}: no part in 12000ms with 12 of 12 permits free"),
+            transport: true,
+            ..Default::default()
+        };
+        assert_eq!(giveup_status(&stalled), (503, "UPSTREAM_STALL", Some(2)));
+        // A pool that really was empty must never be labelled a wire stall.
+        let busy = crate::telegram::GramErr {
+            message: format!("{GATE_BUSY_PREFIX}: waited 12000ms of a 12s window for a part permit (0 free)"),
+            ..Default::default()
+        };
+        assert_ne!(giveup_status(&busy).1, "UPSTREAM_STALL");
+    }
+
+    /// A stall extends the attempt budget; a saturated pool must not.
+    #[test]
+    fn a_stalled_part_earns_more_attempts_than_a_busy_pool() {
+        // First attempt stalls: the budget grows past the original 4.
+        assert_eq!(stall_attempt_budget(1, 4), 1 + PRIME_STALL_EXTRA_ATTEMPTS);
+        assert!(stall_attempt_budget(1, 4) > 4, "a stall must buy more tries");
+        // It only ever grows — a later stall cannot shrink it.
+        assert_eq!(stall_attempt_budget(9, 4), 9 + PRIME_STALL_EXTRA_ATTEMPTS);
+        // An already-generous budget is left alone.
+        assert_eq!(stall_attempt_budget(1, 20), 20);
+    }
+
+    /// The two prefixes must never collapse into one string.
+    ///
+    /// `starts_with` is what routes every one of these decisions, so a prefix that
+    /// is a prefix of the other would send a stalled part down the "wait, the pool
+    /// is saturated" arm — which is exactly the confusion this pair exists to end.
+    #[test]
+    fn a_stalled_part_and_an_empty_pool_are_different_errors() {
+        assert_ne!(GATE_BUSY_PREFIX, PART_STALL_PREFIX);
+        assert!(!PART_STALL_PREFIX.starts_with(GATE_BUSY_PREFIX));
+        assert!(!GATE_BUSY_PREFIX.starts_with(PART_STALL_PREFIX));
     }
 
     #[test]

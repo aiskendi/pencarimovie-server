@@ -1,7 +1,7 @@
 # PencariMovie Server
 
 <p align="center">
-  <strong>Self-hosted Telegram MTProto stream bridge and local file downloader for Stremio, Nuvio, Eclipse Music, and web clients.</strong><br>
+  <strong>Self-hosted Telegram MTProto stream bridge and local file downloader for Stremio, Nuvio, Eclipse Music and other Stremio-compatible music clients, and web browsers.</strong><br>
   Local Execution • Direct MTProto Transport • Zero Cloud Relay
 </p>
 
@@ -10,7 +10,7 @@
   <a href="#quick-install">Quick Install</a> •
   <a href="#1-click-cloud-deployment">Cloud Deploy</a> •
   <a href="#docker--environment-variables">Docker & .env</a> •
-  <a href="#stremio-nuvio--eclipse-music-setup">App Setup</a> •
+  <a href="#stremio-nuvio--music-setup">App Setup</a> •
   <a href="#server-security--remote-token-auth">Security & Auth</a> •
   <a href="#cli-commands-pms">CLI Usage</a> •
   <a href="#features">Features</a> •
@@ -173,7 +173,7 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
 ---
 
-## Stremio, Nuvio & Eclipse Music Setup
+## Stremio, Nuvio & Music Setup
 
 ### 1. Stremio Setup
 
@@ -189,12 +189,19 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
    - **Local Wi-Fi / LAN**: `http://<YOUR-LAN-IP>:8088/manifest.json`
    - **Remote / VPS / Tunnel**: `http://<YOUR-SERVER-IP>:8088/<token>/manifest.json` (or your HTTPS tunnel URL).
 
-### 3. Eclipse Music Setup
+### 3. Music Addon (any Stremio-compatible app)
 
-1. Open the **Eclipse Music** app (`https://eclipsemusic.app`) on your device.
-2. Navigate to **Settings** > **Connections** > **Add Connection** > **Addon**.
-3. Enter your Eclipse manifest URL: `http://<YOUR-LAN-IP>:8088/eclipse/manifest.json` (or `http://127.0.0.1:8088/eclipse`).
-4. Search and stream tracks directly with seekable playback.
+There is one music manifest, and it is not tied to a single player. Eclipse Music, BitChord, and the music rows inside Stremio and Nuvio all read the same URL:
+
+```text
+http://<YOUR-LAN-IP>:8088/music/manifest.json
+```
+
+On a public or tunnelled server the token goes in front: `http://<YOUR-SERVER-IP>:8088/<token>/music/manifest.json`.
+
+Eclipse Music adds it under **Settings** > **Connections** > **Add Connection** > **Addon**. Stremio and Nuvio take the same URL in their addon field. Neither client has a music content type, so the catalogue arrives as a Search row and an Artists row, and picking a track plays the same seekable stream.
+
+Links that use `/eclipse/manifest.json` still answer, so an addon installed from an earlier version keeps working without being re-added.
 
 ---
 
@@ -208,6 +215,7 @@ PencariMovie Server includes built-in security controls for remote hosting:
   ```text
   http://<vps-ip>:8088/<token>/manifest.json
   ```
+  The music addon takes the token in the same position: `http://<vps-ip>:8088/<token>/music/manifest.json`.
 - **CLI password and token management**:
   ```bash
   pms password <new_password>   # Changes server password
@@ -244,6 +252,7 @@ Works across Windows, macOS, Linux, and Termux.
 - Local setup with automated session handling.
 - HTTP 206 range-request streaming for video and audio seeking.
 - Stremio Addon v3 protocol compatibility for media playback.
+- One music manifest shared by Eclipse Music, BitChord, Stremio, and Nuvio.
 - Custom upstream addon bridging to integrate third-party metadata catalogs.
 - Built-in web dashboard for local file access and browser playback.
 - Local network access for connected TVs and mobile devices (`http://<LAN-IP>:8088`).

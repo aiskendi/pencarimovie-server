@@ -45,14 +45,6 @@ Install and start the server on your platform:
 > _(If Play Protect blocks the install, tap **More details** (or **Info**) and choose **Install anyway**.)_
 > _(The link serves the universal build so it runs on any device. Smaller per-ABI APKs (`arm64-v8a`, `armeabi-v7a`) are on the [APK releases page](https://github.com/aiskendi/pencarimovie-server/releases/tag/apk-server-latest). The app updates itself from that release feed.)_
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/android-app-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/android-app-light.png">
-    <img src="assets/android-app-light.png" alt="PencariMovie Server on an Android phone, server running on port 8088 with the video and music addon addresses" width="280">
-  </picture>
-</p>
-
 #### Windows (10 / 11)
 
 Run in **PowerShell**:

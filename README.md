@@ -30,34 +30,6 @@ PencariMovie Server is a lightweight, self-hosted streaming utility and protocol
 
 ---
 
-## Repository layout
-
-This repository contains the Rust server: the crate is at the root, and the dashboard is compiled into the binary. There is no PHP at runtime.
-
-```
-Cargo.toml   the engine: axum + grammers. `cargo build --release` -> one binary.
-src/         the engine sources (routes, telegram, matcher, assets, auth, ...).
-public/      the dashboard (Nuvio shell and downloader overlays), embedded at
-             compile time by src/assets.rs. Never moved: the addon UI and every
-             release artifact stage from this path.
-desktop/     the release launchers (start / stop / restart / tray / autostart),
-             copied next to the binary in each tarball.
-docs/        internal design notes (kept locally, not published).
-legacy/      superseded implementations (see legacy/README.md). Not built,
-             not released, not deployed.
-storage/     runtime state (sessions, auth, caches). Gitignored: only
-             `.gitkeep` is tracked.
-android/     NOT TRACKED. The APK projects are a local build tree because they
-             hold the release signing key; only the built APK is published as
-             a release asset. See ANDROID-SIGNING.md.
-```
-
-Deployment summary: `Dockerfile` builds the crate from source; `Dockerfile.release` packages the prebuilt musl binary; `heroku.yml` and `render.yaml` run the published image. All of them run the Rust engine. The PHP/FrankenPHP engine that preceded it lives in [`legacy/php/`](legacy/php).
-
-Follow-up, deliberately out of scope for the layout refactor: the root installers (`pencarimovie-linux.sh`, `pencarimovie-termux.sh`, `pencarimovie-windows.bat`, `update.ps1`) still carry PHP-era fast paths that start a bundled `frankenphp`/`php -S` when one is present in the install directory. They download and launch the Rust tarballs, so the fallback is dead weight rather than a bug; see `legacy/php/README.md` ("The installers did NOT move").
-
----
-
 ## Quick Install
 
 Launch the server with a single command on your platform:
@@ -178,13 +150,11 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 # Optional: Local Network IP Override (if running behind multi-adapter Docker bridge)
 # LAN_IP=192.168.1.100
 
-# Optional: Performance Tuning (0 = auto; defaults suit most hosts)
-# PM_INFLIGHT=0
+# Optional: Cap simultaneous streams (0 = unlimited)
 # PM_MAX_STREAMS=0
-# PM_PIPELINE=0
 
-# Optional: Where sessions, auth, and caches are stored
-# PM_APP_ROOT=/app/storage
+# Optional: Where sessions, auth, and caches are stored (the Docker image expects /data)
+# PM_APP_ROOT=/data
 ```
 
 ### Configuration Variables Reference
@@ -197,9 +167,7 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 | `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                                                                                                                                    |
 | `BOT_TOKENS`      | _(auto-provision)_   | Pool of bot tokens, comma/space/newline separated (alias `TG_BOT_TOKENS`). Required for multi-instance deployments. Each instance logs in all tokens, and downloads distribute across them.                     |
 | `PM_APP_ROOT`     | `storage/`           | Directory where sessions, auth, and caches live.                                                                                                                                                                |
-| `PM_INFLIGHT`     | _(auto)_             | Maximum concurrent requests (`0` = auto).                                                                                                                                                                       |
 | `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = unlimited (the default). Set a limit only on hosts with short request timeouts so clients receive an immediate `503` with `Retry-After` instead of timing out at the proxy. |
-| `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                           |
 | `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                      |
 | `PM_LISTEN_HOST`  | `0.0.0.0`            | Bind address: all interfaces by default (`127.0.0.1` for loopback only).                                                                                                                                        |
 

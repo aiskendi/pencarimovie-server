@@ -32,7 +32,7 @@ PencariMovie Server is a lightweight, self-hosted streaming utility and protocol
 
 ## Quick Install
 
-Launch the server with a single command on your platform:
+Install and start the server on your platform:
 
 #### Android (APK for TV / Phone / Tablet)
 
@@ -177,7 +177,7 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
 ### 1. Stremio Setup
 
-1. Open the dashboard at `http://127.0.0.1:8088` and select **Addon / Stremio** in the top navigation.
+1. Open the dashboard at `http://127.0.0.1:8088` and select **Addon** in the top navigation.
 2. **Local Sync (Recommended)**: Click **Install via Stremio API Sync** to push the addon across all your Stremio devices automatically.
 3. **Manual / Web**: Copy your manifest URL (`http://<LAN-IP>:8088/manifest.json`, or `http://<SERVER-IP>:8088/<token>/manifest.json` on public servers) and paste it into Stremio's Addon search box.
 

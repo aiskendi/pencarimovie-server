@@ -18,11 +18,7 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/android-app-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/android-app-light.png">
-    <img src="assets/android-app-light.png" alt="PencariMovie Server on an Android phone, server running on port 8088 with the video and music addon addresses" width="320">
-  </picture>
+  <img src="assets/social-preview.png" alt="PencariMovie Server: Telegram MTProto stream bridge for Stremio, Nuvio, addon-based music players, and web browsers, on Windows, Linux, macOS, Android and Docker" width="100%">
 </p>
 
 ---
@@ -48,6 +44,14 @@ Install and start the server on your platform:
 > _(Install on your Android TV, phone, or tablet, tap **Start Server**, and stream)_
 > _(If Play Protect blocks the install, tap **More details** (or **Info**) and choose **Install anyway**.)_
 > _(The link serves the universal build so it runs on any device. Smaller per-ABI APKs (`arm64-v8a`, `armeabi-v7a`) are on the [APK releases page](https://github.com/aiskendi/pencarimovie-server/releases/tag/apk-server-latest). The app updates itself from that release feed.)_
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/android-app-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/android-app-light.png">
+    <img src="assets/android-app-light.png" alt="PencariMovie Server on an Android phone, server running on port 8088 with the video and music addon addresses" width="280">
+  </picture>
+</p>
 
 #### Windows (10 / 11)
 

@@ -1,7 +1,7 @@
 # PencariMovie Server
 
 <p align="center">
-  <strong>Self-hosted Telegram MTProto stream bridge and local file downloader for Stremio, Nuvio, Eclipse Music and other Stremio-compatible music clients, and web browsers.</strong><br>
+  <strong>Self-hosted Telegram MTProto stream bridge and local file downloader for Stremio, Nuvio, addon-based music players such as Eclipse and BitChord, and web browsers.</strong><br>
   Local Execution • Direct MTProto Transport • Zero Cloud Relay
 </p>
 
@@ -189,9 +189,9 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
    - **Local Wi-Fi / LAN**: `http://<YOUR-LAN-IP>:8088/manifest.json`
    - **Remote / VPS / Tunnel**: `http://<YOUR-SERVER-IP>:8088/<token>/manifest.json` (or your HTTPS tunnel URL).
 
-### 3. Music Addon (any Stremio-compatible app)
+### 3. Music Addon (Eclipse, BitChord, Stremio, Nuvio)
 
-There is one music manifest, and it is not tied to a single player. Eclipse Music, BitChord, and the music rows inside Stremio and Nuvio all read the same URL:
+There is one music manifest, and it is not tied to a single player. Eclipse and BitChord are addon-based music players: they search it and play from it. Stremio and Nuvio have no music content type, so they see the same catalogue as `movie` and `series` rows.
 
 ```text
 http://<YOUR-LAN-IP>:8088/music/manifest.json
@@ -199,9 +199,7 @@ http://<YOUR-LAN-IP>:8088/music/manifest.json
 
 On a public or tunnelled server the token goes in front: `http://<YOUR-SERVER-IP>:8088/<token>/music/manifest.json`.
 
-Eclipse Music adds it under **Settings** > **Connections** > **Add Connection** > **Addon**. Stremio and Nuvio take the same URL in their addon field. Neither client has a music content type, so the catalogue arrives as a Search row and an Artists row, and picking a track plays the same seekable stream.
-
-Links that use `/eclipse/manifest.json` still answer, so an addon installed from an earlier version keeps working without being re-added.
+Eclipse Music adds it under **Settings** > **Connections** > **Add Connection** > **Addon**. BitChord adds it under **Settings** > **Sources** > **Add addon**, and its Android app only accepts HTTPS, so it needs the tunnel URL rather than the LAN one. Stremio and Nuvio take it in their addon field.
 
 ---
 

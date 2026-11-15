@@ -114,6 +114,27 @@ pub fn is_lossless(ext: &str, file_size: u64, duration_secs: i64) -> bool {
     }
 }
 
+/// Whether an extension is a file the music addon can serve.
+///
+/// The origin's `/search-music` answers a query with whatever its index holds,
+/// including video (measured 2026-11-15: the empty query returned `.mkv`,
+/// `.iso` and split `.002`/`.003` parts, and `.mkv` rows carried a 4 GiB
+/// placeholder size). Every one of those reached the addon as a "track": the
+/// "Latest Telegram Tracks" row listed video files, and `artist` showed the
+/// file name because no `performer` tag existed. This is the one gate that
+/// keeps a video or an archive out of the music catalogue, the artists
+/// aggregation, and the backfill trigger.
+///
+/// `mka` and `m4b` are audio-only containers and stay: a Matroska audio track
+/// and an audiobook are both playable by the clients this addon serves.
+pub fn is_audio(ext: &str) -> bool {
+    matches!(
+        ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str(),
+        "mp3" | "m4a" | "m4b" | "aac" | "flac" | "wav" | "alac" | "ogg" | "oga" | "opus"
+            | "aif" | "aiff" | "ape" | "wv" | "mka" | "wma"
+    )
+}
+
 /// The tier both addon protocols display and rank on. One place decides it,
 /// because only here are `file_size` and `duration` both in hand.
 pub fn tier(ext: &str, file_size: u64, duration_secs: i64) -> &'static str {
@@ -571,19 +592,81 @@ pub fn quality_score(ext: &str, size_bytes: u64) -> i64 {
     weight + bonus
 }
 
+/// The real name of the file. The flat `title` column is that same name, so it
+/// is a name, never a song title.
+fn file_name_of(item: &Value) -> String {
+    let file = tag(item, "file_name");
+    if file.is_empty() {
+        str_at(item, "title")
+    } else {
+        file
+    }
+}
+
+/// The file's own extension, from the origin's `extension` or the name.
+fn ext_of(item: &Value, file_name: &str) -> String {
+    let ext = tag(item, "extension").to_lowercase();
+    if ext.is_empty() || ext == "noext" {
+        file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_lowercase())
+            .unwrap_or_default()
+    } else {
+        ext
+    }
+}
+
+/// Whether a name reads like a video release rather than a track.
+///
+/// The origin's index is a dump of a Telegram channel, and the audio extracted
+/// from a movie keeps the movie's release tags: `Split 2016 BD ENG RoverX 6CH
+/// 320k mka`, `(aud) [Kusonime] Golden Time BD`. Those are audio files, but they
+/// are not music, and they were what the "Latest" row showed.
+///
+/// The markers are the release vocabulary a music file does not carry:
+/// resolution (`1080p`, `4k`), source (`WEB-DL`, `BluRay`, `HDTV`), codec
+/// (`x264`, `HEVC`, `AAC2 0`), channel layout (`6CH`, `5.1CH`), episode form
+/// (`S01E09`), the `BD` disc marker, and the `(aud)` extraction tag.
+fn looks_like_video_release(text: &str) -> bool {
+    if text.to_ascii_lowercase().contains("(aud)") {
+        return true;
+    }
+    rx(r"(?i)(^|[^a-z0-9])(\d{3,4}p|4k|uhd|web[- .]?dl|webrip|web[- .]?rip|bluray|blu[- .]?ray|bdrip|brrip|hdtv|dvdrip|x264|x265|h\.?264|h\.?265|hevc|avc|aac2[ .]?0|[257][ .]?[01]?ch|bd|s\d{2}e\d{2})([^a-z0-9]|$)")
+        .map(|re| re.is_match(text).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Whether a row belongs in the MUSIC addon, as opposed to "some audio file".
+///
+/// [`is_audio`] answers "can a player play these bytes"; this answers "is this a
+/// track". `.mka` and `.m4b` are excluded because in this catalogue they are a
+/// movie's audio track and an audiobook, not music. Release-tagged names are
+/// excluded for the same reason. A real music file, tagged or not, stays.
+pub fn is_music(item: &Value) -> bool {
+    let file_name = file_name_of(item);
+    let ext = {
+        let e = ext_of(item, &file_name);
+        if e.is_empty() { "mp3".to_string() } else { e }
+    };
+    if !is_audio(&ext) || ext == "mka" || ext == "m4b" {
+        return false;
+    }
+    let mut text = file_name;
+    for key in ["performer", "song_title", "title"] {
+        let value = tag(item, key);
+        if !value.is_empty() {
+            text.push(' ');
+            text.push_str(&value);
+        }
+    }
+    !looks_like_video_release(&text)
+}
+
 /// `fd_eclipse_format_track()` — one `track` object for the addon.
 pub fn format_track(item: &Value) -> Value {
-    // `file_name` is the real name of the file; the flat `title` column is that
-    // same name, so it is a name, never a song title.
-    let file_name = {
-        let f = tag(item, "file_name");
-        if f.is_empty() {
-            str_at(item, "title")
-        } else {
-            f
-        }
-    };
-    let mut artist = tag(item, "performer");
+    let file_name = file_name_of(item);
+    let performer = tag(item, "performer");
+    let mut artist = performer.clone();
     let mut title = tag(item, "song_title");
 
     let name = name_words(&file_name);
@@ -595,17 +678,9 @@ pub fn format_track(item: &Value) -> Value {
     }
 
     let ext = {
-        let e = tag(item, "extension").to_lowercase();
-        if e.is_empty() || e == "noext" {
-            file_name
-                .rsplit_once('.')
-                .map(|(_, e)| e.to_lowercase())
-                .unwrap_or_default()
-        } else {
-            e
-        }
+        let e = ext_of(item, &file_name);
+        if e.is_empty() { "mp3".to_string() } else { e }
     };
-    let ext = if ext.is_empty() { "mp3".to_string() } else { ext };
 
     let duration = item
         .get("audio")
@@ -652,6 +727,13 @@ pub fn format_track(item: &Value) -> Value {
     if !thumb.is_empty() {
         track["artworkURL"] = serde_json::json!(thumb);
     }
+    // Whether `artist` is the file's own tag or the file name fallback above.
+    //
+    // The Artists catalog groups by `artist`, and a fallback artist is the whole
+    // file name (`Reborn Rookie S01E09 1080p ...`), which is not a band. Callers
+    // aggregate only `artistTagged` rows; the row itself still shows the
+    // fallback so a search result is never blank.
+    track["artistTagged"] = serde_json::json!(!performer.is_empty());
     track
 }
 
@@ -836,5 +918,91 @@ mod tests {
             t["size"].as_u64().unwrap_or(0),
             t["duration"].as_i64().unwrap_or(0)
         ));
+    }
+
+    /// The origin answers a query with whatever its index holds, video
+    /// included. Only audio reaches the music catalogue.
+    #[test]
+    fn is_audio_keeps_audio_containers_and_rejects_video_and_parts() {
+        for ext in [
+            "mp3", "m4a", "m4b", "aac", "flac", "wav", "alac", "ogg", "oga", "opus", "aif",
+            "aiff", "ape", "wv", "mka", "wma", "FLAC", ".flac",
+        ] {
+            assert!(is_audio(ext), "{ext} is audio");
+        }
+        for ext in ["mkv", "mp4", "avi", "mov", "ts", "iso", "zip", "002", "003", ""] {
+            assert!(!is_audio(ext), "{ext} is not audio");
+        }
+    }
+
+    /// The Artists catalog groups by `artist`, so a file-name fallback must be
+    /// distinguishable from a real `performer` tag.
+    #[test]
+    fn artist_tagged_separates_a_tag_from_the_file_name() {
+        let tagged = format_track(&serde_json::json!({
+            "short_code": "a1",
+            "song_title": "Be Her",
+            "performer": "Ella Langley",
+            "extension": "flac"
+        }));
+        assert_eq!(tagged["artistTagged"], true);
+
+        let untagged = format_track(&serde_json::json!({
+            "short_code": "a2",
+            "title": "Ella.Langley.Be.Her.flac",
+            "extension": "flac"
+        }));
+        assert_eq!(untagged["artistTagged"], false);
+        assert_eq!(untagged["artist"], "Ella Langley Be Her");
+    }
+
+    /// The origin dumps a Telegram channel, so a movie's extracted audio track
+    /// is an "audio file" but not a track. It must not reach the music rows.
+    #[test]
+    fn is_music_rejects_movie_audio_and_audiobooks() {
+        let mka = serde_json::json!({
+            "short_code": "a1",
+            "file_name": "Split 2016 BD ENG RoverX 6CH 320k mka",
+            "extension": "mka"
+        });
+        assert!(!is_music(&mka), "a movie's audio track is not music");
+
+        let extracted = serde_json::json!({
+            "short_code": "a2",
+            "file_name": "24 END",
+            "performer": "(aud) [Kusonime] Golden Time BD",
+            "extension": "aac"
+        });
+        assert!(!is_music(&extracted), "the `(aud)` extraction tag is a video");
+
+        let episode = serde_json::json!({
+            "short_code": "a3",
+            "file_name": "Show.S01E09.1080p.m4a",
+            "extension": "m4a"
+        });
+        assert!(!is_music(&episode), "SxxEyy plus a resolution is a video");
+
+        let audiobook = serde_json::json!({
+            "short_code": "a4",
+            "file_name": "Some Book.m4b",
+            "extension": "m4b"
+        });
+        assert!(!is_music(&audiobook), "an audiobook is not music");
+
+        let tagged = serde_json::json!({
+            "short_code": "b1",
+            "file_name": "The.Dream.Circle.Steve.Roach.flac",
+            "performer": "Steve Roach",
+            "song_title": "The Dream Circle",
+            "extension": "flac"
+        });
+        assert!(is_music(&tagged));
+
+        let untagged = serde_json::json!({
+            "short_code": "b2",
+            "file_name": "Ella.Langley.Be.Her.flac",
+            "extension": "flac"
+        });
+        assert!(is_music(&untagged), "an untagged music file is still music");
     }
 }

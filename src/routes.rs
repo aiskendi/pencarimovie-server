@@ -1611,45 +1611,30 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             return music_locked(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {
-            // A UNIVERSAL music addon, not an Eclipse-branded one: the id no
-            // longer names a client, so any Stremio-compatible music app can
-            // install it. `/music` is the canonical path and `/eclipse` stays as
-            // the alias every already-installed addon URL uses.
+            // ONE descriptor, THREE clients. [`crate::music_addon::manifest`]
+            // builds the music rows Eclipse and BitChord read, plus the
+            // `movie`-typed rows Stremio and Nuvio can render: neither client
+            // has a music content type, so a track becomes a movie item with a
+            // `/stream` answer (the same shape Flix-Music uses).
             //
-            // The descriptor itself is pinned to backend.php:14315-14346: same
-            // `types` and the `latest` catalog row, since clients render their
-            // catalog list straight from it. The icon stays the SHIPPED logo (the
-            // PHP points at a WordPress upload; operator choice here is to never
-            // depend on that host).
-            //
-            // NO `settings` block, and that is a deletion with a reason: this
-            // engine serves the ONE rendition Telegram holds for a short code, so
-            // a quality picker could not change what plays. Eclipse only shows a
-            // settings cog for addons that list "settings" in `resources` (we do
-            // not), but BitChord renders a picker for any `key: "quality"` — a
-            // listener would pick "Normal Quality" and get the original file.
+            // Still NO `settings` block, and that is a deletion with a reason:
+            // this engine serves the ONE rendition Telegram holds for a short
+            // code, so a quality picker could not change what plays. Eclipse
+            // only shows a settings cog for addons that list "settings" in
+            // `resources` (we do not).
             //
             // The same document is the BitChord manifest: `id`, `name`,
-            // `version` and `resources` are all it requires, and "search" is in
-            // `resources`. It only lacks `bitchordAuth`, which would claim this
-            // server verifies BitChord's hardware-backed proof; without it the
-            // addon works and BitChord just labels the source "outdated".
+            // `version` and `resources` are all it requires. Resources stay a
+            // LIST OF STRINGS because BitChord parses them that way.
+            // The descriptor is NOT cacheable: its `catalogs` list changes when a
+            // shelf is added or removed, and `max-age=3600` kept a removed shelf
+            // on the player's Home for an hour after the server stopped
+            // advertising it (measured 2026-11-15). The document is under 1 KB,
+            // so a re-fetch per launch costs nothing.
             return stremio_json(
                 200,
-                &serde_json::json!({
-                    "id": "org.pencarimovie.music",
-                    "name": "PencariMusic",
-                    "version": "1.1.0",
-                    "description": "Universal music addon - stream Telegram music and audio files via PencariMovie Server",
-                    "resources": ["search", "stream", "catalog"],
-                    "types": ["track", "album", "artist"],
-                    "contentType": "music",
-                    "icon": format!("{}/logo.png", rtrim(&ctx.base_url)),
-                    "catalogs": [
-                        {"id": "latest", "type": "track", "name": "Latest Telegram Tracks"}
-                    ]
-                }),
-                "max-age=3600",
+                &crate::music_addon::manifest(&ctx.base_url, &crate::config::descriptor_version()),
+                "no-store",
             );
         }
         if p.starts_with("/eclipse/search") {
@@ -1738,18 +1723,53 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 }
             }
             let tracks = rank_for_tier(local_artwork(&ctx.base_url, rows), &ctx.qs("quality"));
-            return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
+            // Aggregations come from the SAME answered rows, so a search result
+            // and the Artists/Albums rows can never disagree about a name.
+            let artists = crate::music_addon::search_artists(&tracks, 20);
+            let albums = crate::music_addon::search_albums(&tracks, 20);
+            return stremio_json(
+                200,
+                &serde_json::json!({"tracks": tracks, "artists": artists, "albums": albums}),
+                "no-store",
+            );
+        }
+        // `/music/<route>` reaches here as `/eclipse/<route>`, so both the
+        // canonical and the legacy alias answer every route below.
+        //
+        // The `movie/` prefix is the Stremio/Nuvio face (`/catalog/movie/{id}`,
+        // `/meta/movie/{id}`, `/stream/movie/{id}`); everything else is the
+        // Eclipse/BitChord face. They share the builders in `music_addon`.
+        if let Some(rest) = p.strip_prefix("/eclipse/meta/") {
+            return stremio_meta_response(&ctx, rest.trim_end_matches(".json")).await;
         }
         if let Some(rest) = p.strip_prefix("/eclipse/catalog/") {
-            // `latest` (and any keyword catalog) reuses the music search: the
-            // origin indexes tracks, not rows, so "latest" is a plain search.
-            let cat = rest.trim_end_matches(".json").trim();
-            let q = if cat == "latest" || cat.is_empty() { "" } else { cat };
-            let tracks = local_artwork(&ctx.base_url, music_search(q, 50).await);
-            return stremio_json(200, &serde_json::json!({"tracks": tracks}), "no-store");
+            let rest = rest.trim_end_matches(".json");
+            if let Some(stremio) = rest
+                .strip_prefix("movie/")
+                .or_else(|| rest.strip_prefix("series/"))
+            {
+                return stremio_catalog(&ctx, stremio).await;
+            }
+            return eclipse_catalog(&ctx, rest).await;
+        }
+        if let Some(rest) = p.strip_prefix("/eclipse/artist/") {
+            return music_artist(&ctx, rest.trim_end_matches(".json")).await;
+        }
+        if let Some(rest) = p.strip_prefix("/eclipse/album/") {
+            return music_album(&ctx, rest.trim_end_matches(".json")).await;
+        }
+        if let Some(rest) = p.strip_prefix("/eclipse/playlist/") {
+            return music_playlist(&ctx, rest.trim_end_matches(".json")).await;
         }
         if let Some(rest) = p.strip_prefix("/eclipse/stream/") {
-            return music_stream(&ctx, rest.trim_end_matches(".json")).await;
+            let rest = rest.trim_end_matches(".json");
+            if let Some(stremio) = rest
+                .strip_prefix("movie/")
+                .or_else(|| rest.strip_prefix("series/"))
+            {
+                return stremio_stream(&ctx, stremio).await;
+            }
+            return music_stream(&ctx, rest).await;
         }
         if let Some(rest) = p.strip_prefix("/eclipse/play/") {
             return music_stream(&ctx, rest.trim_end_matches(".json")).await;
@@ -7746,7 +7766,12 @@ async fn music_search(query: &str, limit: usize) -> Vec<Value> {
             };
             let tracks: Vec<Value> = rows
                 .iter()
-                .filter(|r| !str_at(r, "short_code").is_empty())
+                // The origin's index is not a music library: the empty query
+                // answers the newest uploads whatever they are, and the audio
+                // pulled out of a movie keeps the movie's release tags. Only
+                // music reaches the addon, the artist/album rows and the
+                // backfill trigger.
+                .filter(|r| !str_at(r, "short_code").is_empty() && crate::music::is_music(r))
                 .map(crate::music::format_track)
                 .collect();
             // The ORIGIN'S ORDER IS THE RANKING — do not re-sort here.
@@ -7943,17 +7968,34 @@ pub(crate) async fn resolve_stream_target(short_code: &str) -> (Value, u16) {
     last
 }
 
+/// A resolved music stream, split so the Eclipse object answer and the Stremio
+/// stream row share ONE resolve.
+struct MusicStream {
+    body: Value,
+    file_name: String,
+    size: u64,
+    duration: i64,
+}
+
 /// `/eclipse/stream/<short_code>` and `/eclipse/play/<short_code>` — resolve and
 /// hand back a downloadable URL. The URL extension is the FILE'S OWN and the
 /// bytes go out untouched: there is no ALAC→WAV transcode (deleted, see
 /// `download.rs`), so an ALAC `.m4a` is served as `audio/mp4` under its real
 /// name and plays only where an ALAC decoder exists.
 ///
-/// ONE envelope, TWO clients. Eclipse reads `url`/`format`/`mimeType`; BitChord
+/// ONE resolve, TWO envelopes. Eclipse reads `url`/`format`/`mimeType`; BitChord
 /// installs this SAME `/music` addon and reads `url`/`codec`/`container`/
-/// `manifest`/`encrypted` out of the same answer. Both ignore unknown keys, so
-/// there is no second addon and no second route.
+/// `manifest`/`encrypted` out of the same answer. Stremio and Nuvio get the same
+/// payload wrapped in a `streams` row by [`stremio_stream`]. All of them ignore
+/// unknown keys, so there is no second addon and no second resolve.
 async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
+    match music_stream_payload(ctx, short_code).await {
+        Ok(stream) => stremio_json(200, &stream.body, "no-store"),
+        Err(resp) => resp,
+    }
+}
+
+async fn music_stream_payload(ctx: &ReqCtx, short_code: &str) -> Result<MusicStream, Response> {
     // BitChord percent-encodes the id it was handed back to us.
     let code = crate::download::percent_decode(
         short_code
@@ -7964,7 +8006,7 @@ async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
             .trim_end_matches(".json"),
     );
     if code.is_empty() {
-        return stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store");
+        return Err(stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store"));
     }
     log(
         "music stream requested",
@@ -8007,9 +8049,9 @@ async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("5"),
             );
-            return resp;
+            return Err(resp);
         }
-        return stremio_json(404, &serde_json::json!({"error": "Track not found"}), "no-store");
+        return Err(stremio_json(404, &serde_json::json!({"error": "Track not found"}), "no-store"));
     }
     let size = resolved.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
     let ext = file_name
@@ -8156,7 +8198,309 @@ async fn music_stream(ctx: &ReqCtx, short_code: &str) -> Response {
     };
     body["quality"] = serde_json::json!(quality);
     body["audioQuality"] = serde_json::json!(if quality == "high" { "HIGH" } else { "LOSSLESS" });
+    Ok(MusicStream {
+        body,
+        file_name,
+        size,
+        duration,
+    })
+}
+
+/* ── music addon routes: Eclipse catalogs, detail pages, Stremio/Nuvio ───── */
+
+/// The sample one catalogue row is built from.
+///
+/// The origin's EMPTY query answers the newest uploads whatever their type, and
+/// that page can be all video; "flac" is the query that returns tagged music.
+/// Both answers are cached 60 s inside [`music_search`], so the Home rows share
+/// one origin call.
+async fn music_catalog_sample(row: &str) -> Vec<Value> {
+    match row {
+        "lossless" | "hi_res" | "artists" | "albums" => music_search("flac", 100).await,
+        _ => {
+            let newest = music_search("", 100).await;
+            if newest.is_empty() {
+                music_search("flac", 100).await
+            } else {
+                newest
+            }
+        }
+    }
+}
+
+/// The WordPress sponsor, or the PencariMusic brand card when it is absent.
+///
+/// Deliberately separate from [`sponsor_item`], which builds the Stremio STREAM
+/// shape for video. This one carries a title, a description, an image and a
+/// link, because a music tile and a playlist page are not a stream row.
+async fn music_sponsor_card(base: &str) -> crate::music_addon::SponsorCard {
+    let version = cached_wp_json(&wp_version_url(), 600, 8).await;
+    let sponsor = version.get("sponsor");
+    let field = |key: &str| sponsor.and_then(|v| v.get(key)).and_then(|v| v.as_str());
+    crate::music_addon::sponsor_card(
+        field("name"),
+        field("description"),
+        field("url"),
+        field("image"),
+        base,
+    )
+}
+
+/// `/eclipse/catalog/{id}` — the Eclipse catalogue page.
+///
+/// `{tracks}` is still returned beside `{items}` for a Stremio-shaped reader,
+/// but Eclipse reads `items` (its contract), and a row of `artist`/`album` type
+/// must not also look like a list of tracks.
+async fn eclipse_catalog(ctx: &ReqCtx, raw_id: &str) -> Response {
+    let id = crate::download::percent_decode(raw_id);
+    let id = id.trim();
+    let skip = ctx.qs("skip").trim().parse::<usize>().unwrap_or(0);
+    if skip >= 100 {
+        return stremio_json(200, &serde_json::json!({"items": [], "tracks": []}), "no-store");
+    }
+    let Some(row) = crate::music_addon::canonical_row(id) else {
+        // Legacy keyword catalogue: any other id is still a search, so a row
+        // already installed keeps answering instead of turning into a 404.
+        let tracks = local_artwork(&ctx.base_url, music_search(id, 100).await);
+        let items: Vec<Value> = tracks
+            .iter()
+            .filter_map(crate::music_addon::track_item)
+            .collect();
+        return stremio_json(
+            200,
+            &serde_json::json!({"items": items.clone(), "tracks": items}),
+            "no-store",
+        );
+    };
+    if row == "sponsor" {
+        let card = music_sponsor_card(&ctx.base_url).await;
+        return stremio_json(200, &serde_json::json!({"items": [card.item]}), "no-store");
+    }
+    let sample = local_artwork(&ctx.base_url, music_catalog_sample(row).await);
+    let items: Vec<Value> = match row {
+        "artists" => crate::music_addon::artist_items(&sample, 30),
+        "albums" => crate::music_addon::album_items(&sample, 30),
+        _ => crate::music_addon::row_tracks(row, &sample, 100)
+            .iter()
+            .filter_map(crate::music_addon::track_item)
+            .collect(),
+    };
+    let mut body = serde_json::json!({"items": items.clone()});
+    if matches!(row, "latest" | "lossless" | "hi_res") {
+        body["tracks"] = Value::Array(items);
+    }
     stremio_json(200, &body, "no-store")
+}
+
+/// `/eclipse/catalog/movie/{id}[/{extras}]` — the Stremio/Nuvio catalogue page.
+///
+/// The extras segment carries `search=…` and `skip=…` in Stremio's path form.
+/// Every returned track is cached under its short code so the `/meta` call that
+/// follows a tap has a title and an artist to show.
+async fn stremio_catalog(ctx: &ReqCtx, rest: &str) -> Response {
+    let (raw_id, extras) = match rest.split_once('/') {
+        Some((id, extra)) => (id, extra),
+        None => (rest, ""),
+    };
+    let id = crate::download::percent_decode(raw_id);
+    let mut search: Option<String> = None;
+    let mut skip = 0usize;
+    for pair in extras.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "search" => {
+                let term = crate::download::percent_decode(value);
+                if !term.trim().is_empty() {
+                    search = Some(term);
+                }
+            }
+            "skip" => skip = value.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    let empty = || stremio_json(200, &serde_json::json!({"metas": []}), "no-store");
+    let Some(row) = crate::music_addon::canonical_row(id.trim()) else {
+        return empty();
+    };
+    // The search row exists to carry a query. With no term there is nothing to
+    // show, and falling back to the browse sample would make Stremio's empty
+    // search box paint the whole catalogue.
+    if row == "search" && search.is_none() {
+        return empty();
+    }
+    if skip >= 100 {
+        return empty();
+    }
+    if row == "sponsor" {
+        let card = music_sponsor_card(&ctx.base_url).await;
+        return stremio_json(200, &serde_json::json!({"metas": [card.meta]}), "no-store");
+    }
+    let sample = match &search {
+        Some(term) => music_search(term, 100).await,
+        None => music_catalog_sample(row).await,
+    };
+    let sample = local_artwork(&ctx.base_url, sample);
+    if row == "artists" {
+        let metas = crate::music_addon::stremio_artist_metas(&sample, 30);
+        return stremio_json(200, &serde_json::json!({"metas": metas}), "no-store");
+    }
+    let picked = crate::music_addon::row_tracks(row, &sample, 100);
+    for track in &picked {
+        let code = str_at(track, "id");
+        if !code.is_empty() {
+            crate::cache::put("music_meta", &code, track, 3600, 0);
+        }
+    }
+    let metas: Vec<Value> = picked
+        .iter()
+        .filter_map(crate::music_addon::stremio_preview)
+        .collect();
+    stremio_json(200, &serde_json::json!({"metas": metas}), "no-store")
+}
+
+fn music_not_found() -> Response {
+    stremio_json(404, &serde_json::json!({"error": "Not found"}), "no-store")
+}
+
+/// `/eclipse/meta/movie/{id}` — a Stremio meta page.
+async fn stremio_meta_response(ctx: &ReqCtx, rest: &str) -> Response {
+    let Some(raw) = rest
+        .strip_prefix("movie/")
+        .or_else(|| rest.strip_prefix("series/"))
+    else {
+        return music_not_found();
+    };
+    let id = crate::download::percent_decode(raw);
+    let id = id.trim();
+    if id == crate::music_addon::STREMIO_SPONSOR_ID {
+        let card = music_sponsor_card(&ctx.base_url).await;
+        return stremio_json(200, &serde_json::json!({"meta": card.meta}), "no-store");
+    }
+    if let Some(name) = crate::music_addon::stremio_artist_name(id) {
+        let tracks = local_artwork(&ctx.base_url, music_search(&name, 30).await);
+        let meta = crate::music_addon::stremio_artist_meta(&name, &tracks);
+        return stremio_json(200, &serde_json::json!({"meta": meta}), "no-store");
+    }
+    let Some(code) = crate::music_addon::stremio_code(id) else {
+        return music_not_found();
+    };
+    // The catalogue that produced this id is what warms this cache. A cold miss
+    // (a restart, a saved tile) has no title without paying a resolve, and a
+    // fabricated one is worse than an honest 404.
+    let Some(track) = crate::cache::get("music_meta", code) else {
+        return music_not_found();
+    };
+    match crate::music_addon::stremio_meta(track.as_ref()) {
+        Some(meta) => stremio_json(200, &serde_json::json!({"meta": meta}), "no-store"),
+        None => music_not_found(),
+    }
+}
+
+fn music_stream_failure(resp: &Response) -> &'static str {
+    match resp.status() {
+        StatusCode::NOT_FOUND => "Track not found",
+        StatusCode::SERVICE_UNAVAILABLE => "Origin busy, retry in a few seconds",
+        StatusCode::TOO_MANY_REQUESTS => "Rate limited, retry in a few seconds",
+        _ => "Track unavailable",
+    }
+}
+
+fn stremio_stream_body(stream: &MusicStream) -> Response {
+    let row = crate::music_addon::stremio_stream_row(
+        &stream.body,
+        &stream.file_name,
+        stream.size,
+        stream.duration,
+    );
+    stremio_json(200, &serde_json::json!({"streams": [row]}), "no-store")
+}
+
+/// `/eclipse/stream/movie/{id}` — a Stremio/Nuvio stream row.
+///
+/// The stream row is built from the SAME resolved payload Eclipse gets. No
+/// `title` key: stremio-core drops a stream that carries one.
+async fn stremio_stream(ctx: &ReqCtx, rest: &str) -> Response {
+    let id = crate::download::percent_decode(rest);
+    let id = id.trim();
+    if id == crate::music_addon::STREMIO_SPONSOR_ID {
+        let card = music_sponsor_card(&ctx.base_url).await;
+        let streams: Vec<Value> = card.stream.into_iter().collect();
+        return stremio_json(200, &serde_json::json!({"streams": streams}), "no-store");
+    }
+    let fail = |reason: &str| {
+        stremio_json(
+            200,
+            &serde_json::json!({"streams": [{"name": "PencariMusic", "description": reason}]}),
+            "no-store",
+        )
+    };
+    if let Some(name) = crate::music_addon::stremio_artist_name(id) {
+        // An artist tile plays that artist's first matching track: Stremio has
+        // no track-list page to browse, so one resolve is the whole surface.
+        let tracks = music_search(&name, 30).await;
+        let want = crate::matcher::fold_latin_accents(&name.to_lowercase());
+        let Some(track) = tracks
+            .iter()
+            .find(|t| crate::matcher::fold_latin_accents(&str_at(t, "artist").to_lowercase()) == want)
+        else {
+            return fail("No track for this artist");
+        };
+        let code = str_at(track, "id");
+        return match music_stream_payload(ctx, &code).await {
+            Ok(stream) => stremio_stream_body(&stream),
+            Err(resp) => fail(music_stream_failure(&resp)),
+        };
+    }
+    let Some(code) = crate::music_addon::stremio_code(id) else {
+        return fail("Track not found");
+    };
+    match music_stream_payload(ctx, code).await {
+        Ok(stream) => stremio_stream_body(&stream),
+        Err(resp) => fail(music_stream_failure(&resp)),
+    }
+}
+
+/// `/eclipse/artist/{id}` — Eclipse artist page.
+async fn music_artist(ctx: &ReqCtx, raw_id: &str) -> Response {
+    let id = crate::download::percent_decode(raw_id);
+    let id = id.trim();
+    let Some(name) = crate::music_addon::decode_artist(id) else {
+        return music_not_found();
+    };
+    let tracks = local_artwork(&ctx.base_url, music_search(&name, 100).await);
+    match crate::music_addon::artist_detail(id, &tracks) {
+        Some(detail) => stremio_json(200, &detail, "no-store"),
+        None => music_not_found(),
+    }
+}
+
+/// `/eclipse/album/{id}` — Eclipse album page.
+async fn music_album(ctx: &ReqCtx, raw_id: &str) -> Response {
+    let id = crate::download::percent_decode(raw_id);
+    let id = id.trim();
+    let Some((artist, album)) = crate::music_addon::decode_album(id) else {
+        return music_not_found();
+    };
+    let query = if artist.trim().is_empty() {
+        album
+    } else {
+        format!("{artist} {album}")
+    };
+    let tracks = local_artwork(&ctx.base_url, music_search(&query, 100).await);
+    match crate::music_addon::album_detail(id, &tracks) {
+        Some(detail) => stremio_json(200, &detail, "no-store"),
+        None => music_not_found(),
+    }
+}
+
+/// `/eclipse/playlist/{id}` — only the sponsored page exists for now.
+async fn music_playlist(ctx: &ReqCtx, raw_id: &str) -> Response {
+    let id = crate::download::percent_decode(raw_id);
+    if id.trim() != crate::music_addon::SPONSOR_ID {
+        return music_not_found();
+    }
+    let card = music_sponsor_card(&ctx.base_url).await;
+    stremio_json(200, &card.playlist, "no-store")
 }
 
 /// The codec both addon protocols name for a rendition, empty when nothing we

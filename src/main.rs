@@ -32,6 +32,7 @@ mod backfill;
 mod diagnostics;
 mod download;
 mod music;
+mod music_addon;
 mod fileid;
 mod httpc;
 mod log;

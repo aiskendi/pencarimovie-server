@@ -4,6 +4,30 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ## [Unreleased]
 
+### Added
+
+- **PencariMusic addon v2: real catalogs, artist/album pages, and a Stremio/Nuvio face.** The
+  music descriptor advertises `artists` and the `sponsor` row for Eclipse, plus a search catalog
+  (`pm_music_search`, required `search` extra), `pm_music_artists` (a `series` whose episodes are
+  the artist's tracks, so an artist page lists more than one file) and `pm_music_sponsor` as
+  `movie`-typed rows for Stremio/Nuvio, and reports the build version instead of a hardcoded
+  `1.1.0`. The descriptor identifies as `pencarimovie.com` and names itself
+  `PencariMusic (PencariMovie.Com)`, so clients treat it as a new addon and it must be re-added
+  once. The `latest`, `lossless` and `hi_res` shelves were removed: the origin's newest rows
+  are mostly long-form speech, so those names promised a selection the catalogue does not have.
+  `/music/catalog/{id}` answers the Eclipse `items` contract (it used to
+  answer `{tracks}`), `/music/artist/{id}` and `/music/album/{id}` open the detail pages, and the
+  same rows are exposed as `movie`-typed `metas`/`meta`/`streams` under `/music/{catalog,meta,
+  stream}/movie/...` because neither Stremio nor Nuvio has a music content type. Every answer is
+  music only: `.mkv`/`.iso` files, a movie's extracted `.mka` audio track, audiobooks (`.m4b`) and
+  release-tagged names (`1080p`, `BD`, `6CH`, `SxxEyy`, `(aud)`, …) no longer reach the addon, the
+  artist groupings or the backfill trigger. Long-form speech files are still audio and still pass;
+  the origin carries no genre field to separate a podcast from a track. The sponsored row uses the
+  WordPress
+  sponsor and falls back to the PencariMusic brand card; no audio or artwork watermarking.
+  `resources` stays a string array so BitChord keeps parsing the manifest, and no Stremio stream
+  row carries `title`.
+
 ### Fixed
 
 - **`curl -fsSL telegra.my/linux | sh` never came back to the prompt.** The Linux and macOS

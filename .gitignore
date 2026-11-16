@@ -420,6 +420,10 @@ CROSS-PLATFORM.md
 /tmp_*
 /test_*.bin
 /test_*.py
+# Operator tooling: reads the production diagnostic index over SSH. It names the
+# host's account, the index and the credential files it parses. Nothing about it
+# is product code; it is not published.
+/pm_reports.py
 /.codegraph/
 /chunk.bin
 /real_media.bin

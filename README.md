@@ -30,7 +30,7 @@ PencariMovie Server is a lightweight, self-hosted streaming utility and protocol
 - **Client-Side MTProto Bridge**: Directly streams authorized media to the user's local player over MTProto ([`grammers`](https://codeberg.org/Lonami/grammers), compiled into the binary).
 - **No Remote File Hosting**: The server does not host, store, or re-transmit media files; streams originate from Telegram's network directly to the local client.
 - **Local & Private**: Runs on the user's own hardware (localhost or private LAN) without passing credentials or media bytes to external proxy servers.
-- **Cross-Platform**: Available as a native Windows tray application, Linux daemon, Android APK, Termux script, and Docker container.
+- **Cross-Platform**: Available as a native Windows tray application, Linux daemon, Android APK, and Docker container.
 
 ---
 
@@ -246,7 +246,7 @@ pms token rotate       # Rotates the access token
 pms uninstall          # Removes server, configuration, and CLI commands
 ```
 
-Works across Windows, macOS, Linux, and Termux.
+Works across Windows, macOS, and Linux.
 
 ---
 

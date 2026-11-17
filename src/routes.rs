@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -146,9 +147,41 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         .unwrap_or_default();
     let method = parts.method.as_str().to_uppercase();
 
+    // One settings read per request, then an optional public overlay. With
+    // `PM_PUBLIC` off this is exactly the old global document and every branch
+    // below behaves as before.
+    let global_settings = Arc::new(load_catalog_settings_merged());
+    let mut effective_settings = global_settings.clone();
+    let mut public_code: Option<String> = None;
+    let mut public_error: Option<String> = None;
+    let mut config_fp = "d".to_string();
+    let mut route_path = raw_path.clone();
+    let addon_open = crate::config::public_mode();
+    if addon_open {
+        if let Some((code, rest)) = crate::public_config::parse_segment(&raw_path) {
+            match crate::public_config::decode(&code) {
+                Ok(cfg) => {
+                    let merged = crate::public_config::merge(&global_settings, &cfg);
+                    let merged_fp = crate::public_config::response_fingerprint(&merged);
+                    // A catalog-only link must share the stream cache with the
+                    // default: its stream answer is identical.
+                    let global_fp = crate::public_config::response_fingerprint(&global_settings);
+                    config_fp = if merged_fp == global_fp { "d".into() } else { merged_fp };
+                    effective_settings = Arc::new(merged);
+                    public_code = Some(code);
+                    route_path = rest;
+                }
+                Err(e) => {
+                    public_error = Some(e);
+                    route_path = rest;
+                }
+            }
+        }
+    }
+
     let mut ctx = ReqCtx {
         method: method.clone(),
-        path: raw_path.clone(),
+        path: route_path,
         raw_path: raw_path.clone(),
         query,
         headers: parts.headers,
@@ -156,6 +189,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         remote,
         local: String::new(),
         base_url: String::new(),
+        settings: effective_settings,
+        global_settings,
+        addon_open,
+        public_code,
+        public_error,
+        config_fp,
     };
     ctx.base_url = base_url_of(&ctx, state.port);
 
@@ -418,7 +457,43 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         return json_response(200, &check_version().await);
     }
 
+    /* ── public configure API (only when PM_PUBLIC is on) ─────────────────── */
+    if p == "/api/public/options" && m == "GET" {
+        if !crate::config::public_mode() {
+            return not_found_json();
+        }
+        return json_response(200, &crate::public_config::options(&ctx.global_settings));
+    }
+
+    if let Some(payload) = p.strip_prefix("/api/public/config/") {
+        if m != "GET" {
+            return not_found_json();
+        }
+        if !crate::config::public_mode() {
+            return not_found_json();
+        }
+        let payload = payload.trim_matches('/');
+        return match crate::public_config::view(&ctx.global_settings, payload) {
+            Ok(body) => json_response(200, &body),
+            Err(message) => json_response(
+                400,
+                &serde_json::json!({
+                    "ok": 0,
+                    "error": "invalid_config",
+                    "message": message,
+                }),
+            ),
+        };
+    }
+
     if p == "/api/lan-ip" {
+        // On a public instance the LAN address is operator information, not part
+        // of the public addon surface. Private mode keeps the old answer.
+        if crate::config::public_mode() {
+            if let Some(resp) = require_trusted_device(&ctx) {
+                return resp;
+            }
+        }
         return json_response(
             200,
             &serde_json::json!({"ok": 1, "lan_ip": lan_ip(), "port": state.port}),
@@ -524,6 +599,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── catalog settings (backend.php:18496-18657) ───────────────────────── */
     if p == "/api/catalog-settings" && m == "GET" {
+        // Public mode turns this into operator-only data: it carries the stored
+        // upstream manifest URLs (which can contain private tokens) and the music
+        // source URLs. The public Configure page uses /api/public/options instead.
+        if crate::config::public_mode() {
+            if let Some(resp) = require_trusted_device(&ctx) {
+                return resp;
+            }
+        }
         // `fd_load_catalog_settings()` always returns a FULL document; a missing
         // `storage/catalog_settings.json` is not an empty settings object. The
         // dashboard renders the Catalog Configuration / Streams Configuration
@@ -532,7 +615,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             200,
             &serde_json::json!({
                 "ok": 1,
-                "settings": load_catalog_settings_merged(),
+                "settings": ctx.global_settings.as_ref(),
                 "catalog_options": default_catalog_options(),
                 "is_tunnel": false,
             }),
@@ -594,15 +677,36 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             current["upstream_enabled"] = serde_json::json!(v.as_bool().unwrap_or(false));
         }
         if let Some(list) = input.get("upstream_manifests").and_then(|v| v.as_array()) {
+            // `enabled` is the public-mode source switch. An older dashboard does
+            // not send it; carry the stored value by URL rather than silently
+            // re-enabling every row on each save.
+            let existing = current
+                .get("upstream_manifests")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let cleaned: Vec<Value> = list
                 .iter()
                 .filter(|m| m.get("url").and_then(|u| u.as_str()).map(|u| !u.trim().is_empty()).unwrap_or(false))
                 .map(|m| {
+                    let url = m.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let enabled = m
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| {
+                            existing
+                                .iter()
+                                .find(|e| e.get("url").and_then(|u| u.as_str()).map(str::trim) == Some(url))
+                                .and_then(|e| e.get("enabled"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(true);
                     serde_json::json!({
                         "name": m.get("name").and_then(|v| v.as_str()).unwrap_or("Addon").trim(),
-                        "url": m.get("url").and_then(|v| v.as_str()).unwrap_or("").trim(),
+                        "url": url,
                         "id": m.get("id").and_then(|v| v.as_str()).unwrap_or("").trim(),
                         "version": m.get("version").and_then(|v| v.as_str()).unwrap_or("").trim(),
+                        "enabled": enabled,
                     })
                 })
                 .collect();
@@ -751,6 +855,13 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── validate-manifest (backend.php:18715-18751) ──────────────────────── */
     if p == "/api/validate-manifest" && m == "POST" {
+        // This makes the SERVER fetch a URL the caller typed. It had no gate at
+        // all, which was already an SSRF probe on a public host; public mode makes
+        // that unacceptable. The dashboard's add-upstream form runs locally or
+        // with the admin token.
+        if let Some(resp) = require_trusted_device(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         let mut url = jstr(&input, "url");
         if url.is_empty() {
@@ -837,6 +948,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     if p == "/api/country" && m == "POST" {
+        // Writes the global settings document, so it is an operator action. It
+        // used to be ungated; a public instance must not let one visitor change
+        // every other viewer's country.
+        if let Some(resp) = require_trusted_device(&ctx) {
+            return resp;
+        }
         let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
         if !input.is_object() {
             return json_response(400, &serde_json::json!({"ok": 0, "error": "Invalid JSON input"}));
@@ -869,6 +986,11 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         let meta = load_session_meta();
         let has_session = has_local_session("") && !bot_id.is_empty();
         let pool = get_bot_pool();
+        let privileged = auth_privileged(&ctx);
+        // Public mode keeps the operator's bot identity and install id off an
+        // anonymous response. The public addon only needs `has_session` to render
+        // its "provisioning" card.
+        let public_anonymous = crate::config::public_mode() && !privileged;
         let mut bot_username = jstr(&meta, "bot_username");
         let mut bot_name = jstr(&meta, "bot_name");
         if (bot_username.is_empty() || bot_name.is_empty()) && !pool.is_empty() {
@@ -893,11 +1015,11 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "client_version": crate::config::client_version(),
                 "has_session": has_session,
                 "is_provisioning": is_guest_provision_in_progress(),
-                "bot_id": if has_session { bot_id } else { String::new() },
-                "bot_username": if has_session { bot_username } else { String::new() },
-                "bot_name": if has_session { bot_name } else { String::new() },
-                "api_secret": if has_session && auth_privileged(&ctx) { get_api_secret() } else { String::new() },
-                "device_id": get_device_id(),
+                "bot_id": if has_session && !public_anonymous { bot_id } else { String::new() },
+                "bot_username": if has_session && !public_anonymous { bot_username } else { String::new() },
+                "bot_name": if has_session && !public_anonymous { bot_name } else { String::new() },
+                "api_secret": if has_session && privileged { get_api_secret() } else { String::new() },
+                "device_id": if public_anonymous { String::new() } else { get_device_id() },
                 // The pool names every bot this install owns. `has_session` above is
                 // already public and is all the dashboard needs to pick a screen, so
                 // the identities stay with the operator.
@@ -1237,6 +1359,15 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         // detached CLI worker per incident; this port spawns no processes, so the
         // flush rides here instead — otherwise `auto_report: true` uploaded
         // nothing at all (it was stored and reported, never acted on).
+        //
+        // Public mode: this payload names the origin, the device and live stream
+        // counts, so it is operator-only. The Android app reaches it with the
+        // admin token, exactly like the other management routes.
+        if crate::config::public_mode() {
+            if let Some(resp) = require_trusted_device(&ctx) {
+                return resp;
+            }
+        }
         // `has_pending()` first so an idle poll costs one `read_dir`, and
         // `take_auto_flush_slot()` throttles a failing origin to one try / 120s.
         if crate::diagnostics::has_pending() && crate::diagnostics::take_auto_flush_slot() {
@@ -1533,6 +1664,32 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     if addon_path.is_empty() {
         addon_path = "/manifest.json".to_string();
     }
+    // `<payload>` on its own is a valid install URL too; treat its trailing
+    // slash/root as the manifest, exactly like `/<token>` does for the token
+    // transport.
+    if p == "/" && (ctx.public_code.is_some() || ctx.public_error.is_some()) {
+        addon_path = "/manifest.json".to_string();
+    }
+    // A first segment that looked like a config but failed to decode. Return a
+    // descriptor/card that sends the user back to /configure instead of a blank
+    // 404 or the dashboard SPA.
+    if let Some(err) = ctx.public_error.as_deref() {
+        if addon_path == "/manifest.json" {
+            return invalid_config_manifest(&ctx, err);
+        }
+        if addon_path.starts_with("/catalog/") {
+            return stremio_json(200, &serde_json::json!({"metas": []}), "no-store");
+        }
+        if addon_path.starts_with("/meta/") {
+            return not_found_json();
+        }
+        if addon_path.starts_with("/subtitles/") {
+            return stremio_json(200, &serde_json::json!({"subtitles": []}), "no-store");
+        }
+        if addon_path.starts_with("/stream/") {
+            return invalid_config_stream(&ctx).await;
+        }
+    }
     // Player polls only: a `/stream` body never re-enters this function per
     // chunk, and `/catalog` + `/meta` are fetched once per screen.
     if addon_path.starts_with("/stream/")
@@ -1554,7 +1711,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         if let Some((type_part, id_part)) = rest.split_once('/') {
             let id = id_part.strip_suffix(".json").map(|s| s.to_string());
             if let Some(id) = id {
-                if !is_authenticated(&ctx) {
+                if !ctx.addon_open && !is_authenticated(&ctx) {
                     // The sponsored item still goes on top: the user is being
                     // told to re-install, which is exactly when they should see
                     // it. Never cached — a locked answer must not outlive the
@@ -1575,7 +1732,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         return handle_meta(&ctx, &addon_path).await;
     }
     if addon_path.starts_with("/subtitles/") {
-        return handle_subtitles(&addon_path).await;
+        return handle_subtitles(&ctx, &addon_path).await;
     }
 
     /* ── /thumb — a poster from Telegram itself ───────────────────────────── */
@@ -2031,18 +2188,47 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     // client sees. The bare `#configure` hash means the same thing in the
     // dashboard, so an old link and the gear reach the same panel.
     let configure_path = p.trim_end_matches('/');
-    if configure_path == "/configure"
-        || configure_path == "/config"
-        || configure_path == "/manifest.json/configure"
-        || configure_path == "/manifest.json/config"
-    {
+    if configure_path == "/manifest.json/configure" || configure_path == "/manifest.json/config" {
+        if crate::config::public_mode() {
+            // Carry the current link's payload into the editor so the Stremio
+            // gear opens the user's own settings, not an empty form.
+            if let Some(code) = ctx.public_code.as_deref() {
+                return redirect(&format!("/configure?c={code}"));
+            }
+            return redirect("/configure");
+        }
         return redirect("/#catalogs");
     }
+    if configure_path == "/configure" || configure_path == "/config" {
+        // Public mode serves the page below; private mode keeps the old
+        // dashboard Catalogs shortcut.
+        if !crate::config::public_mode() {
+            return redirect("/#catalogs");
+        }
+    }
+
+    if crate::config::public_mode() {
+        if p == "/" || p == "/configure" || p == "/config" {
+            if let Some(resp) = serve_static("configure.html", true) {
+                return resp;
+            }
+        }
+        if p == "/admin" {
+            if let Some(resp) = serve_static("index.html", true) {
+                return resp;
+            }
+        }
+        if p == "/index.html" || p == "/admin/" || p.starts_with("/admin/") {
+            return redirect("/admin");
+        }
+    } else if p == "/admin" || p == "/admin/" || p.starts_with("/admin/") {
+        return redirect("/");
+    }
+
     // Everything below `/api/*`, `/manifest.json`, `/catalog|meta|stream|
     // subtitles|eclipse` has already been answered above, so anything left is
-    // the dashboard and its assets. They are served FROM DISK — this port does
-    // not need the PHP runtime for the UI.
-    if let Some(resp) = serve_static(&p) {
+    // the dashboard/configure page and its assets.
+    if let Some(resp) = serve_static(&p, crate::config::public_mode()) {
         return resp;
     }
     if p == "/" || p == "/index.html" {
@@ -2081,23 +2267,24 @@ The REST API and the Stremio addon routes are unaffected:</p>\n\
 /// A path containing `..` or a dot-segment is rejected: `storage/` (sessions,
 /// `api_secret.key`, `auth.json`) sits beside `public/` in the source tree and
 /// must stay private.
-fn serve_static(p: &str) -> Option<Response> {
+fn serve_static(p: &str, public: bool) -> Option<Response> {
     let rel = p.trim_start_matches('/');
+    let fallback = if public { "configure.html" } else { "index.html" };
     if rel.split('/').any(|seg| seg == ".." || seg.starts_with('.')) {
         return None;
     }
     if crate::storage::env("PM_ASSETS").as_deref() != Some("disk") {
         if let Some(bytes) = crate::assets::get(rel) {
-            // `/` resolves to index.html, so the content type must come from the
-            // RESOLVED name — deriving it from an empty path produced
-            // `application/octet-stream` and the browser DOWNLOADED the
-            // dashboard instead of rendering it.
-            let named = if rel.is_empty() { "index.html" } else { rel };
+            // `/` resolves to the fallback page, so the content type must come
+            // from the RESOLVED name — deriving it from an empty path produced
+            // `application/octet-stream` and the browser DOWNLOADED the page
+            // instead of rendering it.
+            let named = if rel.is_empty() { fallback } else { rel };
             let ctype = content_type_for(std::path::Path::new(named));
             return crate::respond::bytes_response(ctype, bytes::Bytes::from_static(bytes));
         }
         if rel.is_empty() || !rel.contains('.') {
-            if let Some(index) = crate::assets::get("index.html") {
+            if let Some(index) = crate::assets::get(fallback) {
                 return crate::respond::bytes_response(
                     "text/html; charset=utf-8",
                     bytes::Bytes::from_static(index),
@@ -2108,14 +2295,14 @@ fn serve_static(p: &str) -> Option<Response> {
             return None;
         }
     }
-    serve_static_from_disk(rel)
+    serve_static_from_disk(rel, fallback)
 }
 
 /// `PM_ASSETS=disk` (and any build where `public/` was absent at compile time).
-fn serve_static_from_disk(rel: &str) -> Option<Response> {
+fn serve_static_from_disk(rel: &str, fallback: &str) -> Option<Response> {
     let public = crate::storage::public_dir()?;
     if rel.is_empty() {
-        return crate::respond::file_response(&public.join("index.html"), "text/html; charset=utf-8");
+        return crate::respond::file_response(&public.join(fallback), "text/html; charset=utf-8");
     }
     let candidate = public.join(rel);
     if candidate.is_file() {
@@ -2123,7 +2310,7 @@ fn serve_static_from_disk(rel: &str) -> Option<Response> {
         return crate::respond::file_response(&candidate, ctype);
     }
     if !rel.contains('.') {
-        return crate::respond::file_response(&public.join("index.html"), "text/html; charset=utf-8");
+        return crate::respond::file_response(&public.join(fallback), "text/html; charset=utf-8");
     }
     None
 }
@@ -2164,7 +2351,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
     // `/stream/*` response cache (300 s), the equivalent of the PHP's
     // `stream_cache_*.json`. Checked BEFORE any origin/upstream work, so a warm
     // list costs one hash lookup. `finish_streams()` fills it.
-    let skey = stream_cache_key(item_type, item_id, &ctx.base_url);
+    let skey = stream_cache_key(item_type, item_id, &ctx.base_url, &ctx.config_fp);
     if let Some(hit) = crate::cache::get("stream", &skey) {
         if let Some(list) = hit.get("streams").and_then(|s| s.as_array()) {
             log(
@@ -2343,7 +2530,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             if b.is_empty() { active_bot.clone() } else { b }
         };
         let payload = stream_payload(&code, &file_name, &mime, size, &file_id, &bot_for_payload);
-        let url = stream_url(&ctx.base_url, &payload, &file_name);
+        let url = stream_url_for(ctx, &payload, &file_name);
         // A direct `pm_file_` item keeps its file_id in the payload (no
         // resolution at download time) and still gets the sponsored message on
         // top, exactly like every other stream list.
@@ -2383,7 +2570,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
     // they never add their latency to the local list (backend.php:16606-16739
     // does the same with `\Amp\async`).
     if parse_external_id(item_id).is_some() {
-        let upstream = spawn_upstream_streams(item_type, item_id);
+        let upstream = spawn_upstream_streams(ctx, item_type, item_id);
         if let Some(resp) = handle_external_stream(ctx, item_type, item_id, upstream).await {
             return resp;
         }
@@ -2394,7 +2581,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
     // giving up. A `pm:` id never reaches here (handled above) and never fans
     // out. (`tvdb:` / `anilist:` / `tvmaze:` are parsed above, so they take the
     // local path in `handle_external_stream()`.)
-    let upstream_items = await_upstream(spawn_upstream_streams(item_type, item_id), true).await;
+    let upstream_items = await_upstream(spawn_upstream_streams(ctx, item_type, item_id), true).await;
     if !upstream_items.is_empty() {
         return finish_streams(ctx, item_type, item_id, item_id, upstream_items, false, 0).await;
     }
@@ -2423,13 +2610,14 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
 /// (`$isLocalPmId` in the PHP). `None` also means "nothing configured", which
 /// keeps the zero-upstream path allocation-free.
 fn spawn_upstream_streams(
+    ctx: &ReqCtx,
     item_type: &str,
     item_id: &str,
 ) -> Option<tokio::task::JoinHandle<Vec<Value>>> {
     if item_id.starts_with("pm:") || item_id.starts_with("pm_") {
         return None;
     }
-    let settings = load_catalog_settings_merged();
+    let settings = ctx.settings.clone();
     if upstream::configured(&settings, true).is_empty() {
         return None;
     }
@@ -2583,6 +2771,7 @@ async fn handle_post_stream(
         // Fast Path 1 — the whole `fd_fetch_episode_stream_files()` ladder, which
         // also owns the post's own file set (its step 0).
         let resolved = resolve_episode_files(
+            ctx.settings.as_ref(),
             &post_id, &title, &year, &imdb_id, eff_season, eff_episode,
         )
         .await;
@@ -2799,6 +2988,7 @@ fn episode_probe_queries(keyword: &str, year: &str, season: i32, episode: i32) -
 ///    the origin answers `ok` even with zero items, and the PHP stops there
 ///    rather than burning seconds on pointless scans (backend.php:10265).
 async fn resolve_episode_files(
+    settings: &Value,
     post_id: &str,
     title: &str,
     year: &str,
@@ -2806,7 +2996,7 @@ async fn resolve_episode_files(
     season: i32,
     episode: i32,
 ) -> EpisodeResolution {
-    resolve_episode_files_with(post_id, "", Vec::new(), title, year, imdb_id, season, episode).await
+    resolve_episode_files_with(settings, post_id, "", Vec::new(), title, year, imdb_id, season, episode).await
 }
 
 /// The same ladder for a series reached through an EXTERNAL id (`tt…`, `tmdb:…`).
@@ -2824,6 +3014,7 @@ async fn resolve_episode_files(
 /// through the same `$add()` filter below, so it cannot smuggle in a foreign file.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_external_episode_files(
+    settings: &Value,
     external_id: &str,
     title: &str,
     year: &str,
@@ -2832,11 +3023,12 @@ async fn resolve_external_episode_files(
     episode: i32,
     seed: Vec<crate::wp_data::WpFile>,
 ) -> EpisodeResolution {
-    resolve_episode_files_with("", external_id, seed, title, year, imdb_id, season, episode).await
+    resolve_episode_files_with(settings, "", external_id, seed, title, year, imdb_id, season, episode).await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_episode_files_with(
+    settings: &Value,
     post_id: &str,
     external_id: &str,
     seed: Vec<crate::wp_data::WpFile>,
@@ -2872,8 +3064,7 @@ async fn resolve_episode_files_with(
         if imdb_id.trim().is_empty() {
             Vec::new()
         } else {
-            let settings = load_catalog_settings_merged();
-            upstream::episode_names(&settings, imdb_id, season, episode, &title, &year).await
+            upstream::episode_names(settings, imdb_id, season, episode, &title, &year).await
         }
     };
     // The OTHER episodes' titles, for the `$add()` guard below. They make the
@@ -2884,8 +3075,7 @@ async fn resolve_episode_files_with(
         if imdb_id.trim().is_empty() {
             Vec::new()
         } else {
-            let settings = load_catalog_settings_merged();
-            upstream::sibling_episode_names(&settings, imdb_id, season, episode, &title, &year).await
+            upstream::sibling_episode_names(settings, imdb_id, season, episode, &title, &year).await
         }
     };
     let post_files_future = async {
@@ -3295,7 +3485,7 @@ async fn handle_external_stream(
         // without this an unindexed id had NO title at all, so the matcher had
         // nothing to search and the item answered "No Streams Found". Measured
         // on a real phone: tt6751668, tt21952924, tt34809853, tt34991493.
-        let settings = load_catalog_settings_merged();
+        let settings = ctx.settings.as_ref();
         // The addon is asked for the BARE id. A meta endpoint does not know the
         // `:S:E` suffix: measured on the live origin,
         // `/meta/series/tt10603444.json` answers 200 with the whole series while
@@ -3372,7 +3562,7 @@ async fn handle_external_stream(
         && episode > 0
     {
         let bare_media = format!("{}:{}", prefix, value);
-        let settings = load_catalog_settings_merged();
+        let settings = ctx.settings.as_ref();
         match upstream::episode_item_position(&settings, &bare_media, item_id, &title, &year).await {
             Some((s, e)) => {
                 log(
@@ -3478,6 +3668,7 @@ async fn handle_external_stream(
         effective_season_episode(kind == "series", season, episode);
     if kind == "series" {
         let r = resolve_external_episode_files(
+            ctx.settings.as_ref(),
             item_id,
             &title,
             &year,
@@ -3503,9 +3694,9 @@ async fn handle_external_stream(
         // Only runs when the season-relative pass found NOTHING, so a show that
         // really is laid out per season costs nothing and cannot be widened.
         if files.is_empty() && eff_season > 1 {
-            let settings = load_catalog_settings_merged();
+            let settings = ctx.settings.as_ref();
             let absolute = upstream::absolute_episode(
-                &settings,
+                settings,
                 &episode_media_id,
                 eff_season,
                 eff_episode,
@@ -3522,6 +3713,7 @@ async fn handle_external_stream(
                     }),
                 );
                 let r2 = resolve_external_episode_files(
+                    ctx.settings.as_ref(),
                     item_id,
                     &title,
                     &year,
@@ -3721,9 +3913,9 @@ async fn build_streams_from_files(
     // means "no evidence": the matcher then fails OPEN, so adding this can never
     // hide a stream on its own.
     let episode_names: Vec<String> = if is_series && !episode_media_id.trim().is_empty() {
-        let settings = load_catalog_settings_merged();
+        let settings = ctx.settings.as_ref();
         crate::upstream::episode_names(
-            &settings,
+            settings,
             episode_media_id,
             season,
             episode,
@@ -3892,7 +4084,7 @@ async fn build_streams_from_files(
     }
     crate::matcher::detect_parts_by_duration(&mut items);
 
-    let settings = read_catalog_settings();
+    let settings = ctx.settings.as_ref();
     let cfg = crate::matcher::StreamFilterConfig::from_json(
         settings.get("stream_config").unwrap_or(&Value::Null),
     );
@@ -3920,9 +4112,9 @@ async fn build_streams_from_files(
         return finish_streams(ctx, item_type, title, item_id, merged, true, matched.len()).await;
     }
 
-    let mut scored: Vec<(f64, Value)> = kept
+    let mut scored: Vec<(f64, String, Value)> = kept
         .iter()
-        .filter_map(|(idx, _res_key)| {
+        .filter_map(|(idx, res_key)| {
             let f = &matched[*idx];
             if !f.short_code.is_empty() && crate::cache::get("flagged_malware", &f.short_code).is_some() {
                 return None;
@@ -3935,6 +4127,7 @@ async fn build_streams_from_files(
             );
             Some((
                 score,
+                res_key.clone(),
                 stream_item(
                     ctx,
                     &f.short_code,
@@ -3950,7 +4143,18 @@ async fn build_streams_from_files(
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(100);
 
-    let mut streams: Vec<Value> = scored.into_iter().map(|(_, v)| v).collect();
+    let sc = settings.get("stream_config").unwrap_or(&Value::Null);
+    let max_per_res = sc
+        .get("max_streams_per_resolution")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 50) as usize;
+    let max_total = sc
+        .get("max_streams_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 200) as usize;
+    let mut streams: Vec<Value> = apply_stream_caps(scored, max_per_res, max_total);
     let built = streams.len();
     // A browser / WebView player cannot demux Matroska: Chrome rejects
     // `video/x-matroska` inside `<video>`, aborts on the container and re-requests the
@@ -4064,8 +4268,34 @@ const STREAM_CACHE_TTL: i64 = 300;
 ///
 /// Each of those bodies would otherwise be served for the rest of its short TTL
 /// after the fix, which is exactly long enough to look like the fix failed.
-fn stream_cache_key(item_type: &str, item_id: &str, base_url: &str) -> String {
-    format!("v4|{}|{}|{}", item_type, item_id, base_url)
+/// Apply the operator/user `max_streams_*` caps to the already-sorted rows.
+///
+/// The dashboard exposed these two controls but the stream pipeline only
+/// reported them in `active_filter_notes` — setting them did nothing. Public
+/// links make that visible, so enforce them here (0 = no cap).
+fn apply_stream_caps(
+    scored: Vec<(f64, String, Value)>,
+    max_per_res: usize,
+    max_total: usize,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut per_res: HashMap<String, usize> = HashMap::new();
+    for (_score, res, value) in scored {
+        if max_total > 0 && out.len() >= max_total {
+            break;
+        }
+        let used = per_res.get(&res).copied().unwrap_or(0);
+        if max_per_res > 0 && used >= max_per_res {
+            continue;
+        }
+        per_res.insert(res, used + 1);
+        out.push(value);
+    }
+    out
+}
+
+fn stream_cache_key(item_type: &str, item_id: &str, base_url: &str, config_fp: &str) -> String {
+    format!("v5|{}|{}|{}|{}", item_type, item_id, base_url, config_fp)
 }
 
 /// Place the per-answer rows above a finished stream list.
@@ -4150,7 +4380,7 @@ async fn finish_streams(
         // "the sponsor is not on top" reports.
         crate::cache::put(
             "stream",
-            &stream_cache_key(item_type, item_id, &ctx.base_url),
+            &stream_cache_key(item_type, item_id, &ctx.base_url, &ctx.config_fp),
             &serde_json::json!({"streams": &streams}),
             STREAM_CACHE_TTL,
             0,
@@ -4302,7 +4532,7 @@ fn no_streams_card(
     files_before_filter: usize,
 ) -> Value {
     if filtered && files_before_filter > 0 {
-        let settings = load_catalog_settings_merged();
+        let settings = ctx.settings.as_ref();
         let notes = active_filter_notes(&settings["stream_config"]);
         let detail = if notes.is_empty() {
             "your active filters (Resolution / Codec / Size / Keywords)".to_string()
@@ -4366,7 +4596,10 @@ fn no_streams_card(
 /// in a query string here because the value ends up in the cookie jar verbatim.
 fn ddl_domain_value(base_url: &str) -> String {
     let base = rtrim(base_url);
-    if !auth_enabled() {
+    // Public mode makes the admin token an ADMIN credential. It must never be
+    // pasted into a card a public viewer can read; `/api/download` does not need
+    // it in public mode.
+    if crate::config::public_mode() || !auth_enabled() {
         return base;
     }
     let host = url::Url::parse(&base)
@@ -4596,7 +4829,7 @@ fn stream_item(
         }
     };
     let payload = stream_payload(&short_code, &file_name, &mime, size, &payload_id, &payload_bot);
-    let url = stream_url(&ctx.base_url, &payload, &file_name);
+    let url = stream_url_for(ctx, &payload, &file_name);
     // NO `title`. stremio-core (web AND Android) parses a stream into
     // `{ name, description, url|externalUrl|infoHash, behaviorHints }` — `title`
     // is not part of that model, and a row carrying it was dropped while the
@@ -4857,13 +5090,80 @@ fn stream_url(base_url: &str, payload: &Value, file_name: &str) -> String {
     build_stream_url(base_url, &b64, file_name)
 }
 
+/// A payload another node can resolve with its OWN bot pool.
+///
+/// `file_id_mt`/`file_id`/`bot_id` are bound to the bot that minted them, so a
+/// URL for another server keeps only the short code (plus display metadata).
+/// That node's `/api/download` resolves the short code with its own session.
+fn remote_stream_payload(payload: &Value) -> Option<Value> {
+    let short_code = payload
+        .get("short_code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if short_code.is_empty() {
+        return None;
+    }
+    let mut remote = payload.clone();
+    if let Some(obj) = remote.as_object_mut() {
+        obj.remove("file_id_mt");
+        obj.remove("file_id");
+        obj.remove("bot_id");
+    }
+    Some(remote)
+}
+
+/// Public stream/download links are round-robined over `PM_NODES`.
+///
+/// Only public links participate: private links append the admin token, and
+/// that token must never be copied into a URL that points at another server.
+/// The current node is included automatically, so `PM_NODES` can list only the
+/// other nodes.
+static NODE_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
+
+fn node_pool(local: &str, extra: Vec<String>) -> Vec<String> {
+    let local = rtrim(local).to_string();
+    // The local node is deliberately first: when the user opens `/configure`
+    // from a local server, its stream links should stay local before falling
+    // back to the configured remote nodes.
+    let mut pool = vec![local.clone()];
+    for node in extra {
+        let node = rtrim(&node).to_string();
+        if !node.is_empty() && !pool.iter().any(|seen| seen == &node) {
+            pool.push(node);
+        }
+    }
+    pool
+}
+
+fn stream_base(ctx: &ReqCtx) -> String {
+    if ctx.public_code.is_none() {
+        return ctx.base_url.clone();
+    }
+    let pool = node_pool(&ctx.base_url, crate::config::node_urls());
+    let idx = NODE_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % pool.len();
+    pool[idx].clone()
+}
+
+fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
+    let base = stream_base(ctx);
+    let local = rtrim(&ctx.base_url);
+    if rtrim(&base) == local {
+        return stream_url(&base, payload, file_name);
+    }
+    match remote_stream_payload(payload) {
+        Some(remote) => stream_url(&base, &remote, file_name),
+        // No short code: only this node can resolve the file.
+        None => stream_url(&ctx.base_url, payload, file_name),
+    }
+}
+
 fn build_stream_url(base_url: &str, payload_b64: &str, file_name: &str) -> String {
-    let token = if auth_enabled() { auth_token() } else { String::new() };
-    let token_segment = if token.is_empty() {
-        String::new()
-    } else {
-        format!("/{}", urlencode_component(&token))
-    };
+    let token_segment = stream_token_segment(
+        crate::config::public_mode(),
+        auth_enabled(),
+        &auth_token(),
+    );
     format!(
         "{}{}/api/download/{}/{}",
         rtrim(base_url),
@@ -4871,6 +5171,18 @@ fn build_stream_url(base_url: &str, payload_b64: &str, file_name: &str) -> Strin
         urlencode_component(payload_b64),
         urlencode_component(file_name)
     )
+}
+
+/// The `/<token>` prefix for a download URL, or empty when it must not be sent.
+///
+/// Public mode deliberately omits it: the token is the admin credential, and a
+/// stream row is visible to every viewer. `/api/download` stays reachable through
+/// `ctx.addon_open`, so the URL needs no credential.
+fn stream_token_segment(public: bool, auth_enabled: bool, token: &str) -> String {
+    if public || !auth_enabled || token.is_empty() {
+        return String::new();
+    }
+    format!("/{}", urlencode_component(token))
 }
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
@@ -5338,7 +5650,7 @@ fn clean_music_sources(list: &[Value]) -> Result<Vec<Value>, String> {
 /// previous `{catalogs: [manifest rows]}` shape rendered an EMPTY panel: none of
 /// its keys carried a `group`, so every entry was skipped. The PHP map is
 /// reproduced verbatim, plus the port's two merged trending post rows.
-fn default_catalog_options() -> Value {
+pub(crate) fn default_catalog_options() -> Value {
     serde_json::json!({
         // Every row here is one the descriptor can advertise (`pm_catalogs()` +
         // the keyword rows), so a checkbox always does something. The
@@ -5746,7 +6058,7 @@ fn country_name(code: &str) -> String {
 /// EVERY localhost/LAN/Android install, since there is no Cloudflare in front —
 /// it falls back to `MY` with `source: "default"` instead of an empty string.
 fn detect_country(ctx: &ReqCtx) -> Value {
-    let settings = load_catalog_settings_merged();
+    let settings = ctx.global_settings.as_ref();
     let configured = jstr(&settings, "country").trim().to_ascii_uppercase();
     let (mut code, mut source) = if !configured.is_empty() {
         (configured, "configured")
@@ -6724,6 +7036,11 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
     // forwarded RAW: it still carries its own percent-encoding, and re-encoding
     // a decoded `genre=Science+Fiction` would corrupt it.
     if let Some((idx, real_id)) = upstream::parse_bridged(&cat_id) {
+        if ctx.public_code.is_some() {
+            // Public manifests never advertise `up_*` rows. An old cached
+            // manifest may still ask: answer empty instead of forwarding.
+            return stremio_json(200, &serde_json::json!({"metas": []}), "no-store");
+        }
         let raw_extra = raw_addon_extra(path, "/catalog/");
         let query = ctx
             .query
@@ -6731,9 +7048,9 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
             .map(|(k, v)| format!("{}={}", urlencode_component(k), urlencode_component(v)))
             .collect::<Vec<_>>()
             .join("&");
-        let settings = load_catalog_settings_merged();
+        let settings = ctx.settings.as_ref();
         if let Some(body) = upstream::forward_catalog(
-            &settings,
+            settings,
             idx,
             &item_type,
             &real_id,
@@ -7136,8 +7453,13 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
     // bridged from AIOMetadata opens as a BLANK page: the client resolves the
     // upstream's own id against whichever addon advertises `meta` for that
     // prefix, and this addon advertises `tt`/`tmdb:`/… .
-    let settings = load_catalog_settings_merged();
-    if let Some(body) = upstream::forward_meta(&settings, &item_type, &id).await {
+    let settings = ctx.settings.as_ref();
+    let upstream_meta = if ctx.public_code.is_none() {
+        upstream::forward_meta(settings, &item_type, &id).await
+    } else {
+        None
+    };
+    if let Some(body) = upstream_meta {
         // Self-discover on OPEN, not only on Play.
         //
         // Opening an item is the earliest moment this server can learn an
@@ -8106,7 +8428,7 @@ async fn music_stream_payload(ctx: &ReqCtx, short_code: &str) -> Result<MusicStr
         &file_id_mt,
         &bot_for_payload,
     );
-    let url = stream_url(&ctx.base_url, &payload, &file_name);
+    let url = stream_url_for(ctx, &payload, &file_name);
     let mut body = serde_json::json!({
         "url": url,
         "format": ext,
@@ -9105,7 +9427,12 @@ async fn subtitle_target_id(item_type: &str, id: &str) -> String {
     String::new()
 }
 
-async fn handle_subtitles(path: &str) -> Response {
+async fn handle_subtitles(ctx: &ReqCtx, path: &str) -> Response {
+    if ctx.public_code.is_some() {
+        // Public manifests do not advertise `subtitles`; clients use their own
+        // subtitle addon.
+        return stremio_json(200, &serde_json::json!({"subtitles": []}), "no-store");
+    }
     let Some((item_type, id, _extra)) = split_addon(path, "/subtitles/") else {
         return stremio_json(200, &serde_json::json!({"subtitles": []}), "no-store");
     };
@@ -9227,9 +9554,12 @@ fn manifest_identity(ctx: &ReqCtx, origin: &str) -> (&'static str, String) {
 /// bridged catalogs — never the local `pm_*` ones.
 async fn manifest(ctx: &ReqCtx) -> Value {
     let base_url = rtrim(&ctx.base_url).to_string();
-    let (mode, description) = manifest_identity(ctx, &base_url);
+    let (mode, mut description) = manifest_identity(ctx, &base_url);
+    if ctx.public_code.is_some() {
+        description.push_str(" Personalized configuration.");
+    }
 
-    let settings = load_catalog_settings_merged();
+    let settings = ctx.settings.as_ref();
     let mut catalogs: Vec<Value> = pm_catalogs().as_array().cloned().unwrap_or_default();
     // `catalogs_enabled: false` advertises NO catalogs at all (the PHP empties
     // the list AND drops the `catalog` resource); otherwise each row still has
@@ -9244,33 +9574,43 @@ async fn manifest(ctx: &ReqCtx) -> Value {
         // while catalogs are off: the keyword map is an origin call.
         catalogs.extend(topkw_catalogs().await);
         // A detected home country puts its rows first inside each type.
-        catalogs = prioritise_home_country(catalogs, &settings);
-        catalogs.retain(|c| catalog_advertised(&settings, c));
+        catalogs = prioritise_home_country(catalogs, settings);
+        catalogs.retain(|c| catalog_advertised(settings, c));
     } else {
         catalogs.clear();
     }
     let local_count = catalogs.len();
-    // PHP: `$activeTypes` comes from `enabled_types` (backend.php:15336-15341),
-    // so a disabled media type disappears from the top-level `types` AND from
-    // every resource's `types` — the client then never asks for a row that
-    // cannot exist. Bridged upstream types are appended (backend.php:15369-15371).
-    let mut types = active_types(&settings);
-    let (bridged, bridged_types) = upstream::bridged_catalogs(&settings).await;
-    for t in bridged_types {
-        if !types.contains(&t) {
-            types.push(t);
+    let mut types = active_types(settings);
+    // Public links carry PM catalogs only. Admin manifests keep the upstream
+    // bridge exactly as before.
+    if ctx.public_code.is_none() {
+        let (bridged, bridged_types) = upstream::bridged_catalogs(settings).await;
+        for t in bridged_types {
+            if !types.contains(&t) {
+                types.push(t);
+            }
         }
+        let bridged_count = bridged.len();
+        catalogs.extend(bridged);
+        log(
+            "manifest built",
+            &serde_json::json!({
+                "local_catalogs": local_count,
+                "bridged_catalogs": bridged_count,
+                "types": types.clone(),
+            }),
+        );
+    } else {
+        log(
+            "manifest built",
+            &serde_json::json!({
+                "local_catalogs": local_count,
+                "bridged_catalogs": 0,
+                "types": types.clone(),
+                "public": true,
+            }),
+        );
     }
-    let bridged_count = bridged.len();
-    catalogs.extend(bridged);
-    log(
-        "manifest built",
-        &serde_json::json!({
-            "local_catalogs": local_count,
-            "bridged_catalogs": bridged_count,
-            "types": types.clone(),
-        }),
-    );
 
     // `resources` is an array of OBJECTS, exactly like the PHP
     // (backend.php:15418-15438): each one declares the `types` it serves, and
@@ -9278,7 +9618,11 @@ async fn manifest(ctx: &ReqCtx) -> Value {
     // array loses that scoping — the client cannot tell that (say) a `tvdb:`
     // id is answerable — and `catalog` is only advertised when a row actually
     // survived the filters.
-    let resources = manifest_resources(&types, !catalogs.is_empty());
+    let resources = manifest_resources(
+        &types,
+        !catalogs.is_empty(),
+        ctx.public_code.is_none(),
+    );
 
     // The SHIPPED logo only. The PHP keeps a raw.githubusercontent.com copy as a
     // fallback for deployments without `public/logo.png`; this port embeds the
@@ -9286,8 +9630,17 @@ async fn manifest(ctx: &ReqCtx) -> Value {
     // every build serves its own logo and never depends on that host.
     let logo_url = format!("{}/logo.png", base_url);
 
+    let id = if let Some(code) = ctx.public_code.as_deref() {
+        format!(
+            "org.pencarimovie.addon.{}.{}",
+            mode,
+            crate::public_config::payload_id(code)
+        )
+    } else {
+        format!("org.pencarimovie.addon.{}", mode)
+    };
     let mut doc = serde_json::json!({
-        "id": format!("org.pencarimovie.addon.{}", mode),
+        "id": id,
         // The APP version (`1.0.52` on Android), not "1.0.0" and not the engine's
         // `git describe`: Stremio/Nuvio parse and DISPLAY this, so a fixed value
         // made every install look like the first release, and an engine stamp
@@ -9377,7 +9730,7 @@ fn active_types(settings: &Value) -> Vec<String> {
 /// The `resources` array (backend.php:15418-15438): objects, each declaring the
 /// `types` it serves, with `idPrefixes` on meta/stream/subtitles. `catalog` is
 /// advertised only when a row actually survived the filters.
-fn manifest_resources(types: &[String], has_catalogs: bool) -> Vec<Value> {
+fn manifest_resources(types: &[String], has_catalogs: bool, include_subtitles: bool) -> Vec<Value> {
     let mut resources: Vec<Value> = Vec::new();
     if has_catalogs {
         resources.push(serde_json::json!({
@@ -9385,14 +9738,66 @@ fn manifest_resources(types: &[String], has_catalogs: bool) -> Vec<Value> {
             "types": types,
         }));
     }
-    for name in ["meta", "stream", "subtitles"] {
+    for name in ["meta", "stream"] {
         resources.push(serde_json::json!({
             "name": name,
             "types": types,
             "idPrefixes": ID_PREFIXES,
         }));
     }
+    if include_subtitles {
+        resources.push(serde_json::json!({
+            "name": "subtitles",
+            "types": types,
+            "idPrefixes": ID_PREFIXES,
+        }));
+    }
     resources
+}
+
+/// A personalized URL whose payload failed to decode. Stremio renders the
+/// descriptor, so answer one that tells the user where to go instead of a 404
+/// they cannot act on. `configurationRequired` makes the client show Configure,
+/// not Install.
+fn invalid_config_manifest(ctx: &ReqCtx, err: &str) -> Response {
+    let base = rtrim(&ctx.base_url);
+    let doc = serde_json::json!({
+        "id": "org.pencarimovie.addon.invalid",
+        "version": crate::config::descriptor_version(),
+        "name": "PencariMovie (invalid configuration)",
+        "description": format!(
+            "This addon link is invalid ({}). Open {}/configure to build a new one.",
+            err, base
+        ),
+        "resources": [],
+        "types": [],
+        "catalogs": [],
+        "logo": format!("{}/logo.png", base),
+        "background": format!("{}/logo.png", base),
+        "behaviorHints": {
+            "configurable": true,
+            "configurationRequired": true,
+            "adult": false,
+            "p2p": false,
+        },
+    });
+    stremio_json(200, &doc, "no-store")
+}
+
+async fn invalid_config_stream(ctx: &ReqCtx) -> Response {
+    let base = rtrim(&ctx.base_url);
+    single_card_streams(
+        &ctx.base_url,
+        serde_json::json!({
+            "name": "PencariMovie",
+            "description": format!(
+                "This addon link is invalid.\n👉 Open {}/configure to build a new one.",
+                base
+            ),
+            "externalUrl": format!("{}/configure", base),
+        }),
+    )
+    .await
 }
 
 /// The descriptor RESPONSE (backend.php:15468-15488): a byte-stable `ETag`, a
@@ -9485,6 +9890,10 @@ fn version_answer(
         "version": display,
         "client_version": client,
         "build": crate::config::build_id(),
+        // Additive: the dashboard uses this to switch the Addon panel to the
+        // public /configure + /manifest.json links and never print the admin
+        // token as the user-facing address.
+        "public": crate::config::public_mode(),
     });
     if !min_version.is_empty() {
         out["minimum_version"] = serde_json::json!(min_version);
@@ -9535,6 +9944,10 @@ async fn check_version() -> Value {
             obj.insert(
                 "update_needed".to_string(),
                 serde_json::json!(!app_shell && !min.is_empty() && version_less(&current, &min)),
+            );
+            obj.insert(
+                "public".to_string(),
+                serde_json::json!(crate::config::public_mode()),
             );
         }
         return v;
@@ -10204,6 +10617,61 @@ mod tests {
         assert_eq!(parse_external_id(""), None);
     }
 
+    /* ── public mode ──────────────────────────────────────────────────────── */
+
+    #[test]
+    fn public_stream_urls_never_carry_the_admin_token() {
+        assert_eq!(stream_token_segment(true, true, "abc123"), "");
+        assert_eq!(stream_token_segment(true, false, "abc123"), "");
+        assert_eq!(stream_token_segment(false, true, "abc123"), "/abc123");
+        assert_eq!(stream_token_segment(false, false, "abc123"), "");
+        assert_eq!(stream_token_segment(false, true, ""), "");
+    }
+
+    #[test]
+    fn stream_cache_key_is_per_effective_config() {
+        let a = stream_cache_key("movie", "tt1", "http://h", "aaaa");
+        let b = stream_cache_key("movie", "tt1", "http://h", "bbbb");
+        assert_ne!(a, b);
+        assert!(a.starts_with("v5|"));
+    }
+
+    #[test]
+    fn stream_caps_keep_priority_and_limit_each_resolution() {
+        let scored = vec![
+            (5.0, "4k".to_string(), serde_json::json!({"n": 1})),
+            (4.0, "4k".to_string(), serde_json::json!({"n": 2})),
+            (3.0, "1080p".to_string(), serde_json::json!({"n": 3})),
+            (2.0, "1080p".to_string(), serde_json::json!({"n": 4})),
+        ];
+        let out = apply_stream_caps(scored, 1, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["n"], 1);
+        assert_eq!(out[1]["n"], 3);
+        let uncapped = apply_stream_caps(
+            vec![
+                (2.0, "4k".to_string(), serde_json::json!({"n": 1})),
+                (1.0, "4k".to_string(), serde_json::json!({"n": 2})),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(uncapped.len(), 2);
+    }
+
+    #[test]
+    fn a_public_hidden_catalog_is_not_advertised() {
+        let cfg = crate::public_config::PublicConfig {
+            hide_catalogs: vec!["pm_movies_malay".to_string()],
+            ..Default::default()
+        };
+        let merged = crate::public_config::merge(&default_catalog_settings(), &cfg);
+        let row = serde_json::json!({"id": "pm_movies_malay", "type": "movie"});
+        assert!(!catalog_advertised(&merged, &row));
+        let untouched = serde_json::json!({"id": "pm_movies_indo", "type": "movie"});
+        assert!(catalog_advertised(&merged, &untouched));
+    }
+
     /* ── descriptor parity (backend.php:15303-15489) ──────────────────────── */
 
     fn ctx_with(headers: &[(&str, &str)], base: &str, query: &[(&str, &str)]) -> ReqCtx {
@@ -10227,6 +10695,12 @@ mod tests {
             remote: "127.0.0.1".into(),
             local: String::new(),
             base_url: base.to_string(),
+            settings: Arc::new(default_catalog_settings()),
+            global_settings: Arc::new(default_catalog_settings()),
+            addon_open: false,
+            public_code: None,
+            public_error: None,
+            config_fp: "d".into(),
         }
     }
 
@@ -10409,6 +10883,37 @@ mod tests {
         assert_eq!(jstr(&round, "short_code"), "abc123");
         assert_eq!(jstr(&round, "file_id_mt"), "IDMT");
         assert_eq!(jstr(&round, "bot_id"), "bot-1");
+    }
+
+    #[test]
+    fn node_pool_lists_remote_nodes_and_this_server_once() {
+        let pool = node_pool(
+            "https://self.example/",
+            vec!["https://a.example".to_string(), "https://self.example".to_string()],
+        );
+        assert_eq!(
+            pool,
+            vec!["https://self.example".to_string(), "https://a.example".to_string()]
+        );
+
+        let with_local = node_pool("https://self.example", vec!["https://a.example".to_string()]);
+        assert_eq!(
+            with_local,
+            vec!["https://self.example".to_string(), "https://a.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_remote_stream_payload_keeps_only_the_short_code() {
+        let local = stream_payload("abc123", "Film.mkv", "video/x-matroska", 9, "IDMT", "bot-1");
+        let remote = remote_stream_payload(&local).expect("short code is present");
+        assert_eq!(jstr(&remote, "short_code"), "abc123");
+        assert!(remote.get("file_id_mt").is_none());
+        assert!(remote.get("file_id").is_none());
+        assert!(remote.get("bot_id").is_none());
+
+        let id_only = stream_payload("", "Film.mkv", "video/x-matroska", 9, "IDMT", "bot-1");
+        assert!(remote_stream_payload(&id_only).is_none());
     }
 
     #[test]
@@ -10617,7 +11122,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let with = manifest_resources(&types, true);
+        let with = manifest_resources(&types, true, true);
         assert_eq!(with.len(), 4);
         assert!(with.iter().all(|r| r.is_object()), "resources are objects");
         assert_eq!(with[0]["name"], "catalog");
@@ -10629,12 +11134,19 @@ mod tests {
         }
         let names: Vec<&str> = with.iter().map(|r| r["name"].as_str().unwrap_or("")).collect();
         assert_eq!(names, ["catalog", "meta", "stream", "subtitles"]);
+        // Public links do not advertise subtitles.
+        let public = manifest_resources(&types, true, false);
+        let public_names: Vec<&str> = public
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(public_names, ["catalog", "meta", "stream"]);
         // No catalogs → no `catalog` resource at all (backend.php:15418).
-        let without = manifest_resources(&types, false);
+        let without = manifest_resources(&types, false, true);
         assert_eq!(without.len(), 3);
         assert!(without.iter().all(|r| r["name"] != "catalog"));
         // Only the ENABLED types are advertised (backend.php:15421).
-        let only_series = manifest_resources(&["series".to_string()], true);
+        let only_series = manifest_resources(&["series".to_string()], true, true);
         assert_eq!(only_series[0]["types"], serde_json::json!(["series"]));
         // The PHP's order: `pm_` BEFORE `pm:` (backend.php:15458).
         assert_eq!(

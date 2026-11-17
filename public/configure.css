@@ -1,0 +1,155 @@
+/* Public configure screen — extends the dashboard Titanium system.
+ * Colours, faces, radii and control states come from dashboard.css; this file
+ * only places the two-column layout around the existing catalog controls. */
+
+.public-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  gap: 20px;
+  align-items: start;
+}
+
+.public-settings {
+  min-width: 0;
+}
+
+.addon-catalog-item.locked,
+.addon-catalog-pill.locked,
+.addon-catalog-pill:has(input:disabled) {
+  color: var(--pm-text-muted);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* styles.css hard-codes a green focus ring and green checked pill. Keep the
+ * public page on the Titanium focus/accent colours instead. */
+body[data-pm-shell='dashboard'] .addon-catalog-pill:focus-within {
+  border-color: var(--pm-border-focus) !important;
+  background: var(--pm-bg-surface-hover) !important;
+  outline: 2px solid var(--pm-border-focus) !important;
+  outline-offset: 2px !important;
+  box-shadow: none !important;
+}
+
+body[data-pm-shell='dashboard'] .addon-catalog-pill:has(input:checked) {
+  border-color: var(--pm-border-strong);
+  background: var(--pm-bg-surface-hover);
+  color: var(--pm-text-primary);
+}
+
+body[data-pm-shell='dashboard'] .addon-catalog-pill input,
+body[data-pm-shell='dashboard'] .addon-catalog-item input {
+  accent-color: var(--pm-accent);
+}
+
+.public-install {
+  position: sticky;
+  top: 76px;
+  margin-bottom: 16px;
+}
+
+.public-divider {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--pm-bg-surface-hover);
+}
+
+.public-url {
+  min-height: 112px;
+  resize: vertical;
+  font-family: var(--pm-font-mono);
+  font-size: 0.76rem;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.public-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.public-field {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 12px;
+  color: var(--pm-text-secondary);
+  font-size: 0.8rem;
+}
+
+.public-field > span {
+  font-weight: 500;
+}
+
+.public-field .pm-input {
+  font: inherit;
+  font-size: 0.82rem;
+}
+
+.public-status {
+  min-height: 1.2em;
+  margin: 0 0 10px;
+  color: var(--pm-status-online);
+  font-size: 0.84rem;
+}
+
+.public-error {
+  margin: 0 0 10px;
+  color: var(--pm-status-danger);
+  font-size: 0.84rem;
+}
+
+.public-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.public-footer a {
+  color: var(--pm-text-secondary);
+  text-decoration: none;
+}
+
+.public-footer a:hover {
+  color: var(--pm-text-primary);
+  text-decoration: underline;
+}
+
+.public-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.public-filter-grid .public-field {
+  margin: 0;
+}
+
+@media (max-width: 960px) {
+  .public-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .public-install {
+    position: static;
+  }
+}
+
+@media (max-width: 640px) {
+  .pm-header__inner {
+    flex-wrap: nowrap;
+  }
+
+  .pm-status {
+    width: auto;
+    margin-left: auto;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 620px) {
+  .public-actions .pm-btn {
+    flex: 1 1 100%;
+  }
+}

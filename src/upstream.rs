@@ -108,6 +108,12 @@ pub fn configured(settings: &Value, respect_master_switch: bool) -> Vec<Upstream
     list.iter()
         .enumerate()
         .filter_map(|(index, m)| {
+            // Public mode lets a link disable a source. Missing means enabled,
+            // and `index` stays the STORED position so `up_<index>_…` ids do not
+            // shift when a neighbour is turned off.
+            if !m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) {
+                return None;
+            }
             let url = s(m, "url");
             if url.is_empty() {
                 return None;
@@ -1421,6 +1427,24 @@ mod tests {
         assert_eq!(s(&list[0], "name"), "AIOMetadata");
         assert!(s(&list[1], "url").contains("opensubtitles-v3"));
         assert_eq!(s(&list[1], "name"), "OpenSubtitles v3");
+    }
+
+    #[test]
+    fn disabled_upstreams_are_skipped_without_shifting_indexes() {
+        let settings = json!({
+            "upstream_enabled": true,
+            "upstream_manifests": [
+                {"url": "https://a.example/manifest.json", "name": "A"},
+                {"url": "https://b.example/manifest.json", "name": "B", "enabled": false},
+                {"url": "https://c.example/manifest.json", "name": "C", "enabled": true}
+            ]
+        });
+        let ups = configured(&settings, true);
+        assert_eq!(ups.len(), 2);
+        assert_eq!(ups[0].index, 0);
+        assert_eq!(ups[0].name, "A");
+        assert_eq!(ups[1].index, 2, "the disabled middle row must not renumber C");
+        assert_eq!(ups[1].name, "C");
     }
 
     /* ── verified episode names (fd_upstream_episode_names) ─────────────────── */

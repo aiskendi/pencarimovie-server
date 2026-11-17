@@ -30,6 +30,32 @@ Treat that URL as a capability token:
 
 - Anyone with the URL can browse the catalog, resolve files, and stream/download through `/api/download`.
 - Tunnel enable/disable, bot login, bot add/remove, and logout stay restricted to the real local dashboard. Cloudflare connections are not treated as localhost even though `cloudflared` proxies as `127.0.0.1`.
+
+## Public mode (`PM_PUBLIC=1`)
+
+Public mode is an explicit opt-in that makes the addon surface multi-user. The security
+model changes in four ways:
+
+1. **Addon routes are public.** `/manifest.json`, `/catalog/*`, `/meta/*`,
+   `/stream/*`, `/subtitles/*`, `/thumb/*`, and `/api/download` no longer require the
+   admin token. The existing per-IP counters remain the abuse control.
+2. **The admin surface is still closed.** The dashboard is at `/admin`; all management
+   APIs still require the password/token, and `auth_enabled()` is forced on even if the
+   stored `auth.json` says otherwise.
+3. **The admin token is never emitted.** Stream URLs and external links omit the
+   `/<token>` segment while public mode is on. Do not paste `/<token>/manifest.json` into
+   a public support thread; use `/configure` or `/manifest.json`.
+4. **Public links cannot add URLs or loosen filters.** The `<payload>` path segment can
+   hide or show built-in catalogs and tighten stream filters. Public links do not use
+   upstream addons at all, so the server never fetches a URL because of an anonymous
+   public link. Admin manifests and the admin dashboard are unchanged.
+5. **`PM_NODES` is a public URL list.** It only affects public stream/download links and
+   accepts HTTP(S) origins without credentials, queries, or fragments. Those node URLs are
+   emitted to clients; never put an admin token or private hostname in `PM_NODES`.
+
+Startup guards refuse the default `123456` password and the sample tokens published in
+this repository. Set a real `SERVER_PASSWORD`, a fresh `SERVER_TOKEN`, `PM_MAX_STREAMS`
+for the host, and `PM_TRUST_XFF=1` behind a reverse proxy.
 - Tunneled `/api/session` omits `api_secret`.
 - Disable the tunnel from Settings, or run `stop.bat` / `./stop.sh`, when you no longer need public access. Hostnames rotate on each enable.
 

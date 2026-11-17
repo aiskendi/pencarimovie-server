@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::response::Response;
 use rand::RngCore;
@@ -42,6 +42,22 @@ pub struct ReqCtx {
     pub remote: String,
     pub local: String,
     pub base_url: String,
+    /// The settings document THIS request must use: the global file/env merge in
+    /// private mode, or the per-link public configuration merged over it.
+    pub settings: Arc<serde_json::Value>,
+    /// The operator's global settings, unaffected by a public-link overlay. The
+    /// admin endpoints and the public options endpoint must always read this.
+    pub global_settings: Arc<serde_json::Value>,
+    /// True only when public mode is on. Addon routes and `/api/download` use
+    /// this to stay reachable without the admin token; admin routes never do.
+    pub addon_open: bool,
+    /// The config payload from the first path segment, when this request came
+    /// through a personalized link. Also used to prefill the Stremio gear page.
+    pub public_code: Option<String>,
+    /// Set when the first segment looked like a config but failed to decode.
+    pub public_error: Option<String>,
+    /// Fingerprint of the effective stream/source configuration, for cache keys.
+    pub config_fp: String,
 }
 
 impl ReqCtx {
@@ -418,7 +434,14 @@ pub fn auth_save(data: &AuthData) {
 }
 
 pub fn auth_enabled() -> bool {
-    auth_load().enabled.unwrap_or(true)
+    effective_auth_enabled(auth_load().enabled.unwrap_or(true), crate::config::public_mode())
+}
+
+/// Public mode forces the admin gate on even when the stored `auth.json` says
+/// `enabled: false`. The addon routes bypass this through `ctx.addon_open`; the
+/// admin routes never do.
+fn effective_auth_enabled(stored: bool, public: bool) -> bool {
+    stored || public
 }
 
 /// True while the server still accepts the built-in default password.
@@ -876,7 +899,23 @@ mod tests {
             remote: remote.into(),
             local: local.into(),
             base_url: format!("http://{local}:8088"),
+            settings: Arc::new(serde_json::json!({})),
+            global_settings: Arc::new(serde_json::json!({})),
+            addon_open: false,
+            public_code: None,
+            public_error: None,
+            config_fp: "d".into(),
         }
+    }
+
+    /// Public mode forces the admin gate on; the stored `enabled:false` value is
+    /// preserved in `auth.json` but does not leave the admin surface open.
+    #[test]
+    fn public_mode_forces_effective_auth_on() {
+        assert!(effective_auth_enabled(true, true));
+        assert!(effective_auth_enabled(false, true));
+        assert!(effective_auth_enabled(true, false));
+        assert!(!effective_auth_enabled(false, false));
     }
 
     /// A request that arrived through the Cloudflare tunnel is NEVER this
@@ -914,6 +953,10 @@ mod tests {
         let public = ctx_with("8.8.8.8", "192.168.2.225", &[]);
         assert!(!auth_privileged(&public));
         assert!(require_privileged(&public).is_some());
+        // The dashboard/management gate must refuse it too. A localhost probe
+        // cannot exercise this (loopback is deliberately privileged), so this
+        // is where the public-mode gate is pinned.
+        assert!(require_trusted_device(&public).is_some());
     }
 
     /// A LAN peer without a token cannot provision; the engine binds 0.0.0.0 on

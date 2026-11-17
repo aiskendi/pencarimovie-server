@@ -488,6 +488,12 @@ mod tests {
             remote: remote.to_string(),
             local: String::new(),
             base_url: String::new(),
+            settings: std::sync::Arc::new(serde_json::json!({})),
+            global_settings: std::sync::Arc::new(serde_json::json!({})),
+            addon_open: false,
+            public_code: None,
+            public_error: None,
+            config_fp: "d".into(),
         }
     }
 

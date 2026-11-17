@@ -8,6 +8,10 @@ services:
     environment:
       - PORT=${PORT:-8088}
       - MALLOC_ARENA_MAX=2
+      # 1 = public mode (addon routes public, /configure per-user links,
+      # admin at /admin). Keep 0 unless you have set SERVER_PASSWORD and a
+      # fresh SERVER_TOKEN.
+      - PM_PUBLIC=${PM_PUBLIC:-0}
     deploy:
       resources:
         limits:

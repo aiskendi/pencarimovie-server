@@ -25,6 +25,16 @@
     <script src="assets/runtime/legacy-features.js?v=20261028dash18"></script>
   </head>
   <body class="stream-dark" data-pm-shell="dashboard">
+    <div
+      id="publicModeBanner"
+      class="hidden"
+      role="status"
+      style="padding:10px 16px;background:#2a1a12;border-bottom:1px solid #4a2a1a;color:#ffd7c6;font-size:13px;text-align:center"
+    >
+      Public mode is on. Share
+      <a href="/configure" style="color:#ff9a6b">/configure</a>
+      so users can build their own link. The admin token stays private.
+    </div>
     <!-- No #loadingScreen here on purpose. It was a media-shell overlay whose
          only exit was showSettingsGate()/hideSettingsGate(), and those return
          early now that there is no gate — so disconnect left "Provisioning guest
@@ -1959,7 +1969,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261111multitoken2"></script>
+    <script defer src="app.js?v=20261117public1"></script>
     <script defer src="dashboard.js?v=20261111multitoken2"></script>
   </body>
 </html>

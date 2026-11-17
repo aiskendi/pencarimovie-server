@@ -22,6 +22,11 @@
       "value": "123456",
       "required": false
     },
+    "PM_PUBLIC": {
+      "description": "Set to 1 to enable public mode: addon routes become unauthenticated, /configure builds per-user links, and the admin dashboard moves to /admin. The default sample SERVER_TOKEN above is refused in public mode; set a fresh one and a strong SERVER_PASSWORD first.",
+      "value": "0",
+      "required": false
+    },
     "PM_MAX_STREAMS": {
       "description": "Concurrent /api/download bodies before 503 + Retry-After. The engine default is 0 (unlimited), which suits self-hosting; a PaaS with a short request timeout wants an explicit cap, because overflow past it dies on the router timeout (Heroku H12 at 30s) and returns an HTML error page instead of a retryable JSON 503.",
       "value": "256",

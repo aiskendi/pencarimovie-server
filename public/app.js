@@ -65,6 +65,7 @@ const setInert = function () {
 class PencariMovieApp {
   constructor() {
     this.localApiBase = window.location.origin;
+    this.publicMode = false;
     this.wpApiBase = "https://pencarimovie.com/wp-json/pencarimovie-server/v1";
     this.siteName = "PencariMovie";
     this.categories = [];
@@ -710,6 +711,14 @@ class PencariMovieApp {
         const info = document.createElement("div");
         info.style.cssText = "overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;";
         info.innerHTML = '<strong style="font-size: 0.8rem; color: #fff;">'.concat(item.name || "Addon", '</strong> <span style="font-size: 0.72rem; color: #888;">(').concat(item.version || "1.0.0", ')</span><br/><span style="font-size: 0.7rem; color: #aaa; font-family: monospace;">').concat(item.url, "</span>");
+        const enabledToggle = document.createElement("input");
+        enabledToggle.type = "checkbox";
+        enabledToggle.checked = item.enabled !== false;
+        enabledToggle.title = "Enable or disable this source";
+        enabledToggle.style.cssText = "width: 15px; height: 15px; cursor: pointer; flex: 0 0 auto;";
+        enabledToggle.addEventListener("change", () => {
+          item.enabled = enabledToggle.checked;
+        });
         const delBtn = document.createElement("button");
         delBtn.type = "button";
         delBtn.style.cssText = "background: none; border: none; color: #ff5e57; cursor: pointer; font-size: 0.82rem; padding: 4px;";
@@ -720,6 +729,7 @@ class PencariMovieApp {
           renderUpstreamAddons();
           updateCatalogModeUI();
         });
+        row.appendChild(enabledToggle);
         row.appendChild(info);
         row.appendChild(delBtn);
         upstreamAddonsList.appendChild(row);
@@ -758,7 +768,8 @@ class PencariMovieApp {
                 id: m.id,
                 name: m.name,
                 version: m.version,
-                url: m.url
+                url: m.url,
+                enabled: true
               });
               renderUpstreamAddons();
               updateCatalogModeUI();
@@ -1405,7 +1416,10 @@ class PencariMovieApp {
       const pagePort = Number(window.location.port);
       const httpPort = !onTunnel && pagePort > 0 ? pagePort : listenPort;
       const portSuffix = httpPort && httpPort !== 80 ? ":".concat(httpPort) : "";
-      const tokenPrefix = this._authToken ? "/".concat(encodeURIComponent(this._authToken)) : "";
+      const tokenPrefix = this.publicMode ? "" : (this._authToken ? "/".concat(encodeURIComponent(this._authToken)) : "");
+      // The music addon stays admin-only in public mode, so its URL still needs
+      // the token when opened from the operator's dashboard.
+      const musicTokenPrefix = this._authToken ? "/".concat(encodeURIComponent(this._authToken)) : "";
       const pageHost = window.location.hostname;
       const isLocal = pageHost === "localhost" || pageHost === "127.0.0.1" || pageHost === "::1";
       // A page opened from a LAN address is "not local" but its origin must never
@@ -1427,7 +1441,7 @@ class PencariMovieApp {
         // Public origin: the token is mandatory, even if we somehow do not have it
         // loaded yet — a URL without it is a URL that answers the locked card, so
         // say so in the log rather than print a broken manifest address.
-        if (!tokenPrefix) {
+        if (!tokenPrefix && !this.publicMode) {
           console.warn("[addon] public host without an access token — log in so the manifest URL carries it:", h);
         }
         return tokenPrefix;
@@ -1462,11 +1476,11 @@ class PencariMovieApp {
       // (`/eclipse` stays an alias).
       let musicBase = "";
       if (onTunnel && tunnelUrl) {
-        musicBase = "".concat(tunnelUrl).concat(tokenPrefix);
+        musicBase = "".concat(tunnelUrl).concat(musicTokenPrefix);
       } else if (!isLocal && !pageHostIsLan) {
-        musicBase = "".concat(window.location.origin.replace(/\/+$/, "")).concat(tokenPrefix);
+        musicBase = "".concat(window.location.origin.replace(/\/+$/, "")).concat(musicTokenPrefix);
       } else if (tunnelUrl) {
-        musicBase = "".concat(tunnelUrl).concat(tokenPrefix);
+        musicBase = "".concat(tunnelUrl).concat(musicTokenPrefix);
       } else {
         musicBase = "http://127.0.0.1".concat(portSuffix);
       }
@@ -1646,7 +1660,7 @@ class PencariMovieApp {
         const ddlHost = String(window.location.hostname || "").toLowerCase();
         const ddlLoopback = ddlHost === "localhost" || ddlHost.endsWith(".localhost") ||
           ddlHost === "::1" || ddlHost === "[::1]" || /^127\./.test(ddlHost);
-        const ddlToken = ddlLoopback ? "" : String(this._authToken || "").trim();
+        const ddlToken = this.publicMode || ddlLoopback ? "" : String(this._authToken || "").trim();
         const ddldomain = ddlOrigin + (ddlToken ? "/" + encodeURIComponent(ddlToken) : "");
         settingsSearchWebsiteBtn.href = "https://pencarimovie.com/search/?ddldomain=" + encodeURIComponent(ddldomain);
         // The tooltip names the origin only: it is read on a shared screen more
@@ -6028,6 +6042,15 @@ class PencariMovieApp {
           return null;
         }
         const data = yield resp.json();
+        // Public mode is additive: when it is off, every URL below is exactly the
+        // tokenised one it always was. When it is on, the admin token must never
+        // be printed as the user-facing addon address.
+        this.publicMode = !!(data == null ? void 0 : data.public);
+        const publicBanner = document.getElementById("publicModeBanner");
+        if (publicBanner) publicBanner.classList.toggle("hidden", !this.publicMode);
+        if (this.publicMode && typeof this._updateAddonModalUrls === "function") {
+          this._updateAddonModalUrls();
+        }
         if (data == null ? void 0 : data.current_version) {
           // Show the APP version (the installed APK / desktop package) when the
           // engine reports one; `current_version` is the engine and does not

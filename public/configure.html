@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0c10" />
+    <title>PencariMovie — Configure your addon</title>
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="stylesheet" href="/stream-theme.css?v=20261009pm10" />
+    <link rel="stylesheet" href="/styles.css?v=20261024music2" />
+    <link rel="stylesheet" href="/dashboard.css?v=20261112botactions1" />
+    <link rel="stylesheet" href="/configure.css?v=20261118titanium8" />
+  </head>
+  <body data-pm-shell="dashboard">
+    <div class="pm-shell">
+      <header class="pm-header">
+        <div class="pm-container pm-header__inner">
+          <a class="pm-brand" href="/">
+            <img class="pm-brand__logo" src="/logo.png" alt="" width="26" height="26" />
+            <span class="pm-brand__title">PencariMovie</span>
+          </a>
+        </div>
+      </header>
+
+      <main class="pm-main">
+        <div class="pm-container">
+          <h1 class="pm-h1">Configure your addon</h1>
+          <p class="pm-lede">
+            Choose the catalog rows and stream filters this server should carry in your
+            link. Your choices live in the URL; nothing is stored on the server.
+          </p>
+          <p id="status" class="public-status" role="status"></p>
+          <p id="error" class="public-error hidden" role="alert"></p>
+
+          <div class="public-layout">
+            <div class="public-settings">
+              <section class="addon-catalog-card" id="addonCatalogCard">
+                <div class="addon-catalog-card__header">
+                  <span class="addon-catalog-card__title">Catalog Configuration</span>
+                  <span id="catalogModeBadge" class="addon-catalog-card__badge">Enabled</span>
+                </div>
+
+                <div class="addon-catalog-card__modes" role="radiogroup" aria-label="Catalog mode">
+                  <label class="addon-catalog-mode-opt">
+                    <input type="radio" name="catalogModeRadio" id="catalogMasterOn" value="on" checked />
+                    <div class="addon-catalog-mode-opt__info">
+                      <strong>PencariMovie Catalogs: Enabled</strong>
+                      <span>Local home rows, categories and country rows stay in the addon.</span>
+                    </div>
+                  </label>
+                  <label class="addon-catalog-mode-opt">
+                    <input type="radio" name="catalogModeRadio" id="catalogMasterOff" value="off" />
+                    <div class="addon-catalog-mode-opt__info">
+                      <strong>PencariMovie Catalogs: Disabled</strong>
+                      <span>Hide local catalog rows; streams stay active.</span>
+                    </div>
+                  </label>
+                </div>
+
+                <div class="addon-catalog-details" id="addonCatalogDetails">
+                  <div class="addon-catalog-section">
+                    <div class="addon-catalog-section__label">Media Types:</div>
+                    <div class="addon-catalog-pill-group" id="typeRow">
+                      <label class="addon-catalog-pill">
+                        <input id="typeMovie" type="checkbox" checked />
+                        <span>Movies</span>
+                      </label>
+                      <label class="addon-catalog-pill">
+                        <input id="typeSeries" type="checkbox" checked />
+                        <span>Series</span>
+                      </label>
+                      <label class="addon-catalog-pill">
+                        <input id="typeOther" type="checkbox" checked />
+                        <span>Telegram Files (Other)</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="addon-catalog-section">
+                    <div class="addon-catalog-section__label">
+                      <span>Core &amp; Telegram Catalogs:</span>
+                      <span class="addon-catalog-quick-links">
+                        <button type="button" class="addon-catalog-link-btn" id="catalogAllSpecial">All</button>
+                        <button type="button" class="addon-catalog-link-btn" id="catalogNoneSpecial">None</button>
+                      </span>
+                    </div>
+                    <div id="specialList" class="addon-catalog-list"></div>
+                  </div>
+
+                  <div class="addon-catalog-section">
+                    <div class="addon-catalog-section__label">
+                      <span>Categories &amp; Countries:</span>
+                      <span class="addon-catalog-quick-links">
+                        <button type="button" class="addon-catalog-link-btn" id="catalogAllBrowse">All</button>
+                        <button type="button" class="addon-catalog-link-btn" id="catalogNoneBrowse">None</button>
+                      </span>
+                    </div>
+                    <div id="catalogList" class="addon-catalog-list"></div>
+                  </div>
+                </div>
+
+                <div class="addon-catalog-section public-divider">
+                  <div class="addon-catalog-section__label">
+                    <span>Streams Configuration:</span>
+                  </div>
+                  <p class="pm-hint">
+                    Filter, rank and limit the video streams delivered to Stremio and Nuvio.
+                  </p>
+                  <div id="streamFilters"></div>
+                </div>
+              </section>
+            </div>
+
+            <aside class="public-install addon-catalog-card">
+              <div class="addon-catalog-card__header">
+                <span class="addon-catalog-card__title">Install</span>
+                <span id="configMeta" class="addon-catalog-card__badge"></span>
+              </div>
+              <label class="public-field">
+                <span>Your addon manifest URL</span>
+                <textarea id="installUrl" class="pm-input public-url" readonly spellcheck="false" rows="5"></textarea>
+              </label>
+              <div class="public-actions">
+                <a id="installBtn" class="pm-btn pm-btn--primary" href="#">Install on Stremio</a>
+                <button type="button" id="copyBtn" class="pm-btn">Copy link</button>
+                <button type="button" id="resetBtn" class="pm-btn">Reset</button>
+              </div>
+              <p class="pm-hint">
+                Changing a setting creates a new link. Re-install it in Stremio or Nuvio;
+                the old link keeps working until you remove it.
+              </p>
+            </aside>
+          </div>
+        </div>
+      </main>
+
+      <footer class="pm-footer">
+        <div class="pm-container public-footer">
+          <span>PencariMovie Server</span>
+        </div>
+      </footer>
+    </div>
+
+    <script defer src="/configure.js?v=20261118titanium8"></script>
+  </body>
+</html>

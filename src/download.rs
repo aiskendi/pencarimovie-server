@@ -1247,9 +1247,18 @@ fn boot_at() -> i64 {
     *BOOT.get_or_init(now)
 }
 
+/// Public mode opens the addon surface without the admin token, so the old
+/// `is_authenticated` gate must not 401 a viewer. Private mode is unchanged.
+fn download_allowed(addon_open: bool, authenticated: bool) -> bool {
+    addon_open || authenticated
+}
+
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let started = std::time::Instant::now();
-    if !is_authenticated(ctx) {
+    // Public mode is the addon surface: the admin token is no longer embedded in
+    // stream URLs, so the download route is public there and relies on the
+    // existing per-IP limits. Private mode keeps the old auth gate exactly.
+    if !download_allowed(ctx.addon_open, is_authenticated(ctx)) {
         record_refusal(ctx, started, 401, "AUTH_REQUIRED", "Server password or token required", "", serde_json::json!({}));
         return json_response(
             401,
@@ -3110,6 +3119,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_mode_opens_downloads_without_an_admin_token() {
+        assert!(download_allowed(true, false));
+        assert!(download_allowed(true, true));
+        assert!(download_allowed(false, true));
+        assert!(!download_allowed(false, false));
+    }
 
     #[test]
     fn active_titles_tracks_guard_lifetime() {

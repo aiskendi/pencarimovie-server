@@ -6,6 +6,22 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
 
 ### Added
 
+- **Public mode (`PM_PUBLIC=1` / `--public`) with per-user addon links.** The addon
+  surface becomes public while the dashboard moves to `/admin` and stays password/token
+  protected. `/configure` builds a stateless link whose first path segment is a base64url
+  JSON configuration (`/<payload>/manifest.json`), so users can show or hide catalog rows
+  and tighten stream filters with no account and no server-side storage. Public links use
+  PM catalogs and Telegram streams only: upstream addons and the subtitle source are
+  ignored, and viewers add their own metadata/subtitle addons in the client. Public links
+  cannot add upstream URLs; old `u`/`d` source fields are decoded but ignored. The admin
+  dashboard and admin manifests keep upstream addons and subtitles unchanged.
+  Stream/download URLs no longer carry the admin token in public mode. Existing
+  `/<token>/manifest.json` installs keep working. `PM_NODES` can list additional public
+  base URLs; public stream/download links round-robin local-first across the local node
+  and those nodes. A remote link carries only the short code, so that node resolves it
+  with its own bot and shared `BOT_TOKENS` are not required. This is a plain URL list,
+  not a health-checked balancer.
+
 - **PencariMusic addon v2: real catalogs, artist/album pages, and a Stremio/Nuvio face.** The
   music descriptor advertises `artists` and the `sponsor` row for Eclipse, plus a search catalog
   (`pm_music_search`, required `search` extra), `pm_music_artists` (a `series` whose episodes are

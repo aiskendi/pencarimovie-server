@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!   pencarimovie-server --port 8088 [--host 127.0.0.1] [--workers N]
-//!                     [--inflight 8] [--max-streams 256] [--tray]
+//!                     [--inflight 8] [--max-streams 256] [--public] [--tray]
 //!   pencarimovie-server --decode <file_id_mt> [expected_id]
 //! ```
 //!
@@ -39,6 +39,7 @@ mod log;
 mod matcher;
 mod music_upstreams;
 mod proc;
+mod public_config;
 mod ratelimit;
 mod resolve;
 mod respond;
@@ -667,6 +668,32 @@ async fn main() -> anyhow::Result<()> {
         // and "0.0.0.0 :8088" then fails to parse as a socket address.
         .map(|h| h.trim().to_string())
         .unwrap_or_else(|| default_bind_host(cfg!(target_os = "android"), paas_env_present()).to_string());
+
+    // Public mode is a STARTUP decision and is set before anything calls
+    // `auth_enabled()`. With it off, every branch below behaves exactly as before.
+    let public = arg_pos("--public").is_some() || config::env_flag("PM_PUBLIC");
+    config::set_public_mode(public);
+    if public {
+        if !config::env_flag("PM_ALLOW_DEFAULT_PASSWORD") && auth::auth_uses_default_password() {
+            eprintln!(
+                "\n  refusing to start: PM_PUBLIC=1 with the default admin password.\n  \
+                 Set SERVER_PASSWORD to a strong value (or a strong password in the dashboard) first.\n  \
+                 Emergency override: PM_ALLOW_DEFAULT_PASSWORD=1\n"
+            );
+            std::process::exit(2);
+        }
+        if let Some(raw) = storage::env("SERVER_TOKEN") {
+            let token = raw.trim().to_ascii_lowercase();
+            if KNOWN_SAMPLE_TOKENS.iter().any(|sample| *sample == token) {
+                eprintln!(
+                    "\n  refusing to start: PM_PUBLIC=1 with the published sample SERVER_TOKEN.\n  \
+                     That token is an ADMIN credential once the addon surface is public.\n  \
+                     Set a fresh SERVER_TOKEN (or leave it unset and let the server mint one).\n"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     // DEFAULT: 4 connections, on every platform.
     //
     // `workers × inflight` is the number of `upload.getFile` parts the engine can
@@ -904,6 +931,9 @@ async fn main() -> anyhow::Result<()> {
             "max_bodies_per_ip": state.max_bodies_per_ip,
             "cold_starts_per_ip": state.cold_starts_per_ip,
             "cold_start_window": state.cold_start_window,
+            "public": public,
+            "public_configure": if public { "/configure" } else { "" },
+            "public_admin": if public { "/admin" } else { "" },
             "storage": storage::storage_dir().display().to_string(),
             "version": config::app_version(),
             "runtime": format!("pencarimovie-server {}", config::app_version()),
@@ -935,7 +965,7 @@ async fn main() -> anyhow::Result<()> {
     // already gone to stderr above in the "listening" line.
     if !tray_requested {
         println!(
-            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
+            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n  Public mode: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
             shown,
             port,
             host,
@@ -945,6 +975,11 @@ async fn main() -> anyhow::Result<()> {
             inflight,
             workers * inflight,
             max_streams,
+            if public {
+                "ON  (users: /configure, admin: /admin)"
+            } else {
+                "off"
+            },
             // Counted per TITLE, not per socket: a seek, a segmented download and a
             // preload of the same file all cost one. `0` = that counter is off.
             cap_or_off(max_titles_per_ip),
@@ -1094,6 +1129,14 @@ pub fn default_bind_host(_is_android: bool, _paas: bool) -> &'static str {
     "0.0.0.0"
 }
 
+/// The one-click Heroku/Render templates ship this token in a public repository.
+/// In public mode it is an ADMIN credential, so it must never be accepted as
+/// configured; refusing to boot is the only safe answer.
+const KNOWN_SAMPLE_TOKENS: [&str; 2] = [
+    "66ff097863dedb7ccd8401d5ffe616f2",
+    "66ff097863dedb7ccd8401d5ffe616f3",
+];
+
 /// Environment markers a PaaS sets that a desktop never does.
 ///
 /// `PORT` is deliberately NOT one: the PHP launchers set `PORT=8088` on a
@@ -1150,6 +1193,16 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_flag_accepts_the_documented_truthy_values() {
+        for v in ["1", "true", "TRUE", "on", " yes "] {
+            assert!(config::flag_value(v), "{v:?} must enable public mode");
+        }
+        for v in ["0", "false", "off", "no", ""] {
+            assert!(!config::flag_value(v), "{v:?} must not enable public mode");
+        }
+    }
 
     #[test]
     fn default_bind_host_is_all_interfaces_on_all_platforms() {

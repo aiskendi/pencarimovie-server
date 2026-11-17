@@ -1,7 +1,76 @@
 //! Constants lifted from backend.php:172-260 so every module uses the same
 //! values as the PHP runtime (same defaults, same paths, same strings).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::storage::{env, env_or};
+
+/// Public mode is a STARTUP decision (`--public` / `PM_PUBLIC`).
+///
+/// It is deliberately process-global rather than a per-request flag: the switch
+/// changes which routes are addon-facing and therefore public, and that must not
+/// be flippable by a dashboard click on a live process. Nothing here changes
+/// private-mode behaviour; every reader checks `public_mode()` first.
+static PUBLIC_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_public_mode(on: bool) {
+    PUBLIC_MODE.store(on, Ordering::Relaxed);
+}
+
+pub fn public_mode() -> bool {
+    PUBLIC_MODE.load(Ordering::Relaxed)
+}
+
+/// The one truthiness rule for environment switches (`1/true/on/yes`).
+pub fn flag_value(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+pub fn env_flag(key: &str) -> bool {
+    env(key).map(|v| flag_value(&v)).unwrap_or(false)
+}
+
+/// Parse `PM_NODES`: comma/semicolon/whitespace separated public base URLs of
+/// other PencariMovie servers. Only HTTP(S) origins are accepted; a URL with
+/// credentials, a query string or a fragment is ignored.
+pub fn parse_node_urls(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split([',', ';', '\n', '\r', '\t', ' ']) {
+        let part = part.trim().trim_end_matches('/');
+        if part.is_empty() {
+            continue;
+        }
+        let Ok(url) = url::Url::parse(part) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == part) {
+            out.push(part.to_string());
+        }
+    }
+    out
+}
+
+/// Additional public base URLs used for stream/download links.
+///
+/// Empty means "this server only". The local base URL is added by the caller,
+/// so a deploy can list only the other nodes.
+pub fn node_urls() -> Vec<String> {
+    env("PM_NODES")
+        .map(|raw| parse_node_urls(&raw))
+        .unwrap_or_default()
+}
 
 pub fn wp_api_base() -> String {
     env_or(
@@ -160,6 +229,33 @@ pub fn debug_from_env() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_urls_are_http_origins_without_credentials_or_queries() {
+        let parsed = parse_node_urls(
+            "https://a.example.com/, https://b.example.com/base/; \
+             ftp://c.example.com, https://user:pass@d.example.com, \
+             https://e.example.com?q=1, not-a-url, https://a.example.com",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "https://a.example.com".to_string(),
+                "https://b.example.com/base".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_node_list_means_local_only() {
+        assert!(parse_node_urls("").is_empty());
+        assert!(parse_node_urls(" , ; ").is_empty());
+    }
 }
 
 pub const MAX_LOG_SIZE: u64 = 5 * 1024 * 1024;

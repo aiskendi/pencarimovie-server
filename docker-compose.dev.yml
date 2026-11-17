@@ -30,6 +30,7 @@ services:
       # PM_WORKERS: "4"        # one Telegram connection per worker
       # PM_INFLIGHT: "8"       # upload.getFile parts in flight per connection
       # PM_MAX_STREAMS: "256"  # concurrent /api/download bodies
+      # PM_PUBLIC: "0"         # set 1 for public mode (admin moves to /admin)
       TZ: ${TZ:-UTC}
     volumes:
       # sessions, auth.json, caches — MUST persist across image upgrades.

@@ -72,6 +72,15 @@ pub fn node_urls() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A node that serves downloads without exposing the rest of the server.
+///
+/// This is deliberately narrower than `PM_PUBLIC`: it opens `/api/download`
+/// only. The dashboard, admin APIs, manifest and addon routes keep their normal
+/// private-mode gate.
+pub fn node_public_download() -> bool {
+    env_flag("PM_NODE_PUBLIC_DOWNLOAD")
+}
+
 pub fn wp_api_base() -> String {
     env_or(
         "FD_WP_API_BASE",

@@ -57,6 +57,10 @@ model changes in four ways:
    `http://127.0.0.1:8088`, `http://localhost:8088` or `http://[::1]:8088`. It is emitted
    as a download URL, never fetched by the public server. A tunneled request is not
    loopback and remains subject to normal auth.
+7. **`PM_NODE_PUBLIC_DOWNLOAD=1` opens one route.** It allows `/api/download` without a
+   token; it does not open `/`, `/admin`, `/manifest.json`, `/catalog`, `/meta`, `/stream`,
+   `/subtitles`, `/music` or any admin API. Use it only on a node reachable by the main
+   public host and list it in that host's `PM_NODES`.
 
 Startup guards refuse the default `123456` password and the sample tokens published in
 this repository. Set a real `SERVER_PASSWORD`, a fresh `SERVER_TOKEN`, `PM_MAX_STREAMS`

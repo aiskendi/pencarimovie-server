@@ -1247,10 +1247,10 @@ fn boot_at() -> i64 {
     *BOOT.get_or_init(now)
 }
 
-/// Public mode opens the addon surface without the admin token, so the old
-/// `is_authenticated` gate must not 401 a viewer. Private mode is unchanged.
-fn download_allowed(addon_open: bool, authenticated: bool) -> bool {
-    addon_open || authenticated
+/// Public mode opens the whole addon surface; a node can open just downloads.
+/// The rest of the server stays behind its normal private-mode gate.
+fn download_allowed(addon_open: bool, authenticated: bool, node_public: bool) -> bool {
+    addon_open || authenticated || node_public
 }
 
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
@@ -1258,7 +1258,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // Public mode is the addon surface: the admin token is no longer embedded in
     // stream URLs, so the download route is public there and relies on the
     // existing per-IP limits. Private mode keeps the old auth gate exactly.
-    if !download_allowed(ctx.addon_open, is_authenticated(ctx)) {
+    if !download_allowed(
+        ctx.addon_open,
+        is_authenticated(ctx),
+        crate::config::node_public_download(),
+    ) {
         record_refusal(ctx, started, 401, "AUTH_REQUIRED", "Server password or token required", "", serde_json::json!({}));
         return json_response(
             401,
@@ -3122,10 +3126,11 @@ mod tests {
 
     #[test]
     fn public_mode_opens_downloads_without_an_admin_token() {
-        assert!(download_allowed(true, false));
-        assert!(download_allowed(true, true));
-        assert!(download_allowed(false, true));
-        assert!(!download_allowed(false, false));
+        assert!(download_allowed(true, false, false));
+        assert!(download_allowed(true, true, false));
+        assert!(download_allowed(false, true, false));
+        assert!(download_allowed(false, false, true));
+        assert!(!download_allowed(false, false, false));
     }
 
     #[test]

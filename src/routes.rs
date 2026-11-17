@@ -2385,7 +2385,13 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
     // `/stream/*` response cache (300 s), the equivalent of the PHP's
     // `stream_cache_*.json`. Checked BEFORE any origin/upstream work, so a warm
     // list costs one hash lookup. `finish_streams()` fills it.
-    let skey = stream_cache_key(item_type, item_id, &ctx.base_url, &ctx.config_fp);
+    let skey = stream_cache_key(
+        item_type,
+        item_id,
+        &ctx.base_url,
+        &ctx.config_fp,
+        &stream_cache_scope(ctx),
+    );
     if let Some(hit) = crate::cache::get("stream", &skey) {
         if let Some(list) = hit.get("streams").and_then(|s| s.as_array()) {
             log(
@@ -4328,8 +4334,24 @@ fn apply_stream_caps(
     out
 }
 
-fn stream_cache_key(item_type: &str, item_id: &str, base_url: &str, config_fp: &str) -> String {
-    format!("v5|{}|{}|{}|{}", item_type, item_id, base_url, config_fp)
+fn stream_cache_scope(ctx: &ReqCtx) -> String {
+    let route = if ctx.public_code.is_some() { "public" } else { "bare" };
+    let local = ctx
+        .settings
+        .get("public_local_node")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!("{route}|{local}")
+}
+
+fn stream_cache_key(
+    item_type: &str,
+    item_id: &str,
+    base_url: &str,
+    config_fp: &str,
+    scope: &str,
+) -> String {
+    format!("v6|{}|{}|{}|{}|{}", item_type, item_id, base_url, config_fp, scope)
 }
 
 /// Place the per-answer rows above a finished stream list.
@@ -4414,7 +4436,13 @@ async fn finish_streams(
         // "the sponsor is not on top" reports.
         crate::cache::put(
             "stream",
-            &stream_cache_key(item_type, item_id, &ctx.base_url, &ctx.config_fp),
+            &stream_cache_key(
+                item_type,
+                item_id,
+                &ctx.base_url,
+                &ctx.config_fp,
+                &stream_cache_scope(ctx),
+            ),
             &serde_json::json!({"streams": &streams}),
             STREAM_CACHE_TTL,
             0,
@@ -10681,10 +10709,25 @@ mod tests {
 
     #[test]
     fn stream_cache_key_is_per_effective_config() {
-        let a = stream_cache_key("movie", "tt1", "http://h", "aaaa");
-        let b = stream_cache_key("movie", "tt1", "http://h", "bbbb");
+        let a = stream_cache_key("movie", "tt1", "http://h", "aaaa", "public|");
+        let b = stream_cache_key("movie", "tt1", "http://h", "bbbb", "public|");
         assert_ne!(a, b);
-        assert!(a.starts_with("v5|"));
+        assert!(a.starts_with("v6|"));
+    }
+
+    #[test]
+    fn stream_cache_key_separates_bare_public_and_local_node() {
+        let bare = stream_cache_key("movie", "tt1", "http://h", "d", "bare|");
+        let public = stream_cache_key("movie", "tt1", "http://h", "d", "public|");
+        let local = stream_cache_key(
+            "movie",
+            "tt1",
+            "http://h",
+            "d",
+            "public|http://127.0.0.1:8088",
+        );
+        assert_ne!(bare, public);
+        assert_ne!(public, local);
     }
 
     #[test]

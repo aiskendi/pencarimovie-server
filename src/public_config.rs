@@ -50,6 +50,8 @@ pub struct PublicConfig {
     /// Legacy `u` field from older public links. Decoded for compatibility,
     /// ignored by [`merge`].
     pub source_overrides: BTreeMap<String, bool>,
+    /// Optional user-owned loopback server (`127.0.0.1:8088`) for this link.
+    pub local_node: Option<String>,
     /// A subset of `stream_config`; validated by [`apply_public_stream_config`].
     pub stream: Map<String, Value>,
 }
@@ -89,6 +91,19 @@ pub fn looks_like_config(seg: &str) -> bool {
 
 fn is_token(seg: &str) -> bool {
     seg.len() >= 32 && seg.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The only local node a public link may name: the user's own loopback server.
+/// This is emitted to the client, never fetched by this process, so strict loopback
+/// validation is enough to keep the link from becoming an open redirect target.
+pub fn valid_local_node(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_end_matches('/');
+    match value.to_ascii_lowercase().as_str() {
+        "http://127.0.0.1:8088" | "http://localhost:8088" | "http://[::1]:8088" => {
+            Some(value.to_ascii_lowercase())
+        }
+        _ => None,
+    }
 }
 
 pub fn decode(payload: &str) -> Result<PublicConfig, String> {
@@ -140,6 +155,10 @@ pub fn decode(payload: &str) -> Result<PublicConfig, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let local_node = obj
+        .get("l")
+        .and_then(|v| v.as_str())
+        .and_then(valid_local_node);
 
     let stream = match obj.get("s") {
         Some(Value::Object(map)) if map.len() <= MAX_STREAM_KEYS => map.clone(),
@@ -155,6 +174,7 @@ pub fn decode(payload: &str) -> Result<PublicConfig, String> {
         show_catalogs,
         disable_sources,
         source_overrides,
+        local_node,
         stream,
     })
 }
@@ -205,6 +225,9 @@ pub fn to_json(cfg: &PublicConfig) -> Value {
     if !cfg.hide_catalogs.is_empty() {
         out.insert("h".to_string(), json!(cfg.hide_catalogs));
     }
+    if let Some(local) = &cfg.local_node {
+        out.insert("l".to_string(), json!(local));
+    }
     if !cfg.source_overrides.is_empty() {
         out.insert("u".to_string(), json!(cfg.source_overrides));
     }
@@ -233,6 +256,9 @@ pub fn merge(global: &Value, cfg: &PublicConfig) -> Value {
     // ignores the master switch, from fetching an upstream for metadata.
     out["upstream_enabled"] = json!(false);
     out["upstream_manifests"] = json!([]);
+    if let Some(local) = &cfg.local_node {
+        out["public_local_node"] = json!(local);
+    }
 
     if let Some(user) = cfg.catalogs_enabled {
         out["catalogs_enabled"] = json!(user);
@@ -540,6 +566,7 @@ mod tests {
             "h": ["pm_movies_korean"],
             "e": ["pm_movies_japan"],
             "d": ["a1b2c3d4e5f6"],
+            "l": "http://127.0.0.1:8088",
             "s": {"max_size_gb": 10}
         }));
         let cfg = decode(&payload).unwrap();
@@ -548,6 +575,7 @@ mod tests {
         assert_eq!(cfg.hide_catalogs, vec!["pm_movies_korean"]);
         assert_eq!(cfg.show_catalogs, vec!["pm_movies_japan"]);
         assert_eq!(cfg.disable_sources, vec!["a1b2c3d4e5f6"]);
+        assert_eq!(cfg.local_node.as_deref(), Some("http://127.0.0.1:8088"));
         assert_eq!(cfg.stream.get("max_size_gb"), Some(&json!(10)));
     }
 
@@ -626,6 +654,19 @@ mod tests {
         let out = merge(&global(), &cfg);
         assert_eq!(out["upstream_enabled"], json!(false));
         assert_eq!(out["upstream_manifests"], json!([]));
+    }
+
+    #[test]
+    fn merge_can_name_a_loopback_local_node() {
+        let cfg = PublicConfig {
+            local_node: Some("http://127.0.0.1:8088".to_string()),
+            ..Default::default()
+        };
+        let out = merge(&global(), &cfg);
+        assert_eq!(out["public_local_node"], json!("http://127.0.0.1:8088"));
+        assert!(valid_local_node("https://127.0.0.1:8088").is_none());
+        assert!(valid_local_node("http://127.0.0.1:9999").is_none());
+        assert!(valid_local_node("http://example.com:8088").is_none());
     }
 
     #[test]

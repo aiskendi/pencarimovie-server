@@ -70,6 +70,21 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   margin: 12px 0;
 }
 
+.public-local-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 6px;
+  color: var(--pm-text-secondary);
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+
+.public-local-toggle input {
+  margin-top: 2px;
+  accent-color: var(--pm-accent);
+}
+
 .public-field {
   display: grid;
   gap: 6px;

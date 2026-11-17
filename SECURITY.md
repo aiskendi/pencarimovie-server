@@ -52,6 +52,10 @@ model changes in four ways:
 5. **`PM_NODES` is a public URL list.** It only affects public stream/download links and
    accepts HTTP(S) origins without credentials, queries, or fragments. Those node URLs are
    emitted to clients; never put an admin token or private hostname in `PM_NODES`.
+6. **The local-node option is loopback-only.** `l` accepts only
+   `http://127.0.0.1:8088`, `http://localhost:8088` or `http://[::1]:8088`. It is emitted
+   as a download URL, never fetched by the public server. A tunneled request is not
+   loopback and remains subject to normal auth.
 
 Startup guards refuse the default `123456` password and the sample tokens published in
 this repository. Set a real `SERVER_PASSWORD`, a fresh `SERVER_TOKEN`, `PM_MAX_STREAMS`

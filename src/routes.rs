@@ -68,6 +68,33 @@ fn jstr(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
 }
 
+/// `/api/version` is also the browser's probe for a user-installed local node.
+/// The public HTTPS page is cross-origin and targets loopback, so the browser
+/// requires CORS plus the Private Network Access allow header before it will
+/// even let the fetch complete. The endpoint has no sensitive data.
+fn add_local_probe_headers(resp: &mut Response) {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static("GET, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        header::HeaderValue::from_static("600"),
+    );
+    if let Ok(name) = header::HeaderName::from_bytes(b"access-control-allow-private-network") {
+        headers.insert(name, header::HeaderValue::from_static("true"));
+    }
+}
+
 fn header_json(req: &Request<Body>) -> HashMap<String, String> {
     let _ = req;
     HashMap::new()
@@ -453,8 +480,15 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     /* ── lightweight public routes (no version gate) ──────────────────────── */
+    if p == "/api/version" && m == "OPTIONS" {
+        let mut resp = json_response(204, &serde_json::json!({}));
+        add_local_probe_headers(&mut resp);
+        return resp;
+    }
     if p == "/api/version" {
-        return json_response(200, &check_version().await);
+        let mut resp = json_response(200, &check_version().await);
+        add_local_probe_headers(&mut resp);
+        return resp;
     }
 
     /* ── public configure API (only when PM_PUBLIC is on) ─────────────────── */
@@ -5146,6 +5180,23 @@ fn stream_base(ctx: &ReqCtx) -> String {
 }
 
 fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
+    // A per-link local node is stronger than PM_NODES: the user explicitly asked
+    // for their own loopback server to serve this download.
+    if ctx.public_code.is_some() {
+        if let Some(local) = ctx
+            .settings
+            .get("public_local_node")
+            .and_then(|v| v.as_str())
+            .and_then(crate::public_config::valid_local_node)
+        {
+            if rtrim(&local) == rtrim(&ctx.base_url) {
+                return stream_url(&local, payload, file_name);
+            }
+            if let Some(remote) = remote_stream_payload(payload) {
+                return stream_url(&local, &remote, file_name);
+            }
+        }
+    }
     let base = stream_base(ctx);
     let local = rtrim(&ctx.base_url);
     if rtrim(&base) == local {

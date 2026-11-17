@@ -15,10 +15,12 @@
     catalogsEnabled: true,
     types: { movie: true, series: true, other: true },
     catalogOverrides: {},
-    stream: {}
+    stream: {},
+    useLocal: false
   };
   var options = null;
   var currentCode = "";
+  var LOCAL_NODE = "http://127.0.0.1:8088";
 
   var GROUP_LABELS = {
     resolutions: {
@@ -350,6 +352,7 @@
     // default-enabled catalog removes `c` and the install URL looks unchanged
     // even though the user just toggled the control.
     cfg.c = state.catalogsEnabled ? 1 : 0;
+    if (state.useLocal) cfg.l = LOCAL_NODE;
     var mask = 0;
     if (state.types.movie !== false) mask |= 1;
     if (state.types.series !== false) mask |= 2;
@@ -386,6 +389,8 @@
   function applyConfig(cfg) {
     if (!cfg || typeof cfg !== "object") return;
     state.catalogsEnabled = typeof cfg.c === "number" ? cfg.c !== 0 : defaultCatalogsEnabled();
+    state.useLocal = cfg.l === LOCAL_NODE;
+    if ($("useLocalServer")) $("useLocalServer").checked = state.useLocal;
     state.catalogOverrides = {};
     (cfg.h || []).forEach(function (id) { state.catalogOverrides[id] = false; });
     (cfg.e || []).forEach(function (id) { state.catalogOverrides[id] = true; });
@@ -403,6 +408,8 @@
     state.catalogsEnabled = true;
     state.types = { movie: true, series: true, other: true };
     state.catalogOverrides = {};
+    state.useLocal = false;
+    if ($("useLocalServer")) $("useLocalServer").checked = false;
     state.stream = {};
     renderAll();
   }
@@ -437,6 +444,10 @@
         }
         renderInstall();
       });
+    });
+    $("useLocalServer").addEventListener("change", function () {
+      state.useLocal = this.checked;
+      renderInstall();
     });
     var setCatalogGroup = function (group, on) {
       var cats = (options && options.catalog_options) || {};
@@ -481,6 +492,47 @@
     });
   }
 
+  function probeLocalServer() {
+    var checkbox = $("useLocalServer");
+    var status = $("localStatus");
+    if (!checkbox || !status) return;
+    var host = window.location.hostname;
+    if (host === "127.0.0.1" || host === "localhost" || host === "[::1]") {
+      status.textContent = "This page is already served by the local server.";
+      return;
+    }
+    var controller = window.AbortController ? new AbortController() : null;
+    var timer = setTimeout(function () {
+      if (controller) controller.abort();
+    }, 3000);
+    fetch(LOCAL_NODE + "/api/version?probe=" + Date.now(), {
+      mode: "cors",
+      cache: "no-store",
+      signal: controller ? controller.signal : undefined
+    })
+      .then(function (res) {
+        if (!res.ok) throw new Error("local probe failed");
+        return res.json();
+      })
+      .then(function (body) {
+        clearTimeout(timer);
+        if (!body || (!body.version && !body.current_version)) {
+          throw new Error("not a PencariMovie server");
+        }
+        state.useLocal = true;
+        checkbox.checked = true;
+        status.textContent = "Local server detected. Downloads use 127.0.0.1:8088 first.";
+        if (options) renderInstall();
+      })
+      .catch(function () {
+        clearTimeout(timer);
+        if (!state.useLocal) {
+          status.textContent =
+            "Automatic check was blocked by the browser. Tick the box if the local server is running on this device.";
+        }
+      });
+  }
+
   function loadConfigFromApi(code) {
     return fetch("/api/public/config/" + encodeURIComponent(code), { cache: "no-store" })
       .then(function (res) {
@@ -490,6 +542,7 @@
       .then(function (data) {
         applyConfig(data.config);
         setStatus("Editing an existing configuration. Re-install after changes.", false);
+        probeLocalServer();
       });
   }
 
@@ -513,6 +566,7 @@
           loadConfigFromApi(code).catch(function (err) {
             setStatus(err.message || String(err), true);
             renderAll();
+            probeLocalServer();
           });
         } else {
           state.catalogsEnabled = (data.defaults && data.defaults.catalogs_enabled) !== false;
@@ -522,6 +576,7 @@
             other: defaultTypeOn("other")
           };
           renderAll();
+          probeLocalServer();
         }
       })
       .catch(function (err) {

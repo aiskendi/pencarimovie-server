@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="/stream-theme.css?v=20261009pm10" />
     <link rel="stylesheet" href="/styles.css?v=20261024music2" />
     <link rel="stylesheet" href="/dashboard.css?v=20261112botactions1" />
-    <link rel="stylesheet" href="/configure.css?v=20261118titanium8" />
+    <link rel="stylesheet" href="/configure.css?v=20261118titanium9" />
   </head>
   <body data-pm-shell="dashboard">
     <div class="pm-shell">
@@ -120,6 +120,15 @@
                 <span>Your addon manifest URL</span>
                 <textarea id="installUrl" class="pm-input public-url" readonly spellcheck="false" rows="5"></textarea>
               </label>
+              <label class="public-local-toggle">
+                <input type="checkbox" id="useLocalServer" />
+                <span>Use my local server at 127.0.0.1:8088</span>
+              </label>
+              <p class="pm-hint">
+                Only for Stremio/Nuvio on this device. The local server does not need
+                public mode.
+              </p>
+              <p id="localStatus" class="pm-hint"></p>
               <div class="public-actions">
                 <a id="installBtn" class="pm-btn pm-btn--primary" href="#">Install on Stremio</a>
                 <button type="button" id="copyBtn" class="pm-btn">Copy link</button>
@@ -141,6 +150,6 @@
       </footer>
     </div>
 
-    <script defer src="/configure.js?v=20261118titanium8"></script>
+    <script defer src="/configure.js?v=20261118titanium9"></script>
   </body>
 </html>

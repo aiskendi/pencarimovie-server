@@ -213,6 +213,10 @@ admin token or the global settings file.
   Rotating `SERVER_TOKEN` therefore no longer breaks public addon links.
 - Public links can hide or show built-in catalogs and tune stream filters. They cannot add
   an upstream URL or change which upstream addons the server uses.
+- A viewer running PencariMovie on the same device can tick **Use my local server at
+  127.0.0.1:8088**. The link then sends downloads there first; that local server does not
+  need public mode because a loopback request is privileged. This only works when
+  Stremio/Nuvio runs on the same device as the local server.
 - `PM_NODES` can list other public PencariMovie base URLs. Stream/download links then
   round-robin local-first across the local node and those nodes. Remote links carry only
   the short code, so each node resolves the file with its own bot; the nodes do not need

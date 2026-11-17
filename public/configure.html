@@ -145,14 +145,30 @@
             <h2 class="public-faq__title" id="publicFaqTitle">Common questions</h2>
             <div class="public-faq__list">
               <details class="public-faq__item" name="public-faq">
-                <summary>What do I install?</summary>
+                <summary>How do I install it?</summary>
                 <p>
-                  Open the install link in Stremio or Nuvio. For Eclipse or BitChord, use the
-                  music manifest at <a href="/music/manifest.json">/music/manifest.json</a>.
+                  In Nuvio, open Profile, then Content &amp; Discovery, then Addons, and paste
+                  the link. In Stremio, use the Install on Stremio button. Eclipse and BitChord
+                  use the separate music manifest.
                 </p>
               </details>
               <details class="public-faq__item" name="public-faq">
-                <summary>Why does the link change when I change a setting?</summary>
+                <summary>Why is it asking for a password?</summary>
+                <p>
+                  A public link does not need one. If you see a password prompt, the installed
+                  URL is a private or admin manifest, not the public install link. Go back to
+                  this page and copy the link from the Install panel.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Can I use it only as a stream source?</summary>
+                <p>
+                  Yes. Set PencariMovie Catalogs to Disabled. The addon still returns streams
+                  for titles you open from another catalog.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Why did the link change when I changed a setting?</summary>
                 <p>
                   Your choices are encoded in the URL. The server does not store an account or
                   a copy of your settings. Re-install the new link after changing something.
@@ -166,18 +182,19 @@
                 </p>
               </details>
               <details class="public-faq__item" name="public-faq">
-                <summary>Why did a stream stop after it started?</summary>
+                <summary>Why do sources show but playback fails?</summary>
                 <p>
-                  Telegram file references expire. The server refreshes them when it sees the
-                  error, so retry once. If the file is HEVC or 10-bit, choose another row when
-                  your player cannot decode it.
+                  Try another stream row first. Telegram file references expire and the server
+                  refreshes them, so retry once. HEVC and 10-bit files also need a player that
+                  can decode them.
                 </p>
               </details>
               <details class="public-faq__item" name="public-faq">
-                <summary>Do I need a Telegram account?</summary>
+                <summary>Do I need a Telegram account or API keys?</summary>
                 <p>
-                  No. The server reads its own Telegram index and serves the files through its
-                  bot. You do not sign in with Telegram.
+                  No. The public addon needs no phone number, login code, API ID, API Hash or
+                  password. The server uses its own Telegram session and serves the files
+                  through its bot.
                 </p>
               </details>
               <details class="public-faq__item" name="public-faq">
@@ -185,6 +202,21 @@
                 <p>
                   It points the link at a PencariMovie server running on this device. Use it
                   only when that server is running and Stremio or Nuvio is on the same device.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Where is the music addon?</summary>
+                <p>
+                  Music is a separate manifest at
+                  <a href="/music/manifest.json">/music/manifest.json</a>. It is hi-res and
+                  lossless, and works in Eclipse, LastWave, BitChord and other music clients.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Is the public instance shared?</summary>
+                <p>
+                  Yes. The public demo server is shared and can be slower under load. Run your
+                  own server if you want stable playback.
                 </p>
               </details>
               <details class="public-faq__item" name="public-faq">

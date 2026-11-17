@@ -105,10 +105,6 @@ Deploy your personal PencariMovie Server to the cloud with a single click:
 
 > **Permanent Addon URL on Cloud / PaaS**:
 > Always set a static **`SERVER_TOKEN`** (such as `66ff097863dedb7ccd8401d5ffe616f2`) in your cloud provider's environment variables. This keeps your Stremio or Nuvio manifest URL (`https://<your-app>.up.railway.app/<token>/manifest.json`) permanent so you do not need to re-install addons when your container restarts or redeploys.
->
-> **Public mode only:** do not reuse that sample token. Once `PM_PUBLIC=1`, the token is
-> an admin credential; set a fresh random value (or leave it unset and let the server mint
-> one).
 
 ---
 
@@ -162,16 +158,6 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 # Optional: Cap simultaneous streams (0 = unlimited)
 # PM_MAX_STREAMS=0
 
-# Optional: additional public PencariMovie nodes for stream/download links.
-# Comma, semicolon, space, or newline separated. The local node is added
-# automatically. All nodes need the same build and the same BOT_TOKENS.
-# PM_NODES=https://pm-a.example.com,https://pm-b.example.com
-
-# Optional: Public mode (addon routes public; users configure at /configure;
-# admin dashboard moves to /admin). Keep 0 unless SERVER_PASSWORD and
-# SERVER_TOKEN are real values.
-# PM_PUBLIC=0
-
 # Optional: Where sessions, auth, and caches are stored (the Docker image expects /data)
 # PM_APP_ROOT=/data
 ```
@@ -182,66 +168,13 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 | :---------------- | :------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PORT`            | `8088`               | Port where the server listens (or provided by PaaS runtime).                                                                                                                                                    |
 | `SERVER_PASSWORD` | `123456`             | Password for dashboard access on public IPs, tunnels, and cloud hosts. LAN access is password-free.                                                                                                             |
-| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for public addon URLs (`/<token>/manifest.json`); keeps the link permanent.                                                                                                                 |
+| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for addon URLs (`/<token>/manifest.json`); keeps the link permanent.                                                                                                                        |
 | `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                                                                                                                                    |
 | `BOT_TOKENS`      | _(auto-provision)_   | Pool of bot tokens, comma/space/newline separated (alias `TG_BOT_TOKENS`). Required for multi-instance deployments. Each instance logs in all tokens, and downloads distribute across them.                     |
 | `PM_APP_ROOT`     | `storage/`           | Directory where sessions, auth, and caches live.                                                                                                                                                                |
 | `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = unlimited (the default). Set a limit only on hosts with short request timeouts so clients receive an immediate `503` with `Retry-After` instead of timing out at the proxy. |
 | `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                      |
 | `PM_LISTEN_HOST`  | `0.0.0.0`            | Bind address: all interfaces by default (`127.0.0.1` for loopback only).                                                                                                                                        |
-| `PM_PUBLIC`       | `0`                  | `1` enables public mode: addon routes are unauthenticated, `/configure` builds per-user links, and the admin dashboard moves to `/admin`. Off by default; see **Public mode** below.                              |
-| `PM_NODES`        | _(local node only)_  | Extra public base URLs of other PencariMovie servers. Public stream and download links round-robin over the local node first, then these URLs. Public mode only; the URLs are emitted to clients, so never put credentials in them. A remote link carries the short code, so that node resolves it with its own bot. |
-
-### Public mode (`PM_PUBLIC=1`)
-
-Public mode lets one hosted instance serve many viewers without giving any of them the
-admin token or the global settings file.
-
-- Users open `https://<your-host>/configure`, choose which PM catalogs to show or hide
-  and adjust stream filters, and get a link like
-  `https://<your-host>/<payload>/manifest.json`.
-- The settings are encoded **in that first path segment**. There is no account, no
-  database, and nothing stored on the server; links survive restarts and multiple
-  instances.
-- Public links use **PencariMovie catalogs and Telegram streams only**. Upstream Stremio
-  addons and the built-in subtitle source are not used; viewers add their own metadata and
-  subtitle addons in Stremio/Nuvio.
-- The admin dashboard moves to `https://<your-host>/admin` and still requires the
-  password/token. Admin manifests keep the upstream addons and subtitle source. Existing
-  `/<token>/manifest.json` installs keep working.
-- The admin token is never placed in a public manifest, stream row, or download URL.
-  Rotating `SERVER_TOKEN` therefore no longer breaks public addon links.
-- Public links can hide or show built-in catalogs and tune stream filters. They cannot add
-  an upstream URL or change which upstream addons the server uses.
-- Public mode also opens the music addon at `/music/manifest.json` (and its
-  catalog/meta/stream routes), so a music client can install it without the admin token.
-  The music descriptor and `/music/*` handlers stay the same.
-- A viewer running PencariMovie on the same device can tick **Use my local server at
-  127.0.0.1:8088**. The link then sends downloads there first; that local server does not
-  need public mode because a loopback request is privileged. This only works when
-  Stremio/Nuvio runs on the same device as the local server.
-- `PM_NODES` can list other public PencariMovie base URLs. Stream/download links then
-  round-robin local-first across the local node and those nodes. Remote links carry only
-  the short code, so each node resolves the file with its own bot; the nodes do not need
-  to share `BOT_TOKENS`. A node that is offline produces broken stream links because this
-  is a plain URL list, not a health-checked load balancer.
-
-Startup safety: public mode refuses to start with the default `123456` password or with
-one of the sample `SERVER_TOKEN` values published in this README/`app.json`. Set a real
-`SERVER_PASSWORD` and a fresh `SERVER_TOKEN` first. Behind a reverse proxy also set
-`PM_TRUST_XFF=1` so per-IP limits see the real client, and set `PM_MAX_STREAMS` for the
-host's capacity.
-
-```ini
-PM_PUBLIC=1
-SERVER_PASSWORD=a-long-unique-password
-SERVER_TOKEN=<a-fresh-random-token>
-PM_MAX_STREAMS=128
-PM_TRUST_XFF=1
-```
-
-> The `SERVER_TOKEN` in the one-click Heroku/Render examples is a **public sample**. It
-> is an admin credential in public mode; do not use it.
 
 ---
 
@@ -251,9 +184,7 @@ PM_TRUST_XFF=1
 
 1. Open the dashboard at `http://127.0.0.1:8088` and select **Addon** in the top navigation.
 2. **Local Sync (Recommended)**: Click **Install via Stremio API Sync** to push the addon across all your Stremio devices automatically.
-3. **Manual / Web**: Copy your manifest URL (`http://<LAN-IP>:8088/manifest.json`, or `http://<SERVER-IP>:8088/<token>/manifest.json` on public servers) and paste it into Stremio's Addon search box.
-   On a `PM_PUBLIC=1` instance, users should instead open `https://<host>/configure` and
-   install the personal `/<payload>/manifest.json` link it generates.
+3. **Manual / Web**: Copy your manifest URL (`http://<LAN-IP>:8088/manifest.json`, or `http://<SERVER-IP>:8088/<token>/manifest.json` on remote servers) and paste it into Stremio's Addon search box.
 
 ### 2. Nuvio Setup
 
@@ -271,7 +202,7 @@ There is one music manifest, and it is not tied to a single player. Eclipse and 
 http://<YOUR-LAN-IP>:8088/music/manifest.json
 ```
 
-On a public or tunnelled server the token goes in front: `http://<YOUR-SERVER-IP>:8088/<token>/music/manifest.json`.
+On a tunnelled or remote server the token goes in front: `http://<YOUR-SERVER-IP>:8088/<token>/music/manifest.json`.
 
 Eclipse Music adds it under **Settings** > **Connections** > **Add Connection** > **Addon**. BitChord adds it under **Settings** > **Sources** > **Add addon**, and its Android app only accepts HTTPS, so it needs the tunnel URL rather than the LAN one. Stremio and Nuvio take it in their addon field.
 

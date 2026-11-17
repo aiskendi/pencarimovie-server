@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="/stream-theme.css?v=20261009pm10" />
     <link rel="stylesheet" href="/styles.css?v=20261024music2" />
     <link rel="stylesheet" href="/dashboard.css?v=20261112botactions1" />
-    <link rel="stylesheet" href="/configure.css?v=20261118titanium10" />
+    <link rel="stylesheet" href="/configure.css?v=20261118titanium11" />
   </head>
   <body data-pm-shell="dashboard">
     <div class="pm-shell">
@@ -142,91 +142,91 @@
           </div>
 
           <section class="public-faq" aria-labelledby="publicFaqTitle">
-            <h2 class="public-faq__title" id="publicFaqTitle">Common questions</h2>
-            <div class="public-faq__list">
-              <details class="public-faq__item" name="public-faq">
-                <summary>How do I install it?</summary>
-                <p>
-                  In Nuvio, open Profile, then Content &amp; Discovery, then Addons, and paste
-                  the link. In Stremio, use the Install on Stremio button. Eclipse and BitChord
-                  use the separate music manifest.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Why is it asking for a password?</summary>
-                <p>
-                  A public link does not need one. If you see a password prompt, the installed
-                  URL is a private or admin manifest, not the public install link. Go back to
-                  this page and copy the link from the Install panel.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Can I use it only as a stream source?</summary>
-                <p>
-                  Yes. Set PencariMovie Catalogs to Disabled. The addon still returns streams
-                  for titles you open from another catalog.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Why did the link change when I changed a setting?</summary>
-                <p>
-                  Your choices are encoded in the URL. The server does not store an account or
-                  a copy of your settings. Re-install the new link after changing something.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Why are some streams missing?</summary>
-                <p>
-                  The stream filters can remove rows by resolution, size, codec or language.
-                  Set the filters back to Any to see every stream the index has for that title.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Why do sources show but playback fails?</summary>
-                <p>
-                  Try another stream row first. Telegram file references expire and the server
-                  refreshes them, so retry once. HEVC and 10-bit files also need a player that
-                  can decode them.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Do I need a Telegram account or API keys?</summary>
-                <p>
-                  No. The public addon needs no phone number, login code, API ID, API Hash or
-                  password. The server uses its own Telegram session and serves the files
-                  through its bot.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>What is the local server option?</summary>
-                <p>
-                  It points the link at a PencariMovie server running on this device. Use it
-                  only when that server is running and Stremio or Nuvio is on the same device.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Where is the music addon?</summary>
-                <p>
-                  Music is a separate manifest at
-                  <a href="/music/manifest.json">/music/manifest.json</a>. It is hi-res and
-                  lossless, and works in Eclipse, LastWave, BitChord and other music clients.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Is the public instance shared?</summary>
-                <p>
-                  Yes. The public demo server is shared and can be slower under load. Run your
-                  own server if you want stable playback.
-                </p>
-              </details>
-              <details class="public-faq__item" name="public-faq">
-                <summary>Does public mode include upstream catalogs or subtitles?</summary>
-                <p>
-                  No. Public links expose PencariMovie catalogs and Telegram streams only.
-                  Upstream Stremio catalogs and subtitle resources are not added to public links.
-                </p>
-              </details>
-            </div>
+            <details class="public-faq__panel">
+              <summary class="public-faq__summary">
+                <h2 class="public-faq__title" id="publicFaqTitle">Frequently Asked Questions</h2>
+              </summary>
+              <div class="public-faq__body">
+                <div class="public-faq__qa">
+                  <h3>How do I install it?</h3>
+                  <p>
+                    Open Nuvio, then Profile, then Content &amp; Discovery, then Addons, and
+                    paste the link. In Stremio, use the Install on Stremio button.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>Can I use it only as a stream source?</h3>
+                  <p>
+                    Yes. Set PencariMovie Catalogs to Disabled. The addon still returns streams
+                    for titles you open from another catalog.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>What do the catalog controls do?</h3>
+                  <p>
+                    PencariMovie Catalogs Enabled keeps the local home rows, categories and
+                    country rows. Disabled hides them but leaves streams on. Media Types limits
+                    which rows are published: Movies, Series and Telegram Files. Core &amp;
+                    Telegram Catalogs controls the New, Popular, Search and file rows.
+                    Categories &amp; Countries controls the language and genre rows. All and
+                    None toggle a whole group.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>What do the stream filters and size limits do?</h3>
+                  <p>
+                    Resolutions, Source Qualities, Encodes &amp; Formats and Exclusions remove
+                    rows before the link is built. Block All CAM removes CAM and Telesync.
+                    Exclude Unplayable removes known-bad rows. Exclude Part Titles hides files
+                    whose names look like split parts. Size and Count Limits cap total streams,
+                    streams per resolution, minimum MB and maximum GB. 0 means no cap, minimum
+                    or maximum.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>Why do sources show but playback fails?</h3>
+                  <p>
+                    Try another row or stream first. A resolve can be slow, or Telegram can
+                    return a flood wait, so retry once and switch to another row. Some files
+                    also need a player that supports their format.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>Do I need a Telegram account or API keys?</h3>
+                  <p>
+                    No. The public addon needs no phone number, login code, API ID, API Hash or
+                    password. The server uses its own Telegram session and serves the files
+                    through its bot.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>How do I add content?</h3>
+                  <p>
+                    Send the file to <a href="https://t.me/INVISObot" target="_blank" rel="noopener">t.me/INVISObot</a>.
+                    It enters the indexing queue.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>Should I self-host?</h3>
+                  <p>
+                    Yes, if you want your own server. The public instance is free and can slow
+                    down or go down at any time. Download it from
+                    <a href="https://github.com/aiskendi/pencarimovie-server" target="_blank" rel="noopener">GitHub</a>,
+                    run it, then open the dashboard at
+                    <a href="http://127.0.0.1:8088/">http://127.0.0.1:8088/</a> and copy the
+                    addon URL from the Addon panel.
+                  </p>
+                </div>
+                <div class="public-faq__qa">
+                  <h3>Where is the music addon?</h3>
+                  <p>
+                    Music is a separate manifest at
+                    <a href="/music/manifest.json">/music/manifest.json</a>. It is hi-res and
+                    lossless, and works in Eclipse, LastWave, BitChord and other music clients.
+                  </p>
+                </div>
+              </div>
+            </details>
           </section>
         </div>
       </main>

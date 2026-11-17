@@ -147,42 +147,27 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   border-top: 1px solid var(--pm-border-subtle);
 }
 
-.public-faq__title {
-  margin: 0 0 10px;
-  color: var(--pm-text-primary);
-  font-size: 1rem;
-  font-weight: 600;
-}
-
-.public-faq__list {
-  display: grid;
-  gap: 8px;
-}
-
-.public-faq__item {
+.public-faq__panel {
   border: 1px solid var(--pm-border-subtle);
-  border-radius: var(--pm-radius-md);
+  border-radius: var(--pm-radius-lg);
   background: var(--pm-bg-surface);
 }
 
-.public-faq__item summary {
+.public-faq__summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 11px 14px;
-  color: var(--pm-text-primary);
+  padding: 14px 16px;
   cursor: pointer;
-  font-size: 0.86rem;
-  font-weight: 500;
   list-style: none;
 }
 
-.public-faq__item summary::-webkit-details-marker {
+.public-faq__summary::-webkit-details-marker {
   display: none;
 }
 
-.public-faq__item summary::after {
+.public-faq__summary::after {
   content: "+";
   flex: 0 0 auto;
   color: var(--pm-text-secondary);
@@ -190,25 +175,51 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   line-height: 1;
 }
 
-.public-faq__item[open] summary::after {
+.public-faq__panel[open] .public-faq__summary::after {
   content: "-";
 }
 
-.public-faq__item summary:focus-visible {
-  border-radius: var(--pm-radius-md);
+.public-faq__summary:focus-visible {
+  border-radius: var(--pm-radius-lg);
   outline: 2px solid var(--pm-border-focus);
   outline-offset: 2px;
 }
 
-.public-faq__item p {
+.public-faq__title {
   margin: 0;
-  padding: 0 14px 13px;
-  color: var(--pm-text-secondary);
-  font-size: 0.82rem;
-  line-height: 1.55;
+  color: var(--pm-text-primary);
+  font-size: 1rem;
+  font-weight: 600;
 }
 
-.public-faq__item a {
+.public-faq__body {
+  padding: 0 16px 4px;
+}
+
+.public-faq__qa {
+  padding: 14px 0;
+  border-top: 1px solid var(--pm-border-subtle);
+}
+
+.public-faq__qa:first-child {
+  border-top: 0;
+}
+
+.public-faq__qa h3 {
+  margin: 0 0 6px;
+  color: var(--pm-text-primary);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.public-faq__qa p {
+  margin: 0;
+  color: var(--pm-text-secondary);
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+.public-faq__qa a {
   color: var(--pm-text-primary);
   text-decoration: underline;
   text-underline-offset: 2px;

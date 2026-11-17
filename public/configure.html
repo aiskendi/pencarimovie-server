@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="/stream-theme.css?v=20261009pm10" />
     <link rel="stylesheet" href="/styles.css?v=20261024music2" />
     <link rel="stylesheet" href="/dashboard.css?v=20261112botactions1" />
-    <link rel="stylesheet" href="/configure.css?v=20261118titanium9" />
+    <link rel="stylesheet" href="/configure.css?v=20261118titanium10" />
   </head>
   <body data-pm-shell="dashboard">
     <div class="pm-shell">
@@ -140,6 +140,62 @@
               </p>
             </aside>
           </div>
+
+          <section class="public-faq" aria-labelledby="publicFaqTitle">
+            <h2 class="public-faq__title" id="publicFaqTitle">Common questions</h2>
+            <div class="public-faq__list">
+              <details class="public-faq__item" name="public-faq">
+                <summary>What do I install?</summary>
+                <p>
+                  Open the install link in Stremio or Nuvio. For Eclipse or BitChord, use the
+                  music manifest at <a href="/music/manifest.json">/music/manifest.json</a>.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Why does the link change when I change a setting?</summary>
+                <p>
+                  Your choices are encoded in the URL. The server does not store an account or
+                  a copy of your settings. Re-install the new link after changing something.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Why are some streams missing?</summary>
+                <p>
+                  The stream filters can remove rows by resolution, size, codec or language.
+                  Set the filters back to Any to see every stream the index has for that title.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Why did a stream stop after it started?</summary>
+                <p>
+                  Telegram file references expire. The server refreshes them when it sees the
+                  error, so retry once. If the file is HEVC or 10-bit, choose another row when
+                  your player cannot decode it.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Do I need a Telegram account?</summary>
+                <p>
+                  No. The server reads its own Telegram index and serves the files through its
+                  bot. You do not sign in with Telegram.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>What is the local server option?</summary>
+                <p>
+                  It points the link at a PencariMovie server running on this device. Use it
+                  only when that server is running and Stremio or Nuvio is on the same device.
+                </p>
+              </details>
+              <details class="public-faq__item" name="public-faq">
+                <summary>Does public mode include upstream catalogs or subtitles?</summary>
+                <p>
+                  No. Public links expose PencariMovie catalogs and Telegram streams only.
+                  Upstream Stremio catalogs and subtitle resources are not added to public links.
+                </p>
+              </details>
+            </div>
+          </section>
         </div>
       </main>
 

@@ -21,8 +21,9 @@ All notable changes to the PencariMovie Server / Downloader project will be docu
   and those nodes. A remote link carries only the short code, so that node resolves it
   with its own bot and shared `BOT_TOKENS` are not required. The public page also offers a
   loopback-only **Use my local server at 127.0.0.1:8088** option, so a same-device private
-  server can take the download without public mode. This is a plain URL list, not a
-  health-checked balancer.
+  server can take the download without public mode. Public mode also opens the music addon
+  at `/music/manifest.json` and its catalog/meta/stream routes; the private music addon is
+  unchanged. This is a plain URL list, not a health-checked balancer.
 
 - **PencariMusic addon v2: real catalogs, artist/album pages, and a Stremio/Nuvio face.** The
   music descriptor advertises `artists` and the `sponsor` row for Eclipse, plus a search catalog

@@ -1798,7 +1798,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         p
     };
     if p.starts_with("/eclipse") {
-        if !is_authenticated(&ctx) {
+        if !ctx.addon_open && !is_authenticated(&ctx) {
             return music_locked(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {

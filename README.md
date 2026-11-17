@@ -213,6 +213,9 @@ admin token or the global settings file.
   Rotating `SERVER_TOKEN` therefore no longer breaks public addon links.
 - Public links can hide or show built-in catalogs and tune stream filters. They cannot add
   an upstream URL or change which upstream addons the server uses.
+- Public mode also opens the music addon at `/music/manifest.json` (and its
+  catalog/meta/stream routes), so a music client can install it without the admin token.
+  The music descriptor and `/music/*` handlers stay the same.
 - A viewer running PencariMovie on the same device can tick **Use my local server at
   127.0.0.1:8088**. The link then sends downloads there first; that local server does not
   need public mode because a loopback request is privileged. This only works when

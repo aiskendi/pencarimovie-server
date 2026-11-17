@@ -37,8 +37,9 @@ Public mode is an explicit opt-in that makes the addon surface multi-user. The s
 model changes in four ways:
 
 1. **Addon routes are public.** `/manifest.json`, `/catalog/*`, `/meta/*`,
-   `/stream/*`, `/subtitles/*`, `/thumb/*`, and `/api/download` no longer require the
-   admin token. The existing per-IP counters remain the abuse control.
+   `/stream/*`, `/subtitles/*`, `/thumb/*`, `/music/*` (manifest, catalog, meta and
+   stream), and `/api/download` no longer require the admin token. The existing per-IP
+   counters remain the abuse control.
 2. **The admin surface is still closed.** The dashboard is at `/admin`; all management
    APIs still require the password/token, and `auth_enabled()` is forced on even if the
    stored `auth.json` says otherwise.

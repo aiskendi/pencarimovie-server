@@ -75,8 +75,8 @@ pub fn node_urls() -> Vec<String> {
 /// A node that serves downloads without exposing the rest of the server.
 ///
 /// This is deliberately narrower than `PM_PUBLIC`: it opens `/api/download`
-/// only. The dashboard, admin APIs, manifest and addon routes keep their normal
-/// private-mode gate.
+/// and the public music stream JSON routes only. The dashboard, admin APIs,
+/// manifest and the rest of the addon routes keep their private-mode gate.
 pub fn node_public_download() -> bool {
     env_flag("PM_NODE_PUBLIC_DOWNLOAD")
 }

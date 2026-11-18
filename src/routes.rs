@@ -1804,7 +1804,15 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         p
     };
     if p.starts_with("/eclipse") {
-        if !ctx.addon_open && !is_authenticated(&ctx) {
+        if is_music_stream_path(&p) {
+            if let Some(target) = node_redirect_url(&ctx, &p) {
+                return redirect(&target);
+            }
+        }
+        if !ctx.addon_open
+            && !is_authenticated(&ctx)
+            && !(crate::config::node_public_download() && is_music_stream_path(&p))
+        {
             return music_locked(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {
@@ -5193,6 +5201,16 @@ static NODE_REDIRECT_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
 /// Pick a remote node for a redirect. The local main host is never a target:
 /// redirecting to ourselves would loop. A link that explicitly chose the local
 /// node is served directly by that node, not redirected through main.
+fn is_music_stream_path(path: &str) -> bool {
+    if path.starts_with("/eclipse/play/") {
+        return true;
+    }
+    match path.strip_prefix("/eclipse/stream/") {
+        Some(rest) => !rest.starts_with("movie/") && !rest.starts_with("series/"),
+        None => false,
+    }
+}
+
 pub(crate) fn node_redirect_url(ctx: &ReqCtx, path: &str) -> Option<String> {
     if !crate::config::public_mode() {
         return None;

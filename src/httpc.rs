@@ -304,7 +304,24 @@ async fn http_json_h_status_inner(
         // request unauthenticated. The old path returned false immediately while
         // another attempt was in flight, so every range request during startup
         // went out with no token and got 401.
-        crate::credentials::ensure_enrolled_throttled().await;
+        let enrolled = crate::credentials::ensure_enrolled_throttled().await;
+        if !enrolled && !crate::credentials::wait_for_enrolment(10).await {
+            // No token after the wait. Do not send an unauthenticated request:
+            // that is what turns one cold dyno into a 401 storm and an origin
+            // rate-limit. A 503 with retry guidance lets the player retry.
+            crate::log::stderr_log(
+                "origin call deferred until pm-auth enrolment",
+                Some(&serde_json::json!({"url": target})),
+            );
+            return (
+                serde_json::json!({
+                    "ok": 0,
+                    "message": "Auth token is not ready. Retry shortly.",
+                    "retry_after": 5,
+                }),
+                503,
+            );
+        }
     }
 
     let secret = get_api_secret();

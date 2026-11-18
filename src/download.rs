@@ -1303,6 +1303,15 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     {
         short_code = encoded.clone();
     }
+
+    // Public stream rows name this host, but the bytes belong on a node. Choose
+    // the node here, once per actual download request, so playback is spread
+    // evenly instead of depending on which row the player picked.
+    if crate::config::public_mode() && !short_code.is_empty() {
+        if let Some(target) = crate::routes::node_redirect_url(ctx, &ctx.path) {
+            return crate::respond::redirect(&target);
+        }
+    }
     let mut file_size = jnum(&payload, "file_size");
     if file_size == 0 {
         file_size = ctx.first_param(&["file_size", "size"]).parse().unwrap_or(0);

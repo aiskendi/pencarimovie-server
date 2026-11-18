@@ -1685,6 +1685,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     // Same public contract, same input shapes, so an external site can point an
     // `<img>` at a poster exactly the way it already points a player at a stream.
     if crate::thumb::is_public_thumb_path(&p) {
+        if let Some(target) = node_redirect_url(&ctx, &p) {
+            return redirect(&target);
+        }
         return allow_private_network(handle_thumb_api(&state, &ctx).await);
     }
 
@@ -1775,6 +1778,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     // is gone, so the file's own `thumb_size` is the only real poster left.
     if let Some(rest) = addon_path.strip_prefix("/thumb/") {
         let code = crate::download::percent_decode(rest.trim_end_matches(".jpg"));
+        if let Some(target) = node_redirect_url(&ctx, &addon_path) {
+            return redirect(&target);
+        }
         return match crate::thumb::serve(&state, &code).await {
             Some(bytes) => Response::builder()
                 .status(StatusCode::OK)
@@ -5182,6 +5188,41 @@ fn remote_stream_payload(payload: &Value) -> Option<Value> {
 /// The current node is included automatically, so `PM_NODES` can list only the
 /// other nodes.
 static NODE_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
+static NODE_REDIRECT_ROUND_ROBIN: AtomicUsize = AtomicUsize::new(0);
+
+/// Pick a remote node for a redirect. The local main host is never a target:
+/// redirecting to ourselves would loop. A link that explicitly chose the local
+/// node is served directly by that node, not redirected through main.
+pub(crate) fn node_redirect_url(ctx: &ReqCtx, path: &str) -> Option<String> {
+    if !crate::config::public_mode() {
+        return None;
+    }
+    if ctx.settings.get("public_local_node").is_some() {
+        return None;
+    }
+    let local = rtrim(&ctx.base_url);
+    let nodes: Vec<String> = crate::config::node_urls()
+        .into_iter()
+        .map(|n| rtrim(&n).to_string())
+        .filter(|n| !n.is_empty() && n != &local)
+        .collect();
+    if nodes.is_empty() {
+        return None;
+    }
+    let idx = NODE_REDIRECT_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % nodes.len();
+    let mut target = format!("{}{}", nodes[idx], path);
+    if !ctx.query.is_empty() {
+        let query = ctx
+            .query
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencode_component(k), urlencode_component(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        target.push('?');
+        target.push_str(&query);
+    }
+    Some(target)
+}
 
 fn node_pool(local: &str, extra: Vec<String>) -> Vec<String> {
     let local = rtrim(local).to_string();
@@ -5225,15 +5266,25 @@ fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
             }
         }
     }
-    let base = stream_base(ctx);
-    let local = rtrim(&ctx.base_url);
-    if rtrim(&base) == local {
-        return stream_url(&base, payload, file_name);
-    }
-    match remote_stream_payload(payload) {
-        Some(remote) => stream_url(&base, &remote, file_name),
-        // No short code: only this node can resolve the file.
-        None => stream_url(&ctx.base_url, payload, file_name),
+    if ctx.public_code.is_some() {
+        // Public stream rows always name the main host. The download request is
+        // what chooses a node, so the row list is stable and node selection is
+        // evenly spread across actual playback instead of by row order.
+        match remote_stream_payload(payload) {
+            Some(remote) => stream_url(&ctx.base_url, &remote, file_name),
+            None => stream_url(&ctx.base_url, payload, file_name),
+        }
+    } else {
+        let base = stream_base(ctx);
+        let local = rtrim(&ctx.base_url);
+        if rtrim(&base) == local {
+            return stream_url(&base, payload, file_name);
+        }
+        match remote_stream_payload(payload) {
+            Some(remote) => stream_url(&base, &remote, file_name),
+            // No short code: only this node can resolve the file.
+            None => stream_url(&ctx.base_url, payload, file_name),
+        }
     }
 }
 

@@ -125,8 +125,9 @@
                 <span>Use my local server at 127.0.0.1:8088</span>
               </label>
               <p class="pm-hint">
-                Only for Stremio/Nuvio on this device. The local server does not need
-                public mode.
+                Use this only when PencariMovie runs on the same device as Stremio or
+                Nuvio. The link will point to 127.0.0.1:8088. On a phone, TV, or another
+                computer, leave it off.
               </p>
               <p id="localStatus" class="pm-hint"></p>
               <div class="public-actions">
@@ -155,7 +156,7 @@
                   </p>
                 </div>
                 <div class="public-faq__qa">
-                  <h3>Can I use it only as a stream source?</h3>
+                  <h3>Can I use it without the catalogs?</h3>
                   <p>
                     Yes. Set PencariMovie Catalogs to Disabled. The addon still returns streams
                     for titles you open from another catalog.
@@ -169,7 +170,7 @@
                     which rows are published: Movies, Series and Telegram Files. Core &amp;
                     Telegram Catalogs controls the New, Popular, Search and file rows.
                     Categories &amp; Countries controls the language and genre rows. All and
-                    None toggle a whole group.
+                    None select or clear a whole group.
                   </p>
                 </div>
                 <div class="public-faq__qa">
@@ -179,16 +180,16 @@
                     rows before the link is built. Block All CAM removes CAM and Telesync.
                     Exclude Unplayable removes known-bad rows. Exclude Part Titles hides files
                     whose names look like split parts. Size and Count Limits cap total streams,
-                    streams per resolution, minimum MB and maximum GB. 0 means no cap, minimum
-                    or maximum.
+                    streams per resolution, minimum MB and maximum GB. 0 means no limit for that
+                    setting.
                   </p>
                 </div>
                 <div class="public-faq__qa">
-                  <h3>Why do sources show but playback fails?</h3>
+                  <h3>Why do streams show but not play?</h3>
                   <p>
-                    Try another row or stream first. A resolve can be slow, or Telegram can
-                    return a flood wait, so retry once and switch to another row. Some files
-                    also need a player that supports their format.
+                    Try another row first. A resolve can be slow, or Telegram can return a
+                    flood wait, so retry once and switch rows. Some files need a player that
+                    supports their format.
                   </p>
                 </div>
                 <div class="public-faq__qa">
@@ -203,14 +204,14 @@
                   <h3>How do I add content?</h3>
                   <p>
                     Send the file to <a href="https://t.me/INVISObot" target="_blank" rel="noopener">t.me/INVISObot</a>.
-                    It enters the indexing queue.
+                    It goes into the indexing queue.
                   </p>
                 </div>
                 <div class="public-faq__qa">
-                  <h3>Should I self-host?</h3>
+                  <h3>Should I run my own server?</h3>
                   <p>
-                    Yes, if you want your own server. The public instance is free and can slow
-                    down or go down at any time. Download it from
+                    Yes, if you want your own copy. The public instance is free, but it can be
+                    slow or offline. Download it from
                     <a href="https://github.com/aiskendi/pencarimovie-server" target="_blank" rel="noopener">GitHub</a>,
                     run it, then open the dashboard at
                     <a href="http://127.0.0.1:8088/">http://127.0.0.1:8088/</a> and copy the

@@ -5248,6 +5248,20 @@ fn stream_base(ctx: &ReqCtx) -> String {
     pool[idx].clone()
 }
 
+fn public_node_base(ctx: &ReqCtx) -> Option<String> {
+    let local = rtrim(&ctx.base_url);
+    let nodes: Vec<String> = crate::config::node_urls()
+        .into_iter()
+        .map(|n| rtrim(&n).to_string())
+        .filter(|n| !n.is_empty() && n != &local)
+        .collect();
+    if nodes.is_empty() {
+        return None;
+    }
+    let idx = NODE_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % nodes.len();
+    Some(nodes[idx].clone())
+}
+
 fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
     // A per-link local node is stronger than PM_NODES: the user explicitly asked
     // for their own loopback server to serve this download.
@@ -5265,26 +5279,25 @@ fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
                 return stream_url(&local, &remote, file_name);
             }
         }
+        // PM_NODES means nodes carry the download. The main host still builds
+        // the list, but it is not a playback target and the player never comes
+        // back through it for a range request.
+        if let Some(node) = public_node_base(ctx) {
+            if let Some(remote) = remote_stream_payload(payload) {
+                return stream_url(&node, &remote, file_name);
+            }
+        }
+        return stream_url(&ctx.base_url, payload, file_name);
     }
-    if ctx.public_code.is_some() {
-        // Public stream rows always name the main host. The download request is
-        // what chooses a node, so the row list is stable and node selection is
-        // evenly spread across actual playback instead of by row order.
-        match remote_stream_payload(payload) {
-            Some(remote) => stream_url(&ctx.base_url, &remote, file_name),
-            None => stream_url(&ctx.base_url, payload, file_name),
-        }
-    } else {
-        let base = stream_base(ctx);
-        let local = rtrim(&ctx.base_url);
-        if rtrim(&base) == local {
-            return stream_url(&base, payload, file_name);
-        }
-        match remote_stream_payload(payload) {
-            Some(remote) => stream_url(&base, &remote, file_name),
-            // No short code: only this node can resolve the file.
-            None => stream_url(&ctx.base_url, payload, file_name),
-        }
+    let base = stream_base(ctx);
+    let local = rtrim(&ctx.base_url);
+    if rtrim(&base) == local {
+        return stream_url(&base, payload, file_name);
+    }
+    match remote_stream_payload(payload) {
+        Some(remote) => stream_url(&base, &remote, file_name),
+        // No short code: only this node can resolve the file.
+        None => stream_url(&ctx.base_url, payload, file_name),
     }
 }
 

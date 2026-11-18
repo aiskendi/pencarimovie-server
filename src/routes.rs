@@ -1810,6 +1810,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     };
     if p.starts_with("/eclipse") {
         if is_music_stream_path(&p) {
+            if let Some(target) = local_redirect_url(&ctx, &music_path) {
+                return redirect(&target);
+            }
             if let Some(target) = node_redirect_url(&ctx, &music_path) {
                 return redirect(&target);
             }
@@ -5216,6 +5219,33 @@ fn is_music_stream_path(path: &str) -> bool {
     }
 }
 
+fn redirect_url(ctx: &ReqCtx, base: &str, path: &str) -> String {
+    let mut target = format!("{}{}", rtrim(base), path);
+    if !ctx.query.is_empty() {
+        let query = ctx
+            .query
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencode_component(k), urlencode_component(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        target.push('?');
+        target.push_str(&query);
+    }
+    target
+}
+
+fn local_redirect_url(ctx: &ReqCtx, path: &str) -> Option<String> {
+    let local = ctx
+        .settings
+        .get("public_local_node")
+        .and_then(|v| v.as_str())
+        .and_then(crate::public_config::valid_local_node)?;
+    if rtrim(&ctx.base_url) == rtrim(&local) {
+        return None;
+    }
+    Some(redirect_url(ctx, &local, path))
+}
+
 pub(crate) fn node_redirect_url(ctx: &ReqCtx, path: &str) -> Option<String> {
     if !crate::config::public_mode() {
         return None;
@@ -5233,18 +5263,7 @@ pub(crate) fn node_redirect_url(ctx: &ReqCtx, path: &str) -> Option<String> {
         return None;
     }
     let idx = NODE_REDIRECT_ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) % nodes.len();
-    let mut target = format!("{}{}", nodes[idx], path);
-    if !ctx.query.is_empty() {
-        let query = ctx
-            .query
-            .iter()
-            .map(|(k, v)| format!("{}={}", urlencode_component(k), urlencode_component(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        target.push('?');
-        target.push_str(&query);
-    }
-    Some(target)
+    Some(redirect_url(ctx, &nodes[idx], path))
 }
 
 fn node_pool(local: &str, extra: Vec<String>) -> Vec<String> {

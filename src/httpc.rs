@@ -264,6 +264,28 @@ pub async fn http_json_h_status(
     timeout_secs: u64,
     headers: &[(String, String)],
 ) -> (Value, u16) {
+    http_json_h_status_inner(url, params, method, timeout_secs, headers, true).await
+}
+
+/// The auth-enrol request itself must NOT recurse into auth-enrol on a 401.
+pub(crate) async fn http_json_h_status_no_enroll(
+    url: &str,
+    params: &[(String, String)],
+    method: &str,
+    timeout_secs: u64,
+    headers: &[(String, String)],
+) -> (Value, u16) {
+    http_json_h_status_inner(url, params, method, timeout_secs, headers, false).await
+}
+
+async fn http_json_h_status_inner(
+    url: &str,
+    params: &[(String, String)],
+    method: &str,
+    timeout_secs: u64,
+    headers: &[(String, String)],
+    auto_enroll: bool,
+) -> (Value, u16) {
     // PM-Auth self-heal, BEFORE the call that needs it.
     //
     // Boot enrolment alone is not enough on a phone: the engine is only started
@@ -277,7 +299,11 @@ pub async fn http_json_h_status(
     // third-party host leaks an install token for nothing, and asking to enrol
     // because a SOURCE answered 401 is what took the dynos offline on Heroku.
     let origin_call = is_origin_api(&target);
-    if origin_call && crate::credentials::auth_token().is_empty() {
+    if auto_enroll && origin_call && crate::credentials::auth_token().is_empty() {
+        // This waits for the in-flight boot enrolment instead of firing the
+        // request unauthenticated. The old path returned false immediately while
+        // another attempt was in flight, so every range request during startup
+        // went out with no token and got 401.
         crate::credentials::ensure_enrolled_throttled().await;
     }
 
@@ -374,7 +400,7 @@ pub async fn http_json_h_status(
     // cannot drift meaningfully in 10 minutes, so this is free.
     static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(0);
-    if status == 401 && origin_call {
+    if auto_enroll && status == 401 && origin_call {
         // Re-learn the clock BEFORE re-signing, in BOTH cases.
         //
         // A skewed clock is the one fault that makes an install look tokenless: a

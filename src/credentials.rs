@@ -559,6 +559,32 @@ fn log_skip(reason: &str, extra: serde_json::Value) {
     crate::log::stderr_log("pm-auth enrol skipped", Some(&ctx));
 }
 
+/// Wait for the in-flight boot enrolment to either mint a token or finish.
+///
+/// The old `ensure_enrolled_throttled()` returned `false` the moment another
+/// attempt held the latch. On a cold PaaS dyno the listener starts before the
+/// detached boot enrolment completes, so every early `/api/download` resolve
+/// went out unauthenticated, got 401, and was retried by the player. Waiting
+/// here costs a few hundred milliseconds once instead of a 401 storm.
+pub async fn wait_for_enrolment(timeout_secs: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    if !auth_token().is_empty() {
+        return true;
+    }
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    while tokio::time::Instant::now() < deadline {
+        if !auth_token().is_empty() {
+            return true;
+        }
+        if !ENROLLING.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    !auth_token().is_empty()
+}
+
 /// [`ensure_enrolled()`] for the call path: never re-entrant, and rate limited to
 /// one attempt per backoff window, so it is safe to call before every origin
 /// request.
@@ -569,7 +595,7 @@ pub async fn ensure_enrolled_throttled() -> bool {
     }
     let Some(_latch) = EnrolLatch::take() else {
         log_skip("another attempt is in flight", serde_json::json!({}));
-        return false;
+        return wait_for_enrolment(10).await;
     };
     let now = crate::storage::now();
     let (waited, delay) = enrol_wait(now);
@@ -633,7 +659,7 @@ pub async fn ensure_enrolled() -> EnrolOutcome {
     // refused us" and "the origin was unreachable" into the same empty body, and the
     // two need different retry policies.
     let (resp, status) =
-        Box::pin(crate::httpc::http_json_h_status(&url, &params, "POST", 20, &[])).await;
+        Box::pin(crate::httpc::http_json_h_status_no_enroll(&url, &params, "POST", 20, &[])).await;
     let ok = resp
         .get("ok")
         .map(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) != 0)

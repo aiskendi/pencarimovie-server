@@ -1173,6 +1173,23 @@ fn refuse_limit(
 ///
 /// ponytail: reads the 20 s origin gate, so a genuine miss arriving right after an
 /// outage also answers 503 for at most those 20 s — the retry gets the real 400/404.
+fn resolve_busy_wait(v: &Value) -> Option<i64> {
+    let retry = jnum(v, "retry_after");
+    if retry > 0 {
+        return Some(retry.clamp(2, 30) as i64);
+    }
+    let text = v.get("message").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+    if text.contains("busy")
+        || text.contains("flood")
+        || text.contains("rate limit")
+        || text.contains("rate cap")
+        || text.contains("retry")
+    {
+        return Some(5);
+    }
+    None
+}
+
 fn empty_resolve_refusal(origin_down_secs: i64) -> (u16, &'static str, &'static str) {
     if origin_down_secs > 0 {
         (
@@ -1736,6 +1753,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     );
     bot_id = chosen_bot;
 
+    let mut resolve_busy: Option<i64> = None;
     if file_id.is_empty() && !short_code.is_empty() {
         let resolved = resolve_shortcode_concurrent(&short_code, &candidates).await;
         let candidate_id = {
@@ -1743,6 +1761,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             if a.is_empty() { jstr(&resolved, "file_id") } else { a }
         };
         let message = jstr(&resolved, "message");
+        if candidate_id.is_empty() {
+            resolve_busy = resolve_busy_wait(&resolved);
+        }
         if candidate_id.is_empty() && message.to_ascii_lowercase().contains("not found for this request") {
             log(
                 "download refused - WordPress does not have this short_code",
@@ -1790,6 +1811,30 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     }
 
     if file_id.is_empty() {
+        if let Some(wait) = resolve_busy {
+            record_refusal(
+                ctx,
+                started,
+                503,
+                "ORIGIN_BUSY",
+                "The origin is busy resolving this file. Retry shortly.",
+                &short_code,
+                serde_json::json!({"retry_after": wait, "bot_id": bot_id}),
+            );
+            let body = serde_json::json!({
+                "ok": 0,
+                "error": "ORIGIN_BUSY",
+                "message": "The origin is busy resolving this file. Retry shortly.",
+                "short_code": short_code,
+                "retry_after": wait,
+            });
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::RETRY_AFTER, wait.to_string())
+                .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+                .unwrap_or_else(|_| json_response(503, &body));
+        }
         let down = crate::httpc::wp_origin_down_secs();
         let (status, stage, message) = empty_resolve_refusal(down);
         record_refusal(

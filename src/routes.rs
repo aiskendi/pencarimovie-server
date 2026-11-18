@@ -1798,6 +1798,11 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     /* ── eclipse ──────────────────────────────────────────────────────────── */
     // `/music` is the canonical name for this addon; `/eclipse` is kept as
     // an alias so every URL already installed in a client keeps resolving.
+    let music_path = if p.starts_with("/eclipse") {
+        p.replacen("/eclipse", "/music", 1)
+    } else {
+        p.clone()
+    };
     let p = if p == "/music" || p.starts_with("/music/") {
         p.replacen("/music", "/eclipse", 1)
     } else {
@@ -1805,7 +1810,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     };
     if p.starts_with("/eclipse") {
         if is_music_stream_path(&p) {
-            if let Some(target) = node_redirect_url(&ctx, &p) {
+            if let Some(target) = node_redirect_url(&ctx, &music_path) {
                 return redirect(&target);
             }
         }

@@ -1522,7 +1522,13 @@ pub async fn auto_provision_guest(
     }
 
     // ── existing session ──────────────────────────────────────────────────
-    let existing = get_bot_id();
+    // An env-supplied BOT_TOKEN is the operator's fixed bot. Do not let a guest
+    // session left on the dyno take precedence over it.
+    let existing = if env_bot_tokens().is_empty() {
+        get_bot_id()
+    } else {
+        String::new()
+    };
     if !existing.is_empty() && crate::telegram::has_session_file(&existing) {
         let meta = load_session_meta();
         match tg.boot(&existing, None).await {
@@ -1605,7 +1611,7 @@ pub async fn auto_provision_guest(
     // bookkeeping was lost, so ADOPT it first: it is a working bot and costs no
     // origin provision. Only a session that will not boot is discarded, and then a
     // fresh lease follows in the same call.
-    if existing.is_empty() && get_bot_id().is_empty() {
+    if env_bot_tokens().is_empty() && existing.is_empty() && get_bot_id().is_empty() {
         let orphan = find_orphan_session_bot_id();
         if !orphan.is_empty() {
             match tg.boot(&orphan, None).await {
@@ -1716,7 +1722,7 @@ pub async fn auto_provision_guest(
             }),
         );
     }
-    if !env_bot_tokens().is_empty() && !all_rate_limited {
+    if !env_bot_tokens().is_empty() {
         let env_bots = env_bot_tokens().len();
         log(
             "guest bot lease skipped: BOT_TOKENS supplies the pool",
@@ -2027,8 +2033,9 @@ pub async fn ensure_guest_bot(tg: &crate::telegram::TelegramPool) -> usize {
             })
             .count()
     };
-    // A user-supplied bot (env or dashboard) satisfies the requirement, so no
-    // guest lease is spent.
+    if !env_bot_tokens().is_empty() {
+        return count();
+    }
     if count() >= GUEST_BOTS_PER_INSTANCE {
         return count();
     }

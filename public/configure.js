@@ -521,14 +521,14 @@
         }
         state.useLocal = true;
         checkbox.checked = true;
-        status.textContent = "Local server detected. Downloads use 127.0.0.1:8088 first.";
+        status.textContent = "PencariMovie is running here. Keep the box ticked to point this link at 127.0.0.1:8088.";
         if (options) renderInstall();
       })
       .catch(function () {
         clearTimeout(timer);
         if (!state.useLocal) {
           status.textContent =
-            "Automatic check was blocked by the browser. Tick the box if the local server is running on this device.";
+            "The browser blocked the automatic check. Tick the box if PencariMovie is running on this device.";
         }
       });
   }

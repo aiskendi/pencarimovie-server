@@ -1190,20 +1190,12 @@ fn resolve_busy_wait(v: &Value) -> Option<i64> {
     None
 }
 
-fn empty_resolve_refusal(origin_down_secs: i64) -> (u16, &'static str, &'static str) {
-    if origin_down_secs > 0 {
-        (
-            503,
-            crate::httpc::ORIGIN_UNREACHABLE,
-            crate::httpc::ORIGIN_UNREACHABLE_MSG,
-        )
-    } else {
-        (
-            400,
-            "MISSING_FILE_ID",
-            "file_id or valid short_code is required for local browser download.",
-        )
-    }
+fn empty_resolve_refusal(_origin_down_secs: i64) -> (u16, &'static str, &'static str) {
+    (
+        503,
+        "ORIGIN_BUSY",
+        "The origin could not resolve this file. Retry shortly.",
+    )
 }
 
 pub fn plan_download_candidates(
@@ -1836,6 +1828,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 .unwrap_or_else(|_| json_response(503, &body));
         }
         let down = crate::httpc::wp_origin_down_secs();
+        let wait = down.max(5);
         let (status, stage, message) = empty_resolve_refusal(down);
         record_refusal(
             ctx, started, status, stage, message, &short_code,
@@ -1851,14 +1844,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             "error": stage,
             "message": message,
             "short_code": short_code,
-            "retry_after": down,
-            "hint": "Pass a Bot API file id or shortcode to resolve the file.",
+            "retry_after": wait,
+            "hint": "Retry the same stream in a few seconds.",
         });
         if status == 503 {
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::RETRY_AFTER, down.max(1).to_string())
+                .header(header::RETRY_AFTER, wait.to_string())
                 .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
                 .unwrap_or_else(|_| json_response(503, &body));
         }
@@ -3524,11 +3517,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_origin_is_a_503_not_a_missing_file_id() {
+    fn a_short_code_with_no_id_is_busy_not_missing() {
         let (status, stage, _) = empty_resolve_refusal(20);
-        assert_eq!((status, stage), (503, "ORIGIN_UNREACHABLE"));
+        assert_eq!((status, stage), (503, "ORIGIN_BUSY"));
         let (status, stage, _) = empty_resolve_refusal(0);
-        assert_eq!((status, stage), (400, "MISSING_FILE_ID"));
+        assert_eq!((status, stage), (503, "ORIGIN_BUSY"));
     }
 
     #[test]

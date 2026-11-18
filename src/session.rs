@@ -1729,14 +1729,8 @@ pub async fn auto_provision_guest(
             &serde_json::json!({"env_bots": env_bots, "pool_error": env_err.clone()}),
         );
         return Err(ProvisionResult::error(match env_err {
-            Some(env) => format!(
-                "None of this instance's {} configured BOT_TOKENS could sign in, and a BOT_TOKENS deploy never leases a guest bot.\n{}",
-                env_bots, env
-            ),
-            None => format!(
-                "This instance is configured from {} BOT_TOKENS, so it does not lease a guest bot.",
-                env_bots
-            ),
+            Some(env) => format!("Bot sign-in failed: {env}"),
+            None => "No configured bot is signed in.".to_string(),
         }));
     }
 

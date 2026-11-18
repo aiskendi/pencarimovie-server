@@ -7009,15 +7009,76 @@ fn episode_gaps(files: &[crate::wp_data::WpFile]) -> std::collections::BTreeSet<
     gaps
 }
 
-/// Episode entries for the gaps [`episode_gaps()`] found, resolved against the
+/// The highest `(season, episode)` a post's OWN rows reach.
+///
+/// The picker is built from those rows, so this is the point where the list
+/// simply stops. [`episode_gaps()`] only fills holes BELOW it; an episode
+/// released after the post was last edited never appears at all, which is the
+/// "episodes not updated" report. `None` when no row carries an episode number.
+fn episode_ceiling(files: &[crate::wp_data::WpFile]) -> Option<(i32, i32)> {
+    let mut ceiling: Option<(i32, i32)> = None;
+    for f in files {
+        let (s, e, _) = crate::matcher::classify_season_episode(
+            &f.title,
+            f.season_num,
+            f.episode_num,
+            &f.caption,
+        );
+        if e <= 0 {
+            continue;
+        }
+        let key = (s.max(1), e);
+        ceiling = Some(match ceiling {
+            Some(c) if c >= key => c,
+            _ => key,
+        });
+    }
+    ceiling
+}
+
+/// An episode past the post's own numbering: a later episode of the ceiling
+/// season, or any episode of a later season.
+fn episode_is_newer(key: (i32, i32), ceiling: (i32, i32)) -> bool {
+    key.0 > ceiling.0 || (key.0 == ceiling.0 && key.1 > ceiling.1)
+}
+
+/// [`episode_is_newer()`] AND within one window of the ceiling.
+///
+/// The bound is not cosmetic. A file's "episode number" is guessed from its
+/// name, so `…2023.720p…` classifies as E720 and a trailing title year as
+/// E2023. The gaps path can never reach those (it only looks BELOW the
+/// ceiling), but the tail path looks above it — unguarded, it added S1E720 and
+/// S1E2023 to "Constable Girpade 2023" (measured, 2026-11-19). A real episode
+/// released next sits one or two past the ceiling, so a 50-episode window keeps
+/// every genuine tail and drops the misparses.
+fn episode_is_tail(key: (i32, i32), ceiling: (i32, i32)) -> bool {
+    episode_is_newer(key, ceiling) && key.1 <= ceiling.1.saturating_add(MAX_TAIL_EPISODES as i32)
+}
+
+/// How many episodes beyond the post's own last one one `/meta` build may add.
+/// A broad keyword matches a long-running show's whole run; one search must not
+/// turn a 12-episode post into a 300-row picker.
+const MAX_TAIL_EPISODES: usize = 50;
+
+/// Episode entries the post's own rows cannot produce, resolved against the
 /// origin index with the SAME strict matcher `/stream` uses, so the picker can
 /// never advertise an episode the player cannot answer.
 ///
-/// Costs one index search, and only for a series whose numbering has a hole.
-/// The outcome — including "nothing to fill" — is cached for 10 min: a series
-/// like "The Witch 2025" has E11–E15 missing everywhere, and must not pay an
-/// origin search on every `/meta` request.
-async fn gap_episode_videos(
+/// Two kinds are added by ONE index search:
+///
+///  1. holes below the ceiling ([`episode_gaps()`]) — the origin index holds
+///     episodes the post never linked;
+///  2. episodes past the ceiling ([`episode_is_tail()`]) — the origin's
+///     `post-files` resolves the post title to a keyword WITH the year baked in
+///     ("love in disguise 2026"), and Manticore ANDs every term, so a release
+///     named without the year (`Love.in.Disguise.S01E09.1080p…`, `…EP10.MalaySub`)
+///     is invisible to it. Measured on "Love in Disguise 2026": post-files
+///     answered E1–E8 while the index held E9 (17 files) and E10 (14).
+///
+/// Costs one index search per build for a series (cached 10 min), and the
+/// variants dedupe to one for any title without an apostrophe, so the usual
+/// price is the single search the gap path already paid on a holed series.
+async fn extra_episode_videos(
     base: &str,
     media_id: &str,
     post_id: &str,
@@ -7028,12 +7089,13 @@ async fn gap_episode_videos(
     anchor: Option<&str>,
 ) -> Vec<Value> {
     let gaps = episode_gaps(files);
-    if gaps.is_empty() || title.trim().is_empty() {
+    let ceiling = episode_ceiling(files);
+    if title.trim().is_empty() || (gaps.is_empty() && ceiling.is_none()) {
         return Vec::new();
     }
 
     let ckey = format!("{post_id}|{title}|{year}");
-    if let Some(hit) = crate::cache::get("series_gap", &ckey) {
+    if let Some(hit) = crate::cache::get("series_extra", &ckey) {
         if let Some(list) = hit.get("videos").and_then(|v| v.as_array()) {
             return list.clone();
         }
@@ -7042,6 +7104,7 @@ async fn gap_episode_videos(
     let keyword = stream_keyword_from_post_title(title);
     let mut found: std::collections::BTreeMap<(i32, i32), crate::wp_data::WpFile> =
         std::collections::BTreeMap::new();
+    let mut tail = 0usize;
     if !keyword.is_empty() {
         // Two variants at most: the plain keyword, then its possessive/accent
         // form. More than that spends the origin's time for a handful of rows.
@@ -7057,7 +7120,14 @@ async fn gap_episode_videos(
                     &row.caption,
                 );
                 let key = (s.max(1), e);
-                if e <= 0 || !gaps.contains(&key) || found.contains_key(&key) {
+                if e <= 0 || found.contains_key(&key) {
+                    continue;
+                }
+                // Two reasons to take a row: it fills a hole in the post's own
+                // numbering, or it is a genuine episode just past it.
+                let hole = gaps.contains(&key);
+                let newer = ceiling.map_or(false, |c| episode_is_tail(key, c));
+                if !hole && !(newer && tail < MAX_TAIL_EPISODES) {
                     continue;
                 }
                 if !crate::matcher::series_file_matches_title(
@@ -7072,8 +7142,14 @@ async fn gap_episode_videos(
                     continue;
                 }
                 found.insert(key, row);
+                if newer && !hole {
+                    tail += 1;
+                }
             }
-            if found.len() == gaps.len() {
+            // The first variant already scanned the whole index for this
+            // keyword, so a second one only helps unfilled HOLES — variants
+            // dedupe to one for any title without an apostrophe.
+            if gaps.iter().all(|g| found.contains_key(g)) {
                 break;
             }
         }
@@ -7086,18 +7162,20 @@ async fn gap_episode_videos(
         series_videos(base, media_id, &extra, poster, anchor)
     };
     log(
-        "meta: episode gaps backfilled from the index",
+        "meta: episodes added past the post's own rows",
         &serde_json::json!({
             "post_id": post_id,
             "gaps": gaps
                 .iter()
                 .map(|(s, e)| format!("S{}E{}", s, e))
                 .collect::<Vec<_>>(),
+            "ceiling": ceiling.map(|(s, e)| format!("S{}E{}", s, e)),
             "filled": videos.len(),
+            "newer": tail,
         }),
     );
     crate::cache::put(
-        "series_gap",
+        "series_extra",
         &ckey,
         &serde_json::json!({ "videos": videos }),
         600,
@@ -7463,8 +7541,10 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
             let anchor = series_released_anchor(&post);
             let mut videos = series_videos(&ctx.base_url, &id, &files, &meta["poster"], anchor.as_deref());
             // The post is not always the whole show: episodes whose files live
-            // only in the origin index are answerable by `/stream` but were
-            // absent from the picker. See `gap_episode_videos()`.
+            // only in the origin index are answerable by `/stream` but would be
+            // absent from the picker — holes in the numbering AND anything
+            // released after the post's own last episode. See
+            // `extra_episode_videos()`.
             let series_title = meta["name"].as_str().unwrap_or("").to_string();
             let series_year = meta
                 .get("releaseInfo")
@@ -7472,7 +7552,7 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
                 .unwrap_or("")
                 .to_string();
             videos.extend(
-                gap_episode_videos(
+                extra_episode_videos(
                     &ctx.base_url,
                     &id,
                     pid,
@@ -11883,6 +11963,59 @@ mod tests {
             .collect();
         let gaps: Vec<(i32, i32)> = episode_gaps(&two_seasons).into_iter().collect();
         assert_eq!(gaps, vec![(2, 1)]);
+    }
+
+    /// The picker used to stop where the POST's own numbering stopped, because
+    /// the origin resolves the post title to a keyword with the year baked in
+    /// ("love in disguise 2026") and Manticore ANDs every term — so a later
+    /// release named WITHOUT the year never reaches the post's row set at all.
+    /// Measured on "Love in Disguise 2026": the picker stopped at E8 while the
+    /// index held E9 (17 files) and E10 (14), all playable by `/stream`.
+    #[test]
+    fn episodes_past_the_post_last_one_are_not_holes_but_are_newer() {
+        use crate::wp_data::WpFile;
+
+        let owned: Vec<WpFile> = (1..=8)
+            .map(|e| WpFile {
+                title: format!("Love.in.Disguise.2026.EP{:02}.MalaySub.mclub.mp4", e),
+                ..Default::default()
+            })
+            .collect();
+        let ceiling = episode_ceiling(&owned);
+        assert_eq!(ceiling, Some((1, 8)));
+        // Below or at the ceiling is never "newer", so it is never re-added.
+        assert!(!episode_is_newer((1, 7), (1, 8)));
+        assert!(!episode_is_newer((1, 8), (1, 8)));
+        // The real EP09/EP10 name shapes carry no year, and must still read as
+        // episodes past the ceiling.
+        for name in [
+            "Love.in.Disguise.S01E09.1080p.AMZN.WEB.DL.Multi.DD.mkv",
+            "LayarAsia.Love.in.Disguise.E09.720p.mp4",
+            "Love.in.Disguise.EP10.MalaySub.mp4",
+        ] {
+            let (s, e, _) = crate::matcher::classify_season_episode(name, 0, 0, "");
+            assert!(e >= 9, "{name} classified as S{s}E{e}");
+            assert!(episode_is_newer((s.max(1), e), ceiling.unwrap()));
+        }
+        // A later season is past any episode of the ceiling season.
+        assert!(episode_is_newer((2, 1), (1, 8)));
+        // …but the tail window still bounds it: a misparsed "720p" or a title
+        // year must never become an episode. Unbounded, S1E720 and S1E2023 were
+        // added to "Constable Girpade 2023".
+        assert!(episode_is_tail((1, 9), (1, 8)));
+        assert!(episode_is_tail((1, 10), (1, 8)));
+        assert!(!episode_is_tail((1, 720), (1, 8)));
+        assert!(!episode_is_tail((1, 2023), (1, 8)));
+        assert!(episode_is_tail((2, 1), (1, 8)));
+        // No numbering at all -> no ceiling -> nothing can be past it.
+        assert_eq!(episode_ceiling(&[]), None);
+        assert_eq!(
+            episode_ceiling(&[WpFile {
+                title: "Show.Complete.Series.mkv".to_string(),
+                ..Default::default()
+            }]),
+            None
+        );
     }
 
     /// A series' by-id page is ONE page of the whole show, so it must never be

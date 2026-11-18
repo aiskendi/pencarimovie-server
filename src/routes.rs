@@ -5293,7 +5293,8 @@ fn stream_base(ctx: &ReqCtx) -> String {
 fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
     // A per-link local node is stronger than PM_NODES: the user explicitly asked
     // for their own loopback server to serve this download.
-    if ctx.public_code.is_some() {
+    let node_public = crate::config::node_public_download();
+    if ctx.public_code.is_some() || node_public {
         if let Some(local) = ctx
             .settings
             .get("public_local_node")
@@ -5309,6 +5310,12 @@ fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
         }
         // The list stays on the main host. The player gets the node from the
         // 302 on /api/download, so node hostnames do not appear in the rows.
+        //
+        // A public node builds these URLs too. It must strip file_id/bot_id for
+        // the same reason main does: Heroku can route the next Range request to
+        // another dyno, and a file reference minted by dyno A is not usable by
+        // dyno B. The short code lets whichever dyno receives the request mint
+        // its own reference.
         match remote_stream_payload(payload) {
             Some(remote) => stream_url(&ctx.base_url, &remote, file_name),
             None => stream_url(&ctx.base_url, payload, file_name),

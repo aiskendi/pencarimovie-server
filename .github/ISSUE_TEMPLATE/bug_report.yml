@@ -1,0 +1,152 @@
+name: Bug report
+description: Something is broken — playback, seeking, addon install, the dashboard, updates or remote access.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Almost every report needs the same four facts before it can be triaged:
+        **version**, **platform**, **what the player did**, and **what the server says about
+        itself**. The fields below collect exactly those, so a fix does not start with two
+        days of "which build are you on?".
+
+        Before you fill this in:
+
+        - **Security issues do not belong here.** Tokens, auth bypass, LAN exposure and
+          tunnel problems go to [SECURITY.md](https://github.com/aiskendi/pencarimovie-server/security/policy),
+          privately.
+        - **Never paste** `SERVER_TOKEN`, `BOT_TOKEN` / `BOT_TOKENS`, a session file, or a
+          tunnel URL. Anyone holding a tunnel URL can stream through your server.
+        - The dashboard's diagnostics never contain a bot token; `server.log` might. Read the
+          lines you paste.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected, what you got instead, and whether it happens every time or only sometimes.
+      placeholder: |
+        Expected: the episode plays and seeking works.
+        Actual: the stream list appears, the player spins for 30 s, then "Playback error".
+        Happens every time, on both the phone and the TV.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, starting from a dashboard you can open. Name the menu or the URL, not "the addon".
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which part fails?
+      options:
+        - Addon install / manifest URL
+        - Catalog, search or metadata
+        - Stream list
+        - Playback, buffering or seeking
+        - Subtitles
+        - Downloads
+        - Dashboard, settings or login
+        - Tunnel or remote access
+        - Update or APK install
+        - Telegram session or bots
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: Which client shows it?
+      description: The player is a separate program from the server; this is where the failure is visible.
+      options:
+        - Stremio
+        - Nuvio
+        - Eclipse or BitChord (music)
+        - Browser dashboard / built-in player
+        - Android app shell
+        - Terminal (curl, yt-dlp, aria2)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where does the server run?
+      options:
+        - Windows 10/11
+        - Linux
+        - macOS
+        - Android (phone or TV box)
+        - Docker
+        - Cloud / PaaS (Heroku, Railway, Render, Orkestr)
+        - Built from source
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: |
+        Open http://127.0.0.1:8088/api/version and copy `current_version`; add `build`.
+        On Android, `app_shell` is the installed APK.
+      placeholder: 3.2.0 (build 8962a50)
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Self-test output
+      description: |
+        Dashboard → Settings → System → **Run Self-Test**, then paste what it prints
+        (device id, OS, model, disk, report counts). It contains no token.
+        If the dashboard will not load, open http://127.0.0.1:8088/api/diagnostics instead
+        and paste the useful fields.
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log
+      description: |
+        The last ~50 lines around the failure. Where to get them depends on how you run it:
+        - Windows tray: tray icon → **Open log**, or `%USERPROFILE%\pencarimovie-server\storage\server.log`
+        - Docker: `docker logs --tail 50 pencarimovie-server`
+        - Linux / macOS service: `journalctl --user -u pencarimovie -n 50`, or run `bash start.sh` in a terminal and watch it
+        - Built from source: the terminal you started it in
+        - Nothing useful in any of those: open `/api/debug-mode?enable=1`, reproduce, then `/api/logs` returns the last 400 lines
+
+        Cut the token and any phone number before pasting.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        Reverse proxy (`PM_TRUST_XFF`), custom `PM_*` overrides, VPN, NAS model, a second
+        client that works, or screenshots dragged into this box.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched open and closed issues for a duplicate
+          required: true
+        - label: This is not a security vulnerability (those go to SECURITY.md, privately)
+          required: true
+        - label: I removed tokens, session files and personal URLs from this report
+          required: true
+        - label: I am on the latest release, per `/api/update/check`

@@ -1,0 +1,73 @@
+name: Feature request
+description: An idea for the server, the dashboard, a platform build or the music addon.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you write:
+
+        - This is **one Rust binary** that bridges your own Telegram files to Stremio, Nuvio
+          and addon-based music players. It does not host, index or supply media, and it
+          cannot make Stremio or Nuvio render a list differently — anything a player draws
+          has to be supported by that player.
+        - "Add support for a site/channel" is not a feature request. Point the server at a
+          channel you can already read, or use the upstream catalog settings.
+        - A request that says what you are trying to accomplish beats a request that names a
+          button, because the button may not be the right place to fix it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do that you cannot do today?
+      description: The situation, not the solution. Include the steps you take and where they stop.
+      placeholder: |
+        I keep two Telegram channels, one per language, and want the same title to show both
+        audio tracks as separate entries instead of one merged row.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should happen instead?
+      description: If it involves a UI control, name the dashboard tab. If it involves a route, name the route.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      multiple: true
+      options:
+        - Catalog, search or metadata
+        - Stream list and filename matching
+        - Playback, seeking or range requests
+        - Subtitles
+        - Downloads
+        - Dashboard and settings
+        - Music addon (Eclipse, BitChord)
+        - Packaging (Windows, Linux, macOS, Android, Docker)
+        - Updates and releases
+        - Docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you tried
+      description: An existing setting, a different client, an upstream addon, or a manual step. Say why it is not enough.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched open and closed issues for a duplicate
+          required: true
+        - label: I understand this project does not host or index media, and that some requests require a change in the player app itself
+          required: true
+        - label: I can test a pre-release build of this change

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/aiskendi/pencarimovie-server/security/policy
+    about: Tokens, auth bypass, LAN exposure or tunnel problems. Please do not open a public issue for these.
+  - name: Install, update and troubleshooting
+    url: https://github.com/aiskendi/pencarimovie-server#quick-install
+    about: Install commands per platform, the .env reference, Stremio/Nuvio/music setup, and the pms CLI.

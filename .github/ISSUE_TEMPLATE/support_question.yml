@@ -1,0 +1,98 @@
+name: Setup & support question
+description: Install, LAN or TV access, tunnel, token auth, or "works on localhost but not on my TV".
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is for "it is not working yet", where nothing is necessarily broken.
+
+        Three answers fix most setup reports before anyone replies:
+
+        - **`127.0.0.1` only means "this computer".** A TV, phone or another PC must use the
+          machine's LAN address: `http://192.168.x.x:8088/manifest.json`. The dashboard prints
+          that address at the top of the Addon tab.
+        - **Remote and tunnelled URLs need the token in the path:**
+          `https://<your-host>/<token>/manifest.json`. The bare `/manifest.json` is for the
+          local network only.
+        - **A Docker install needs the `/data` volume and, on a NAS with bridge networking,
+          usually `LAN_IP`** — otherwise the manifest advertises the container's internal
+          address, which nothing on your LAN can reach.
+
+        Install commands and the `.env` reference live in the
+        [README](https://github.com/aiskendi/pencarimovie-server#quick-install).
+        Security problems (tokens, auth bypass, exposure) belong in
+        [SECURITY.md](https://github.com/aiskendi/pencarimovie-server/security/policy), not here.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to set up?
+      description: Include the exact step you are on and the exact error or symptom you see.
+      placeholder: |
+        Fresh Windows install, dashboard opens on the PC, but the TV says the addon could not
+        be reached. I copied the Wi-Fi / LAN URL from the Addon tab.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: The URLs you opened and where you opened them from (PC or TV), plus any setting you changed.
+
+  - type: dropdown
+    id: setup
+    attributes:
+      label: How are you reaching the server?
+      options:
+        - Same machine only (localhost)
+        - TV or phone on the same Wi-Fi
+        - Cloudflare tunnel
+        - VPS / cloud host (Heroku, Railway, Render, Orkestr)
+        - Docker on a NAS
+        - Reverse proxy on my own domain
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where does the server run?
+      options:
+        - Windows 10/11
+        - Linux
+        - macOS
+        - Android (phone or TV box)
+        - Docker
+        - Cloud / PaaS (Heroku, Railway, Render, Orkestr)
+        - Built from source
+    validations:
+      required: true
+
+  - type: input
+    id: manifest-url
+    attributes:
+      label: The manifest URL you used
+      description: Replace the token with `<token>` if it is in the URL. Do not paste the real one.
+      placeholder: http://192.168.1.20:8088/manifest.json
+
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: From http://127.0.0.1:8088/api/version (`current_version`), or the APK's `app_shell`.
+      placeholder: 3.2.0
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I followed the install steps for my platform in the README
+          required: true
+        - label: I searched open and closed issues for the same symptom
+          required: true
+        - label: I did not paste my `SERVER_TOKEN`, a bot token, a session file or a live tunnel URL
+          required: true

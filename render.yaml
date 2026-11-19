@@ -35,8 +35,8 @@ services:
       # /configure builds per-user links. The admin dashboard then lives at
       # /admin and still requires SERVER_PASSWORD. Do not use the sample token
       # above in public mode.
+      # Set to "0" for private mode
       - key: PM_PUBLIC
-        value: "0"
         sync: false
       # Ephemeral disk: storage/catalog_settings.json is gone after every
       # restart/redeploy, so the dashboard's catalog/upstream/stream config is

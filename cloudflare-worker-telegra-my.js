@@ -403,7 +403,7 @@ const HTML_HOMEPAGE = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PencariMovie Server</title>
-<meta name="description" content="Self-hosted Telegram media server. One binary per OS, no PHP.">
+<meta name="description" content="Self-hosted Telegram media server in one binary, with the dashboard built in.">
 <link rel="icon" href="/logo.png">
 <link rel="apple-touch-icon" href="/logo.png">
 <style>
@@ -691,8 +691,8 @@ const HTML_HOMEPAGE = `<!DOCTYPE html>
 <main>
   <section class="hero">
     <div class="hero__head">
-      <h1>Your media, on your own machine.</h1>
-      <p class="hero__lede">One binary, dashboard included, no PHP.</p>
+      <h1>Your own media server, in one binary.</h1>
+      <p class="hero__lede">Serves your Telegram media, and the dashboard comes with it.</p>
     </div>
     <div class="hero__addr">
       <code>http://127.0.0.1:8088</code>

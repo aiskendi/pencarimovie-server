@@ -4211,7 +4211,7 @@ async fn build_streams_from_files(
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
 
-    let mut scored: Vec<(f64, String, Value)> = kept
+    let mut scored: Vec<(f64, String, u64, Value)> = kept
         .iter()
         .filter_map(|(idx, res_key)| {
             let f = &matched[*idx];
@@ -4227,6 +4227,7 @@ async fn build_streams_from_files(
             Some((
                 score,
                 res_key.clone(),
+                f.file_size,
                 stream_item(
                     ctx,
                     &f.short_code,
@@ -4295,6 +4296,7 @@ async fn build_streams_from_files(
         scored.push((
             score,
             res_key.clone(),
+            total,
             stream_item_joined(
                 ctx,
                 &parts,
@@ -4306,7 +4308,23 @@ async fn build_streams_from_files(
         ));
     }
 
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        stream_res_rank(&a.3)
+            .cmp(&stream_res_rank(&b.3))
+            .then_with(|| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    // Same title/quality/size means the same upload mirrored under a second
+    // short code. Rounding absorbs the few-KB differences seen on re-uploads.
+    let mut seen_uploads = std::collections::HashSet::new();
+    scored.retain(|(_, _, _, value)| {
+        let head = value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('\n').next())
+            .unwrap_or("")
+            .to_string();
+        seen_uploads.insert((head, stream_res_rank(value)))
+    });
     scored.truncate(100);
 
     let max_per_res = sc
@@ -4319,7 +4337,22 @@ async fn build_streams_from_files(
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .clamp(0, 200) as usize;
+    let scored: Vec<(f64, String, Value)> = scored
+        .into_iter()
+        .map(|(score, res, _size, value)| (score, res, value))
+        .collect();
     let mut streams: Vec<Value> = apply_stream_caps(scored, max_per_res, max_total);
+    streams.sort_by_key(stream_res_rank);
+    let mut seen_final = std::collections::HashSet::new();
+    streams.retain(|value| {
+        let head = value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('\n').next())
+            .unwrap_or("")
+            .to_string();
+        seen_final.insert(head)
+    });
     let built = streams.len();
     // A browser / WebView player cannot demux Matroska: Chrome rejects
     // `video/x-matroska` inside `<video>`, aborts on the container and re-requests the
@@ -4438,6 +4471,27 @@ const STREAM_CACHE_TTL: i64 = 300;
 /// The dashboard exposed these two controls but the stream pipeline only
 /// reported them in `active_filter_notes` — setting them did nothing. Public
 /// links make that visible, so enforce them here (0 = no cap).
+fn stream_res_rank(value: &Value) -> u8 {
+    let name = value
+        .pointer("/behaviorHints/filename")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("description").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_4k = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == "2160p" || t == "4k");
+    if is_4k {
+        0
+    } else if name.contains("1080p") {
+        1
+    } else if name.contains("720p") {
+        2
+    } else {
+        3
+    }
+}
+
 fn apply_stream_caps(
     scored: Vec<(f64, String, Value)>,
     max_per_res: usize,
@@ -4476,7 +4530,7 @@ fn stream_cache_key(
     config_fp: &str,
     scope: &str,
 ) -> String {
-    format!("v6|{}|{}|{}|{}|{}", item_type, item_id, base_url, config_fp, scope)
+    format!("v9|{}|{}|{}|{}|{}", item_type, item_id, base_url, config_fp, scope)
 }
 
 /// Place the per-answer rows above a finished stream list.
@@ -4534,6 +4588,16 @@ async fn finish_streams(
     filtered: bool,
     files_before_filter: usize,
 ) -> Response {
+    streams.sort_by_key(stream_res_rank);
+    let mut seen_final = std::collections::HashSet::new();
+    streams.retain(|value| {
+        value
+            .get("description")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.split('\n').next())
+            .map(|head| seen_final.insert(head.to_string()))
+            .unwrap_or(true)
+    });
     let real_rows = streams.len();
     if streams.is_empty() {
         streams.push(no_streams_card(ctx, title, item_id, filtered, files_before_filter));
@@ -11053,7 +11117,7 @@ mod tests {
         let a = stream_cache_key("movie", "tt1", "http://h", "aaaa", "public|");
         let b = stream_cache_key("movie", "tt1", "http://h", "bbbb", "public|");
         assert_ne!(a, b);
-        assert!(a.starts_with("v6|"));
+        assert!(a.starts_with("v9|"));
     }
 
     #[test]

@@ -568,6 +568,11 @@ impl TelegramPool {
             username,
             first_name,
         };
+        // A token that signs in again is not dead any more: the login the operator
+        // re-did (or re-supplied through `BOT_TOKENS`) clears the retirement mark
+        // `mark_bot_dead()` left behind.
+        crate::session::clear_bot_dead(&identity.id);
+        crate::session::clear_bot_dead(&key);
 
         let mut clients = vec![client];
         let mut tasks = vec![task];

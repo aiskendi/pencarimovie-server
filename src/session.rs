@@ -48,6 +48,42 @@ pub fn bot_id_cache_path() -> PathBuf {
     storage_path("bot_id.txt")
 }
 
+/// Bots the ORIGIN has declared dead, keyed by bot id.
+///
+/// A `BOT_TOKENS` bot cannot be removed from a running process, so the verdict
+/// needs somewhere to live that outlives the request: this file. It is the only
+/// reason a token that still logs in is skipped, and it is cleared the moment
+/// that token signs in again ([`clear_bot_dead()`], called from the login path).
+pub fn dead_bots_path() -> PathBuf {
+    storage_path("dead_bots.json")
+}
+
+pub fn dead_bots() -> serde_json::Map<String, Value> {
+    fs::read_to_string(dead_bots_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+pub fn is_bot_dead(bot_id: &str) -> bool {
+    let id = bot_id.trim();
+    !id.is_empty() && dead_bots().contains_key(id)
+}
+
+/// Forget a dead verdict: the bot signed in again, so the operator's retry counts.
+pub fn clear_bot_dead(bot_id: &str) {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return;
+    }
+    let mut map = dead_bots();
+    if map.remove(id).is_some() {
+        let _ = fs::write(dead_bots_path(), Value::Object(map).to_string());
+        log("dead bot mark cleared after a successful sign-in", &serde_json::json!({"bot_id": id}));
+    }
+}
+
 pub fn load_session_meta() -> Value {
     fs::read_to_string(session_meta_path())
         .ok()
@@ -146,7 +182,10 @@ pub fn get_bot_id() -> String {
     if !from_meta.is_empty() {
         return from_meta;
     }
-    if let Some(first) = env_bot_tokens().first() {
+    if let Some(first) = env_bot_tokens().iter().find(|t| {
+        let id = t.split(':').next().unwrap_or("").trim().to_string();
+        !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) && !is_bot_dead(&id)
+    }) {
         let id = first.split(':').next().unwrap_or("").trim();
         if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
             return id.to_string();
@@ -156,11 +195,14 @@ pub fn get_bot_id() -> String {
     for b in &pool {
         let active = b.get("is_active").and_then(|v| v.as_bool()).unwrap_or(false);
         let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
-        if active && !id.is_empty() {
+        if active && !id.is_empty() && !is_bot_dead(id) {
             return id.to_string();
         }
     }
-    if let Some(first) = pool.first() {
+    if let Some(first) = pool
+        .iter()
+        .find(|b| !is_bot_dead(b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("")))
+    {
         let id = first.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
         if !id.is_empty() {
             return id.to_string();
@@ -186,7 +228,7 @@ pub fn has_local_session(bot_id: &str) -> bool {
     }
     for b in get_bot_pool() {
         let bid = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
-        if !bid.is_empty() && crate::telegram::has_session_file(bid) {
+        if !bid.is_empty() && !is_bot_dead(bid) && crate::telegram::has_session_file(bid) {
             return true;
         }
     }
@@ -261,6 +303,24 @@ pub fn get_bot_pool() -> Vec<Value> {
             "updated_at": now(),
         }));
     }
+    // A retired env token stays in the list (it cannot be deleted from the
+    // environment), but its row must SAY so — otherwise `/api/bots` shows a bot
+    // "online" that every resolve is skipping.
+    let dead = dead_bots();
+    if !dead.is_empty() {
+        for b in pool.iter_mut() {
+            let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let Some(entry) = dead.get(&id) else { continue };
+            if let Some(obj) = b.as_object_mut() {
+                obj.insert("status".to_string(), serde_json::json!("dead"));
+                obj.insert(
+                    "dead_reason".to_string(),
+                    entry.get("reason").cloned().unwrap_or(Value::Null),
+                );
+                obj.insert("is_active".to_string(), Value::Bool(false));
+            }
+        }
+    }
     pool
 }
 
@@ -279,7 +339,7 @@ pub fn pool_ready() -> Vec<Value> {
         .into_iter()
         .filter(|b| {
             let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
-            !id.is_empty() && crate::telegram::has_session_file(id)
+            !id.is_empty() && !is_bot_dead(id) && crate::telegram::has_session_file(id)
         })
         .collect()
 }
@@ -462,6 +522,70 @@ pub fn remove_pool_bot(bot_id: &str) -> Vec<Value> {
     get_bot_pool()
 }
 
+/// Retire a bot the ORIGIN has declared dead.
+///
+/// A deleted bot is indistinguishable from a healthy one at login time: Telegram
+/// still accepts `auth.ImportBotAuthorization`, the session file is written, and
+/// `boot()` answers `Ok`, so `has_session_file()` / `pick_pool_bot()` / the
+/// auto-provision "existing session" shortcut all treat it as usable. The first
+/// thing that can tell is the origin's relay (`relay destination bot no longer
+/// exists`), which is why the retire happens from the resolve path.
+///
+/// Removing it is the WHOLE recovery. Nothing is leased here on purpose: a pool
+/// that still holds a bot is the operator's, and quietly adding a guest bot next
+/// to it is how one dead token turned into a three-bot pool in the 2026-11-20
+/// test (`/api/provision` answered "success" twice without ever removing the
+/// dead row). When the last bot goes, the identity files are cleared by
+/// [`remove_pool_bot()`], `/api/session` reports `has_session: false`, and only
+/// then may a guest bot be leased.
+pub fn mark_bot_dead(bot_id: &str, reason: &str) -> Vec<Value> {
+    let id = bot_id.trim().to_string();
+    if id.is_empty() {
+        return get_bot_pool();
+    }
+    // Recorded for EVERY bot, including a `BOT_TOKENS` one: that token cannot be
+    // removed from a running process, but it must stop being used. Every reader
+    // that picks a bot consults this (see `pool_ready`, `pick_pool_bot`,
+    // `auto_provision_guest` and the download candidate filter).
+    let mut dead = dead_bots();
+    if !dead.contains_key(&id) {
+        dead.insert(
+            id.clone(),
+            serde_json::json!({"reason": reason, "at": now()}),
+        );
+        let _ = fs::write(dead_bots_path(), Value::Object(dead).to_string());
+    }
+    let was_active = get_bot_id() == id;
+    // Always-on: this is the line that explains why a pool shrank, and it is the
+    // only trace an operator gets for an env-supplied token.
+    crate::log::stderr_log(
+        "dead bot retired",
+        Some(&serde_json::json!({
+            "bot_id": id,
+            "reason": reason,
+            "was_active": was_active,
+            "source": if env_token_for(&id).is_some() { "BOT_TOKENS" } else { "pool" },
+            "fix": if env_token_for(&id).is_some() {
+                "remove this token from BOT_TOKENS (or BOT_TOKEN) and restart the server"
+            } else {
+                "add a working bot token"
+            },
+        })),
+    );
+    // An env bot has no file row to delete; deleting it here would only hide it
+    // until the next request re-added it from the environment. Its identity still
+    // has to stop being "the active bot", or `/api/session` keeps reporting a
+    // signed-in corpse and the app never provisions.
+    if env_token_for(&id).is_some() {
+        if was_active {
+            clear_session_meta();
+            clear_bot_id();
+        }
+        return get_bot_pool();
+    }
+    remove_pool_bot(&id)
+}
+
 pub fn filter_and_pick_pool_bot<'a>(
     pool: &'a [Value],
     ts: i64,
@@ -500,7 +624,12 @@ pub fn pick_pool_bot() -> Option<Value> {
         .and_then(|t| t.trim().parse::<usize>().ok())
         .unwrap_or(0);
 
-    if let Some((picked, next)) = filter_and_pick_pool_bot(&pool, ts, crate::telegram::has_session_file, idx) {
+    if let Some((picked, next)) = filter_and_pick_pool_bot(
+        &pool,
+        ts,
+        |id| !is_bot_dead(id) && crate::telegram::has_session_file(id),
+        idx,
+    ) {
         let _ = fs::write(&rr, next.to_string());
         return Some(picked.clone());
     }
@@ -531,7 +660,23 @@ pub fn pick_pool_bot() -> Option<Value> {
 /// left. Bounded by the pool size (20 bots = 20 stats + 20 cache reads), so it is
 /// safe to call on a dashboard poll.
 pub fn pool_health() -> Value {
-    summarise_pool(&get_bot_pool(), now(), crate::telegram::has_session_file, flood_remaining_for)
+    summarise_pool(
+        &get_bot_pool(),
+        now(),
+        |id| !is_bot_dead(id) && crate::telegram::has_session_file(id),
+        flood_remaining_for,
+    )
+}
+
+/// Is every row of the pool retired? The only state in which a guest bot may be
+/// leased next to an existing pool: nothing there can serve, and a `BOT_TOKENS`
+/// row cannot be deleted from a running process.
+fn pool_is_all_dead(pool: &[Value]) -> bool {
+    !pool.is_empty()
+        && pool.iter().all(|b| {
+            let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+            !id.is_empty() && is_bot_dead(id)
+        })
 }
 
 /// Pure core of [`pool_health`]: `has_session` and `flood_for` are injected so the
@@ -1529,7 +1674,7 @@ pub async fn auto_provision_guest(
     } else {
         String::new()
     };
-    if !existing.is_empty() && crate::telegram::has_session_file(&existing) {
+    if !existing.is_empty() && !is_bot_dead(&existing) && crate::telegram::has_session_file(&existing) {
         let meta = load_session_meta();
         match tg.boot(&existing, None).await {
             Ok(_) => {
@@ -1583,7 +1728,7 @@ pub async fn auto_provision_guest(
 
     // Re-check after acquiring the lock (another worker may have finished).
     let recheck = get_bot_id();
-    if !recheck.is_empty() && crate::telegram::has_session_file(&recheck) {
+    if !recheck.is_empty() && !is_bot_dead(&recheck) && crate::telegram::has_session_file(&recheck) {
         let meta = load_session_meta();
         if tg.boot(&recheck, None).await.is_ok() {
             return Ok(ProvisionResult {
@@ -1659,6 +1804,17 @@ pub async fn auto_provision_guest(
             format!("env_{}", random_suffix())
         };
         env_ids.push(target.clone());
+        // A retired env token is not retried: every attempt costs an
+        // `auth.ImportBotAuthorization`, and on a deleted bot it can only fail.
+        // `clear_bot_dead()` un-retires it the moment it signs in again.
+        if is_bot_dead(&target) {
+            log(
+                "env bot token skipped - retired as dead",
+                &serde_json::json!({"bot_id": target}),
+            );
+            env_err.get_or_insert_with(|| format!("bot {}: retired as dead by the origin", target));
+            continue;
+        }
         match tg.boot(&target, Some(&token)).await {
             Ok(entry) => {
                 remember_env_identity(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
@@ -1713,6 +1869,11 @@ pub async fn auto_provision_guest(
     // logins, so it cannot repeat the storm it is there to survive.
     let all_rate_limited = !env_ids.is_empty()
         && env_ids.iter().all(|id| flood_remaining_for(id) > 0);
+    // A token the ORIGIN has retired is the same kind of permanent-looking,
+    // actually-operator-fixable state: the process cannot edit `BOT_TOKENS`, so
+    // the only thing that keeps the install serving is a lease. `mark_bot_dead()`
+    // records it in `dead_bots.json`, so this is not a guess.
+    let all_env_dead = !env_ids.is_empty() && env_ids.iter().all(|id| is_bot_dead(id));
     if all_rate_limited {
         log(
             "every BOT_TOKENS bot is rate-limited - leasing a guest bot instead",
@@ -1722,7 +1883,16 @@ pub async fn auto_provision_guest(
             }),
         );
     }
-    if !env_bot_tokens().is_empty() {
+    if all_env_dead {
+        crate::log::stderr_log(
+            "every BOT_TOKENS bot is dead - leasing a guest bot to stay up",
+            Some(&serde_json::json!({
+                "bots": env_ids.len(),
+                "fix": "replace the BOT_TOKENS entries with live tokens and restart",
+            })),
+        );
+    }
+    if !env_bot_tokens().is_empty() && !all_rate_limited && !all_env_dead {
         let env_bots = env_bot_tokens().len();
         log(
             "guest bot lease skipped: BOT_TOKENS supplies the pool",
@@ -1738,6 +1908,44 @@ pub async fn auto_provision_guest(
     // every `provision-session` call, so leasing is also how a multi-instance
     // deploy builds a pool without anyone handling tokens — see
     // `ensure_pool_size()`.
+    //
+    // NOT while a bot that can actually serve is on file. A dead bot is removed
+    // from the pool rather than replaced: leasing here is what appended a second
+    // (and third) bot beside the dead one on 2026-11-20, all reported as "success".
+    let pool = get_bot_pool();
+    if let Some(bot) = pool_ready().first() {
+        let id = bot.get("bot_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !id.is_empty() {
+            save_session_meta(
+                &id,
+                bot.get("bot_username").and_then(|v| v.as_str()).unwrap_or(""),
+                bot.get("bot_name").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+            log(
+                "provision satisfied from the existing pool - no guest lease",
+                &serde_json::json!({"bot_id": id, "pool": pool.len()}),
+            );
+            let meta = load_session_meta();
+            return Ok(ProvisionResult {
+                bot_id: id,
+                bot_username: meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                error: None,
+            });
+        }
+    }
+    // Rows that are neither serving nor retired: an entry that has never logged in
+    // here. That is still an operator's pool, so it is not written over with a
+    // guest bot.
+    if !pool.is_empty() && !pool_is_all_dead(&pool) {
+        let msg = "The bot pool has no signed-in bot. Sign one in, or remove the dead rows.";
+        log(
+            "provision refused - the pool has rows but none can serve",
+            &serde_json::json!({"pool": pool.len()}),
+        );
+        return Err(ProvisionResult::error(msg));
+    }
+
     match lease_guest_bot(tg).await {
         Ok(res) => {
             save_session_meta(&res.bot_id, &res.bot_username, &res.bot_name);
@@ -1761,6 +1969,22 @@ pub async fn auto_provision_guest(
 /// becomes the active one (provisioning takes the first, `ensure_pool_size()`
 /// keeps the bot that is already active).
 async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<ProvisionResult, String> {
+    // A POOL IS THE OPERATOR'S. Never lease next to one that can still serve.
+    //
+    // `/api/provision` used to lease whenever the *active* bot could not be
+    // proven healthy, which on a dead bot meant "success" was reported for the
+    // corpse and a fresh guest bot was appended beside it (measured 2026-11-20:
+    // pool went 1 → 2 → 3 across three provisions, and the dead row stayed
+    // active). A dead bot is REMOVED by `mark_bot_dead()`; a token is only leased
+    // once nothing on file can serve — which includes the case where every
+    // `BOT_TOKENS` entry is retired (that variable cannot be edited at runtime).
+    let pool = get_bot_pool();
+    if !pool.is_empty() && !pool_is_all_dead(&pool) {
+        return Err(
+            "The bot pool still has a usable bot, so no guest bot was leased. Remove the dead ones and add a working token."
+                .to_string(),
+        );
+    }
     let mut last_error: Option<String> = None;
     // One keypair per install: the origin seals the bot token to it, so a
     // captured response (proxy log, CDN, another install) cannot be reused.
@@ -2023,7 +2247,7 @@ pub async fn ensure_guest_bot(tg: &crate::telegram::TelegramPool) -> usize {
             .iter()
             .filter(|b| {
                 let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
-                !id.is_empty() && crate::telegram::has_session_file(id)
+                !id.is_empty() && !is_bot_dead(id) && crate::telegram::has_session_file(id)
             })
             .count()
     };

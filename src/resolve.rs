@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use crate::cache;
 use crate::config::wp_api_base;
-use crate::httpc::{http_json, http_json_h_status};
+use crate::httpc::{http_json, http_json_h_status_body};
 use crate::log::log;
 use crate::session::{get_bot_id, get_bot_pool, pick_pool_bot};
 use crate::storage::now;
@@ -246,6 +246,52 @@ fn not_found_result(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Did the origin REFUSE the BOT, rather than the file?
+///
+/// `bot_dead: true` is the origin's verdict carried in the body (`410` is the
+/// status it uses for it). Both mean the row must leave the pool — the token is
+/// dead and every retry costs the player a `Retry-After`.
+pub fn dead_bot_result(v: &Value) -> bool {
+    match v.get("bot_dead") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    }
+}
+
+/// The origin's two shapes for "this bot can never resolve again": the `410`
+/// status and the `bot_dead` flag in the body.
+fn dead_verdict(v: &Value, status: u16) -> bool {
+    status == 410 || dead_bot_result(v)
+}
+
+/// Remove a dead bot from the pool and log the origin's own reason.
+///
+/// The pool is the operator's: this only deletes the row (and its session), never
+/// leases a replacement — see `session::lease_guest_bot`. Annotations are added
+/// to `res` so the download path can answer `410 BOT_DEAD` with the same sentence.
+fn retire_if_dead(bot: &str, res: &mut Value, status: u16) -> bool {
+    if !dead_verdict(res, status) {
+        return false;
+    }
+    if let Some(obj) = res.as_object_mut() {
+        obj.insert("bot_dead".to_string(), Value::Bool(true));
+    }
+    let reason = res
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("the origin refused this bot")
+        .to_string();
+    log(
+        "bot retired: the origin says it can no longer resolve",
+        &serde_json::json!({"bot_id": bot, "status": status, "reason": reason}),
+    );
+    crate::session::mark_bot_dead(bot, &reason);
+    true
+}
+
 /// `fd_resolve_shortcode()`: WordPress `/resolve-file` with the retry ladder.
 pub async fn resolve_shortcode(short_code: &str, bot_id: &str, bypass_cache: bool) -> Value {
     resolve_shortcode_status(short_code, bot_id, bypass_cache).await.0
@@ -339,6 +385,20 @@ async fn resolve_shortcode_status_inner(
             return (resolve_shortcode_concurrent(short_code, &[]).await, 0);
         }
     }
+    // A bot the origin has already retired is not asked again: the verdict is
+    // recorded in `dead_bots.json`, and re-asking costs the player an origin
+    // round-trip for an answer we already have.
+    if crate::session::is_bot_dead(&bot) {
+        return (
+            serde_json::json!({
+                "ok": 0,
+                "bot_dead": true,
+                "bot_id": bot,
+                "message": "This bot token is dead. Remove it and add a working bot token.",
+            }),
+            410,
+        );
+    }
     if !bypass_cache {
         if let Some(cached) = resolve_shortcode_cached(short_code, &bot) {
             return (cached, 200);
@@ -375,9 +435,12 @@ async fn resolve_shortcode_status_inner(
         params.push(("nocache".to_string(), "1".to_string()));
     }
 
-    let (mut res, mut status) = http_json_h_status(&url, &params, "GET", 6, &[]).await;
+    let (mut res, mut status) = http_json_h_status_body(&url, &params, "GET", 6, &[]).await;
     if has_id(&res) {
         save_resolve_cache(short_code, &bot, &res);
+        return (res, status);
+    }
+    if retire_if_dead(&bot, &mut res, status) {
         return (res, status);
     }
     // An unanswered resolve used to leave no trail at all: the caller answered
@@ -404,7 +467,7 @@ async fn resolve_shortcode_status_inner(
     // once before the fast ladder, or a busy origin looks like a dead track.
     if status >= 500 || status == 0 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let (r2, s2) = http_json_h_status(&url, &params, "GET", 6, &[]).await;
+        let (r2, s2) = http_json_h_status_body(&url, &params, "GET", 6, &[]).await;
         res = r2;
         status = s2;
         if has_id(&res) {
@@ -428,11 +491,14 @@ async fn resolve_shortcode_status_inner(
     }
     for delay in [1200u64, 1500, 1500] {
         tokio::time::sleep(Duration::from_millis(delay)).await;
-        let (r, s) = http_json_h_status(&url, &retry, "GET", 6, &[]).await;
+        let (r, s) = http_json_h_status_body(&url, &retry, "GET", 6, &[]).await;
         res = r;
         status = s;
         if has_id(&res) {
             save_resolve_cache(short_code, &bot, &res);
+            return (res, status);
+        }
+        if retire_if_dead(&bot, &mut res, status) {
             return (res, status);
         }
         if not_found_result(&res) {
@@ -495,12 +561,12 @@ async fn resolve_shortcode_concurrent_inner(short_code: &str, candidates: &[Stri
     let mut bots: Vec<String> = Vec::new();
     for c in candidates {
         let c = c.trim();
-        if !c.is_empty() && !bots.iter().any(|b| b == c) {
+        if !c.is_empty() && !crate::session::is_bot_dead(c) && !bots.iter().any(|b| b == c) {
             bots.push(c.to_string());
         }
     }
     let active = get_bot_id();
-    if !active.is_empty() && !bots.iter().any(|b| b == &active) {
+    if !active.is_empty() && !crate::session::is_bot_dead(&active) && !bots.iter().any(|b| b == &active) {
         bots.push(active);
     }
     if let Some(picked) = pick_pool_bot() {
@@ -511,7 +577,7 @@ async fn resolve_shortcode_concurrent_inner(short_code: &str, candidates: &[Stri
     }
     for b in get_bot_pool() {
         let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
-        if !id.is_empty() && !bots.iter().any(|b| b == id) {
+        if !id.is_empty() && !crate::session::is_bot_dead(id) && !bots.iter().any(|b| b == id) {
             bots.push(id.to_string());
         }
     }
@@ -1080,6 +1146,33 @@ mod tests {
         save_resolve_cache("batch1", "test-bot", &full);
         let hit = resolve_shortcode_cached("batch1", "test-bot").expect("a full row is usable");
         assert_eq!(hit["title"], "02.Billie.Eilish.LUNCH.flac");
+    }
+
+    /// The origin's verdict on a DEAD BOT must be recognised without guessing
+    /// from prose.
+    ///
+    /// 2026-11-20: a deleted bot resolved to `404 {"message":"File ID not found
+    /// for this request, try to Reset and enter new bot token."}` while the
+    /// origin's own log said `relay destination bot no longer exists`. Nothing
+    /// retired the row, `/api/download` answered `503 ORIGIN_BUSY + Retry-After:
+    /// 5`, and the player retried a permanent fault. The flag (and the 410 the
+    /// patched origin now sends with it) is what ends that loop.
+    #[test]
+    fn a_dead_bot_is_recognised_by_the_flag_not_by_prose() {
+        assert!(dead_bot_result(&serde_json::json!({"ok": 0, "bot_dead": true})));
+        assert!(dead_bot_result(&serde_json::json!({"ok": 0, "bot_dead": 1})));
+        assert!(dead_verdict(&serde_json::json!({"ok": 0}), 410));
+        // A missing FILE is not a dead bot: retiring on a plain 404 would empty a
+        // healthy pool the first time someone asked for a deleted title.
+        assert!(!dead_verdict(
+            &serde_json::json!({
+                "ok": 0,
+                "message": "File ID not found for this request, try to Reset and enter new bot token.",
+            }),
+            404
+        ));
+        assert!(!dead_verdict(&serde_json::json!({"ok": 1, "file_id_mt": "AQADx"}), 200));
+        assert!(!dead_verdict(&Value::Null, 0));
     }
 
     /// Entries already on disk from an older build must read as a MISS, not as a

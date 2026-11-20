@@ -3121,6 +3121,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // a candidate. Judging every bot by one bot's wait is what took the healthy
     // ones offline with the sick ones.
     let usable = |id: &str| {
+        // A bot the ORIGIN has retired cannot resolve, however healthy its login
+        // looked: `mark_bot_dead` recorded it, so stop routing streams to it.
+        if crate::session::is_bot_dead(id) {
+            return false;
+        }
         // A bot whose SESSION is broken is not usable, however healthy its
         // network is: Telegram answered `AUTH_BYTES_INVALID`, and no number of
         // retries fixes an auth key. Skipped for 30 minutes (see
@@ -3173,6 +3178,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     bot_id = chosen_bot;
 
     let mut resolve_busy: Option<i64> = None;
+    // The origin's own verdict when it refuses the BOT (not the file). Carried out
+    // of the resolve block because the empty-`file_id` answer below has to say
+    // "this bot is dead" instead of "the origin is busy".
+    let mut resolve_bot_dead: Option<String> = None;
     if file_id.is_empty() && !short_code.is_empty() {
         let resolved = resolve_shortcode_concurrent(&short_code, &candidates).await;
         let candidate_id = {
@@ -3181,23 +3190,38 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         };
         let message = jstr(&resolved, "message");
         if candidate_id.is_empty() {
-            resolve_busy = resolve_busy_wait(&resolved);
-        }
-        if candidate_id.is_empty() && message.to_ascii_lowercase().contains("not found for this request") {
-            log(
-                "download refused - WordPress does not have this short_code",
-                &serde_json::json!({"short_code": short_code}),
-            );
-            return json_response(
-                404,
-                &serde_json::json!({
-                    "ok": 0,
-                    "message": message,
-                    "short_code": short_code,
-                    "bot_id": bot_id,
-                    "retried_bots": candidates.len(),
-                }),
-            );
+            if crate::resolve::dead_bot_result(&resolved) {
+                // Permanent, and it is the origin's sentence, not ours: "origin
+                // busy + Retry-After: 5" sent players into a retry loop against a
+                // bot that had been deleted at Telegram (2026-11-20).
+                let why = if message.trim().is_empty() {
+                    "This bot token is dead. Remove it and add a working bot token.".to_string()
+                } else {
+                    message.clone()
+                };
+                log(
+                    "download refused - the origin says this bot is dead",
+                    &serde_json::json!({"short_code": short_code, "bot_id": bot_id, "reason": why}),
+                );
+                resolve_bot_dead = Some(why);
+            } else if message.to_ascii_lowercase().contains("not found for this request") {
+                log(
+                    "download refused - WordPress does not have this short_code",
+                    &serde_json::json!({"short_code": short_code}),
+                );
+                return json_response(
+                    404,
+                    &serde_json::json!({
+                        "ok": 0,
+                        "message": message,
+                        "short_code": short_code,
+                        "bot_id": bot_id,
+                        "retried_bots": candidates.len(),
+                    }),
+                );
+            } else {
+                resolve_busy = resolve_busy_wait(&resolved);
+            }
         }
         if !candidate_id.is_empty() {
             file_id = candidate_id;
@@ -3230,6 +3254,36 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     }
 
     if file_id.is_empty() {
+        if let Some(reason) = resolve_bot_dead {
+            // 410, NOT 503: a deleted bot is permanent. No `Retry-After`, because
+            // there is no future moment at which this token relays again — the
+            // answer tells the caller to swap the token, and `/api/bots` has
+            // already dropped the row (`mark_bot_dead`).
+            record_refusal(
+                ctx,
+                started,
+                410,
+                "BOT_DEAD",
+                &reason,
+                &short_code,
+                serde_json::json!({
+                    "bot_id": bot_id,
+                    "removed_from_pool": true,
+                    "pool_bots": crate::session::get_bot_pool().len(),
+                }),
+            );
+            return json_response(
+                410,
+                &serde_json::json!({
+                    "ok": 0,
+                    "error": "BOT_DEAD",
+                    "message": reason,
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "pool_bots": crate::session::get_bot_pool().len(),
+                }),
+            );
+        }
         if let Some(wait) = resolve_busy {
             record_refusal(
                 ctx,

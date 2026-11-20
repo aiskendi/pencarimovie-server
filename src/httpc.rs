@@ -264,7 +264,32 @@ pub async fn http_json_h_status(
     timeout_secs: u64,
     headers: &[(String, String)],
 ) -> (Value, u16) {
-    http_json_h_status_inner(url, params, method, timeout_secs, headers, true).await
+    http_json_h_status_inner(url, params, method, timeout_secs, headers, true, false).await
+}
+
+/// [`http_json_h_status()`] that KEEPS the origin's body on a non-2xx answer.
+///
+/// The origin answers its most specific verdicts with a 4xx and a body that names
+/// the fault — `404 {"message":"File ID not found for this request, try to Reset
+/// and enter new bot token."}`, `410 {"bot_dead":true,…}`. The default variant
+/// throws that body away (`return (Value::Object(empty), status)`), so the
+/// resolver could only say "no file id", `/api/download` turned that into
+/// `503 ORIGIN_BUSY` + `Retry-After: 5`, and the player retried a permanent fault
+/// forever. Measured 2026-11-20: the origin logged
+/// `description: "relay destination bot no longer exists"` while the client saw
+/// "The origin could not resolve this file. Retry shortly."
+///
+/// Only the resolver uses this: every other caller keys on `ok`, and a 4xx body
+/// carries `ok:0`, so keeping it cannot change their behaviour — but it lets the
+/// download path answer the origin's own sentence instead of inventing one.
+pub async fn http_json_h_status_body(
+    url: &str,
+    params: &[(String, String)],
+    method: &str,
+    timeout_secs: u64,
+    headers: &[(String, String)],
+) -> (Value, u16) {
+    http_json_h_status_inner(url, params, method, timeout_secs, headers, true, true).await
 }
 
 /// The auth-enrol request itself must NOT recurse into auth-enrol on a 401.
@@ -275,7 +300,7 @@ pub(crate) async fn http_json_h_status_no_enroll(
     timeout_secs: u64,
     headers: &[(String, String)],
 ) -> (Value, u16) {
-    http_json_h_status_inner(url, params, method, timeout_secs, headers, false).await
+    http_json_h_status_inner(url, params, method, timeout_secs, headers, false, false).await
 }
 
 async fn http_json_h_status_inner(
@@ -285,6 +310,7 @@ async fn http_json_h_status_inner(
     timeout_secs: u64,
     headers: &[(String, String)],
     auto_enroll: bool,
+    keep_error_body: bool,
 ) -> (Value, u16) {
     // PM-Auth self-heal, BEFORE the call that needs it.
     //
@@ -498,6 +524,16 @@ async fn http_json_h_status_inner(
             "http_json failed",
             &serde_json::json!({"url": target, "status": status, "error": err}),
         );
+        // The origin's 4xx body is the verdict — a dead bot, a refused lease, a
+        // reset-the-token demand. Discarding it is what made every one of those
+        // look like "no file id" upstream.
+        if keep_error_body {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                if v.is_object() {
+                    return (v, status);
+                }
+            }
+        }
         return (Value::Object(serde_json::Map::new()), status);
     }
     (

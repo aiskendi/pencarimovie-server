@@ -27,7 +27,7 @@ use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1262,6 +1262,1418 @@ fn download_allowed(addon_open: bool, authenticated: bool, node_public: bool) ->
     addon_open || authenticated || node_public
 }
 
+/* ── split (byte-concatenated) streams ───────────────────────────────────── */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Matroska,
+    Mp4,
+}
+
+impl Container {
+    fn mime(self) -> &'static str {
+        match self {
+            Container::Matroska => "video/x-matroska",
+            Container::Mp4 => "video/mp4",
+        }
+    }
+
+    fn ext(self) -> &'static str {
+        match self {
+            Container::Matroska => "mkv",
+            Container::Mp4 => "mp4",
+        }
+    }
+}
+
+/// Sniff the container from the first bytes.
+///
+/// The origin's MIME cannot be trusted for split parts: the measured `.mkv.001`
+/// row answers `application/zip`, and `stream_filename` then appends `.mp4`
+/// because `ext_by_mime` has no ZIP arm. Four bytes decide it correctly.
+fn sniff_container(head: &[u8]) -> Option<Container> {
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some(Container::Matroska);
+    }
+    if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        return Some(Container::Mp4);
+    }
+    None
+}
+
+/// Give the name the extension its BYTES prove. Keeps the `.001`/`.part1`
+/// marker: a part served alone is still only that part.
+fn retype_media(file_name: &str, container: Container) -> (String, &'static str) {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".webm") && container == Container::Matroska {
+        return (file_name.to_string(), "video/webm");
+    }
+    let mime = container.mime();
+    if lower.ends_with(&format!(".{}", container.ext())) {
+        return (file_name.to_string(), mime);
+    }
+    let stem = file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(file_name);
+    (format!("{}.{}", stem, container.ext()), mime)
+}
+
+#[derive(Debug, Clone)]
+struct SplitPart {
+    short_code: String,
+    size: u64,
+}
+
+/// `parts: [{short_code, file_size}, …]`, or `None` for an ordinary single file.
+fn split_parts_from_payload(payload: &Value) -> Result<Option<Vec<SplitPart>>, String> {
+    let Some(value) = payload.get("parts") else {
+        return Ok(None);
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "parts must be an array".to_string())?;
+    if arr.len() < 2 {
+        return Err("a joined stream needs at least two parts".to_string());
+    }
+    if arr.len() > 32 {
+        return Err("too many parts for one joined stream".to_string());
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, p) in arr.iter().enumerate() {
+        let code = p
+            .get("short_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let size = p.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+        if code.is_empty() {
+            return Err(format!("part {} has no short_code", i + 1));
+        }
+        if size == 0 {
+            return Err(format!("part {} has no file_size", i + 1));
+        }
+        // Telegram's own cap is 4 GB per document; 8 GiB leaves room for the
+        // largest Premium upload without letting a crafted `?d=` payload drive
+        // the window planner into a multi-terabyte plan.
+        if size > 8 * 1024 * 1024 * 1024 {
+            return Err(format!("part {} is larger than one Telegram document", i + 1));
+        }
+        out.push(SplitPart {
+            short_code: code.to_string(),
+            size,
+        });
+    }
+    let total = out.iter().map(|p| p.size).sum::<u64>();
+    if total > 512 * 1024 * 1024 * 1024 {
+        return Err("joined stream is too large".to_string());
+    }
+    Ok(Some(out))
+}
+
+/// One Telegram read: `[skip, end)` of the returned buffer is the client's bytes,
+/// and it starts at `pos` in part `part`.
+#[derive(Debug, Clone, Copy)]
+struct SplitWindow {
+    part: usize,
+    pos: u64,
+    want: u64,
+    skip: u64,
+}
+
+/// Map a byte range of the virtual file to part-local Telegram reads.
+///
+/// `pos` is rounded DOWN to 4096 because `fetch_range_gated` plans its chunk size
+/// from `pos` and assumes it is aligned; the over-fetched prefix is carried in
+/// `skip` and dropped when the window is written. Each window ends at the next
+/// 1 MB boundary **in that part**, which is Telegram's `upload.getFile` rule.
+fn split_windows(parts: &[SplitPart], start: u64, end: u64) -> Vec<SplitWindow> {
+    const ALIGN: u64 = 4096;
+    const MB: u64 = 1024 * 1024;
+    let mut out = Vec::new();
+    let mut cursor = start;
+    let mut base = 0u64;
+    for (i, part) in parts.iter().enumerate() {
+        let part_start = base;
+        let part_end = base + part.size - 1;
+        base += part.size;
+        if cursor > part_end {
+            continue;
+        }
+        // The requested range ends before this part: every later part starts
+        // after it too, so stop. Without this, `seg_end < part_start` underflows
+        // and the loop walks to u64::MAX (caught by the guard below).
+        if cursor > end {
+            break;
+        }
+        let seg_start = cursor.max(part_start);
+        let seg_end = end.min(part_end);
+        if seg_start > seg_end {
+            continue;
+        }
+        let mut s = seg_start - part_start;
+        let e = seg_end - part_start;
+        let mut guard = 0usize;
+        while s <= e {
+            guard += 1;
+            let skip = s % ALIGN;
+            let pos = s - skip;
+            let to_boundary = MB - (pos % MB);
+            let want = (e - pos + 1).min(to_boundary).min(MB);
+            assert!(
+                guard <= 1_000_000,
+                "split window plan ran away: part={i} s={s} e={e} pos={pos} want={want} skip={skip}"
+            );
+            if want > skip {
+                out.push(SplitWindow {
+                    part: i,
+                    pos,
+                    want,
+                    skip,
+                });
+            }
+            s = pos + want;
+        }
+        cursor = part_end + 1;
+    }
+    out
+}
+
+/// Resolve one part to a live `DocTarget`, once. The mutex is what makes a
+/// background prefetch and a window that needs the same part share one resolve.
+async fn ensure_split_target(
+    i: usize,
+    parts: &[SplitPart],
+    targets: &[tokio::sync::Mutex<Option<DocTarget>>],
+    bot_id: &str,
+) -> Result<DocTarget, String> {
+    let mut slot = targets[i].lock().await;
+    if let Some(t) = slot.as_ref() {
+        return Ok(t.clone());
+    }
+    let code = &parts[i].short_code;
+    let mut res = resolve_shortcode_cached(code, bot_id).unwrap_or(Value::Null);
+    let mut id = id_of(&res);
+    if id.is_empty() {
+        res = resolve_shortcode(code, bot_id, false).await;
+        id = id_of(&res);
+    }
+    if id.is_empty() {
+        return Err(format!("could not resolve part {}", code));
+    }
+    let target = prepare_file_target(&id, parts[i].size)?;
+    *slot = Some(target.clone());
+    Ok(target)
+}
+
+fn zip_bad() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static B: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Remember a part set that answered 415, so the next /stream list hides it.
+fn mark_zip_bad(parts: &[SplitPart]) {
+    let now = std::time::Instant::now();
+    if let Ok(mut m) = zip_bad().lock() {
+        for p in parts {
+            m.insert(p.short_code.clone(), now);
+        }
+    }
+}
+
+pub fn zip_marked_bad(code: &str) -> bool {
+    zip_bad()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(code).copied())
+        .map(|t| t.elapsed().as_secs() < 3600)
+        .unwrap_or(false)
+}
+
+/// True when a split `.zip` group resolves to one stored, seekable entry.
+/// Used by the stream list to hide rows that can only answer 415.
+pub async fn zip_probe_ok(
+    parts_in: &[(String, u64)],
+    entry: Arc<crate::telegram::BotEntry>,
+    bot_id: &str,
+) -> bool {
+    let parts: Arc<Vec<SplitPart>> = Arc::new(
+        parts_in
+            .iter()
+            .map(|(code, size)| SplitPart {
+                short_code: code.clone(),
+                size: *size,
+            })
+            .collect(),
+    );
+    let sizes: Vec<u64> = parts.iter().map(|p| p.size).collect();
+    let targets: Arc<Vec<tokio::sync::Mutex<Option<DocTarget>>>> =
+        Arc::new((0..parts.len()).map(|_| tokio::sync::Mutex::new(None)).collect());
+    let fetcher: crate::split_remux::Fetcher = {
+        let entry = entry.clone();
+        let parts = parts.clone();
+        let targets = targets.clone();
+        let bot = bot_id.to_string();
+        Arc::new(move |index, pos, want| {
+            let entry = entry.clone();
+            let parts = parts.clone();
+            let targets = targets.clone();
+            let bot = bot.clone();
+            async move {
+                let mut target = ensure_split_target(
+                    index,
+                    parts.as_ref().as_slice(),
+                    targets.as_ref().as_slice(),
+                    &bot,
+                )
+                .await?;
+                let mut attempt = 0u32;
+                loop {
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
+                        .await
+                    {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.file_reference && attempt == 0 => {
+                            attempt += 1;
+                            target = refresh_split_target(
+                                index,
+                                parts.as_ref().as_slice(),
+                                targets.as_ref().as_slice(),
+                                &bot,
+                            )
+                            .await?;
+                        }
+                        Err(e) => return Err(e.message),
+                    }
+                }
+            }
+            .boxed()
+        })
+    };
+    let key = parts
+        .iter()
+        .map(|p| format!("{}:{}", p.short_code, p.size))
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::zip_split::probe_cached(key, sizes, fetcher)
+        .await
+        .map(|z| z.method == 0 && z.uncomp_size > 0)
+        .unwrap_or(false)
+}
+
+/// Stored-entry ZIP passthrough: one HTTP body for the movie inside a split
+/// `.zip.001` archive. `Range` maps to `entry.data_start + range.start`; the
+/// central directory is read only for the probe (tail + CD + local header).
+async fn serve_zip_split(
+    requested_name: &str,
+    parts: Arc<Vec<SplitPart>>,
+    targets: Arc<Vec<tokio::sync::Mutex<Option<DocTarget>>>>,
+    entry: Arc<crate::telegram::BotEntry>,
+    bot_id: String,
+    total_size: u64,
+    stream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    limit_guard: Option<crate::ratelimit::Guard>,
+    started: std::time::Instant,
+    range_header: String,
+) -> Response {
+    let part_count = parts.len();
+    let first_code = parts[0].short_code.clone();
+    let sizes: Vec<u64> = parts.iter().map(|p| p.size).collect();
+
+    let fetcher: crate::split_remux::Fetcher = {
+        let entry = entry.clone();
+        let parts = parts.clone();
+        let targets = targets.clone();
+        let bot = bot_id.clone();
+        Arc::new(move |index, pos, want| {
+            let entry = entry.clone();
+            let parts = parts.clone();
+            let targets = targets.clone();
+            let bot = bot.clone();
+            async move {
+                let mut target = ensure_split_target(
+                    index,
+                    parts.as_ref().as_slice(),
+                    targets.as_ref().as_slice(),
+                    &bot,
+                )
+                .await?;
+                let mut attempt = 0u32;
+                loop {
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
+                        .await
+                    {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.file_reference && attempt == 0 => {
+                            attempt += 1;
+                            target = refresh_split_target(
+                                index,
+                                parts.as_ref().as_slice(),
+                                targets.as_ref().as_slice(),
+                                &bot,
+                            )
+                            .await?;
+                        }
+                        Err(e) => return Err(e.message),
+                    }
+                }
+            }
+            .boxed()
+        })
+    };
+
+    let cache_key = parts
+        .iter()
+        .map(|p| format!("{}:{}", p.short_code, p.size))
+        .collect::<Vec<_>>()
+        .join(",");
+    let zip = match crate::zip_split::probe_cached(cache_key, sizes, fetcher).await {
+        Ok(z) => z,
+        Err(e) => {
+            mark_zip_bad(parts.as_ref().as_slice());
+            log(
+                "split download: ZIP probe failed",
+                &serde_json::json!({"error": e, "short_code": first_code, "parts": part_count}),
+            );
+            return json_response(
+                415,
+                &serde_json::json!({
+                    "ok": 0,
+                    "error": "ZIP_UNREADABLE",
+                    "message": e,
+                }),
+            );
+        }
+    };
+    if zip.method != 0 {
+        mark_zip_bad(parts.as_ref().as_slice());
+        log(
+            "split download: ZIP entry is deflated",
+            &serde_json::json!({
+                "short_code": first_code,
+                "entry": zip.name,
+                "method": zip.method,
+                "comp": zip.comp_size,
+                "uncomp": zip.uncomp_size,
+            }),
+        );
+        return json_response(
+            415,
+            &serde_json::json!({
+                "ok": 0,
+                "error": "ZIP_DEFLATED",
+                "message": "This ZIP entry is deflated; only stored ZIP entries can be seeked on the fly.",
+            }),
+        );
+    }
+
+    let total = zip.uncomp_size;
+    let range = if range_header.is_empty() {
+        None
+    } else {
+        parse_range_header(&range_header, total)
+    };
+    if !range_header.is_empty() && range.is_none() {
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+            .body(Body::empty())
+            .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0})));
+    }
+    let (start, end) = match range {
+        Some(r) => (r.start, r.end),
+        None => (0, total.saturating_sub(1)),
+    };
+    let total_req = end.saturating_sub(start) + 1;
+
+    let ext = zip
+        .name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = mime_by_ext(&ext).unwrap_or("application/octet-stream");
+    let joined_name = stream_filename(&zip.name, mime);
+
+    let plan = split_windows(parts.as_ref().as_slice(), zip.data_start + start, zip.data_start + end);
+    if plan.is_empty() && total_req > 0 {
+        return json_response(
+            500,
+            &serde_json::json!({"ok": 0, "message": "ZIP window plan is empty"}),
+        );
+    }
+
+    log(
+        "zip split served",
+        &serde_json::json!({
+            "short_code": first_code,
+            "parts": part_count,
+            "archive_size": total_size,
+            "entry": zip.name,
+            "entry_size": zip.uncomp_size,
+            "data_start": zip.data_start,
+            "range": range_header,
+            "windows": plan.len(),
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let entry_task = entry.clone();
+    let parts_task = parts.clone();
+    let targets_task = targets.clone();
+    let bot_task = bot_id.clone();
+    let code_for_task = first_code.clone();
+    let pipeline = pipeline_depth();
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        let _limit_guard = limit_guard;
+        let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&code_for_task);
+
+        let stream = futures_util::stream::iter(plan.into_iter().map(|w| {
+            let entry = entry_task.clone();
+            let parts = parts_task.clone();
+            let targets = targets_task.clone();
+            let bot = bot_task.clone();
+            async move {
+                let mut attempt = 0u32;
+                loop {
+                    let target = match ensure_split_target(
+                        w.part,
+                        parts.as_ref().as_slice(),
+                        targets.as_ref().as_slice(),
+                        &bot,
+                    )
+                    .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => return Err(e),
+                    };
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, w.pos, w.want)
+                        .await
+                    {
+                        Ok(v) => return Ok((w, v)),
+                        Err(e) => {
+                            if e.file_reference && attempt == 0 {
+                                attempt += 1;
+                                let code = parts[w.part].short_code.clone();
+                                invalidate_resolve_cache(&code, &bot);
+                                if let Ok(mut slot) = targets[w.part].try_lock() {
+                                    *slot = None;
+                                }
+                                let fresh = resolve_shortcode_fresh(&code, &bot).await;
+                                let id = id_of(&fresh);
+                                if !id.is_empty() {
+                                    if let Ok(t) = prepare_file_target(&id, parts[w.part].size) {
+                                        *targets[w.part].lock().await = Some(t);
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Err(format!("part {} at {}: {}", w.part + 1, w.pos, e.message));
+                        }
+                    }
+                }
+            }
+        }))
+        .buffered(pipeline);
+
+        futures_util::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            if tx.is_closed() {
+                return;
+            }
+            match item {
+                Ok((w, data)) => {
+                    let skip = w.skip.min(data.len() as u64) as usize;
+                    if skip >= data.len() {
+                        continue;
+                    }
+                    let out = Bytes::copy_from_slice(&data[skip..]);
+                    if tx.send(Ok(out)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    log(
+                        "zip split aborted mid-body",
+                        &serde_json::json!({"error": e, "short_code": code_for_task}),
+                    );
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut builder = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, total_req.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename*=UTF-8''{}", percent_encode(&joined_name)),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            "Access-Control-Expose-Headers",
+            "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+        )
+        .header("X-Accel-Buffering", "no")
+        .header("X-PM-Parts", part_count.to_string())
+        .header("X-PM-Zip", "stored")
+        .header("X-PM-Zip-Entry", &zip.name);
+    if range.is_some() {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+    }
+    let stream = ReceiverStream::new(rx).map(|item| match item {
+        Ok(b) => Ok::<Bytes, std::io::Error>(b),
+        Err(e) => Err(e),
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0, "message": "response build failed"})))
+}
+
+/// Serve the indexed B+ remux: exact length, `Accept-Ranges`, and a body that
+/// regenerates only the clusters a `Range` asks for.
+async fn serve_indexed_remux(
+    index: Arc<crate::split_index::Index>,
+    fetcher: crate::split_remux::Fetcher,
+    requested_name: &str,
+    code: String,
+    stream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    limit_guard: Option<crate::ratelimit::Guard>,
+    started: std::time::Instant,
+    range_header: String,
+) -> Response {
+    let total = index.total;
+    let range = if range_header.is_empty() {
+        None
+    } else {
+        parse_range_header(&range_header, total)
+    };
+    if !range_header.is_empty() && range.is_none() {
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", total))
+            .body(Body::empty())
+            .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0})));
+    }
+    let (start, end) = range
+        .as_ref()
+        .map(|r| (r.start, r.end))
+        .unwrap_or((0, total.saturating_sub(1)));
+    let total_req = end.saturating_sub(start) + 1;
+
+    log(
+        "indexed remux served",
+        &serde_json::json!({
+            "short_code": code,
+            "total": total,
+            "range": range_header,
+            "clusters": index.clusters.len(),
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let code_task = code.clone();
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        let _limit_guard = limit_guard;
+        let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&code_task);
+
+        let header_len = index.header.len() as u64;
+        let base = header_len.saturating_sub(index.payload_len);
+        let cluster_total: u64 = index.clusters.iter().map(|c| c.output_size).sum();
+        let cues_start = header_len + cluster_total;
+
+        // Header slice.
+        if start < header_len {
+            let s = start as usize;
+            let e = (end.min(header_len - 1) + 1) as usize;
+            if tx.send(Ok(Bytes::copy_from_slice(&index.header[s..e]))).await.is_err() {
+                return;
+            }
+        }
+
+        // Cluster spans.
+        if end >= header_len && start < cues_start {
+            for c in &index.clusters {
+                let fpos = base + c.output_pos;
+                if fpos + c.output_size <= start {
+                    continue;
+                }
+                if fpos > end {
+                    break;
+                }
+                let local_from = start.saturating_sub(fpos);
+                let local_to = (end.min(fpos + c.output_size - 1) + 1 - fpos).min(c.output_size);
+                if let Err(e) =
+                    crate::split_index::stream_cluster_range(&fetcher, c, local_from, local_to, &tx)
+                        .await
+                {
+                    log(
+                        "indexed remux cluster failed",
+                        &serde_json::json!({"error": e, "short_code": code_task}),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Cues slice.
+        if end >= cues_start {
+            let s = start.saturating_sub(cues_start) as usize;
+            let e = ((end.min(cues_start + index.cues.len() as u64 - 1)) + 1 - cues_start) as usize;
+            let e = e.min(index.cues.len());
+            if s < e
+                && tx
+                    .send(Ok(Bytes::copy_from_slice(&index.cues[s..e])))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let mime = crate::download::mime_by_ext(
+        &requested_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default(),
+    )
+    .unwrap_or("video/x-matroska");
+    let mut builder = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, total_req.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename*=UTF-8''{}", percent_encode(requested_name)),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            "Access-Control-Expose-Headers",
+            "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+        )
+        .header("X-Accel-Buffering", "no")
+        .header("X-PM-Remux", "matroska")
+        .header("X-PM-Seekable", "1");
+    if range.is_some() {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+    }
+    let stream = ReceiverStream::new(rx).map(|item| match item {
+        Ok(b) => Ok::<Bytes, std::io::Error>(b),
+        Err(e) => Err(e),
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0})))
+}
+
+/// B-live: one chunked Matroska body remuxed from N complete MKV documents.
+///
+/// No `Content-Length` and no `Range` are advertised: the output length is only
+/// known after every cluster header has been walked, which is the B+ index pass.
+/// The player gets a single `Segment` and a monotonic cluster timeline; seeking
+/// is whatever the client can do from the start of a chunked stream.
+async fn serve_remux_split(
+    requested_name: &str,
+    parts: Arc<Vec<SplitPart>>,
+    targets: Arc<Vec<tokio::sync::Mutex<Option<DocTarget>>>>,
+    entry: Arc<crate::telegram::BotEntry>,
+    bot_id: String,
+    total_size: u64,
+    stream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    limit_guard: Option<crate::ratelimit::Guard>,
+    started: std::time::Instant,
+    range_header: String,
+    seek: bool,
+) -> Response {
+    let part_count = parts.len();
+    let sizes: Vec<u64> = parts.iter().map(|p| p.size).collect();
+    let first_code = parts[0].short_code.clone();
+    let joined_name = stream_filename(requested_name, "video/x-matroska");
+
+    let fetcher: crate::split_remux::Fetcher = {
+        let entry = entry.clone();
+        let parts = parts.clone();
+        let targets = targets.clone();
+        let bot = bot_id.clone();
+        Arc::new(move |index, pos, want| {
+            let entry = entry.clone();
+            let parts = parts.clone();
+            let targets = targets.clone();
+            let bot = bot.clone();
+            async move {
+                let mut target = ensure_split_target(
+                    index,
+                    parts.as_ref().as_slice(),
+                    targets.as_ref().as_slice(),
+                    &bot,
+                )
+                .await?;
+                let mut attempt = 0u32;
+                loop {
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
+                        .await
+                    {
+                        Ok(v) => return Ok(v),
+                        Err(e) if e.file_reference && attempt == 0 => {
+                            attempt += 1;
+                            target = refresh_split_target(
+                                index,
+                                parts.as_ref().as_slice(),
+                                targets.as_ref().as_slice(),
+                                &bot,
+                            )
+                            .await?;
+                        }
+                        Err(e) => return Err(e.message),
+                    }
+                }
+            }
+            .boxed()
+        })
+    };
+
+    if seek {
+        let index_key = parts
+            .iter()
+            .map(|p| format!("{}:{}", p.short_code, p.size))
+            .collect::<Vec<_>>()
+            .join(",");
+        let index_parts: Vec<(String, u64)> = parts
+            .iter()
+            .map(|p| (p.short_code.clone(), p.size))
+            .collect();
+        match crate::split_index::build(index_key, index_parts, fetcher.clone()).await {
+            Ok(index) => {
+                return serve_indexed_remux(
+                    index,
+                    fetcher.clone(),
+                    &joined_name,
+                    first_code,
+                    stream_permit,
+                    limit_guard,
+                    started,
+                    range_header,
+                )
+                .await;
+            }
+            Err(e) => {
+                log(
+                    "split remux index unavailable - live fallback",
+                    &serde_json::json!({"error": e, "short_code": first_code}),
+                );
+            }
+        }
+    }
+
+    log(
+        "split remux served",
+        &serde_json::json!({
+            "short_code": first_code,
+            "parts": part_count,
+            "total_size": total_size,
+            "range": range_header,
+            "range_ignored": !range_header.is_empty(),
+            "elapsed_ms": started.elapsed().as_millis(),
+        }),
+    );
+
+    let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let code_for_count = first_code.clone();
+    // Count what actually left the remuxer: a player that opens the body and
+    // closes after 0 bytes is a rejected response, not a Telegram fault.
+    tokio::spawn(async move {
+        let mut bytes_sent = 0u64;
+        while let Some(item) = inner_rx.recv().await {
+            if let Ok(b) = &item {
+                bytes_sent += b.len() as u64;
+            }
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
+        log(
+            "split remux client closed",
+            &serde_json::json!({"short_code": code_for_count, "bytes_sent": bytes_sent}),
+        );
+    });
+    let code_for_task = first_code.clone();
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        let _limit_guard = limit_guard;
+        let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&code_for_task);
+        let mut duration_total = 0.0f64;
+        let mut duration_known = false;
+        for (i, &size) in sizes.iter().enumerate() {
+            if let Some(d) =
+                crate::split_remux::probe_duration(fetcher.clone(), i, size).await
+            {
+                duration_total += d;
+                duration_known = true;
+            }
+        }
+        let duration = if duration_known { Some(duration_total) } else { None };
+        if let Err(e) = crate::split_remux::stream(&sizes, fetcher, inner_tx, duration).await {
+            log(
+                "split remux aborted",
+                &serde_json::json!({"error": e, "short_code": code_for_task}),
+            );
+        }
+    });
+
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/x-matroska")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename*=UTF-8''{}", percent_encode(&joined_name)),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header("X-Accel-Buffering", "no")
+        .header("X-PM-Parts", part_count.to_string())
+        .header("X-PM-Remux", "matroska");
+    let stream = ReceiverStream::new(rx).map(|item| match item {
+        Ok(b) => Ok::<Bytes, std::io::Error>(b),
+        Err(e) => Err(e),
+    });
+    builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+        json_response(
+            500,
+            &serde_json::json!({"ok": 0, "message": "response build failed"}),
+        )
+    })
+}
+
+/// Drop a cached reference and mint a live one. Used when Telegram answers
+/// `FILE_REFERENCE_EXPIRED` — a normal event after the resolve cache ages out.
+async fn refresh_split_target(
+    i: usize,
+    parts: &[SplitPart],
+    targets: &[tokio::sync::Mutex<Option<DocTarget>>],
+    bot_id: &str,
+) -> Result<DocTarget, String> {
+    let code = &parts[i].short_code;
+    invalidate_resolve_cache(code, bot_id);
+    if let Ok(mut slot) = targets[i].try_lock() {
+        *slot = None;
+    }
+    let fresh = resolve_shortcode_fresh(code, bot_id).await;
+    let id = id_of(&fresh);
+    if id.is_empty() {
+        return Err(format!("could not refresh part {}", code));
+    }
+    let target = prepare_file_target(&id, parts[i].size)?;
+    *targets[i].lock().await = Some(target.clone());
+    Ok(target)
+}
+
+/// Warm every part of a joined set as soon as playback starts.
+///
+/// One batch `/resolve-files` call queues the whole set at the origin, then each
+/// part is resolved into a `DocTarget`. The stream itself stays lazy: if a part
+/// is still cold at a boundary, `ensure_split_target` waits on the same mutex —
+/// but in the normal case the boundary never pays a resolve.
+async fn warm_split_targets(
+    parts: &[SplitPart],
+    targets: &[tokio::sync::Mutex<Option<DocTarget>>],
+    bot_id: &str,
+) {
+    let codes: Vec<String> = parts.iter().map(|p| p.short_code.clone()).collect();
+    let _ = crate::resolve::resolve_shortcodes_batch(&codes, bot_id, 8).await;
+    for i in 0..parts.len() {
+        let _ = ensure_split_target(i, parts, targets, bot_id).await;
+    }
+}
+
+/// First 64 bytes of one part, with one fresh resolve on an expired reference.
+async fn fetch_split_head(
+    i: usize,
+    parts: &[SplitPart],
+    targets: &[tokio::sync::Mutex<Option<DocTarget>>],
+    entry: &Arc<crate::telegram::BotEntry>,
+    bot_id: &str,
+) -> Result<Vec<u8>, String> {
+    let mut target = ensure_split_target(i, parts, targets, bot_id).await?;
+    let mut attempt = 0u32;
+    loop {
+        let (client, _gate) = entry.pick_slot();
+        match crate::telegram::fetch_range(&client, &target, 0, 64).await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.file_reference && attempt == 0 => {
+                attempt += 1;
+                target = refresh_split_target(i, parts, targets, bot_id).await?;
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+}
+
+/// `Range` for a virtual file, then one HTTP body that streams the mapped parts
+/// back to back. Every header (`Content-Length`, `Content-Range`, status) is
+/// committed only after part 1's bytes proved the set is a byte split.
+async fn handle_split_download(
+    state: &Arc<AppState>,
+    ctx: &ReqCtx,
+    payload: &Value,
+    parts: Vec<SplitPart>,
+    started: std::time::Instant,
+) -> Response {
+    let total_size: u64 = parts.iter().map(|p| p.size).sum();
+    let first_code = parts[0].short_code.clone();
+    let part_count = parts.len();
+    let requested_name = jstr(payload, "file_name");
+    let range_header = ctx.hdr("range");
+    let range = if range_header.is_empty() {
+        None
+    } else {
+        parse_range_header(&range_header, total_size)
+    };
+    let seek = ctx
+        .query
+        .iter()
+        .any(|(k, v)| k == "seek" && v == "1");
+    if !range_header.is_empty() && range.is_none() {
+        return Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", total_size))
+            .body(Body::empty())
+            .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0})));
+    }
+    let (start, end) = match range {
+        Some(r) => (r.start, r.end),
+        None => (0, total_size.saturating_sub(1)),
+    };
+    let total = end.saturating_sub(start) + 1;
+
+    // One joined set is one title and one body, whatever its part count.
+    let bot_for_limits = get_bot_id();
+    let warm_first = !first_code.is_empty()
+        && !bot_for_limits.is_empty()
+        && resolve_shortcode_cached(&first_code, &bot_for_limits).is_some();
+    let mut limit_guard: Option<crate::ratelimit::Guard> = None;
+    if let Some(limit_key) = crate::ratelimit::client_key(ctx) {
+        match state.limits.acquire(
+            &limit_key,
+            &first_code,
+            state.max_titles_per_ip,
+            state.max_bodies_per_ip,
+        ) {
+            Ok(g) => limit_guard = Some(g),
+            Err(r) => return refuse_limit(ctx, started, r, &first_code),
+        }
+        // A seek, a segmented download and a replay arrive with part 1 already
+        // cached; only a genuinely cold set may spend the resolve budget.
+        if !warm_first {
+            if let Err(wait) = state.limits.check_cold(
+                &limit_key,
+                state.cold_starts_per_ip,
+                state.cold_start_window,
+            ) {
+                return refuse_limit(
+                    ctx,
+                    started,
+                    crate::ratelimit::Refusal {
+                        error: "IP_COLD_START_LIMIT",
+                        message: "Too many new streams from this address. Please retry shortly.",
+                        retry_after: wait,
+                    },
+                    &first_code,
+                );
+            }
+        }
+    }
+
+    let stream_permit = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.download_gate.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => Some(p),
+        _ => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "1")
+                .body(Body::from(
+                    serde_json::json!({
+                        "ok": 0,
+                        "message": "Server busy streaming other viewers. Please retry shortly.",
+                        "retry_after": 1,
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| json_response(503, &serde_json::json!({"ok": 0, "retry_after": 1})));
+        }
+    };
+
+    let mut bot_id = get_bot_id();
+    let mut entry = None;
+    if !bot_id.is_empty() {
+        let token = crate::session::env_token_for(&bot_id);
+        entry = state.telegram.boot(&bot_id, token.as_deref()).await.ok();
+    }
+    if entry.is_none() {
+        if let Ok(prov) = auto_provision_guest(&state.telegram).await {
+            bot_id = prov.bot_id.clone();
+            entry = state.telegram.boot(&prov.bot_id, None).await.ok();
+        }
+    }
+    let Some(entry) = entry else {
+        return json_response(
+            503,
+            &serde_json::json!({
+                "ok": 0,
+                "message": "Telegram Bot is not connected. Please connect your bot token in Settings to stream.",
+            }),
+        );
+    };
+
+    let parts = Arc::new(parts);
+    let targets: Arc<Vec<tokio::sync::Mutex<Option<DocTarget>>>> = Arc::new(
+        (0..part_count)
+            .map(|_| tokio::sync::Mutex::new(None))
+            .collect(),
+    );
+
+    // Batch-warm the whole set while the first head is being checked. The
+    // origin receives ONE `/resolve-files` call for all parts instead of a
+    // resolve at each boundary.
+    {
+        let parts = parts.clone();
+        let targets = targets.clone();
+        let bot = bot_id.clone();
+        tokio::spawn(async move {
+            warm_split_targets(
+                parts.as_ref().as_slice(),
+                targets.as_ref().as_slice(),
+                &bot,
+            )
+            .await;
+        });
+    }
+
+    // A cached ZIP layout is enough to serve the next Range: skip the part-head
+    // probes (2.4 s on a warm seek) and go straight to the entry mapping.
+    let zip_key = parts
+        .iter()
+        .map(|p| format!("{}:{}", p.short_code, p.size))
+        .collect::<Vec<_>>()
+        .join(",");
+    if crate::zip_split::cached(&zip_key).is_some() {
+        return serve_zip_split(
+            &requested_name,
+            parts.clone(),
+            targets.clone(),
+            entry.clone(),
+            bot_id.clone(),
+            total_size,
+            stream_permit,
+            limit_guard,
+            started,
+            range_header.clone(),
+        )
+        .await;
+    }
+
+    // The two heads are independent: fetching them sequentially made a cold
+    // 4K set wait part 1's resolve, then part 2's (measured 6.9 s), which is
+    // longer than a player's first-byte budget.
+    let (head1, head2) = tokio::join!(
+        fetch_split_head(0, parts.as_ref().as_slice(), targets.as_ref().as_slice(), &entry, &bot_id),
+        fetch_split_head(1, parts.as_ref().as_slice(), targets.as_ref().as_slice(), &entry, &bot_id),
+    );
+    let head = match head1 {
+        Ok(v) => v,
+        Err(e) => {
+            log(
+                "split download: first head failed",
+                &serde_json::json!({"error": e, "short_code": first_code}),
+            );
+            return json_response(503, &serde_json::json!({"ok": 0, "message": e, "retry_after": 3}));
+        }
+    };
+    // A ZIP volume (`…mkv.zip.001`) is not Matroska and not a byte split: the
+    // movie is one stored entry inside a ZIP64 archive. Probe the central
+    // directory and serve the entry directly when it is stored.
+    if head.starts_with(&[0x50, 0x4B, 0x03, 0x04]) || head.starts_with(&[0x50, 0x4B, 0x05, 0x06]) {
+        log(
+            "split download: ZIP volumes, probing the central directory",
+            &serde_json::json!({"short_code": first_code, "parts": part_count}),
+        );
+        return serve_zip_split(
+            &requested_name,
+            parts.clone(),
+            targets.clone(),
+            entry.clone(),
+            bot_id.clone(),
+            total_size,
+            stream_permit,
+            limit_guard,
+            started,
+            range_header.clone(),
+        )
+        .await;
+    }
+
+    let Some(container) = sniff_container(&head) else {
+        return json_response(
+            415,
+            &serde_json::json!({
+                "ok": 0,
+                "error": "NOT_A_MEDIA_CONTAINER",
+                "message": "The first part is not a media container this server can join.",
+            }),
+        );
+    };
+
+    // A `.001` name is a hypothesis. If part 2 ALSO starts with a media magic,
+    // this is a container split (mkvmerge/ffmpeg), not a byte split: joining the
+    // bytes would play part 1 and then garbage, so remux the containers instead.
+    //
+    // If part 2's HEAD CANNOT BE READ, do not guess: a byte join on an unverified
+    // set is the one failure that looks like a successful play (part 1 only).
+    // Answer 503 so the client retries when the origin is back.
+    let h2 = match head2 {
+        Ok(h2) => h2,
+        Err(e) => {
+            log(
+                "split download: part 2 head failed - refusing to guess the layout",
+                &serde_json::json!({"error": e, "short_code": first_code, "parts": part_count}),
+            );
+            return json_response(
+                503,
+                &serde_json::json!({
+                    "ok": 0,
+                    "message": "Could not verify the second part yet. Please retry shortly.",
+                    "retry_after": 5,
+                }),
+            );
+        }
+    };
+    if let Some(kind) = sniff_container(&h2) {
+            if container == Container::Matroska && kind == Container::Matroska {
+                log(
+                    "split download: container parts, remuxing",
+                    &serde_json::json!({
+                        "short_code": parts[0].short_code,
+                        "parts": part_count,
+                        "part2_magic": h2.iter().take(4).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "),
+                    }),
+                );
+                return serve_remux_split(
+                    &requested_name,
+                    parts.clone(),
+                    targets.clone(),
+                    entry.clone(),
+                    bot_id.clone(),
+                    total_size,
+                    stream_permit,
+                    limit_guard,
+                    started,
+                    range_header.clone(),
+                    seek,
+                )
+                .await;
+            }
+            // MP4 parts need a sample-table merge (or fMP4 rebase), which this
+            // stage does not implement. Serving part 1 is honest and playable;
+            // feeding MP4 to the Matroska remuxer is not.
+            let single = serde_json::json!({
+                "short_code": parts[0].short_code,
+                "file_name": requested_name,
+                "mime": kind.mime(),
+                "file_size": parts[0].size,
+            });
+            let url = crate::routes::stream_url_for(ctx, &single, &requested_name);
+            log(
+                "split download: MP4 container parts are not remuxed yet - serving part 1",
+                &serde_json::json!({
+                    "short_code": parts[0].short_code,
+                    "parts": part_count,
+                    "part2_magic": h2.iter().take(4).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "),
+                }),
+            );
+            return crate::respond::redirect(&url);
+    }
+
+    let (joined_name, joined_mime) = retype_media(&requested_name, container);
+    let joined_name = stream_filename(&joined_name, joined_mime);
+    let plan = split_windows(parts.as_ref().as_slice(), start, end);
+    if plan.is_empty() && total > 0 {
+        return json_response(
+            500,
+            &serde_json::json!({"ok": 0, "message": "split window plan is empty"}),
+        );
+    }
+
+    log(
+        "split download served",
+        &serde_json::json!({
+            "short_code": first_code.clone(),
+            "parts": part_count,
+            "part_sizes": parts.iter().map(|p| p.size).collect::<Vec<_>>(),
+            "total_size": total_size,
+            "range": range_header,
+            "container": joined_mime,
+            "windows": plan.len(),
+        }),
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let entry_task = entry.clone();
+    let parts_task = parts.clone();
+    let targets_task = targets.clone();
+    let bot_task = bot_id.clone();
+    let pipeline = pipeline_depth();
+    let code_for_task = first_code.clone();
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        let _limit_guard = limit_guard;
+        let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
+        let _titles = TitleGuard::new(&code_for_task);
+
+        let stream = futures_util::stream::iter(plan.into_iter().map(|w| {
+            let entry = entry_task.clone();
+            let parts = parts_task.clone();
+            let targets = targets_task.clone();
+            let bot = bot_task.clone();
+            async move {
+                let mut attempt = 0u32;
+                loop {
+                    let target =
+                        match ensure_split_target(w.part, parts.as_ref().as_slice(), targets.as_ref().as_slice(), &bot)
+                            .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => return Err(e),
+                        };
+                    let (client, gate) = entry.pick_slot();
+                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, w.pos, w.want).await
+                    {
+                        Ok(v) => return Ok((w, v)),
+                        Err(e) => {
+                            if e.file_reference && attempt == 0 {
+                                attempt += 1;
+                                let code = parts[w.part].short_code.clone();
+                                invalidate_resolve_cache(&code, &bot);
+                                if let Ok(mut slot) = targets[w.part].try_lock() {
+                                    *slot = None;
+                                }
+                                let fresh = resolve_shortcode_fresh(&code, &bot).await;
+                                let id = id_of(&fresh);
+                                if !id.is_empty() {
+                                    if let Ok(t) = prepare_file_target(&id, parts[w.part].size) {
+                                        *targets[w.part].lock().await = Some(t);
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Err(format!("part {} at {}: {}", w.part + 1, w.pos, e.message));
+                        }
+                    }
+                }
+            }
+        }))
+        .buffered(pipeline);
+
+        futures_util::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            if tx.is_closed() {
+                return;
+            }
+            match item {
+                Ok((w, data)) => {
+                    let skip = w.skip.min(data.len() as u64) as usize;
+                    if skip >= data.len() {
+                        continue;
+                    }
+                    let out = Bytes::copy_from_slice(&data[skip..]);
+                    if tx.send(Ok(out)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    log(
+                        "split download aborted mid-body",
+                        &serde_json::json!({"error": e, "short_code": code_for_task}),
+                    );
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut builder = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, joined_mime)
+        .header(header::CONTENT_LENGTH, total.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("inline; filename*=UTF-8''{}", percent_encode(&joined_name)),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(
+            "Access-Control-Expose-Headers",
+            "Accept-Ranges, Content-Range, Content-Length, Content-Type",
+        )
+        .header("X-Accel-Buffering", "no")
+        .header("X-PM-Parts", part_count.to_string());
+    if range.is_some() {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total_size),
+        );
+    }
+    let stream = ReceiverStream::new(rx).map(|item| match item {
+        Ok(b) => Ok::<Bytes, std::io::Error>(b),
+        Err(e) => Err(e),
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0, "message": "response build failed"})))
+}
+
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let started = std::time::Instant::now();
     // Public mode is the addon surface: the admin token is no longer embedded in
@@ -1293,6 +2705,21 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     } else {
         decode_download_payload(&encoded)
     };
+
+    match split_parts_from_payload(&payload) {
+        Ok(Some(parts)) => return handle_split_download(state, ctx, &payload, parts, started).await,
+        Ok(None) => {}
+        Err(e) => {
+            return json_response(
+                400,
+                &serde_json::json!({
+                    "ok": 0,
+                    "error": "BAD_PARTS",
+                    "message": e,
+                }),
+            )
+        }
+    }
 
     let mut file_id = {
         let a = jstr(&payload, "file_id_mt");
@@ -2757,6 +4184,31 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         return json_response(status, &payload);
     };
 
+    // The origin's MIME is wrong for split parts: the measured `.mkv.001` row
+    // answers `application/zip`, and `stream_filename` then appends `.mp4`.
+    // Four bytes decide the container correctly, so a player gets
+    // `video/x-matroska` + `.mkv` instead of ZIP + `.mp4`.
+    if start == 0 {
+        if let Some(container) = sniff_container(&first_buf) {
+            let (new_name, new_mime) = retype_media(&file_name, container);
+            let new_name = stream_filename(&new_name, new_mime);
+            if new_name != file_name || new_mime != file_mime {
+                log(
+                    "download retyped by container magic",
+                    &serde_json::json!({
+                        "short_code": short_code,
+                        "from_name": file_name,
+                        "from_mime": file_mime,
+                        "to_name": new_name,
+                        "to_mime": new_mime,
+                    }),
+                );
+                file_name = new_name;
+                file_mime = new_mime.to_string();
+            }
+        }
+    }
+
     if start == 0 && is_disguised_executable(&first_buf, &file_name, &file_mime) {
         log(
             "malicious payload detected: executable binary disguised as media",
@@ -3205,6 +4657,85 @@ mod tests {
 
         let mkv = "Movie.2026.mkv";
         assert_eq!(guess_video_mime(mkv, ""), "video/x-matroska");
+    }
+
+    /* split joining ---------------------------------------------------------- */
+
+    #[test]
+    fn sniff_container_reads_the_magic() {
+        assert_eq!(
+            sniff_container(&[0x1A, 0x45, 0xDF, 0xA3, 0x00]),
+            Some(Container::Matroska)
+        );
+        assert_eq!(sniff_container(b"\0\0\0\x18ftypisom"), Some(Container::Mp4));
+        assert_eq!(sniff_container(b"PK\x03\x04"), None);
+        assert_eq!(sniff_container(b""), None);
+    }
+
+    /// Measured on `OFiNzc`: the origin said `application/zip`, so the old path
+    /// answered ZIP + `….001.mp4`. The bytes say Matroska; the name must follow.
+    #[test]
+    fn retype_media_fixes_the_zip_mkv_part() {
+        let (name, mime) = retype_media("Show.mkv.001.mp4", Container::Matroska);
+        assert_eq!(name, "Show.mkv.001.mkv");
+        assert_eq!(mime, "video/x-matroska");
+
+        let (name, mime) = retype_media("Movie.2026.mkv", Container::Matroska);
+        assert_eq!(name, "Movie.2026.mkv");
+        assert_eq!(mime, "video/x-matroska");
+
+        let (name, mime) = retype_media("Movie.2026.mp4", Container::Mp4);
+        assert_eq!(name, "Movie.2026.mp4");
+        assert_eq!(mime, "video/mp4");
+
+        // WebM shares EBML; do not relabel it as Matroska.
+        let (name, mime) = retype_media("Clip.webm", Container::Matroska);
+        assert_eq!(name, "Clip.webm");
+        assert_eq!(mime, "video/webm");
+    }
+
+    #[test]
+    fn split_windows_cover_the_range_and_stay_inside_each_part() {
+        let parts = vec![
+            SplitPart { short_code: "a".into(), size: 100 },
+            SplitPart { short_code: "b".into(), size: 100 },
+            SplitPart { short_code: "c".into(), size: 50 },
+        ];
+        // 90..=210 crosses both boundaries.
+        let plan = split_windows(&parts, 90, 210);
+        let mut delivered = 0u64;
+        for w in &plan {
+            assert_eq!(w.pos % 4096, 0, "Telegram needs an aligned offset");
+            assert!(w.pos + w.want <= parts[w.part].size, "window crosses a part");
+            assert!(w.want > w.skip);
+            delivered += w.want - w.skip;
+        }
+        assert_eq!(delivered, 210 - 90 + 1);
+
+        // A range wholly inside one part still lands in that part. The offsets
+        // are PART-local: part 1 starts at virtual offset 100, so 120 is local 20.
+        let plan = split_windows(&parts, 120, 130);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].part, 1);
+        assert_eq!(plan[0].skip, 20);
+        assert_eq!(plan[0].want, 31);
+    }
+
+    #[test]
+    fn a_joined_payload_needs_at_least_two_parts() {
+        let one = serde_json::json!({"parts": [{"short_code": "a", "file_size": 10}]});
+        assert!(split_parts_from_payload(&one).is_err());
+
+        let two = serde_json::json!({"parts": [
+            {"short_code": "a", "file_size": 10},
+            {"short_code": "b", "file_size": 20},
+        ]});
+        let parts = split_parts_from_payload(&two).unwrap().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].size, 20);
+
+        let none = serde_json::json!({"short_code": "a", "file_size": 10});
+        assert!(split_parts_from_payload(&none).unwrap().is_none());
     }
 
     /// The stream URL advertises `.wav` for an ALAC source, but the PAYLOAD

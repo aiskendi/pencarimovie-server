@@ -1693,6 +1693,60 @@ pub struct SplitPartInfo {
     pub clean_base: String,
     pub part_num: i32,
     pub total_parts: i32,
+    /// Which naming convention matched. `.part001` and `.mkv.007` can reduce to
+    /// the same `clean_base`, so they must not be grouped together: a duplicate
+    /// part 7 from the other convention breaks the contiguous check.
+    /// 0 caption/unknown, 1 Part, 2 DotPart (`NNN.mkv`), 3 ExtPart (`.mkv.NNN`),
+    /// 4 Raw (`.0NN`), 5 CD/Disc/pt, 6 N-of-M, 7 bracket.
+    pub style: u8,
+    /// The marker sits at the END of the file name (optionally followed by a
+    /// media extension). A terminal marker is evidence of a fragment even when
+    /// no sibling is in this page; a mid-name "Part 1" is not (Detective Conan
+    /// episode 100 is one complete file whose TITLE contains "Part 1").
+    pub terminal: bool,
+}
+
+/// True when `whole` is the last meaningful token of `file`.
+///
+/// This is only POSITION. Whether a terminal `part` marker is evidence of a
+/// fragment is decided by its zero-padding: `…part002.mkv` is a split volume,
+/// `…Part.1.mkv` is a title (the `real_split_siblings_are_flagged_and_ordered`
+/// fixture, and Detective Conan episode 100).
+fn marker_is_terminal(file: &str, whole: &str) -> bool {
+    let Some(at) = file.rfind(whole) else {
+        return true;
+    };
+    let after = file[at + whole.len()..].trim();
+    after.is_empty()
+        || has(
+            "(?i)^\\.(mp4|mkv|avi|webm|mov|m4v|ts|m2ts)$",
+            after,
+        )
+}
+
+/// `part002` / `CD01` are volume markers; `Part.2` / `CD1` are human titles.
+/// The regex's `0*` eats the padding from the capture, so read it from the match.
+fn zero_padded_marker(whole: &str) -> bool {
+    has("(?i)(?:part|cd|disc|disk|dvd|pt)[._\\s-]*0\\d", whole)
+}
+
+/// `AAC5.1.mp4`, `DDP5.1.mkv`, `7.1` — the dot-number is an audio layout, not a
+/// split ordinal. The match starts at the separator before the number; if a
+/// DIGIT sits immediately before it, this is the second half of a decimal.
+fn decimal_suffix(file: &str, whole: &str) -> bool {
+    file.rfind(whole)
+        .map(|at| at > 0 && file.as_bytes()[at - 1].is_ascii_digit())
+        .unwrap_or(false)
+}
+
+/// `…H.265-ProAce.mkv.zip.001` is a ZIP VOLUME that contains a movie, not an
+/// archive we must hide. The truncated catalogue title often loses the `.zip`
+/// part, so the caption is the authority.
+fn media_zip_volume(name: &str) -> bool {
+    has(
+        "(?i)\\.(mkv|mp4|m4v|avi|mov|webm|ts|m2ts)\\.zip(?:\\.\\d{1,4})?$",
+        name,
+    )
 }
 
 /// Port of `fd_extract_split_part_info()` (backend.php:8144).
@@ -1702,11 +1756,23 @@ pub fn extract_split_part_info(filename: &str, caption: &str) -> SplitPartInfo {
     let mut part_num = 0i32;
     let mut total_parts = 0i32;
     let mut matched = false;
+    let mut terminal = false;
+    let mut style = 0u8;
     let mut clean_base = f.to_string();
 
     const RE_PART: &str = "(?i)[._\\s-]part[._\\s-]*0*(\\d{1,4})(?:[._\\s/-]+(?:of[._\\s-]+)?0*(\\d{1,4}))?";
     const RE_DOT_PART: &str = "(?i)[._\\s-]0*(\\d{1,3})\\.(mp4|mkv|avi|webm)$";
     const RE_EXT_PART: &str = "(?i)\\.(?:mp4|mkv|avi|webm)\\.0*(\\d{1,4})$";
+    // Jellyfin/Plex "multiple parts" names: CD1, Disc2, DVD1, pt3.
+    const RE_DISC: &str =
+        "(?i)(?:^|[._\\s-])(?:cd|disc|disk|dvd|pt)[._\\s-]*0*(\\d{1,2})(?=[._\\s-]|$)";
+    // "1of2", "1 of 2", "[1/2]", "(1/2)".
+    const RE_OF: &str =
+        "(?i)(?:^|[._\\s-])0*(\\d{1,2})[._\\s-]*(?:of|/)[._\\s-]*0*(\\d{1,2})(?=[._\\s-]|$)";
+    const RE_BRACKET: &str = "(?i)[\\[(]0*(\\d{1,2})\\s*/\\s*0*(\\d{1,2})[\\])]";
+    // Raw split volumes with no media extension: "...HDR10.001", "...x265.002".
+    // A leading zero is required, so ".1080", ".264" and ".2021" never match.
+    const RE_RAW: &str = "(?i)[._\\s-]0+(\\d{1,4})$";
 
     if let Some(g) = groups(RE_PART, f) {
         part_num = g[1].parse().unwrap_or(0);
@@ -1714,16 +1780,43 @@ pub fn extract_split_part_info(filename: &str, caption: &str) -> SplitPartInfo {
             total_parts = g[2].parse().unwrap_or(0);
         }
         matched = true;
+        style = 1;
+        terminal = zero_padded_marker(&g[0]) && marker_is_terminal(f, &g[0]);
         clean_base = replace_all(RE_PART, f, "");
+    } else if let Some(g) = groups(RE_DISC, f) {
+        part_num = g[1].parse().unwrap_or(0);
+        matched = true;
+        style = 5;
+        terminal = zero_padded_marker(&g[0]) && marker_is_terminal(f, &g[0]);
+        clean_base = replace_all(RE_DISC, f, "");
+    } else if let Some(g) = groups(RE_OF, f) {
+        part_num = g[1].parse().unwrap_or(0);
+        total_parts = g[2].parse().unwrap_or(0);
+        matched = true;
+        style = 6;
+        terminal = false;
+        clean_base = replace_all(RE_OF, f, "");
+    } else if let Some(g) = groups(RE_BRACKET, f) {
+        part_num = g[1].parse().unwrap_or(0);
+        total_parts = g[2].parse().unwrap_or(0);
+        matched = true;
+        style = 7;
+        terminal = false;
+        clean_base = replace_all(RE_BRACKET, f, "").trim().to_string();
     } else if let Some(g) = groups(RE_DOT_PART, f) {
         let num: i32 = g[1].parse().unwrap_or(0);
         let whole = &g[0];
         // NEVER read a codec suffix as a part index: "…AAC2.0.H.264.mkv" is
         // "." + "264" + ".mkv", so every H.264/H.265 release was flagged as
         // "part 264" and then dropped by `exclude_part_title` (ON by default).
-        if !has("(?i)\\b(2160p|1080p|720p|480p|360p)\\b", whole) && !(263..=265).contains(&num) {
+        if !has("(?i)\\b(2160p|1080p|720p|480p|360p)\\b", whole)
+            && !(263..=265).contains(&num)
+            && !decimal_suffix(f, whole)
+        {
             part_num = num;
             matched = true;
+            style = 2;
+            terminal = true;
             let g1 = &g[1];
             let g2 = &g[2];
             let pattern = format!("(?i)[._\\s-]0*{}\\.{}$", escape(g1), g2);
@@ -1732,8 +1825,16 @@ pub fn extract_split_part_info(filename: &str, caption: &str) -> SplitPartInfo {
     } else if let Some(g) = groups(RE_EXT_PART, f) {
         part_num = g[1].parse().unwrap_or(0);
         matched = true;
+        style = 3;
+        terminal = true;
         let pattern = format!("(?i)\\.0*{}$", escape(&g[1]));
         clean_base = replace_all(&pattern, f, "");
+    } else if let Some(g) = groups(RE_RAW, f) {
+        part_num = g[1].parse().unwrap_or(0);
+        matched = true;
+        style = 4;
+        terminal = true;
+        clean_base = replace_all(RE_RAW, f, "");
     }
 
     if matched && total_parts == 0 && !cap.is_empty() {
@@ -1780,6 +1881,8 @@ pub fn extract_split_part_info(filename: &str, caption: &str) -> SplitPartInfo {
             clean_base: String::new(),
             part_num: 0,
             total_parts: 0,
+            style: 0,
+            terminal: false,
         };
     }
 
@@ -1792,6 +1895,8 @@ pub fn extract_split_part_info(filename: &str, caption: &str) -> SplitPartInfo {
         clean_base,
         part_num,
         total_parts,
+        style,
+        terminal,
     }
 }
 
@@ -1812,6 +1917,12 @@ pub struct FileItem {
     pub part_num: i32,
     pub total_parts: i32,
     pub clean_base: String,
+    /// Naming convention that matched (`SplitPartInfo::style`). Two releases can
+    /// reduce to the same `clean_base` with different styles; never merge them.
+    pub split_style: u8,
+    /// A terminal fragment with no complete sibling set (a lone Part 1/2/3).
+    /// It is not a playable title and is dropped from the list entirely.
+    pub split_orphan: bool,
 }
 
 /// Port of `fd_group_split_parts()` (backend.php:8215).
@@ -1840,7 +1951,7 @@ pub fn group_split_parts(files: &mut [FileItem]) -> Vec<usize> {
     let mut perm: Vec<usize> = (0..files.len()).collect();
     perm.sort_by(|&a, &b| {
         let (ai, bi) = (&infos[a], &infos[b]);
-        if ai.is_part && bi.is_part && ai.base_key == bi.base_key {
+        if ai.is_part && bi.is_part && ai.base_key == bi.base_key && ai.style == bi.style {
             ai.part_num.cmp(&bi.part_num)
         } else {
             std::cmp::Ordering::Equal
@@ -1860,7 +1971,7 @@ pub fn group_split_parts(files: &mut [FileItem]) -> Vec<usize> {
     for info in &infos {
         if info.is_part && !info.base_key.is_empty() {
             parts_by_base
-                .entry(info.base_key.clone())
+                .entry(format!("{}#{}", info.base_key, info.style))
                 .or_default()
                 .insert(info.part_num);
         }
@@ -1870,15 +1981,38 @@ pub fn group_split_parts(files: &mut [FileItem]) -> Vec<usize> {
         if !info.is_part {
             continue;
         }
-        let sibling_parts = parts_by_base.get(&info.base_key).map(|s| s.len()).unwrap_or(0);
+        let sibling_parts = parts_by_base
+            .get(&format!("{}#{}", info.base_key, info.style))
+            .map(|s| s.len())
+            .unwrap_or(0);
+        // The ordinal set must start at 1 and be contiguous. `[2,3]` has no
+        // Part 1 and `[1,3]` has a gap: both are incomplete fragments, and every
+        // member is dropped rather than shown as a partial movie.
+        let ordinals_ok = parts_by_base
+            .get(&format!("{}#{}", info.base_key, info.style))
+            .map(|set| {
+                let mut v: Vec<i32> = set.iter().copied().collect();
+                v.sort_unstable();
+                v.iter().enumerate().all(|(k, &n)| n == k as i32 + 1)
+            })
+            .unwrap_or(false);
         let is_real_split = info.total_parts > 1 || sibling_parts > 1;
-        if !is_real_split {
+        // A TERMINAL marker (…part002.mkv, …mkv.002, …HDR10.001) is evidence of a
+        // fragment even when the sibling is missing from this page. Leaving it
+        // unflagged made a 422 MB "part002" look like a complete film and play
+        // half a movie. A mid-name "Part 1" (Detective Conan episode 100) stays
+        // unflagged: it is one complete file whose TITLE contains those words.
+        if !is_real_split && !info.terminal {
             continue;
         }
         file.is_split_part = true;
         file.part_num = info.part_num;
         file.total_parts = info.total_parts;
         file.clean_base = info.clean_base.clone();
+        file.split_style = info.style;
+        file.split_orphan = !ordinals_ok
+            || sibling_parts <= 1
+            || (info.total_parts > 0 && info.total_parts as usize != sibling_parts);
     }
     perm
 }
@@ -1967,6 +2101,76 @@ pub fn detect_parts_by_duration(files: &mut [FileItem]) {
     }
 }
 
+/// Groups that can be joined into one stream: a contiguous `1..=N` set with the
+/// same `clean_base`.
+///
+/// The DOWNLOAD route decides HOW to join: if part 2 starts with a media
+/// container magic it remuxes (B), otherwise it byte-concatenates (A). Size
+/// shape is deliberately not used here: `mkvmerge --split` parts vary in size,
+/// and a two-part set trivially passes any "all but the last are equal" test.
+///
+/// A group is returned only when it has at least two siblings, a contiguous
+/// ordinal, and every part agrees on `total_parts` (when one is known).
+pub fn joinable_groups(files: &[FileItem]) -> Vec<Vec<usize>> {
+    let mut by_base: HashMap<(String, u8), Vec<usize>> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        if !f.is_split_part || f.part_num <= 0 || f.file_size == 0 {
+            continue;
+        }
+        let key = (f.clean_base.trim().to_lowercase(), f.split_style);
+        if key.0.is_empty() {
+            continue;
+        }
+        by_base.entry(key).or_default().push(i);
+    }
+
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for (_, mut idxs) in by_base {
+        if idxs.len() < 2 || idxs.len() > 32 {
+            continue;
+        }
+        idxs.sort_by_key(|&i| files[i].part_num);
+        // Duplicate uploads of the same ordinal are common: the SDR set has two
+        // `part004` rows (3.4 GB with Atmos/10bit, 3.0 GB without). `[1,2,3,4,4]`
+        // failed the contiguous check, so the whole set stayed unjoined. Keep
+        // the LARGER copy of a duplicated ordinal and drop the other.
+        let mut unique: Vec<usize> = Vec::with_capacity(idxs.len());
+        for i in idxs.drain(..) {
+            if let Some(&last) = unique.last() {
+                if files[last].part_num == files[i].part_num {
+                    if files[i].file_size > files[last].file_size {
+                        *unique.last_mut().unwrap() = i;
+                    }
+                    continue;
+                }
+            }
+            unique.push(i);
+        }
+        let idxs = unique;
+        let n = idxs.len() as i32;
+        if n < 2 {
+            continue;
+        }
+        let contiguous = idxs
+            .iter()
+            .enumerate()
+            .all(|(k, &i)| files[i].part_num == k as i32 + 1);
+        if !contiguous {
+            continue;
+        }
+        if idxs
+            .iter()
+            .any(|&i| files[i].total_parts > 0 && files[i].total_parts != n)
+        {
+            continue;
+        }
+        out.push(idxs);
+    }
+    // Stable order for tests and diagnostics.
+    out.sort_by_key(|g| g[0]);
+    out
+}
+
 /// Port of `fd_calculate_stream_sort_score()` (backend.php:8084).
 pub fn stream_sort_score(title: &str, caption: &str, file_size: u64, preferred_res: &str) -> f64 {
     let tags = extract_media_tags(title, caption);
@@ -2043,8 +2247,8 @@ pub fn categorize_quality_key(title: &str, caption: &str) -> String {
 /// `storage/catalog_settings.json`).
 ///
 /// `Default` is written by hand because the PHP's defaults are not all `false`:
-/// `exclude_unplayable` and `exclude_part_title` default to **ON**, and getting
-/// that wrong silently un-hides every archive and split part.
+/// `exclude_unplayable` defaults to **ON**; `exclude_part_title` defaults to
+/// **OFF** so a joined row and its labelled parts are visible out of the box.
 #[derive(Debug, Clone)]
 pub struct StreamFilterConfig {
     pub resolutions: HashMap<String, bool>,
@@ -2069,7 +2273,7 @@ impl Default for StreamFilterConfig {
             visual_tags: HashMap::new(),
             exclude_cam: false,
             exclude_unplayable: true,
-            exclude_part_title: true,
+            exclude_part_title: false,
             min_size_mb: 0,
             max_size_gb: 0,
             excluded_keywords: Vec::new(),
@@ -2108,7 +2312,7 @@ impl StreamFilterConfig {
             visual_tags: table(cfg.get("visual_tags")),
             exclude_cam: flag("exclude_cam", false),
             exclude_unplayable: flag("exclude_unplayable", true),
-            exclude_part_title: flag("exclude_part_title", true),
+            exclude_part_title: flag("exclude_part_title", false),
             min_size_mb: cfg.get("min_size_mb").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
             max_size_gb: cfg.get("max_size_gb").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
             excluded_keywords: words(cfg.get("excluded_keywords")),
@@ -2153,16 +2357,35 @@ pub fn apply_stream_filters(files: &[FileItem], cfg: &StreamFilterConfig) -> Vec
             continue;
         }
         // Unplayable (archives / raw split chunks).
+        //
+        // The TITLE is often truncated and the real volume name is in the
+        // caption: measured on `The.Spiderwick…HDR10.001`, whose caption says
+        // `…H.265-ProAce.mkv.zip.001`. Checking only the title missed the ZIP and
+        // produced a joined row that 415'd on play. The caption's first line is
+        // the full original file name.
+        let caption_first = caption.lines().next().unwrap_or("").trim();
         let has_playable_ext = has(
             "(?i)\\.(mp4|m4v|mkv|webm|avi|mov|ts|m2ts|flv|wmv|3gp|mpg|mpeg|mp3|m4a|flac|wav|ogg|opus|aac)$",
             &title,
         );
-        let is_archive = has(
-            "(?i)\\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)$",
-            &title,
+        // The caption may carry the full name of a raw volume (`…mkv.001`) or a
+        // ZIP volume (`…mkv.zip.001`); both are media even though the truncated
+        // title ends in `.001`.
+        let caption_has_media = has(
+            "(?i)\\.(mp4|m4v|mkv|webm|avi|mov|ts|m2ts|flv|wmv|3gp|mpg|mpeg|mp3|m4a|flac|wav|ogg|opus|aac)(?:\\.zip)?(?:\\.\\d{1,4})?$",
+            caption_first,
         );
-        let is_raw_split = !has_playable_ext && has("\\.(?:0\\d{2,3}|\\d{3})$", &title);
-        if cfg.exclude_unplayable && !has_playable_ext && (is_raw_split || is_archive) {
+        let is_archive = (has(
+            "(?i)\\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)(?:\\.\\d{1,4})?(?:\\s|$)",
+            &title,
+        ) && !media_zip_volume(&title))
+            || (has(
+                "(?i)\\.(?:zip|rar|7z|tar|gz|bz2|xz|iso|bin|exe|apk|pdf|epub)(?:\\.\\d{1,4})?(?:\\s|$)",
+                caption_first,
+            ) && !media_zip_volume(caption_first));
+        let is_raw_split =
+            !has_playable_ext && !caption_has_media && has("\\.(?:0\\d{2,3}|\\d{3})$", &title);
+        if cfg.exclude_unplayable && (is_archive || is_raw_split) {
             continue;
         }
         // 3. Encodes.
@@ -2211,6 +2434,14 @@ pub fn apply_stream_filters(files: &[FileItem], cfg: &StreamFilterConfig) -> Vec
             continue;
         }
         // 8. Exclude split-release parts (flag comes from group_split_parts).
+        //
+        // An ORPHAN fragment is dropped even when `exclude_part_title` is off:
+        // a lone `...part001.mkv` is not a title, it is a missing-data row that
+        // would play half a movie. Only a sibling set that can actually be
+        // joined survives.
+        if item.split_orphan {
+            continue;
+        }
         if cfg.exclude_part_title && item.is_split_part {
             continue;
         }
@@ -2922,6 +3153,8 @@ mod tests {
             "Movie.Name.AAC2.0.H.264.mkv",
             "Movie.Name.AAC2.0.H.265.mkv",
             "Movie.Name.2019.1080p.BluRay.x264.mkv",
+            "Spider.Man.Brand.New.Day.2026.1080p.WEBRip.x265.10bit.AAC5.1.mp4",
+            "Movie.2020.1080p.DDP5.1.mkv",
         ] {
             let info = extract_split_part_info(file, "");
             assert!(!info.is_part, "{file} must not be a split part");
@@ -3012,8 +3245,360 @@ mod tests {
         assert_eq!(kept[0].1, "1080p");
 
         files[0].is_split_part = true;
-        let kept = apply_stream_filters(&files, &cfg);
-        assert!(kept.is_empty(), "exclude_part_title defaults to ON");
+        let mut on = StreamFilterConfig::default();
+        on.exclude_part_title = true;
+        let kept = apply_stream_filters(&files, &on);
+        assert!(kept.is_empty(), "explicitly enabling the part filter hides them");
+    }
+
+    #[test]
+    fn caption_media_zip_volume_is_kept() {
+        let files = vec![FileItem {
+            title: "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.001"
+                .into(),
+            caption:
+                "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB-DL.MULTi.AAC.HDR10.H.265-ProAce.mkv.zip.001\n\n#MSM32Bot"
+                    .into(),
+            file_size: 4_194_304_000,
+            ..Default::default()
+        }];
+        let cfg = StreamFilterConfig::default();
+        assert_eq!(
+            apply_stream_filters(&files, &cfg).len(),
+            1,
+            "a .mkv.zip.NNN volume is a playable ZIP container, not an archive to hide"
+        );
+    }
+
+    #[test]
+    fn caption_plain_archive_is_unplayable() {
+        let files = vec![FileItem {
+            title: "Some.Movie.2026.1080p.001".into(),
+            caption: "Some.Movie.2026.1080p.mkv.rar.001".into(),
+            file_size: 1,
+            ..Default::default()
+        }];
+        let cfg = StreamFilterConfig::default();
+        assert!(apply_stream_filters(&files, &cfg).is_empty());
+    }
+
+    #[test]
+    fn caption_media_extension_keeps_a_raw_split() {
+        let files = vec![FileItem {
+            title: "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.001"
+                .into(),
+            caption:
+                "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB-DL.MULTi.AAC.HDR10.H.265-ProAce.mkv.001"
+                    .into(),
+            file_size: 4_194_304_000,
+            ..Default::default()
+        }];
+        let cfg = StreamFilterConfig::default();
+        assert_eq!(
+            apply_stream_filters(&files, &cfg).len(),
+            1,
+            "a caption with a media extension is a real raw split, not an archive"
+        );
+    }
+
+    /* container joining ------------------------------------------------------ */
+
+    #[test]
+    fn joinable_groups_take_contiguous_ordinals_whatever_the_sizes() {
+        let mib = 1_048_576u64;
+        let mut files = vec![
+            FileItem {
+                title: "Show.S01E01.1080p.mkv.001".into(),
+                file_size: 4_000 * mib,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.S01E01.1080p.mkv.002".into(),
+                file_size: 123_456,
+                ..Default::default()
+            },
+            // A real mkvmerge --split set measured on this catalogue: six ~4 GB
+            // chunks and a short tail. The sizes vary; it still joins, and the
+            // download route remuxes it (part 2 starts with EBML).
+            FileItem {
+                title: "Movie.2026.2160p.mkv.001".into(),
+                file_size: 4_146_255_560,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.2160p.mkv.002".into(),
+                file_size: 4_130_938_223,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.2160p.mkv.003".into(),
+                file_size: 301_954_429,
+                ..Default::default()
+            },
+            // A two-part container split, also measured: 4,194,245,378 + 1,091,836,976.
+            FileItem {
+                title: "Obsession.2026.Open.Matte.4K.2160p.WEBRip.HEVC.mkv.001".into(),
+                file_size: 4_194_245_378,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Obsession.2026.Open.Matte.4K.2160p.WEBRip.HEVC.mkv.002".into(),
+                file_size: 1_091_836_976,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        let groups = joinable_groups(&files);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], vec![0, 1]);
+        assert_eq!(groups[1], vec![2, 3, 4]);
+        assert_eq!(groups[2], vec![5, 6]);
+    }
+
+    #[test]
+    fn joinable_groups_require_a_contiguous_ordinal() {
+        let mut files = vec![
+            FileItem {
+                title: "Show.mkv.001".into(),
+                file_size: 1_000,
+                ..Default::default()
+            },
+            // .002 is missing.
+            FileItem {
+                title: "Show.mkv.003".into(),
+                file_size: 10,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        assert!(
+            joinable_groups(&files).is_empty(),
+            "a gap in the ordinals must never be joined"
+        );
+    }
+
+    /// The screenshot bug: `…HDR.part001..007.mkv` and a lone `…HDR.mkv.007`
+    /// reduce to the SAME clean_base. Grouping by base alone made part 7 appear
+    /// twice and broke the contiguous check, so the seven-part set stayed
+    /// unjoined. The naming style is part of the group identity.
+    #[test]
+    fn part_and_mkv_styles_do_not_share_a_group() {
+        let mut files: Vec<FileItem> = (1..=7)
+            .map(|n| FileItem {
+                title: format!("Show.2026.4K.HDR.part{n:03}.mkv"),
+                file_size: 100,
+                ..Default::default()
+            })
+            .collect();
+        files.push(FileItem {
+            title: "Show.2026.4K.HDR.mkv.007".into(),
+            file_size: 100,
+            ..Default::default()
+        });
+
+        group_split_parts(&mut files);
+        let groups = joinable_groups(&files);
+        assert_eq!(groups.len(), 1, "only the seven .partNNN parts join");
+        assert_eq!(groups[0].len(), 7);
+        assert!(
+            !groups[0].contains(&7),
+            "the .mkv.007 file uses a different style and must not join"
+        );
+    }
+
+    /// The SDR set has two `part004` uploads (3.4 GB and 3.0 GB). `[1,2,3,4,4]`
+    /// failed the contiguous check; the larger copy must be chosen.
+    #[test]
+    fn duplicate_ordinal_keeps_the_larger_copy() {
+        let mut files = vec![
+            FileItem {
+                title: "Show.2026.4K.SDR.part001.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.SDR.part002.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.SDR.part003.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.SDR.part004.mkv".into(),
+                file_size: 340,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.SDR.part004.mkv".into(),
+                file_size: 300,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        let groups = joinable_groups(&files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec![0, 1, 2, 3]);
+        assert_eq!(files[3].file_size, 340);
+    }
+
+    /// Manticore has 2,561 rows like `…HDR10.001` / `…x265.002` with NO media
+    /// extension before the volume number. The old matcher hid them as "raw
+    /// split"; they are a byte split and can be joined.
+    #[test]
+    fn raw_numeric_suffix_is_a_byte_split() {
+        let a = extract_split_part_info(
+            "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.001",
+            "",
+        );
+        assert!(a.is_part && a.part_num == 1 && a.terminal);
+        assert_eq!(
+            a.clean_base,
+            "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10"
+        );
+
+        let b = extract_split_part_info(
+            "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.002",
+            "",
+        );
+        assert!(b.is_part && b.part_num == 2 && b.terminal);
+        assert_eq!(a.base_key, b.base_key);
+
+        let mut files = vec![
+            FileItem {
+                title: "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.001"
+                    .into(),
+                file_size: 4_194_304_000,
+                ..Default::default()
+            },
+            FileItem {
+                title: "The.Spiderwick.Chronicles.2008.1080p.AMZN.WEB.DL.MULTi.AAC.HDR10.002"
+                    .into(),
+                file_size: 1_246_521_237,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        let groups = joinable_groups(&files);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0], vec![0, 1]);
+    }
+
+    #[test]
+    fn cd_disc_dvd_and_pt_are_parts() {
+        let cd = extract_split_part_info("Movie.2021.CD1.mkv", "");
+        assert!(cd.is_part && cd.part_num == 1);
+        assert!(!cd.terminal, "a one-digit CD1 is a title unless a sibling proves it");
+        assert_eq!(cd.clean_base, "Movie.2021.mkv");
+
+        let disc = extract_split_part_info("Show.S01.Disc2.mkv", "");
+        assert!(disc.is_part && disc.part_num == 2);
+
+        let pt = extract_split_part_info("Show.pt3.mkv", "");
+        assert!(pt.is_part && pt.part_num == 3);
+
+        let dvd = extract_split_part_info("Movie.DVD1.avi", "");
+        assert!(dvd.is_part && dvd.part_num == 1);
+    }
+
+    #[test]
+    fn n_of_m_and_bracket_forms_carry_the_total() {
+        let of = extract_split_part_info("Movie.2021.1of2.mkv", "");
+        assert!(of.is_part && of.part_num == 1 && of.total_parts == 2);
+
+        let bracket = extract_split_part_info("Movie.2021.[2/2].mkv", "");
+        assert!(bracket.is_part && bracket.part_num == 2 && bracket.total_parts == 2);
+    }
+
+    /// The reported bug: `…SonyLiv.WEB.D.part002.mkv` was listed as a normal
+    /// 422 MB movie because its sibling is missing. A terminal marker must still
+    /// flag it, so `exclude_part_title` hides it (or badges it) instead of
+    /// presenting half a film as complete.
+    #[test]
+    fn orphan_terminal_part_is_flagged_without_a_sibling() {
+        let mut files = vec![FileItem {
+            title: "Spider.Man.No.Way.Home.2021.1080p.SonyLiv.WEB.D.part002.mkv".into(),
+            file_size: 442_090_175,
+            ..Default::default()
+        }];
+        group_split_parts(&mut files);
+        assert!(files[0].is_split_part);
+        assert!(files[0].split_orphan);
+        assert_eq!(files[0].part_num, 2);
+        let cfg = StreamFilterConfig::default();
+        assert!(
+            apply_stream_filters(&files, &cfg).is_empty(),
+            "a lone part 2 is not a title and must not be listed"
+        );
+    }
+
+    #[test]
+    fn lone_part_one_is_excluded_even_with_the_part_filter_off() {
+        let mut files = vec![FileItem {
+            title: "Spider.Man.Brand.New.Day.2026.1080p.WEBRip.AAC5.1.part001.mp4".into(),
+            file_size: 2_400_000_000,
+            ..Default::default()
+        }];
+        group_split_parts(&mut files);
+        assert!(files[0].split_orphan);
+        let mut cfg = StreamFilterConfig::default();
+        cfg.exclude_part_title = false;
+        assert!(
+            apply_stream_filters(&files, &cfg).is_empty(),
+            "a lone part 1 must not appear as a playable title"
+        );
+    }
+
+    /// `part002` + `part003` with no Part 1: the set cannot be played from the
+    /// beginning, so every member is dropped, not just the missing one.
+    #[test]
+    fn parts_without_part_one_are_orphans() {
+        let mut files = vec![
+            FileItem {
+                title: "Show.2026.4K.part002.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.part003.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        assert!(files.iter().all(|f| f.split_orphan));
+        let cfg = StreamFilterConfig::default();
+        assert!(apply_stream_filters(&files, &cfg).is_empty());
+    }
+
+    #[test]
+    fn a_gap_after_part_one_is_an_orphan_set() {
+        let mut files = vec![
+            FileItem {
+                title: "Show.2026.4K.part001.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Show.2026.4K.part003.mkv".into(),
+                file_size: 100,
+                ..Default::default()
+            },
+        ];
+        group_split_parts(&mut files);
+        assert!(files.iter().all(|f| f.split_orphan));
+    }
+
+    #[test]
+    fn a_mid_name_part_is_not_terminal() {
+        let info = extract_split_part_info(
+            "Detective.Conan.Episode.100.Malay.Dub.Special.Episode.Part.1",
+            "",
+        );
+        assert!(info.is_part);
+        assert!(!info.terminal, "the marker is not at the end of the name");
     }
 
     /* web.dl / webdl are WEB-DL, not WEBRip ---------------------------------- */
@@ -3225,28 +3810,22 @@ mod tests {
     }
 
     #[test]
-    fn duration_detection_feeds_the_default_exclude_filter() {
-        // The whole point: `exclude_part_title` (ON by default) must act on the
-        // chunks once duration proves them, and must leave a whole file alone.
+    fn duration_detection_is_visible_by_default_and_filterable() {
+        // `exclude_part_title` is OFF by default, so duration-proven chunks are
+        // visible (and can be joined by the route). Turning the filter ON hides
+        // them; turning it OFF gives the seven straight back.
         let cfg = StreamFilterConfig::default();
         let mut parts = chunks(&[1361, 1323, 1323, 1401, 1289, 1313, 1322]);
         detect_parts_by_duration(&mut parts);
-        assert!(apply_stream_filters(&parts, &cfg).is_empty());
+        assert_eq!(apply_stream_filters(&parts, &cfg).len(), 7);
+
+        let mut on = StreamFilterConfig::default();
+        on.exclude_part_title = true;
+        assert!(apply_stream_filters(&parts, &on).is_empty());
 
         let mut whole = chunks(&[9332, 9333]);
         detect_parts_by_duration(&mut whole);
         assert_eq!(apply_stream_filters(&whole, &cfg).len(), 2);
-
-        // Unchecking `exclude_part_title` gives the seven straight back: the flag
-        // is the ONLY thing that removed them. The Obsession chunks are a
-        // different story — they never reach this filter, because they are not in
-        // the post's file set and their 2026 name is a `Near` year against a 2025
-        // post, so `year_keep_mask()` drops them first.
-        let off = StreamFilterConfig {
-            exclude_part_title: false,
-            ..StreamFilterConfig::default()
-        };
-        assert_eq!(apply_stream_filters(&parts, &off).len(), 7);
     }
 
     #[test]
@@ -3269,6 +3848,33 @@ mod tests {
         let uhd = stream_sort_score("Movie.2020.2160p.WEB-DL.mkv", "", 1_000_000_000, "auto");
         let sd = stream_sort_score("Movie.2020.480p.WEBRip.mkv", "", 1_000_000_000, "auto");
         assert!(uhd > sd);
+    }
+
+    /// The stream route passes `stream_config.preferred_resolution` here. A
+    /// configured preference must outrank the default resolution order, because
+    /// that preference is also what the filter uses to decide what is kept.
+    #[test]
+    fn sort_score_follows_the_configured_preference() {
+        let uhd = stream_sort_score("Movie.2020.2160p.WEB-DL.mkv", "", 1_000_000_000, "1080p");
+        let hd = stream_sort_score("Movie.2020.1080p.WEB-DL.mkv", "", 1_000_000_000, "1080p");
+        assert!(hd > uhd, "1080p preference must put the 1080p row first");
+    }
+
+    #[test]
+    fn joined_4k_scores_above_1080p() {
+        let uhd = stream_sort_score(
+            "Spider.Man.Brand.New.Day.2026.2160p.AMZN.WEx.MomStealer.mkv",
+            "",
+            17_000_000_000,
+            "auto",
+        );
+        let hd = stream_sort_score(
+            "Spider.Man.Brand.New.Day.2026.1080p.WEBRip.x264.AAC5.1.YTS.mp4",
+            "",
+            2_700_000_000,
+            "auto",
+        );
+        assert!(uhd > hd, "4K joined row scored {uhd}, 1080p scored {hd}");
     }
 
     #[test]

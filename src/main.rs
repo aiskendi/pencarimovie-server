@@ -45,6 +45,8 @@ mod resolve;
 mod respond;
 mod routes;
 mod session;
+mod split_index;
+mod split_remux;
 mod storage;
 mod telegram;
 mod thumb;
@@ -64,6 +66,7 @@ mod tunnel;
 mod update;
 mod upstream;
 mod wp_data;
+mod zip_split;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;

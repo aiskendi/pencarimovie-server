@@ -4152,7 +4152,35 @@ async fn build_streams_from_files(
     );
     let kept = crate::matcher::apply_stream_filters(&items, &cfg);
 
-    if kept.is_empty() {
+    // Byte-split joins: ONE row replaces N sibling rows. `byte_split_groups` is
+    // the cheap size-shape test (fixed pieces + short tail); the download route
+    // re-checks part 2's magic before it joins anything, because a `.001` name
+    // can also be mkvmerge output.
+    let joins = crate::matcher::joinable_groups(&items);
+    // Every row of a joined base/style is consumed, including a duplicate
+    // upload of one ordinal that `joinable_groups` discarded in favour of the
+    // larger copy. Otherwise the discarded `part004` would appear as a stray
+    // "Part 4" next to the joined row.
+    let mut join_member: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for group in &joins {
+        let i0 = group[0];
+        let base = items[i0].clean_base.to_lowercase();
+        let style = items[i0].split_style;
+        for (i, item) in items.iter().enumerate() {
+            if item.is_split_part
+                && item.split_style == style
+                && item.clean_base.to_lowercase() == base
+            {
+                join_member.insert(i);
+            }
+        }
+    }
+    let kept: Vec<(usize, String)> = kept
+        .into_iter()
+        .filter(|(idx, _)| !join_member.contains(idx))
+        .collect();
+
+    if kept.is_empty() && joins.is_empty() {
         log(
             "stream: files filtered out by stream_config",
             &serde_json::json!({"item_id": item_id, "matched": matched.len()}),
@@ -4174,6 +4202,15 @@ async fn build_streams_from_files(
         return finish_streams(ctx, item_type, title, item_id, merged, true, matched.len()).await;
     }
 
+    // Rank with the SAME preference the filter uses. `stream_sort_score(..., "auto")`
+    // ignored `preferred_resolution`, so a configured 1080p preference changed
+    // which rows were KEPT but not their order.
+    let sc = settings.get("stream_config").unwrap_or(&Value::Null);
+    let preferred = sc
+        .get("preferred_resolution")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+
     let mut scored: Vec<(f64, String, Value)> = kept
         .iter()
         .filter_map(|(idx, res_key)| {
@@ -4185,7 +4222,7 @@ async fn build_streams_from_files(
                 &f.title,
                 &f.caption,
                 f.file_size,
-                "auto",
+                preferred,
             );
             Some((
                 score,
@@ -4202,10 +4239,76 @@ async fn build_streams_from_files(
             ))
         })
         .collect();
+
+    for group in &joins {
+        let i0 = group[0];
+        let first = &matched[i0];
+        if first.short_code.is_empty() {
+            continue;
+        }
+        let title = items[i0].clean_base.clone();
+        if title.is_empty() {
+            continue;
+        }
+        let total: u64 = group.iter().map(|&i| matched[i].file_size).sum();
+        let joined_item = crate::matcher::FileItem {
+            title: title.clone(),
+            caption: first.caption.clone(),
+            file_size: total,
+            duration: 0,
+            is_split_part: false,
+            part_num: 0,
+            total_parts: 0,
+            clean_base: String::new(),
+            split_style: 0,
+            split_orphan: false,
+        };
+        // The joined row still obeys every non-part filter (resolution, codec,
+        // size, keyword), but it is not hidden by `exclude_part_title`: it IS the
+        // replacement for the parts that filter hides.
+        let allowed = crate::matcher::apply_stream_filters(std::slice::from_ref(&joined_item), &cfg);
+        let Some((_, res_key)) = allowed.first() else {
+            continue;
+        };
+        let parts: Vec<(String, u64)> = group
+            .iter()
+            .map(|&i| (matched[i].short_code.clone(), matched[i].file_size))
+            .collect();
+        if parts.iter().any(|(code, _)| code.is_empty()) {
+            continue;
+        }
+        let is_zip = joined_item.title.to_ascii_lowercase().contains(".zip")
+            || joined_item.caption.to_ascii_lowercase().contains(".zip");
+        if is_zip
+            && parts
+                .iter()
+                .any(|(code, _)| crate::download::zip_marked_bad(code))
+        {
+            continue;
+        }
+        let ext = title
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = crate::download::mime_by_ext(&ext).unwrap_or("video/x-matroska");
+        let score = crate::matcher::stream_sort_score(&title, &first.caption, total, preferred);
+        scored.push((
+            score,
+            res_key.clone(),
+            stream_item_joined(
+                ctx,
+                &parts,
+                &joined_item,
+                mime,
+                parts.first().map(|p| p.1 == 4_194_304_000).unwrap_or(false)
+                    || is_zip,
+            ),
+        ));
+    }
+
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(100);
 
-    let sc = settings.get("stream_config").unwrap_or(&Value::Null);
     let max_per_res = sc
         .get("max_streams_per_resolution")
         .and_then(|v| v.as_i64())
@@ -4928,6 +5031,67 @@ fn stream_item(
     })
 }
 
+/// One row for a byte-split set, built from the first part's display data.
+///
+/// The URL carries `parts: [{short_code, file_size}, …]`; `/api/download`
+/// resolves each part and streams them back to back under one `Content-Length`.
+fn stream_item_joined(
+    ctx: &ReqCtx,
+    parts: &[(String, u64)],
+    item: &crate::matcher::FileItem,
+    mime: &str,
+    seekable: bool,
+) -> Value {
+    let mut row = stream_item(
+        ctx,
+        &parts[0].0,
+        &item.title,
+        &item.caption,
+        item.file_size,
+        mime,
+        item,
+    );
+    let file_name = crate::download::stream_filename(&item.title, mime);
+    let payload = serde_json::json!({
+        "file_name": item.title,
+        "mime": mime,
+        "file_size": item.file_size,
+        "short_code": parts[0].0,
+        "parts": parts
+            .iter()
+            .map(|(code, size)| serde_json::json!({"short_code": code, "file_size": size}))
+            .collect::<Vec<_>>(),
+    });
+    row["url"] = serde_json::json!(stream_url_for(ctx, &payload, &file_name));
+    if let Some(hints) = row.get_mut("behaviorHints").and_then(|v| v.as_object_mut()) {
+        hints.insert("videoSize".into(), serde_json::json!(item.file_size));
+        hints.insert("filename".into(), serde_json::json!(file_name));
+    }
+    // The one line every client renders says this is a joined row, not a single
+    // file with a suspiciously large size.
+    if let Some(description) = row.get("description").and_then(|v| v.as_str()) {
+        let mut lines = description.splitn(2, '\n');
+        let head = lines.next().unwrap_or("");
+        let tail = lines.next().unwrap_or("");
+        let head = format!(
+            "{} · 🧩 {} parts joined · {}",
+            head,
+            parts.len(),
+            if seekable {
+                "✅ seek + resume"
+            } else {
+                "⚠️ no seek"
+            }
+        );
+        row["description"] = serde_json::json!(if tail.is_empty() {
+            head
+        } else {
+            format!("{}\n{}", head, tail)
+        });
+    }
+    row
+}
+
 /// Runtime in seconds from the resolve cache (`0` = not resolved yet).
 fn cached_duration(short_code: &str, bot_id: &str) -> u32 {
     if short_code.is_empty() || bot_id.is_empty() {
@@ -5290,7 +5454,7 @@ fn stream_base(ctx: &ReqCtx) -> String {
     pool[idx].clone()
 }
 
-fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
+pub(crate) fn stream_url_for(ctx: &ReqCtx, payload: &Value, file_name: &str) -> String {
     // A per-link local node is stronger than PM_NODES: the user explicitly asked
     // for their own loopback server to serve this download.
     let node_public = crate::config::node_public_download();
@@ -5603,7 +5767,7 @@ pub(crate) fn lan_ip() -> String {
 
 /// PHP `fd_load_catalog_settings()` defaults. The `stream_config` keys are the
 /// ones the AIOStreams filter block reads, so an absent file must still produce
-/// them (`exclude_unplayable` / `exclude_part_title` default to ON).
+/// them (`exclude_unplayable` defaults ON, `exclude_part_title` OFF).
 /// The seeded `enabled_catalogs` map.
 ///
 /// `backend.php:11964-11967` seeds **every** option from its own `default` flag:
@@ -5660,7 +5824,7 @@ fn default_catalog_settings() -> Value {
             "visual_tags": {"hdr": true, "dv": true},
             "exclude_cam": false,
             "exclude_unplayable": true,
-            "exclude_part_title": true,
+            "exclude_part_title": false,
             "preferred_resolution": "auto",
             "max_streams_per_resolution": 0,
             "max_streams_total": 0,
@@ -11823,10 +11987,9 @@ mod tests {
         assert_eq!(perm.len(), rows.len());
         rows = crate::matcher::reorder_with(&rows, &perm);
 
-        let kept = crate::matcher::apply_stream_filters(
-            &items,
-            &crate::matcher::StreamFilterConfig::default(),
-        );
+        let mut cfg = crate::matcher::StreamFilterConfig::default();
+        cfg.exclude_part_title = true;
+        let kept = crate::matcher::apply_stream_filters(&items, &cfg);
         assert_eq!(kept.len(), 2, "only the two whole files survive");
         for (idx, _) in kept {
             assert_eq!(rows[idx], items[idx].title, "row {idx} lost its pairing");

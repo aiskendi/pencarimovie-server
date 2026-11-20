@@ -4302,7 +4302,8 @@ async fn build_streams_from_files(
                 &parts,
                 &joined_item,
                 mime,
-                parts.first().map(|p| p.1 == 4_194_304_000).unwrap_or(false)
+                matches!(items[i0].split_style, 3)
+                    || parts.first().map(|p| p.1 == 4_194_304_000).unwrap_or(false)
                     || is_zip,
             ),
         ));

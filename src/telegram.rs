@@ -1253,10 +1253,15 @@ const PART_MAX_ATTEMPTS: usize = 4;
 /// 150 / 500 / 1500 ms between transport retries: ~2.2 s of patience, and the
 /// last backoff is reused for any further attempt.
 const PART_BACKOFF_MS: [u64; 3] = [150, 500, 1500];
-/// A `FLOOD_WAIT` at or below this is slept and retried once (inside the same
+/// A `FLOOD_WAIT` at or below this is slept and retried (inside the same
 /// permit); above it the caller answers 429 so the client retries on its own
 /// schedule instead of holding a connection for minutes.
 pub const FLOOD_WAIT_RETRY_MAX_SECS: u64 = 30;
+/// MadelineProto re-queues every flood below its 30s limit, not once. A single
+/// retry still failed a part on the second 1-3s flood, which is exactly the
+/// rate-limit pattern this server sees under load. Keep a bound so a genuinely
+/// hostile wait cannot pin a permit forever.
+const FLOOD_WAIT_MAX_RETRIES: usize = 5;
 
 /// Fetch `want` bytes starting at an already 4096-aligned `pos`, ungated.
 pub async fn fetch_range(client: &Client, target: &DocTarget, pos: u64, want: u64) -> Result<Vec<u8>, GramErr> {
@@ -1306,17 +1311,21 @@ async fn fetch_range_core(
     };
 
     let mut transport_attempts = 0usize;
-    let mut flood_retried = false;
+    let mut flood_retries = 0usize;
     loop {
         match fetch_range_once(client, target, limit, skip, want).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if let Some(secs) = e.flood_wait {
-                    if !flood_retried && secs <= FLOOD_WAIT_RETRY_MAX_SECS {
-                        flood_retried = true;
+                    if flood_retries < FLOOD_WAIT_MAX_RETRIES && secs <= FLOOD_WAIT_RETRY_MAX_SECS {
+                        flood_retries += 1;
                         log(
                             "upload.getFile rate limited, sleeping then retrying part",
-                            &serde_json::json!({"flood_wait_seconds": secs, "pos": pos}),
+                            &serde_json::json!({
+                                "flood_wait_seconds": secs,
+                                "pos": pos,
+                                "retry": flood_retries,
+                            }),
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
                         continue;

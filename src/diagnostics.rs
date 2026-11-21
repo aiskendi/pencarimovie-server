@@ -962,16 +962,13 @@ pub async fn report_send(path: &std::path::Path) -> bool {
     // "diag upload rejected status=401" every two minutes while every report piled
     // up locally. The ticket is included too: it also authorises bot-scoped routes.
     let send = |url: String, text: String| async move {
-        let mut req = crate::httpc::client()
+        let req = crate::httpc::client()
             .post(&url)
             .timeout(std::time::Duration::from_secs(12))
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .body(text);
-        let secret = crate::credentials::get_api_secret();
-        if !secret.is_empty() {
-            req = req.header("X-API-Secret", secret);
-        }
+        let mut req = req;
         for (k, v) in crate::credentials::ticket_headers()
             .into_iter()
             .chain(crate::httpc::pm_auth_headers("POST", &url))

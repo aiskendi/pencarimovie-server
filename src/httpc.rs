@@ -4,9 +4,9 @@
 //! `fd_http_fire_and_forget`, `fd_http_download_file`.
 //!
 //! Amp and cURL do not exist here; `reqwest` (rustls) is the single transport.
-//! The behaviour that matters is preserved: JSON API + `X-API-Secret`, the
-//! `telegra.my` DPI fallback, disk caching with a stale fallback, and a
-//! timeout that never throws to the caller (returns `{}` like the PHP).
+//! The behaviour that matters is preserved: JSON API, the `telegra.my` DPI
+//! fallback, disk caching with a stale fallback, and a timeout that never throws
+//! to the caller (returns `{}` like the PHP).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -15,7 +15,6 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{user_agent, wp_api_base, wp_api_base_fallback, WP_FALLBACK_HOST};
-use crate::credentials::get_api_secret;
 use crate::log::log;
 
 pub fn client() -> &'static reqwest::Client {
@@ -350,7 +349,6 @@ async fn http_json_h_status_inner(
         }
     }
 
-    let secret = get_api_secret();
     let mut extra: Vec<(String, String)> = headers.iter().cloned().collect();
     if origin_call {
         extra.extend(crate::credentials::ticket_headers());
@@ -374,7 +372,7 @@ async fn http_json_h_status_inner(
 
     // Headers are passed IN, so the retry below can rebuild them after a re-enrol
     // (a closure that captured `extra` could not be used twice with new values).
-    let call = |u: &str, extra: Vec<(String, String)>, secret: String, body: Option<String>| {
+    let call = |u: &str, extra: Vec<(String, String)>, body: Option<String>| {
         let target = u.to_string();
         async move {
             let mut req = client()
@@ -389,9 +387,6 @@ async fn http_json_h_status_inner(
                 .timeout(Duration::from_secs(timeout_secs.max(1)))
                 .header("Accept", "application/json")
                 .header("X-Requested-With", "XMLHttpRequest");
-            if !secret.is_empty() {
-                req = req.header("X-API-Secret", secret);
-            }
             for (k, v) in &extra {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -414,7 +409,7 @@ async fn http_json_h_status_inner(
 
     let had_auth = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("X-PM-Auth"));
     let (mut ok, mut status, mut text, mut err) =
-        call(&target, extra.clone(), secret.clone(), body.clone()).await;
+        call(&target, extra.clone(), body.clone()).await;
 
     // A 401 means the origin refused this request, and there are TWO cases — both
     // need the same recovery, and the second one used to get none:
@@ -473,7 +468,6 @@ async fn http_json_h_status_inner(
         }
         if had_auth {
             log("wp auth refused with a token, re-enrolling", &serde_json::json!({"url": target, "status": status}));
-            crate::credentials::clear_auth_token();
         } else {
             // The reason is the whole point: "without a token" alone cannot tell a
             // read-only volume from a clock that ate the token from a missing file.
@@ -486,6 +480,12 @@ async fn http_json_h_status_inner(
                 }),
             );
         }
+        // Clear even when `had_auth` was false. A token can exist on disk and
+        // still produce no proof (its signing key no longer matches this
+        // install). Leaving it made `ensure_enrolled_throttled()` return true
+        // immediately, so no enrolment happened and every retry repeated the
+        // same 426.
+        crate::credentials::clear_auth_token();
         if crate::credentials::ensure_enrolled_throttled().await {
             extra = headers
                 .iter()
@@ -496,7 +496,7 @@ async fn http_json_h_status_inner(
             // Never retry an auth refusal with X-API-Secret. It is the retired
             // credential, and sending it again is what turns a missing PM-Auth
             // token into a permanent 426 loop instead of a clear auth failure.
-            let r = call(&target, extra.clone(), String::new(), body.clone()).await;
+            let r = call(&target, extra.clone(), body.clone()).await;
             ok = r.0;
             status = r.1;
             text = r.2;
@@ -509,7 +509,7 @@ async fn http_json_h_status_inner(
             if is_connection_reset(e) {
                 if let Some(alt) = fallback_url(&target) {
                     log("wp request reset, retrying via fallback host", &serde_json::json!({"url": target}));
-                    let r = call(&alt, extra.clone(), secret.clone(), body.clone()).await;
+                    let r = call(&alt, extra.clone(), body.clone()).await;
                     ok = r.0;
                     status = r.1;
                     text = r.2;
@@ -748,12 +748,8 @@ pub fn fire_and_forget(url: &str, params: &[(String, String)]) {
         target.push(if target.contains('?') { '&' } else { '?' });
         target.push_str(&q);
     }
-    let secret = get_api_secret();
     tokio::spawn(async move {
-        let mut req = client().get(&target).timeout(Duration::from_secs(60));
-        if !secret.is_empty() {
-            req = req.header("X-API-Secret", secret);
-        }
+        let req = client().get(&target).timeout(Duration::from_secs(60));
         let _ = req.send().await;
     });
 }

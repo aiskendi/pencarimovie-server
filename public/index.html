@@ -1510,6 +1510,13 @@
                   <input type="checkbox" id="streamExcludePartTitle" checked />
                   <span style="color: var(--pm-status-danger)">Exclude Part Titles</span>
                 </label>
+                <label
+                  class="addon-catalog-pill"
+                  title="Hides joined multi-part rows whose parts cannot be range-seeked. With Exclude Part Titles on as well, a release that only has such a row disappears entirely."
+                >
+                  <input type="checkbox" id="streamExcludeNoSeek" />
+                  <span style="color: var(--pm-status-danger)">Exclude No-Seek Rows</span>
+                </label>
               </div>
             </div>
 
@@ -1538,6 +1545,136 @@
                 <label class="addon-catalog-pill">
                   <input type="checkbox" id="streamVisDv" checked />
                   <span>Dolby Vision</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Languages -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: var(--pm-text-secondary); margin-bottom: 4px">
+                Languages (a row tagged with an unchecked marker is hidden):
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangMalay" checked />
+                  <span>Malay</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangEnglish" checked />
+                  <span>English</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangIndo" checked />
+                  <span>Indo</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangHindi" checked />
+                  <span>Hindi</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangKorean" checked />
+                  <span>Korean</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangJapanese" checked />
+                  <span>Japanese</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangChinese" checked />
+                  <span>Chinese</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangThai" checked />
+                  <span>Thai</span>
+                </label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangTagalog" checked /><span>Tagalog</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangVietnamese" checked /><span>Vietnamese</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangBurmese" checked /><span>Burmese</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangKhmer" checked /><span>Khmer</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangLaos" checked /><span>Laotian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangTamil" checked /><span>Tamil</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangTelugu" checked /><span>Telugu</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangBengali" checked /><span>Bengali</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangUrdu" checked /><span>Urdu</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangArabic" checked /><span>Arabic</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangPersian" checked /><span>Persian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangTurkish" checked /><span>Turkish</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangSpanish" checked /><span>Spanish</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangFrench" checked /><span>French</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangGerman" checked /><span>German</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangItalian" checked /><span>Italian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangRussian" checked /><span>Russian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangPortuguese" checked /><span>Portuguese</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangDutch" checked /><span>Dutch</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangPolish" checked /><span>Polish</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangHebrew" checked /><span>Hebrew</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangGreek" checked /><span>Greek</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangNepali" checked /><span>Nepali</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangSinhala" checked /><span>Sinhala</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangUkrainian" checked /><span>Ukrainian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangRomanian" checked /><span>Romanian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangCzech" checked /><span>Czech</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangHungarian" checked /><span>Hungarian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangSwedish" checked /><span>Swedish</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangNorwegian" checked /><span>Norwegian</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangDanish" checked /><span>Danish</span></label>
+                <label class="addon-catalog-pill"><input type="checkbox" id="streamLangFinnish" checked /><span>Finnish</span></label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangDubbed" checked />
+                  <span>Dubbed</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangMulti" checked />
+                  <span>Multi / Dual Audio</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamLangUnknown" checked />
+                  <span>Unknown</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Audio -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: var(--pm-text-secondary); margin-bottom: 4px">
+                Audio (a row carrying an unchecked audio type is hidden):
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioAtmos" checked />
+                  <span>Atmos</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioDdp" checked />
+                  <span>DD+ (DDP / EAC3)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioAc3" checked />
+                  <span>DD / AC3</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioDts" checked />
+                  <span>DTS</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioTruehd" checked />
+                  <span>TrueHD</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioAac" checked />
+                  <span>AAC</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioFlac" checked />
+                  <span>FLAC</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioOpus" checked />
+                  <span>Opus</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamAudioUnknown" checked />
+                  <span>Unknown</span>
                 </label>
               </div>
             </div>
@@ -1969,7 +2106,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261117public1"></script>
+    <script defer src="app.js?v=20261121langs1"></script>
     <script defer src="dashboard.js?v=20261111multitoken2"></script>
   </body>
 </html>

@@ -4,12 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0b0c10" />
-    <title>PencariMovie — Configure your addon</title>
+    <meta
+      name="description"
+      content="Pick the catalog rows and stream filters this PencariMovie link should carry, then install it in Stremio or Nuvio."
+    />
+    <title>PencariMovie: configure your addon</title>
     <link rel="icon" type="image/png" href="/logo.png" />
     <link rel="stylesheet" href="/stream-theme.css?v=20261009pm10" />
     <link rel="stylesheet" href="/styles.css?v=20261024music2" />
     <link rel="stylesheet" href="/dashboard.css?v=20261112botactions1" />
-    <link rel="stylesheet" href="/configure.css?v=20261118titanium11" />
+    <link rel="stylesheet" href="/configure.css?v=20261121catalog1" />
   </head>
   <body data-pm-shell="dashboard">
     <div class="pm-shell">
@@ -24,15 +28,16 @@
 
       <main class="pm-main">
         <div class="pm-container">
-          <h1 class="pm-h1">Configure your addon</h1>
-          <p class="pm-lede">
-            Choose the catalog rows and stream filters this server should carry in your
-            link. Your choices live in the URL; nothing is stored on the server.
-          </p>
-          <p id="status" class="public-status" role="status"></p>
-          <p id="error" class="public-error hidden" role="alert"></p>
+          <section class="pm-panel public-panel" aria-labelledby="publicTitle">
+            <h1 class="pm-h2" id="publicTitle">Configure your addon</h1>
+            <p class="pm-lede">
+              Every control below belongs to your link only. Nothing is stored on the
+              server.
+            </p>
+            <p id="status" class="public-status" role="status"></p>
+            <p id="error" class="public-error hidden" role="alert"></p>
 
-          <div class="public-layout">
+            <div class="public-layout">
             <div class="public-settings">
               <section class="addon-catalog-card" id="addonCatalogCard">
                 <div class="addon-catalog-card__header">
@@ -124,11 +129,6 @@
                 <input type="checkbox" id="useLocalServer" />
                 <span>Use the PencariMovie server running on this device</span>
               </label>
-              <p class="pm-hint">
-                Use this only when PencariMovie runs on the same device as Stremio or
-                Nuvio. The link will point to 127.0.0.1:8088. On a phone, TV, or another
-                computer, leave it off.
-              </p>
               <p id="localStatus" class="pm-hint"></p>
               <div class="public-actions">
                 <a id="installBtn" class="pm-btn pm-btn--primary" href="#">Install Addon</a>
@@ -140,10 +140,11 @@
                 the old link keeps working until you remove it.
               </p>
             </aside>
-          </div>
+            </div>
+          </section>
 
           <section class="public-faq" aria-labelledby="publicFaqTitle">
-            <details class="public-faq__panel">
+            <details class="public-faq__panel pm-panel">
               <summary class="public-faq__summary">
                 <h2 class="public-faq__title" id="publicFaqTitle">Frequently Asked Questions</h2>
               </summary>
@@ -213,7 +214,7 @@
                     Yes, if you want your own copy. Download it from
                     <a href="https://github.com/aiskendi/pencarimovie-server" target="_blank" rel="noopener">GitHub</a>
                     and run it on this device. Then tick
-                    "Use the PencariMovie server running on this device" above. The install
+                    “Use the PencariMovie server running on this device” above. The install
                     link will point to 127.0.0.1:8088.
                   </p>
                 </div>
@@ -238,6 +239,6 @@
       </footer>
     </div>
 
-    <script defer src="/configure.js?v=20261118titanium13"></script>
+    <script defer src="/configure.js?v=20261121langs1"></script>
   </body>
 </html>

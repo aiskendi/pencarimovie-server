@@ -448,7 +448,16 @@ pub struct MediaTags {
     pub source: String,
     pub platform: String,
     pub codec: String,
+    /// The strongest audio tag, in [`AUDIO_TAGS`] order. What the row shows and
+    /// what [`stream_sort_score`] prefers.
     pub audio: String,
+    /// Every audio tag the name carries, not just the strongest.
+    ///
+    /// A release called `DDP5.1.Atmos.AAC` is one file with two audio tracks; the
+    /// pills can only show one, but a filter must be able to say "has AAC" and
+    /// "has Atmos" at the same time. `audio` stays the first entry, so nothing
+    /// that reads it changes.
+    pub audio_all: Vec<String>,
     pub visual: Vec<String>,
     pub edition: String,
 }
@@ -460,6 +469,52 @@ fn first_tag(text: &str, table: &[(&str, &str)], fallback: &str) -> String {
         }
     }
     fallback.to_string()
+}
+
+/// Audio families the filter can test, in pill order. The whitelist and the
+/// defaults both iterate this, so a family cannot exist on one side only.
+pub const AUDIO_KEYS: &[&str] = &[
+    "atmos", "ddp", "ac3", "dts", "truehd", "aac", "flac", "opus", "unknown",
+];
+
+/// Audio tags, strongest first. Order is load-bearing twice: `MediaTags.audio`
+/// takes the first match (that is the pill and the sort preference), and
+/// [`audio_family`] maps each of these to the key the filter toggles use.
+const AUDIO_TAGS: &[(&str, &str)] = &[
+    ("(?i)\\b(atmos)\\b", "Atmos"),
+    ("(?i)\\b(ddp\\s*5\\.1|dd\\+\\s*5\\.1|eac3\\s*5\\.1)\\b", "DDP5.1"),
+    ("(?i)\\b(ddp\\s*2\\.0|dd\\+\\s*2\\.0|eac3\\s*2\\.0)\\b", "DDP2.0"),
+    ("(?i)\\b(ddp|dd\\+|eac3)\\b", "DDP"),
+    ("(?i)\\b(dd\\s*5\\.1|ac3\\s*5\\.1)\\b", "DD5.1"),
+    ("(?i)\\b(ac3|dd)\\b", "AC3"),
+    ("(?i)\\b(dts-hd\\s*ma)\\b", "DTS-HD MA"),
+    ("(?i)\\b(dts-hd)\\b", "DTS-HD"),
+    ("(?i)\\b(dts)\\b", "DTS"),
+    ("(?i)\\b(truehd)\\b", "TrueHD"),
+    ("(?i)\\b(aac\\s*5\\.1|5\\.1\\s*aac)\\b", "AAC5.1"),
+    ("(?i)\\b(aac\\s*2\\.0|2\\.0\\s*aac|aac2)\\b", "AAC2.0"),
+    ("(?i)\\b(aac)\\b", "AAC"),
+    ("(?i)\\b(flac)\\b", "FLAC"),
+    ("(?i)\\b(opus)\\b", "Opus"),
+];
+
+/// The filter key one audio tag belongs to (`Atmos` → `atmos`, `DDP5.1` → `ddp`).
+///
+/// Grouped rather than 1:1 with the display tags because "DDP5.1" and "DDP" are
+/// one choice to a viewer — the distinction that matters is codec family, and
+/// the channel count is a separate line on the row.
+pub fn audio_family(tag: &str) -> &'static str {
+    match tag {
+        "Atmos" => "atmos",
+        "DDP" | "DDP5.1" | "DDP2.0" => "ddp",
+        "AC3" | "DD5.1" => "ac3",
+        "DTS" | "DTS-HD" | "DTS-HD MA" => "dts",
+        "TrueHD" => "truehd",
+        "AAC" | "AAC5.1" | "AAC2.0" => "aac",
+        "FLAC" => "flac",
+        "Opus" => "opus",
+        _ => "unknown",
+    }
 }
 
 /// Port of `fd_extract_media_tags()` (backend.php:7926).
@@ -521,27 +576,15 @@ pub fn extract_media_tags(title: &str, caption: &str) -> MediaTags {
         ],
         "",
     );
-    let audio = first_tag(
-        &text,
-        &[
-            ("(?i)\\b(atmos)\\b", "Atmos"),
-            ("(?i)\\b(ddp\\s*5\\.1|dd\\+\\s*5\\.1|eac3\\s*5\\.1)\\b", "DDP5.1"),
-            ("(?i)\\b(ddp\\s*2\\.0|dd\\+\\s*2\\.0|eac3\\s*2\\.0)\\b", "DDP2.0"),
-            ("(?i)\\b(ddp|dd\\+|eac3)\\b", "DDP"),
-            ("(?i)\\b(dd\\s*5\\.1|ac3\\s*5\\.1)\\b", "DD5.1"),
-            ("(?i)\\b(ac3|dd)\\b", "AC3"),
-            ("(?i)\\b(dts-hd\\s*ma)\\b", "DTS-HD MA"),
-            ("(?i)\\b(dts-hd)\\b", "DTS-HD"),
-            ("(?i)\\b(dts)\\b", "DTS"),
-            ("(?i)\\b(truehd)\\b", "TrueHD"),
-            ("(?i)\\b(aac\\s*5\\.1|5\\.1\\s*aac)\\b", "AAC5.1"),
-            ("(?i)\\b(aac\\s*2\\.0|2\\.0\\s*aac|aac2)\\b", "AAC2.0"),
-            ("(?i)\\b(aac)\\b", "AAC"),
-            ("(?i)\\b(flac)\\b", "FLAC"),
-            ("(?i)\\b(opus)\\b", "Opus"),
-        ],
-        "",
-    );
+    let audio = first_tag(&text, AUDIO_TAGS, "");
+    // Every tag the name carries, in `AUDIO_TAGS` order (strongest first), for
+    // the audio filter. `audio` above keeps the old single-value behaviour.
+    let mut audio_all: Vec<String> = Vec::new();
+    for (pattern, value) in AUDIO_TAGS {
+        if has(pattern, &text) && !audio_all.iter().any(|v| v == value) {
+            audio_all.push((*value).to_string());
+        }
+    }
     let mut visual = Vec::new();
     if has("(?i)\\b(hdr10\\+|hdr10|hdr)\\b", &text) {
         visual.push("HDR".to_string());
@@ -576,6 +619,7 @@ pub fn extract_media_tags(title: &str, caption: &str) -> MediaTags {
         platform,
         codec,
         audio,
+        audio_all,
         visual,
         edition,
     }
@@ -2243,6 +2287,97 @@ pub fn categorize_quality_key(title: &str, caption: &str) -> String {
     .to_string()
 }
 
+/* ── language markers ──────────────────────────────────────────────────────── */
+
+/// Every language the filter can test, in pill order.
+///
+/// `LANGUAGE_TAGS` detects them; this list is what the config whitelist and the
+/// dashboard iterate, so a key can never exist on one side only. The eight at the
+/// front are the ones whose display label is set — the rest are filter-only.
+pub const LANGUAGE_KEYS: &[&str] = &[
+    "malay", "english", "indo", "hindi", "korean", "japanese", "chinese", "thai", "tagalog",
+    "vietnamese", "burmese", "khmer", "laos", "tamil", "telugu", "bengali", "urdu", "arabic",
+    "persian", "turkish", "spanish", "french", "german", "italian", "russian", "portuguese",
+    "dutch", "polish", "hebrew", "greek", "nepali", "sinhala", "ukrainian", "romanian", "czech",
+    "hungarian", "swedish", "norwegian", "danish", "finnish", "dubbed", "multi", "unknown",
+];
+
+/// `(pattern, filter key, row label)`. An EMPTY label is filter-only: it is
+/// detected and filterable but never reaches the `💬` line, so widening the table
+/// does not change what any existing row prints.
+///
+/// One table, two consumers — [`language_flags`] renders the row,
+/// [`language_filter_keys`] feeds `stream_config.languages`. Splitting them would
+/// let the filter and the visible flag disagree about the same release name.
+const LANGUAGE_TAGS: &[(&str, &str, &str)] = &[
+    (r"(?i)\b(malay|malaysub|sub\s*malay|msia|melayu)\b", "malay", "🇲🇾 Malay"),
+    (r"(?i)\b(eng|english|esub|sub\s*eng)\b", "english", "🇬🇧 English"),
+    (r"(?i)\b(indo|indonesia|indosub)\b", "indo", "🇮🇩 Indo"),
+    (r"(?i)\b(hindi|hin|dub\s*hindi)\b", "hindi", "🇮🇳 Hindi"),
+    (r"(?i)\b(korean|kor|kdrama)\b", "korean", "🇰🇷 Korean"),
+    (r"(?i)\b(japanese|jap|anime)\b", "japanese", "🇯🇵 Japanese"),
+    (r"(?i)\b(chinese|mandarin|cantonese|c-drama)\b", "chinese", "🇨🇳 Chinese"),
+    (r"(?i)\b(thai)\b", "thai", "🇹🇭 Thai"),
+    // Filter-only from here down: detected, never printed. Uploads in this
+    // catalogue name a language in words, not ISO codes, so the patterns are the
+    // words a release actually uses.
+    (r"(?i)\b(tagalog|filipino|pinoy)\b", "tagalog", ""),
+    (r"(?i)\b(vietnamese|viet)\b", "vietnamese", ""),
+    (r"(?i)\b(burmese|myanmar)\b", "burmese", ""),
+    (r"(?i)\b(khmer|cambodian)\b", "khmer", ""),
+    (r"(?i)\b(lao|laos|laotian)\b", "laos", ""),
+    (r"(?i)\b(tamil|tamizh)\b", "tamil", ""),
+    (r"(?i)\b(telugu)\b", "telugu", ""),
+    (r"(?i)\b(bengali|bangla)\b", "bengali", ""),
+    (r"(?i)\b(urdu)\b", "urdu", ""),
+    (r"(?i)\b(arabic|arab)\b", "arabic", ""),
+    (r"(?i)\b(persian|farsi)\b", "persian", ""),
+    (r"(?i)\b(turkish|turkce)\b", "turkish", ""),
+    (r"(?i)\b(spanish|espanol|español)\b", "spanish", ""),
+    (r"(?i)\b(french|francais|français)\b", "french", ""),
+    (r"(?i)\b(german|deutsch)\b", "german", ""),
+    (r"(?i)\b(italian|italiano)\b", "italian", ""),
+    (r"(?i)\b(russian|russkiy)\b", "russian", ""),
+    (r"(?i)\b(portuguese|portugues)\b", "portuguese", ""),
+    (r"(?i)\b(dutch|nederlands)\b", "dutch", ""),
+    (r"(?i)\b(polish|polski)\b", "polish", ""),
+    (r"(?i)\b(hebrew|ivrit)\b", "hebrew", ""),
+    (r"(?i)\b(greek|ellinika)\b", "greek", ""),
+    (r"(?i)\b(nepali|nepalese)\b", "nepali", ""),
+    (r"(?i)\b(sinhala|sinhalese)\b", "sinhala", ""),
+    (r"(?i)\b(ukrainian|ukrainska)\b", "ukrainian", ""),
+    (r"(?i)\b(romanian|romana)\b", "romanian", ""),
+    (r"(?i)\b(czech|cesky)\b", "czech", ""),
+    (r"(?i)\b(hungarian|magyar)\b", "hungarian", ""),
+    (r"(?i)\b(swedish|svenska)\b", "swedish", ""),
+    (r"(?i)\b(norwegian|norsk)\b", "norwegian", ""),
+    (r"(?i)\b(danish|dansk)\b", "danish", ""),
+    (r"(?i)\b(finnish|suomi)\b", "finnish", ""),
+    // Audio traits: a marker, not a language.
+    (r"(?i)\b(dubbed|dub)\b", "dubbed", ""),
+    (r"(?i)\b(multi(?:\s*audio)?|dual\s*audio)\b", "multi", ""),
+];
+
+/// The `💬 🇲🇾 Malay / 🇬🇧 English` labels for one row (backend.php:17803-17830).
+pub fn language_flags(title: &str, caption: &str) -> Vec<&'static str> {
+    let text = format!("{} {}", title, caption);
+    LANGUAGE_TAGS
+        .iter()
+        .filter(|(re, _, label)| !label.is_empty() && has(re, &text))
+        .map(|(_, _, label)| *label)
+        .collect()
+}
+
+/// Every language marker for the filter, `dubbed` and `multi` included.
+pub fn language_filter_keys(title: &str, caption: &str) -> Vec<&'static str> {
+    let text = format!("{} {}", title, caption);
+    LANGUAGE_TAGS
+        .iter()
+        .filter(|(re, _, _)| has(re, &text))
+        .map(|(_, key, _)| *key)
+        .collect()
+}
+
 /// The AIOStreams-style filter config (`stream_config` in
 /// `storage/catalog_settings.json`).
 ///
@@ -2255,9 +2390,21 @@ pub struct StreamFilterConfig {
     pub qualities: HashMap<String, bool>,
     pub encodes: HashMap<String, bool>,
     pub visual_tags: HashMap<String, bool>,
+    /// Language markers, keyed by [`LANGUAGE_TAGS`]' second column plus
+    /// `unknown`. A row is hidden when ANY of its markers is switched off — the
+    /// same any-match rule `visual_tags` uses, which is what "hide Malay dub"
+    /// has to mean when a release is both `ENG` and `Malay`.
+    pub languages: HashMap<String, bool>,
+    /// Audio families, keyed by [`audio_family`] plus `unknown`.
+    pub audio: HashMap<String, bool>,
     pub exclude_cam: bool,
     pub exclude_unplayable: bool,
     pub exclude_part_title: bool,
+    /// Drop joined rows whose parts cannot be served as a range (the ones the
+    /// row itself labels `⚠️ no seek`). Applied where seekability is decided —
+    /// [`crate::routes`], not here: a single file is always seekable and this
+    /// function only ever sees single files.
+    pub exclude_no_seek: bool,
     pub min_size_mb: i64,
     pub max_size_gb: i64,
     pub excluded_keywords: Vec<String>,
@@ -2271,9 +2418,12 @@ impl Default for StreamFilterConfig {
             qualities: HashMap::new(),
             encodes: HashMap::new(),
             visual_tags: HashMap::new(),
+            languages: HashMap::new(),
+            audio: HashMap::new(),
             exclude_cam: false,
             exclude_unplayable: true,
             exclude_part_title: false,
+            exclude_no_seek: false,
             min_size_mb: 0,
             max_size_gb: 0,
             excluded_keywords: Vec::new(),
@@ -2310,9 +2460,12 @@ impl StreamFilterConfig {
             qualities: table(cfg.get("qualities")),
             encodes: table(cfg.get("encodes")),
             visual_tags: table(cfg.get("visual_tags")),
+            languages: table(cfg.get("languages")),
+            audio: table(cfg.get("audio")),
             exclude_cam: flag("exclude_cam", false),
             exclude_unplayable: flag("exclude_unplayable", true),
             exclude_part_title: flag("exclude_part_title", false),
+            exclude_no_seek: flag("exclude_no_seek", false),
             min_size_mb: cfg.get("min_size_mb").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
             max_size_gb: cfg.get("max_size_gb").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
             excluded_keywords: words(cfg.get("excluded_keywords")),
@@ -2340,7 +2493,11 @@ pub fn apply_stream_filters(files: &[FileItem], cfg: &StreamFilterConfig) -> Vec
                 title = first.to_string();
             }
         }
-        let lower_title = title.to_lowercase();
+        // Keyword gates read BOTH the title and the caption: the caption carries
+        // the untruncated original name, and a marker that only lives there
+        // (`sample`, `part 2`, `CAM`) was unfilterable while this looked at the
+        // title alone.
+        let lower_keyword_text = format!("{} {}", title, caption).to_lowercase();
         let tags = extract_media_tags(&title, &caption);
 
         // 1. Resolution.
@@ -2415,6 +2572,38 @@ pub fn apply_stream_filters(files: &[FileItem], cfg: &StreamFilterConfig) -> Vec
                 continue;
             }
         }
+        // 4b. Audio family. ANY switched-off family on the row hides it — a
+        // `DDP5.1.Atmos.AAC` release has three tracks and "hide AAC" has to mean
+        // this row, not "the row whose strongest tag happens to be AAC".
+        //
+        // A name with no audio tag at all is `unknown`, the same rule languages
+        // use: without that branch the Unknown pill would be a control that
+        // cannot ever do anything.
+        if tags.audio_all.is_empty() {
+            if cfg.audio.get("unknown") == Some(&false) {
+                continue;
+            }
+        } else if tags
+            .audio_all
+            .iter()
+            .any(|tag| cfg.audio.get(audio_family(tag)) == Some(&false))
+        {
+            continue;
+        }
+        // 4c. Language markers. A row with no marker is `unknown`: hidden only
+        // when that key is off, so a fresh install (everything on) never loses
+        // an untagged file to a language filter.
+        let lang_keys = language_filter_keys(&title, &caption);
+        if lang_keys.is_empty() {
+            if cfg.languages.get("unknown") == Some(&false) {
+                continue;
+            }
+        } else if lang_keys
+            .iter()
+            .any(|k| cfg.languages.get(*k) == Some(&false))
+        {
+            continue;
+        }
         // 5. Size range.
         if cfg.min_size_mb > 0 && size > 0 && (size as i64) < cfg.min_size_mb * 1_048_576 {
             continue;
@@ -2424,12 +2613,18 @@ pub fn apply_stream_filters(files: &[FileItem], cfg: &StreamFilterConfig) -> Vec
         }
         // 6/7. Keyword gates.
         if !cfg.excluded_keywords.is_empty()
-            && cfg.excluded_keywords.iter().any(|k| lower_title.contains(k))
+            && cfg
+                .excluded_keywords
+                .iter()
+                .any(|k| lower_keyword_text.contains(k))
         {
             continue;
         }
         if !cfg.required_keywords.is_empty()
-            && !cfg.required_keywords.iter().any(|k| lower_title.contains(k))
+            && !cfg
+                .required_keywords
+                .iter()
+                .any(|k| lower_keyword_text.contains(k))
         {
             continue;
         }
@@ -3890,5 +4085,432 @@ mod tests {
         assert_eq!(strip_title_decorations("Veil of Shadows 2026 • TvSeries"), "Veil of Shadows");
         assert_eq!(decode_html_entities("Tom & Jerry 'Show'"), "Tom & Jerry 'Show'");
         assert_eq!(norm_title_for_match("Avengers.Infinity.War.2018.2160p.mkv"), "avengers infinity war");
+    }
+
+    /* language / audio filters ------------------------------------------------ */
+
+    fn one(title: &str, caption: &str) -> Vec<FileItem> {
+        vec![FileItem {
+            title: title.into(),
+            caption: caption.into(),
+            file_size: 1,
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn language_filter_hides_a_row_tagged_with_a_disabled_marker() {
+        let files = one("Movie.2026.Malay.Dubbed.1080p.mkv", "");
+        let off = StreamFilterConfig::from_json(&serde_json::json!({
+            "languages": {"malay": false}
+        }));
+        assert!(apply_stream_filters(&files, &off).is_empty());
+        // The same row survives when every marker is on.
+        let on = StreamFilterConfig::from_json(&serde_json::json!({
+            "languages": {"malay": true, "dubbed": true}
+        }));
+        assert_eq!(apply_stream_filters(&files, &on).len(), 1);
+    }
+
+    #[test]
+    fn an_untagged_row_lives_until_unknown_is_switched_off() {
+        let files = one("Movie.2026.1080p.WEB-DL.mkv", "");
+        let malay_off = StreamFilterConfig::from_json(&serde_json::json!({
+            "languages": {"malay": false}
+        }));
+        assert_eq!(
+            apply_stream_filters(&files, &malay_off).len(),
+            1,
+            "a filter for Malay must not eat rows that name no language"
+        );
+        let unknown_off = StreamFilterConfig::from_json(&serde_json::json!({
+            "languages": {"unknown": false}
+        }));
+        assert!(apply_stream_filters(&files, &unknown_off).is_empty());
+    }
+
+    #[test]
+    fn every_language_key_is_detected_and_every_detected_key_is_listed() {
+        for (_, key, _) in LANGUAGE_TAGS {
+            assert!(LANGUAGE_KEYS.contains(key), "{key} is detected but not listed");
+        }
+        for key in LANGUAGE_KEYS {
+            if *key == "unknown" {
+                continue;
+            }
+            assert!(
+                LANGUAGE_TAGS.iter().any(|(_, k, _)| k == key),
+                "{key} is listed but has no pattern"
+            );
+        }
+        // A filter-only marker filters without adding a row label.
+        assert!(language_flags("Movie.2026.Tagalog.mkv", "").is_empty());
+        assert_eq!(
+            language_filter_keys("Movie.2026.Tagalog.mkv", ""),
+            vec!["tagalog"]
+        );
+        // And a display marker still does both.
+        assert_eq!(language_flags("Movie.2026.Malay.mkv", ""), vec!["🇲🇾 Malay"]);
+    }
+
+    /// Every filter-only language is detected from a real release name and can
+    /// remove that row — the check that the widened table is not just 32 pills
+    /// with no pattern behind them.
+    #[test]
+    fn every_filter_only_language_is_detected_and_filters() {
+        let cases: &[(&str, &str)] = &[
+            ("tagalog", "Movie.2026.Tagalog.1080p.WEB-DL.mkv"),
+            ("vietnamese", "Movie.2026.Vietnamese.1080p.WEB-DL.mkv"),
+            ("burmese", "Movie.2026.Burmese.720p.WEBRip.mkv"),
+            ("khmer", "Movie.2026.Khmer.720p.WEBRip.mkv"),
+            ("laos", "Movie.2026.Laotian.720p.WEBRip.mkv"),
+            ("tamil", "Movie.2026.Tamil.1080p.HDRip.mkv"),
+            ("telugu", "Movie.2026.Telugu.1080p.HDRip.mkv"),
+            ("bengali", "Movie.2026.Bengali.720p.WEBRip.mkv"),
+            ("urdu", "Movie.2026.Urdu.720p.WEBRip.mkv"),
+            ("arabic", "Movie.2026.Arabic.720p.WEBRip.mkv"),
+            ("persian", "Movie.2026.Persian.720p.WEBRip.mkv"),
+            ("turkish", "Movie.2026.Turkish.720p.WEBRip.mkv"),
+            ("spanish", "Movie.2026.Spanish.1080p.WEBRip.mkv"),
+            ("french", "Movie.2026.French.1080p.WEBRip.mkv"),
+            ("german", "Movie.2026.German.1080p.WEBRip.mkv"),
+            ("italian", "Movie.2026.Italian.720p.WEBRip.mkv"),
+            ("russian", "Movie.2026.Russian.1080p.WEBRip.mkv"),
+            ("portuguese", "Movie.2026.Portuguese.720p.WEBRip.mkv"),
+            ("dutch", "Movie.2026.Dutch.720p.WEBRip.mkv"),
+            ("polish", "Movie.2026.Polish.720p.WEBRip.mkv"),
+            ("hebrew", "Movie.2026.Hebrew.720p.WEBRip.mkv"),
+            ("greek", "Movie.2026.Greek.720p.WEBRip.mkv"),
+            ("nepali", "Movie.2026.Nepali.720p.WEBRip.mkv"),
+            ("sinhala", "Movie.2026.Sinhala.720p.WEBRip.mkv"),
+            ("ukrainian", "Movie.2026.Ukrainian.720p.WEBRip.mkv"),
+            ("romanian", "Movie.2026.Romanian.720p.WEBRip.mkv"),
+            ("czech", "Movie.2026.Czech.720p.WEBRip.mkv"),
+            ("hungarian", "Movie.2026.Hungarian.720p.WEBRip.mkv"),
+            ("swedish", "Movie.2026.Swedish.720p.WEBRip.mkv"),
+            ("norwegian", "Movie.2026.Norwegian.720p.WEBRip.mkv"),
+            ("danish", "Movie.2026.Danish.720p.WEBRip.mkv"),
+            ("finnish", "Movie.2026.Finnish.720p.WEBRip.mkv"),
+        ];
+        for (key, name) in cases {
+            let found = language_filter_keys(name, "");
+            assert!(
+                found.contains(key),
+                "{name} must be detected as {key}, got {found:?}"
+            );
+            let mut langs = serde_json::Map::new();
+            langs.insert((*key).to_string(), serde_json::Value::Bool(false));
+            let off = StreamFilterConfig::from_json(&serde_json::json!({"languages": langs}));
+            assert!(
+                apply_stream_filters(&one(name, ""), &off).is_empty(),
+                "languages.{key} off must hide {name}"
+            );
+            let all_on = StreamFilterConfig::from_json(&serde_json::json!({"languages": {}}));
+            assert_eq!(
+                apply_stream_filters(&one(name, ""), &all_on).len(),
+                1,
+                "{name} must survive a config that switches nothing off"
+            );
+        }
+        // A marker that only the caption carries counts too: the caption is the
+        // untruncated name.
+        let caption_only = one("Movie.2026.1080p.mkv", "Movie.2026.Tagalog.1080p.WEB-DL.mkv");
+        let off = StreamFilterConfig::from_json(&serde_json::json!({
+            "languages": {"tagalog": false}
+        }));
+        assert!(apply_stream_filters(&caption_only, &off).is_empty());
+    }
+
+    #[test]
+    fn dubbed_is_a_filter_marker_but_never_a_row_flag() {
+        // The `💬` line names languages, not audio traits; the filter needs both.
+        let flags = language_flags("Movie.2026.Malay.Dubbed.mkv", "");
+        assert_eq!(flags, vec!["🇲🇾 Malay"]);
+        let keys = language_filter_keys("Movie.2026.Malay.Dubbed.mkv", "");
+        assert_eq!(keys, vec!["malay", "dubbed"]);
+    }
+
+    #[test]
+    fn audio_all_lists_every_tag_in_strength_order() {
+        let tags = extract_media_tags("Movie.2026.DDP5.1.Atmos.AAC.mkv", "");
+        assert_eq!(tags.audio, "Atmos", "the pill still shows the strongest tag");
+        assert_eq!(
+            tags.audio_all,
+            vec!["Atmos".to_string(), "DDP5.1".to_string(), "AAC".to_string()]
+        );
+    }
+
+    #[test]
+    fn audio_filter_matches_every_tag_on_the_row() {
+        let files = one("Movie.2026.DDP5.1.Atmos.AAC.mkv", "");
+        for (key, expected) in [("aac", 0usize), ("atmos", 0), ("ddp", 0), ("hevc", 1)] {
+            let cfg = StreamFilterConfig::from_json(&serde_json::json!({
+                "audio": { key: false }
+            }));
+            assert_eq!(
+                apply_stream_filters(&files, &cfg).len(),
+                expected,
+                "audio.{key}_off"
+            );
+        }
+    }
+
+    #[test]
+    fn keywords_read_the_caption_too() {
+        // The caption carries the untruncated name; this is where `sample` lives.
+        let files = one("Movie.2026.1080p.mkv", "Movie.2026.1080p.SAMPLE.mkv");
+        let cfg = StreamFilterConfig::from_json(&serde_json::json!({
+            "excluded_keywords": "sample"
+        }));
+        assert!(apply_stream_filters(&files, &cfg).is_empty());
+
+        // And a required keyword that only the caption carries must keep the row.
+        let keep = StreamFilterConfig::from_json(&serde_json::json!({
+            "required_keywords": "hindi"
+        }));
+        let captioned = one("Movie.2026.1080p.mkv", "Movie.2026.Hindi.1080p.mkv");
+        assert_eq!(apply_stream_filters(&captioned, &keep).len(), 1);
+    }
+
+    /* every filter key ------------------------------------------------------- */
+
+    /// A `stream_config` object with one map and only the given members.
+    fn only(key: &str, members: &[(&str, bool)]) -> serde_json::Value {
+        let members: serde_json::Map<String, serde_json::Value> = members
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::Value::Bool(*v)))
+            .collect();
+        let mut cfg = serde_json::Map::new();
+        cfg.insert(key.to_string(), serde_json::Value::Object(members));
+        serde_json::Value::Object(cfg)
+    }
+
+    /// Every `stream_config` map key (1–6) plus `exclude_cam`: the row named by
+    /// the last column must be dropped by its own key and nothing else, and each
+    /// family carries a case where a sibling key is still ON, so this table
+    /// cannot pass by filtering everything.
+    #[test]
+    fn every_filter_key_removes_its_own_rows_and_nothing_else() {
+        let cases: Vec<(serde_json::Value, &str, &str, bool, &str)> = vec![
+            // 1. resolutions (`unknown` = a row with no resolution token).
+            (only("resolutions", &[("4k", false)]), "Movie.2026.2160p.mkv", "", false, "resolutions.4k off"),
+            (only("resolutions", &[("1080p", false)]), "Movie.2026.1080p.mkv", "", false, "resolutions.1080p off"),
+            (only("resolutions", &[("720p", false)]), "Movie.2026.720p.mkv", "", false, "resolutions.720p off"),
+            (only("resolutions", &[("sd", false)]), "Movie.2026.480p.mkv", "", false, "resolutions.sd off"),
+            (only("resolutions", &[("unknown", false)]), "Movie.2026.mkv", "", false, "resolutions.unknown off"),
+            (only("resolutions", &[("4k", false), ("1080p", true)]), "Movie.2026.1080p.mkv", "", true, "resolutions.1080p still on"),
+            // 2. qualities (`unknown` = a row with no source token).
+            (only("qualities", &[("remux", false)]), "Movie.2026.REMUX.mkv", "", false, "qualities.remux off"),
+            (only("qualities", &[("bluray", false)]), "Movie.2026.BluRay.mkv", "", false, "qualities.bluray off"),
+            (only("qualities", &[("webdl", false)]), "Movie.2026.WEB-DL.mkv", "", false, "qualities.webdl off"),
+            // `categorize_quality_key` maps HDRip to the `webrip` key (a WEBRip
+            // name is deliberately `unknown`).
+            (only("qualities", &[("webrip", false)]), "Movie.2026.HDRip.mkv", "", false, "qualities.webrip off"),
+            (only("qualities", &[("hdtv", false)]), "Movie.2026.HDTV.mkv", "", false, "qualities.hdtv off"),
+            (only("qualities", &[("cam", false)]), "Movie.2026.CAM.mkv", "", false, "qualities.cam off"),
+            (only("qualities", &[("unknown", false)]), "Movie.2026.mkv", "", false, "qualities.unknown off"),
+            (only("qualities", &[("cam", false), ("webdl", true)]), "Movie.2026.WEB-DL.mkv", "", true, "qualities.webdl still on"),
+            // 3. encodes.
+            (only("encodes", &[("hevc", false)]), "Movie.2026.HEVC.mkv", "", false, "encodes.hevc off"),
+            (only("encodes", &[("avc", false)]), "Movie.2026.x264.mkv", "", false, "encodes.avc off"),
+            (only("encodes", &[("av1", false)]), "Movie.2026.AV1.mkv", "", false, "encodes.av1 off"),
+            (only("encodes", &[("hevc", false), ("avc", true)]), "Movie.2026.x264.mkv", "", true, "encodes.avc still on"),
+            // 4. visual tags.
+            (only("visual_tags", &[("hdr", false)]), "Movie.2026.HDR.mkv", "", false, "visual_tags.hdr off"),
+            (only("visual_tags", &[("dv", false)]), "Movie.2026.DV.mkv", "", false, "visual_tags.dv off"),
+            (only("visual_tags", &[("dv", false)]), "Movie.2026.HDR.DV.mkv", "", false, "visual_tags.dv off on a dual-tag row"),
+            (only("visual_tags", &[("dv", false), ("hdr", true)]), "Movie.2026.HDR.mkv", "", true, "visual_tags.hdr still on"),
+            // 5. languages (`unknown` = a row with no language marker).
+            (only("languages", &[("malay", false)]), "Movie.2026.Malay.mkv", "", false, "languages.malay off"),
+            (only("languages", &[("english", false)]), "Movie.2026.English.mkv", "", false, "languages.english off"),
+            (only("languages", &[("indo", false)]), "Movie.2026.Indo.mkv", "", false, "languages.indo off"),
+            (only("languages", &[("hindi", false)]), "Movie.2026.Hindi.mkv", "", false, "languages.hindi off"),
+            (only("languages", &[("korean", false)]), "Movie.2026.Korean.mkv", "", false, "languages.korean off"),
+            (only("languages", &[("japanese", false)]), "Movie.2026.Japanese.mkv", "", false, "languages.japanese off"),
+            (only("languages", &[("chinese", false)]), "Movie.2026.Chinese.mkv", "", false, "languages.chinese off"),
+            (only("languages", &[("thai", false)]), "Movie.2026.Thai.mkv", "", false, "languages.thai off"),
+            (only("languages", &[("dubbed", false)]), "Movie.2026.Dubbed.mkv", "", false, "languages.dubbed off"),
+            (only("languages", &[("multi", false)]), "Movie.2026.Multi.mkv", "", false, "languages.multi off"),
+            (only("languages", &[("unknown", false)]), "Movie.2026.1080p.mkv", "", false, "languages.unknown off"),
+            (only("languages", &[("malay", false), ("english", true)]), "Movie.2026.English.mkv", "", true, "languages.english still on"),
+            // 6. audio families. No audio tag at all is `unknown`, so that key
+            // hides rows whose name says nothing about the audio.
+            (only("audio", &[("atmos", false)]), "Movie.2026.Atmos.mkv", "", false, "audio.atmos off"),
+            (only("audio", &[("ddp", false)]), "Movie.2026.DDP5.1.mkv", "", false, "audio.ddp off"),
+            (only("audio", &[("ac3", false)]), "Movie.2026.AC3.mkv", "", false, "audio.ac3 off"),
+            (only("audio", &[("dts", false)]), "Movie.2026.DTS.mkv", "", false, "audio.dts off"),
+            (only("audio", &[("truehd", false)]), "Movie.2026.TrueHD.mkv", "", false, "audio.truehd off"),
+            (only("audio", &[("aac", false)]), "Movie.2026.AAC.mkv", "", false, "audio.aac off"),
+            (only("audio", &[("flac", false)]), "Movie.2026.FLAC.mkv", "", false, "audio.flac off"),
+            (only("audio", &[("opus", false)]), "Movie.2026.Opus.mkv", "", false, "audio.opus off"),
+            (only("audio", &[("unknown", false)]), "Movie.2026.1080p.mkv", "", false, "audio.unknown off hides a row with no audio tag"),
+            (only("audio", &[("unknown", false)]), "Movie.2026.AAC.mkv", "", true, "audio.unknown off keeps a tagged row"),
+            (only("audio", &[("aac", false), ("ddp", true)]), "Movie.2026.DDP5.1.mkv", "", true, "audio.ddp still on"),
+            (only("audio", &[("aac", false), ("atmos", true)]), "Movie.2026.DDP5.1.Atmos.AAC.mkv", "", false, "audio.aac off beats a still-on atmos tag"),
+            // 2b. exclude_cam is its own bool, not the qualities.cam member.
+            (serde_json::json!({"exclude_cam": true}), "Movie.2026.CAM.mkv", "", false, "exclude_cam on"),
+            (serde_json::json!({"exclude_cam": true}), "Movie.2026.WEB-DL.mkv", "", true, "exclude_cam on keeps non-cam"),
+        ];
+        for (config, title, caption, kept, case) in cases {
+            let cfg = StreamFilterConfig::from_json(&config);
+            assert_eq!(
+                apply_stream_filters(&one(title, caption), &cfg).len(),
+                if kept { 1 } else { 0 },
+                "{case}"
+            );
+        }
+    }
+
+    /// Keys 8, 9, 11, 12, 13, 14: each gate removes only its own rows, and the
+    /// size gate never touches a row whose size is unknown (`0`).
+    #[test]
+    fn size_keywords_and_part_flags_gate_independently() {
+        let mib = 1_048_576u64;
+        let gib = 1_073_741_824u64;
+        let row = |title: &str, caption: &str, size: u64| FileItem {
+            title: title.into(),
+            caption: caption.into(),
+            file_size: size,
+            ..Default::default()
+        };
+        let cfg = |json: serde_json::Value| StreamFilterConfig::from_json(&json);
+
+        // 8. exclude_unplayable: archive and raw `.001` chunk, flag off keeps both.
+        let archive = row("Movie.2026.1080p.zip", "", 10);
+        let raw = row("Movie.2026.1080p.001", "", 10);
+        assert!(
+            apply_stream_filters(&[archive.clone(), raw.clone()], &cfg(serde_json::json!({"exclude_unplayable": true}))).is_empty(),
+            "exclude_unplayable on drops the archive and the raw .001"
+        );
+        assert_eq!(
+            apply_stream_filters(&[archive, raw], &cfg(serde_json::json!({"exclude_unplayable": false}))).len(),
+            2,
+            "exclude_unplayable off keeps both"
+        );
+
+        // 9. exclude_part_title: off by default, drops only a flagged part.
+        let mut part = row("Movie.2026.1080p.part001.mkv", "", 100 * mib);
+        part.is_split_part = true;
+        assert_eq!(
+            apply_stream_filters(&[part.clone()], &StreamFilterConfig::default()).len(),
+            1,
+            "exclude_part_title off keeps a flagged part"
+        );
+        assert!(
+            apply_stream_filters(&[part], &cfg(serde_json::json!({"exclude_part_title": true}))).is_empty(),
+            "exclude_part_title on drops a flagged part"
+        );
+
+        // 11. min_size_mb: below the floor drops, above keeps.
+        let min = cfg(serde_json::json!({"min_size_mb": 100}));
+        assert!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", 50 * mib)], &min).is_empty(),
+            "min_size_mb 100 drops a 50 MB row"
+        );
+        assert_eq!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", 200 * mib)], &min).len(),
+            1,
+            "min_size_mb 100 keeps a 200 MB row"
+        );
+
+        // 12. max_size_gb: above the ceiling drops, below keeps.
+        let max = cfg(serde_json::json!({"max_size_gb": 1}));
+        assert!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", 2 * gib)], &max).is_empty(),
+            "max_size_gb 1 drops a 2 GB row"
+        );
+        assert_eq!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", gib / 2)], &max).len(),
+            1,
+            "max_size_gb 1 keeps a 0.5 GB row"
+        );
+
+        // Both bounds at once must still ignore an unknown size.
+        let both = cfg(serde_json::json!({"min_size_mb": 100, "max_size_gb": 1}));
+        assert_eq!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", 0)], &both).len(),
+            1,
+            "size 0 is never dropped by a size bound"
+        );
+
+        // 13. excluded_keywords: title match and caption-only match both drop.
+        let excluded = cfg(serde_json::json!({"excluded_keywords": "sample"}));
+        assert!(
+            apply_stream_filters(&[row("Movie.2026.1080p.SAMPLE.mkv", "", 100 * mib)], &excluded).is_empty(),
+            "excluded_keywords drops a title match"
+        );
+        assert!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "Movie.2026.1080p.SAMPLE.mkv", 100 * mib)], &excluded).is_empty(),
+            "excluded_keywords drops a keyword that lives only in the caption"
+        );
+
+        // 14. required_keywords: a non-empty list keeps only a match, and the
+        // match may live in the caption.
+        let required = cfg(serde_json::json!({"required_keywords": "hindi"}));
+        assert!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "", 100 * mib)], &required).is_empty(),
+            "required_keywords drops a row without the keyword"
+        );
+        assert_eq!(
+            apply_stream_filters(&[row("Movie.2026.1080p.mkv", "Movie.2026.Hindi.1080p.mkv", 100 * mib)], &required).len(),
+            1,
+            "required_keywords keeps a caption-only match"
+        );
+    }
+
+    /// The shipped `Default` adds no gate of its own: only the orphan rule
+    /// (which is not a config key) still fires.
+    #[test]
+    fn a_default_config_drops_nothing_but_orphans() {
+        let mut rows = vec![
+            FileItem {
+                title: "Movie.2026.2160p.WEB-DL.HDR.DV.HEVC.DDP5.1.Atmos.mkv".into(),
+                file_size: 8_000_000_000,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.1080p.BluRay.x264.AAC.mkv".into(),
+                file_size: 2_000_000_000,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.720p.HDTV.mkv".into(),
+                file_size: 700_000_000,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.480p.Malay.English.mkv".into(),
+                file_size: 100_000_000,
+                ..Default::default()
+            },
+            FileItem {
+                title: "Movie.2026.FLAC.Opus.mkv".into(),
+                file_size: 50_000_000,
+                ..Default::default()
+            },
+        ];
+        let cfg = StreamFilterConfig::default();
+        let kept = apply_stream_filters(&rows, &cfg);
+        let indexes: Vec<usize> = kept.iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            indexes,
+            (0..rows.len()).collect::<Vec<_>>(),
+            "the default config must keep every well-formed row in order"
+        );
+
+        // The one rule that still fires by default: a lone part is an orphan.
+        let orphan = rows.len();
+        rows.push(FileItem {
+            title: "Movie.2026.1080p.part001.mkv".into(),
+            file_size: 200_000_000,
+            split_orphan: true,
+            ..Default::default()
+        });
+        let kept = apply_stream_filters(&rows, &cfg);
+        assert_eq!(kept.len(), rows.len() - 1, "a lone part001 is dropped even with exclude_part_title off");
+        assert!(
+            !kept.iter().any(|(i, _)| *i == orphan),
+            "the orphan row must not be kept just because the default config is permissive"
+        );
     }
 }

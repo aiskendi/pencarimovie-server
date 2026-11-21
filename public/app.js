@@ -62,6 +62,11 @@ const setInert = function () {
     if (on) el.setAttribute("inert", "");else el.removeAttribute("inert");
   };
 }();
+// Checkbox ids are `#streamLang<Name>` / `#streamAudio<Name>`; the second column
+// is the key in `stream_config.languages|audio` and must match the server's
+// whitelist in `routes::apply_stream_config`.
+var STREAM_LANGUAGE_KEYS = [["Malay", "malay"], ["English", "english"], ["Indo", "indo"], ["Hindi", "hindi"], ["Korean", "korean"], ["Japanese", "japanese"], ["Chinese", "chinese"], ["Thai", "thai"], ["Tagalog", "tagalog"], ["Vietnamese", "vietnamese"], ["Burmese", "burmese"], ["Khmer", "khmer"], ["Laos", "laos"], ["Tamil", "tamil"], ["Telugu", "telugu"], ["Bengali", "bengali"], ["Urdu", "urdu"], ["Arabic", "arabic"], ["Persian", "persian"], ["Turkish", "turkish"], ["Spanish", "spanish"], ["French", "french"], ["German", "german"], ["Italian", "italian"], ["Russian", "russian"], ["Portuguese", "portuguese"], ["Dutch", "dutch"], ["Polish", "polish"], ["Hebrew", "hebrew"], ["Greek", "greek"], ["Nepali", "nepali"], ["Sinhala", "sinhala"], ["Ukrainian", "ukrainian"], ["Romanian", "romanian"], ["Czech", "czech"], ["Hungarian", "hungarian"], ["Swedish", "swedish"], ["Norwegian", "norwegian"], ["Danish", "danish"], ["Finnish", "finnish"], ["Dubbed", "dubbed"], ["Multi", "multi"], ["Unknown", "unknown"]];
+var STREAM_AUDIO_KEYS = [["Atmos", "atmos"], ["Ddp", "ddp"], ["Ac3", "ac3"], ["Dts", "dts"], ["Truehd", "truehd"], ["Aac", "aac"], ["Flac", "flac"], ["Opus", "opus"], ["Unknown", "unknown"]];
 class PencariMovieApp {
   constructor() {
     this.localApiBase = window.location.origin;
@@ -1105,6 +1110,18 @@ class PencariMovieApp {
           const visDvEl = this.$("#streamVisDv");
           if (visHdrEl) visHdrEl.checked = visConfig["hdr"] !== false;
           if (visDvEl) visDvEl.checked = visConfig["dv"] !== false;
+          const langConfig = streamConfig.languages || {};
+          STREAM_LANGUAGE_KEYS.forEach((_ref) => {
+            const el = this.$("#streamLang" + _ref[0]);
+            if (el) el.checked = langConfig[_ref[1]] !== false;
+          });
+          const audioConfig = streamConfig.audio || {};
+          STREAM_AUDIO_KEYS.forEach((_ref) => {
+            const el = this.$("#streamAudio" + _ref[0]);
+            if (el) el.checked = audioConfig[_ref[1]] !== false;
+          });
+          const excludeNoSeekEl = this.$("#streamExcludeNoSeek");
+          if (excludeNoSeekEl) excludeNoSeekEl.checked = !!streamConfig.exclude_no_seek;
           const preferredResEl = this.$("#streamPreferredRes");
           const maxPerResEl = this.$("#streamMaxPerRes");
           const maxTotalEl = this.$("#streamMaxTotal");
@@ -1214,6 +1231,17 @@ class PencariMovieApp {
           const resUnknownEl = this.$("#streamResUnknown");
           const preferredResEl = this.$("#streamPreferredRes");
           const maxPerResEl = this.$("#streamMaxPerRes");
+          // A checkbox that is absent from the DOM keeps its "on" value: these
+          // groups hide rows by the presence of a marker, so a missing control
+          // must never switch a marker off.
+          const streamGroup = (prefix, keys) => {
+            const map = {};
+            keys.forEach((k) => {
+              const el = this.$("#" + prefix + k[0]);
+              map[k[1]] = el ? el.checked : true;
+            });
+            return map;
+          };
           const payload = {
             catalogs_enabled: isEnabled,
             country: addonCountrySelect ? this._countryCodeFromInput(addonCountrySelect.value) || "" : catalogSettingsState.country || "",
@@ -1258,6 +1286,9 @@ class PencariMovieApp {
                 "hdr": this.$("#streamVisHdr") ? this.$("#streamVisHdr").checked : true,
                 "dv": this.$("#streamVisDv") ? this.$("#streamVisDv").checked : true
               },
+              languages: streamGroup("streamLang", STREAM_LANGUAGE_KEYS),
+              audio: streamGroup("streamAudio", STREAM_AUDIO_KEYS),
+              exclude_no_seek: this.$("#streamExcludeNoSeek") ? this.$("#streamExcludeNoSeek").checked : false,
               exclude_cam: this.$("#streamExcludeCam") ? this.$("#streamExcludeCam").checked : false,
               exclude_unplayable: this.$("#streamExcludeUnplayable") ? this.$("#streamExcludeUnplayable").checked : false,
               exclude_part_title: this.$("#streamExcludePartTitle") ? this.$("#streamExcludePartTitle").checked : true,

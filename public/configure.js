@@ -39,17 +39,76 @@
       cam: "CAM / Telesync"
     },
     encodes: { hevc: "HEVC (H.265)", avc: "AVC (H.264)", av1: "AV1" },
-    visual_tags: { hdr: "HDR / HDR10+", dv: "Dolby Vision" }
+    visual_tags: { hdr: "HDR / HDR10+", dv: "Dolby Vision" },
+    languages: {
+      malay: "Malay",
+      english: "English",
+      indo: "Indo",
+      hindi: "Hindi",
+      korean: "Korean",
+      japanese: "Japanese",
+      chinese: "Chinese",
+      thai: "Thai",
+      tagalog: "Tagalog",
+      vietnamese: "Vietnamese",
+      burmese: "Burmese",
+      khmer: "Khmer",
+      laos: "Laotian",
+      tamil: "Tamil",
+      telugu: "Telugu",
+      bengali: "Bengali",
+      urdu: "Urdu",
+      arabic: "Arabic",
+      persian: "Persian",
+      turkish: "Turkish",
+      spanish: "Spanish",
+      french: "French",
+      german: "German",
+      italian: "Italian",
+      russian: "Russian",
+      portuguese: "Portuguese",
+      dutch: "Dutch",
+      polish: "Polish",
+      hebrew: "Hebrew",
+      greek: "Greek",
+      nepali: "Nepali",
+      sinhala: "Sinhala",
+      ukrainian: "Ukrainian",
+      romanian: "Romanian",
+      czech: "Czech",
+      hungarian: "Hungarian",
+      swedish: "Swedish",
+      norwegian: "Norwegian",
+      danish: "Danish",
+      finnish: "Finnish",
+      dubbed: "Dubbed",
+      multi: "Multi / Dual Audio",
+      unknown: "Unknown"
+    },
+    audio: {
+      atmos: "Atmos",
+      ddp: "DD+ (DDP / EAC3)",
+      ac3: "DD / AC3",
+      dts: "DTS",
+      truehd: "TrueHD",
+      aac: "AAC",
+      flac: "FLAC",
+      opus: "Opus",
+      unknown: "Unknown"
+    }
   };
   var GROUP_TITLES = {
     resolutions: "Resolutions:",
     qualities: "Source Qualities:",
-    encodes: "Encodes & Formats:"
+    encodes: "Encodes & Formats:",
+    languages: "Languages (hide rows tagged with an unchecked marker):",
+    audio: "Audio (hide rows carrying an unchecked type):"
   };
   var FLAGS = [
     ["exclude_cam", "Block All CAM"],
     ["exclude_unplayable", "Exclude Unplayable"],
-    ["exclude_part_title", "Exclude Part Titles"]
+    ["exclude_part_title", "Exclude Part Titles"],
+    ["exclude_no_seek", "Exclude No-Seek Rows"]
   ];
   var NUMBERS = [
     ["max_streams_total", "Max streams total (0 = no cap)"],
@@ -224,7 +283,7 @@
     var host = $("streamFilters");
     host.textContent = "";
 
-    ["resolutions", "qualities", "encodes"].forEach(function (group) {
+    ["resolutions", "qualities", "encodes", "languages", "audio"].forEach(function (group) {
       var section = document.createElement("div");
       section.className = "addon-catalog-section";
       var title = document.createElement("div");

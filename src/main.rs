@@ -37,6 +37,7 @@ mod fileid;
 mod httpc;
 mod log;
 mod matcher;
+mod media_probe;
 mod music_upstreams;
 mod proc;
 mod public_config;
@@ -510,6 +511,98 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+        }
+        return Ok(());
+    }
+
+    // `--probe-tracks <file_id_mt|short_code> [bot_id]`: read the first chunk of
+    // the file and report the audio and subtitle tracks the CONTAINER declares.
+    //
+    // `/stream` still labels a row from its filename: a list render must not spend
+    // MTProto parts, because `workers × inflight` is the part budget shared by every
+    // viewer (AGENTS.md §9) and probing a hundred rows would starve playback. This
+    // answers the earlier question — what the file itself says — without touching
+    // that budget, and is what the filter work is waiting on.
+    if let Some(i) = arg_pos("--probe-tracks") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(raw) = args.get(i + 1) else {
+            eprintln!("usage: pencarimovie-server --probe-tracks <file_id_mt|short_code> [bot_id]");
+            std::process::exit(2);
+        };
+        let bot = args
+            .get(i + 2)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(session::get_bot_id);
+        if bot.is_empty() {
+            eprintln!("{{\"ok\":0,\"error\":\"no bot_id: pass one as the second argument\"}}");
+            std::process::exit(2);
+        }
+        let mut file_id = raw.trim().to_string();
+        let mut file_size = 0u64;
+        let mut short_code = String::new();
+        if fileid::decode_file_id(&file_id).is_err() {
+            short_code = raw.trim().to_string();
+            let res = resolve::resolve_shortcode(&file_id, &bot, false).await;
+            let id = {
+                let a = res.get("file_id_mt").and_then(|v| v.as_str()).unwrap_or("");
+                if a.is_empty() {
+                    res.get("file_id").and_then(|v| v.as_str()).unwrap_or("")
+                } else {
+                    a
+                }
+            }
+            .trim()
+            .to_string();
+            file_size = res
+                .get("file_size")
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0);
+            if id.is_empty() {
+                eprintln!("{{\"ok\":0,\"error\":\"resolve returned no file_id_mt\"}}");
+                std::process::exit(1);
+            }
+            file_id = id;
+        }
+        let pool = telegram::TelegramPool::new(1, 8);
+        let entry = match pool.boot(&bot, None).await {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"bot boot failed: {}\"}}", e);
+                std::process::exit(1);
+            }
+        };
+        let client = entry.pick();
+        match probe_fetch(&client, &mut file_id, &mut file_size, "", &short_code, &bot).await {
+            Ok(bytes) => {
+                // `None` is "could not tell" and must stay distinct from "no
+                // tracks": an unreadable prefix is not evidence of a silent file.
+                let tracks = match media_probe::probe(&bytes) {
+                    Some(t) => serde_json::json!({
+                        "audio": t.audio,
+                        "channels": t.channels,
+                        "audio_languages": t.audio_languages,
+                        "subtitle_languages": t.subtitle_languages,
+                    }),
+                    None => serde_json::Value::Null,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": 1,
+                        "short_code": short_code,
+                        "file_size": file_size,
+                        "prefix_bytes": bytes.len(),
+                        "kind": bytes_kind(&bytes),
+                        "tracks": tracks,
+                    }))
+                    .unwrap_or_default()
+                );
+            }
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"{}\"}}", e.replace('"', "'"));
+                std::process::exit(1);
             }
         }
         return Ok(());

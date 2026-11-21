@@ -4299,20 +4299,26 @@ async fn build_streams_from_files(
             .map(|(_, e)| e.to_ascii_lowercase())
             .unwrap_or_default();
         let mime = crate::download::mime_by_ext(&ext).unwrap_or("video/x-matroska");
+        let seekable = matches!(items[i0].split_style, 3)
+            || parts.first().map(|p| p.1 == 4_194_304_000).unwrap_or(false)
+            || is_zip;
+        // `exclude_no_seek`: this row would be tagged `⚠️ no seek`, and a viewer
+        // who asked for seekable rows only does not want it.
+        //
+        // The interaction to keep in mind: with `exclude_part_title` ALSO on, a
+        // release whose only representation is this joined row disappears from the
+        // list entirely — the parts are hidden by the first flag, the joined row by
+        // this one. That is the correct trade for someone who cannot seek at all,
+        // but it is why this flag defaults to OFF and why the filter notes say so.
+        if cfg.exclude_no_seek && !seekable {
+            continue;
+        }
         let score = crate::matcher::stream_sort_score(&title, &first.caption, total, preferred);
         scored.push((
             score,
             res_key.clone(),
             total,
-            stream_item_joined(
-                ctx,
-                &parts,
-                &joined_item,
-                mime,
-                matches!(items[i0].split_style, 3)
-                    || parts.first().map(|p| p.1 == 4_194_304_000).unwrap_or(false)
-                    || is_zip,
-            ),
+            stream_item_joined(ctx, &parts, &joined_item, mime, seekable),
         ));
     }
 
@@ -4762,11 +4768,16 @@ fn active_filter_notes(stream_config: &Value) -> Vec<String> {
     if flag("exclude_cam") {
         out.push("CAM releases excluded".to_string());
     }
+    if flag("exclude_no_seek") {
+        out.push("rows that cannot seek excluded".to_string());
+    }
     for (group, label) in [
         ("resolutions", "resolution"),
         ("qualities", "quality"),
         ("encodes", "codec"),
         ("visual_tags", "tag"),
+        ("languages", "language"),
+        ("audio", "audio"),
     ] {
         if let Some(map) = stream_config.get(group).and_then(|v| v.as_object()) {
             let off: Vec<&str> = map
@@ -5037,7 +5048,7 @@ fn stream_item(
         None => display_name.clone(),
     };
     let mut description = format!("{}\n{}", file_line, spec_bits.join(" • "));
-    let flags = language_flags(&display_title, caption);
+    let flags = crate::matcher::language_flags(&display_title, caption);
     if !flags.is_empty() {
         description.push_str(&format!("\n💬 {}", flags.join(" / ")));
     }
@@ -5245,36 +5256,6 @@ fn part_label(item: &crate::matcher::FileItem) -> Option<String> {
     })
 }
 
-
-/// `💬 🇲🇾 Malay / 🇬🇧 English` (backend.php:17803-17830). Compiled once.
-fn language_flags(title: &str, caption: &str) -> Vec<&'static str> {
-    static PATTERNS: std::sync::OnceLock<Vec<(fancy_regex::Regex, &'static str)>> =
-        std::sync::OnceLock::new();
-    let patterns = PATTERNS.get_or_init(|| {
-        let table: [(&str, &'static str); 8] = [
-            (r"(?i)\b(malay|malaysub|sub\s*malay|msia|melayu)\b", "🇲🇾 Malay"),
-            (r"(?i)\b(eng|english|esub|sub\s*eng)\b", "🇬🇧 English"),
-            (r"(?i)\b(indo|indonesia|indosub)\b", "🇮🇩 Indo"),
-            (r"(?i)\b(hindi|hin|dub\s*hindi)\b", "🇮🇳 Hindi"),
-            (r"(?i)\b(korean|kor|kdrama)\b", "🇰🇷 Korean"),
-            (r"(?i)\b(japanese|jap|anime)\b", "🇯🇵 Japanese"),
-            (r"(?i)\b(chinese|mandarin|cantonese|c-drama)\b", "🇨🇳 Chinese"),
-            (r"(?i)\b(thai)\b", "🇹🇭 Thai"),
-        ];
-        table
-            .into_iter()
-            .filter_map(|(p, label)| fancy_regex::Regex::new(p).ok().map(|re| (re, label)))
-            .collect()
-    });
-    let text = format!("{} {}", title, caption);
-    let mut out: Vec<&'static str> = Vec::new();
-    for (re, label) in patterns {
-        if re.is_match(&text).unwrap_or(false) && !out.contains(label) {
-            out.push(label);
-        }
-    }
-    out
-}
 
 /// `GET /api/thumb/<short_code>[.jpg]`
 ///
@@ -5837,6 +5818,15 @@ pub(crate) fn lan_ip() -> String {
     pick_lan_ip(egress.as_deref(), &ifaces)
 }
 
+/// `{key: true}` for a filter group whose default is "everything on".
+fn all_true(keys: &[&str]) -> Value {
+    let mut map = serde_json::Map::new();
+    for key in keys {
+        map.insert((*key).to_string(), Value::Bool(true));
+    }
+    Value::Object(map)
+}
+
 /// PHP `fd_load_catalog_settings()` defaults. The `stream_config` keys are the
 /// ones the AIOStreams filter block reads, so an absent file must still produce
 /// them (`exclude_unplayable` defaults ON, `exclude_part_title` OFF).
@@ -5894,9 +5884,14 @@ fn default_catalog_settings() -> Value {
             "qualities": {"remux": true, "bluray": true, "webdl": true, "webrip": true, "hdtv": true, "cam": true},
             "encodes": {"hevc": true, "avc": true, "av1": true},
             "visual_tags": {"hdr": true, "dv": true},
+            // Every language marker ON, `unknown` included: a fresh install must
+            // never hide a file because its name named no language.
+            "languages": all_true(crate::matcher::LANGUAGE_KEYS),
+            "audio": all_true(crate::matcher::AUDIO_KEYS),
             "exclude_cam": false,
             "exclude_unplayable": true,
             "exclude_part_title": false,
+            "exclude_no_seek": false,
             "preferred_resolution": "auto",
             "max_streams_per_resolution": 0,
             "max_streams_total": 0,
@@ -6200,6 +6195,28 @@ fn apply_stream_config(sc: &mut Value, input: &serde_json::Map<String, Value>) {
             "dv": v.get("dv").and_then(|x| x.as_bool()).unwrap_or(false),
         });
     }
+    // Language and audio groups default a MISSING key to `true`, unlike the three
+    // groups above: these hide files by the presence of a marker, so a client that
+    // sends a partial map must not silently switch every other marker off.
+    let group = |input: &serde_json::Map<String, Value>, name: &str, keys: &[&str]| {
+        let Some(v) = input.get(name).and_then(|x| x.as_object()) else {
+            return None;
+        };
+        let mut out = serde_json::Map::new();
+        for key in keys {
+            out.insert(
+                (*key).to_string(),
+                serde_json::json!(v.get(*key).and_then(|x| x.as_bool()).unwrap_or(true)),
+            );
+        }
+        Some(Value::Object(out))
+    };
+    if let Some(v) = group(input, "languages", crate::matcher::LANGUAGE_KEYS) {
+        sc["languages"] = v;
+    }
+    if let Some(v) = group(input, "audio", crate::matcher::AUDIO_KEYS) {
+        sc["audio"] = v;
+    }
     if let Some(pref) = input.get("preferred_resolution") {
         let pref = pref.as_str().unwrap_or("auto").trim().to_ascii_lowercase();
         let allowed = ["auto", "4k", "1080p", "720p", "sd"];
@@ -6223,7 +6240,12 @@ fn apply_stream_config(sc: &mut Value, input: &serde_json::Map<String, Value>) {
     if input.contains_key("max_size_gb") {
         sc["max_size_gb"] = serde_json::json!(clamp(input.get("max_size_gb"), 0, 200));
     }
-    for key in ["exclude_cam", "exclude_unplayable", "exclude_part_title"] {
+    for key in [
+        "exclude_cam",
+        "exclude_unplayable",
+        "exclude_part_title",
+        "exclude_no_seek",
+    ] {
         if let Some(v) = input.get(key) {
             sc[key] = serde_json::json!(v.as_bool().unwrap_or(false));
         }
@@ -11939,15 +11961,48 @@ mod tests {
             "resolutions": {"4k": false, "1080p": true},
             "qualities": {"cam": true},
             "encodes": {"hevc": true},
-            "visual_tags": {"dv": false}
+            "visual_tags": {"dv": false},
+            "languages": {"malay": false},
+            "audio": {"aac": false},
+            "exclude_no_seek": true
         });
         let notes = active_filter_notes(&sc);
         assert!(notes.iter().any(|n| n.contains("required keywords \"avengers\"")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("max size 5 GB")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("resolution off: 4k")), "{notes:?}");
         assert!(notes.iter().any(|n| n.contains("tag off: dv")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("language off: malay")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("audio off: aac")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("cannot seek excluded")),
+            "the no-seek flag must explain an empty list too: {notes:?}"
+        );
         // Shipped defaults restrict nothing, so the card keeps the generic text.
         assert!(active_filter_notes(&default_catalog_settings()["stream_config"]).is_empty());
+    }
+
+    /// A partial `languages`/`audio` map must never switch the untouched markers
+    /// off: these groups hide rows by the presence of a marker, so a client that
+    /// only sends the key it changed would otherwise hide everything else.
+    #[test]
+    fn a_partial_marker_map_keeps_the_untouched_markers_on() {
+        let mut sc = default_catalog_settings()["stream_config"].clone();
+        let input = serde_json::json!({
+            "languages": {"malay": false},
+            "audio": {"aac": false},
+            "exclude_no_seek": true
+        });
+        apply_stream_config(&mut sc, input.as_object().unwrap());
+        assert_eq!(sc["languages"]["malay"], serde_json::json!(false));
+        assert_eq!(sc["languages"]["english"], serde_json::json!(true));
+        assert_eq!(sc["audio"]["aac"], serde_json::json!(false));
+        assert_eq!(sc["audio"]["dts"], serde_json::json!(true));
+        assert_eq!(sc["exclude_no_seek"], serde_json::json!(true));
+        // And the filter config built from it agrees.
+        let cfg = crate::matcher::StreamFilterConfig::from_json(&sc);
+        assert_eq!(cfg.languages.get("malay"), Some(&false));
+        assert_eq!(cfg.languages.get("english"), Some(&true));
+        assert!(cfg.exclude_no_seek);
     }
 
     /// An origin probe must send a BARE id, and only when the origin can resolve
@@ -12393,5 +12448,137 @@ mod tests {
         assert!(v["origin"]["host"].is_string(), "origin.host is the configured endpoint");
         assert!(v["origin"]["down_s"].is_number());
         assert!(v["origin"]["resolve_cooldown_s"].is_number());
+    }
+
+    /* every stream config key survives a save -------------------------------- */
+
+    /// The save path whitelists keys; a dropped key is a checkbox that does
+    /// nothing. Send all 17 at once with a non-default value each and read every
+    /// one back.
+    #[test]
+    fn every_stream_config_key_survives_a_save_round_trip() {
+        let input = serde_json::json!({
+            "resolutions": {"4k": false, "1080p": true, "720p": true, "sd": true, "unknown": true},
+            "qualities": {"remux": true, "bluray": false, "webdl": true, "webrip": true, "hdtv": true, "cam": true, "unknown": true},
+            "encodes": {"hevc": false, "avc": true, "av1": true},
+            "visual_tags": {"hdr": false, "dv": true},
+            "languages": {
+                "malay": false, "english": true, "indo": true, "hindi": true,
+                "korean": true, "japanese": true, "chinese": true, "thai": true,
+                "dubbed": true, "multi": true, "unknown": true
+            },
+            "audio": {
+                "atmos": false, "ddp": true, "ac3": true, "dts": true, "truehd": true,
+                "aac": true, "flac": true, "opus": true, "unknown": true
+            },
+            "exclude_cam": true,
+            "exclude_unplayable": false,
+            "exclude_part_title": true,
+            "exclude_no_seek": true,
+            "min_size_mb": 150,
+            "max_size_gb": 12,
+            "excluded_keywords": "cam, sample",
+            "required_keywords": "hindi, tamil",
+            "max_streams_per_resolution": 3,
+            "max_streams_total": 7,
+            "preferred_resolution": "720p"
+        });
+        assert_eq!(
+            input.as_object().map(|o| o.len()),
+            Some(17),
+            "the dashboard sends every stream_config key"
+        );
+
+        let mut sc = default_catalog_settings()["stream_config"].clone();
+        apply_stream_config(&mut sc, input.as_object().unwrap());
+
+        for key in ["resolutions", "qualities", "encodes", "visual_tags"] {
+            assert_eq!(
+                sc[key], input[key],
+                "stream_config.{key} did not survive the save whitelist"
+            );
+        }
+        // The language and audio groups are normalised to the canonical key set,
+        // so equality with the sparse input is the wrong assertion: what must
+        // survive is every member the input sent, and the saved group must be
+        // complete — a partial group would hide rows by accident.
+        for (name, keys) in [
+            ("languages", crate::matcher::LANGUAGE_KEYS),
+            ("audio", crate::matcher::AUDIO_KEYS),
+        ] {
+            let sent = input[name].as_object().expect("group object");
+            for (member, value) in sent {
+                assert_eq!(
+                    sc[name][member.as_str()], *value,
+                    "{name}.{member} did not survive the save whitelist"
+                );
+            }
+            for member in keys {
+                assert!(
+                    sc[name][*member].is_boolean(),
+                    "{name}.{member} is missing from the saved group"
+                );
+            }
+        }
+        for key in [
+            "exclude_cam",
+            "exclude_unplayable",
+            "exclude_part_title",
+            "exclude_no_seek",
+            "min_size_mb",
+            "max_size_gb",
+            "excluded_keywords",
+            "required_keywords",
+            "max_streams_per_resolution",
+            "max_streams_total",
+            "preferred_resolution",
+        ] {
+            assert_eq!(
+                sc[key], input[key],
+                "stream_config.{key} did not survive the save whitelist"
+            );
+        }
+    }
+
+    /// `exclude_no_seek` is applied in the `/stream` handler's join loop (that is
+    /// where seekability is decided), which needs a full request context — that
+    /// loop is covered by the handler's integration path, NOT by this unit test.
+    /// What is reachable here is the wiring: the flag must parse out of
+    /// `stream_config`, and every config `default_catalog_settings()` seeds must
+    /// carry the key, so a stale stored file gains it through
+    /// `load_catalog_settings_merged` (the stored keys are copied over this base)
+    /// instead of leaving the checkbox undefined.
+    #[test]
+    fn a_disabled_no_seek_row_cannot_reach_the_list() {
+        let settings = default_catalog_settings();
+        let stream_config = &settings["stream_config"];
+        assert_eq!(
+            stream_config["exclude_no_seek"],
+            serde_json::json!(false),
+            "default_catalog_settings() must seed exclude_no_seek"
+        );
+        assert!(
+            stream_config
+                .get("exclude_no_seek")
+                .and_then(|v| v.as_bool())
+                .is_some(),
+            "the seeded key must be a real bool, not a placeholder"
+        );
+
+        let cfg = crate::matcher::StreamFilterConfig::from_json(stream_config);
+        assert!(!cfg.exclude_no_seek, "the shipped default must not hide no-seek rows");
+
+        let mut disabled = stream_config.clone();
+        disabled["exclude_no_seek"] = serde_json::json!(true);
+        let cfg = crate::matcher::StreamFilterConfig::from_json(&disabled);
+        assert!(cfg.exclude_no_seek, "from_json must read exclude_no_seek");
+
+        let bare = crate::matcher::StreamFilterConfig::from_json(
+            &serde_json::json!({"exclude_no_seek": true}),
+        );
+        assert!(
+            bare.exclude_no_seek,
+            "a hand-written config without the seeded base still parses the flag on"
+        );
     }
 }

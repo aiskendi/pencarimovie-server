@@ -1,16 +1,42 @@
-/* Public configure screen — extends the dashboard Titanium system.
- * Colours, faces, radii and control states come from dashboard.css; this file
- * only places the two-column layout around the existing catalog controls. */
+/* Hallmark · shape: dashboard panel, borrowed from #catalog · genre: modern-minimal · theme: brand · redesign: full
+ * paper: var(--pm-bg-canvas) · accent: var(--pm-accent) · display: var(--pm-font-sans) · body: var(--pm-font-sans) · hero: kept (none) · nav: kept · footer: kept · signature: the catalog card itself, the same object the dashboard shows
+ * axes: titanium/grotesk/accent · posture: kept · contrast: pass · fold: pass · v2.0.0 */
+/* Hallmark · pre-emit critique: weakest entry is the second column. The private #catalog is one column, so the install card gets the same chrome as a card in that panel and the grid collapses below 1024px instead of inventing a public-only density. */
+/* Public configure screen. System, faces, radii and control states are the
+ * dashboard's (styles.css, dashboard.css); this file places the same
+ * .addon-catalog-card the #catalog tab uses, and adds nothing of its own beyond
+ * a second column and the FAQ list. */
+
+html,
+body {
+  overflow-x: clip;
+}
+
+.public-panel {
+  padding: 16px 20px 20px;
+}
+
+.public-panel > .pm-lede {
+  margin: 0 0 16px;
+}
 
 .public-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
-  gap: 20px;
+  gap: 16px;
   align-items: start;
 }
 
 .public-settings {
   min-width: 0;
+}
+
+/* The install card is a sibling of the catalog card inside one panel, which is
+ * the #catalog arrangement, not a card inside a card. */
+.public-install {
+  position: sticky;
+  top: 76px;
+  margin: 0 0 16px;
 }
 
 .addon-catalog-item.locked,
@@ -42,20 +68,35 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   accent-color: var(--pm-accent);
 }
 
-.public-install {
-  position: sticky;
-  top: 76px;
-  margin-bottom: 16px;
+/* States the shared button does not paint, kept to transform and opacity. */
+.public-panel :is(a, button, summary, input, textarea, select):focus-visible {
+  border-radius: var(--pm-radius-sm);
+  outline: 2px solid var(--pm-border-focus);
+  outline-offset: 2px;
+}
+
+.pm-btn:active {
+  transform: translateY(1px);
+}
+
+.pm-btn:disabled,
+.pm-btn[aria-disabled='true'] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.addon-catalog-pill:active {
+  background: var(--pm-bg-surface-hover);
 }
 
 .public-divider {
   margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px dashed var(--pm-bg-surface-hover);
+  padding-top: 16px;
+  border-top: 1px dashed var(--pm-border-subtle);
 }
 
 .public-url {
-  min-height: 112px;
+  min-height: 104px;
   resize: vertical;
   font-family: var(--pm-font-mono);
   font-size: 0.76rem;
@@ -74,7 +115,7 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  margin: 12px 0 6px;
+  margin: 12px 0 8px;
   color: var(--pm-text-secondary);
   cursor: pointer;
   font-size: 0.82rem;
@@ -87,7 +128,7 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
 
 .public-field {
   display: grid;
-  gap: 6px;
+  gap: 8px;
   margin: 0 0 12px;
   color: var(--pm-text-secondary);
   font-size: 0.8rem;
@@ -104,13 +145,13 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
 
 .public-status {
   min-height: 1.2em;
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   color: var(--pm-status-online);
   font-size: 0.84rem;
 }
 
 .public-error {
-  margin: 0 0 10px;
+  margin: 0 0 12px;
   color: var(--pm-status-danger);
   font-size: 0.84rem;
 }
@@ -141,26 +182,26 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   margin: 0;
 }
 
+/* The FAQ is a panel like any settings panel; its own chrome comes from
+ * .pm-panel, so only the list rhythm lives here. */
 .public-faq {
-  margin-top: 28px;
-  padding-top: 18px;
-  border-top: 1px solid var(--pm-border-subtle);
+  margin-top: 16px;
 }
 
 .public-faq__panel {
+  background: var(--pm-bg-surface);
   border: 1px solid var(--pm-border-subtle);
   border-radius: var(--pm-radius-lg);
-  background: var(--pm-bg-surface);
 }
 
 .public-faq__summary {
-  display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px;
   cursor: pointer;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
   list-style: none;
+  padding: 16px;
 }
 
 .public-faq__summary::-webkit-details-marker {
@@ -168,28 +209,22 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
 }
 
 .public-faq__summary::after {
-  content: "+";
-  flex: 0 0 auto;
+  content: '+';
   color: var(--pm-text-secondary);
+  flex: 0 0 auto;
   font-size: 1rem;
   line-height: 1;
 }
 
 .public-faq__panel[open] .public-faq__summary::after {
-  content: "-";
-}
-
-.public-faq__summary:focus-visible {
-  border-radius: var(--pm-radius-lg);
-  outline: 2px solid var(--pm-border-focus);
-  outline-offset: 2px;
+  content: '–';
 }
 
 .public-faq__title {
-  margin: 0;
   color: var(--pm-text-primary);
   font-size: 1rem;
   font-weight: 600;
+  margin: 0;
 }
 
 .public-faq__body {
@@ -197,8 +232,8 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
 }
 
 .public-faq__qa {
-  padding: 14px 0;
   border-top: 1px solid var(--pm-border-subtle);
+  padding: 16px 0;
 }
 
 .public-faq__qa:first-child {
@@ -206,17 +241,17 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
 }
 
 .public-faq__qa h3 {
-  margin: 0 0 6px;
   color: var(--pm-text-primary);
   font-size: 0.86rem;
   font-weight: 600;
+  margin: 0 0 8px;
 }
 
 .public-faq__qa p {
-  margin: 0;
   color: var(--pm-text-secondary);
   font-size: 0.82rem;
   line-height: 1.6;
+  margin: 0;
 }
 
 .public-faq__qa a {
@@ -225,7 +260,7 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   text-underline-offset: 2px;
 }
 
-@media (max-width: 960px) {
+@media (max-width: 1024px) {
   .public-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -239,16 +274,16 @@ body[data-pm-shell='dashboard'] .addon-catalog-item input {
   .pm-header__inner {
     flex-wrap: nowrap;
   }
-
-  .pm-status {
-    width: auto;
-    margin-left: auto;
-    justify-content: flex-end;
-  }
 }
 
 @media (max-width: 620px) {
   .public-actions .pm-btn {
     flex: 1 1 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pm-btn:active {
+    transform: none;
   }
 }

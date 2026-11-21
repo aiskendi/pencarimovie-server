@@ -337,7 +337,14 @@ fn apply_public_stream_config(base: &mut Value, user: &Map<String, Value>) {
         *base = json!({});
     }
 
-    for group in ["resolutions", "qualities", "encodes", "visual_tags"] {
+    for group in [
+        "resolutions",
+        "qualities",
+        "encodes",
+        "visual_tags",
+        "languages",
+        "audio",
+    ] {
         let Some(input) = user.get(group).and_then(|v| v.as_object()) else {
             continue;
         };
@@ -358,7 +365,12 @@ fn apply_public_stream_config(base: &mut Value, user: &Map<String, Value>) {
         }
     }
 
-    for flag in ["exclude_cam", "exclude_unplayable", "exclude_part_title"] {
+    for flag in [
+        "exclude_cam",
+        "exclude_unplayable",
+        "exclude_part_title",
+        "exclude_no_seek",
+    ] {
         let Some(user_on) = user.get(flag).and_then(|v| v.as_bool()) else {
             continue;
         };

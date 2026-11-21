@@ -559,6 +559,20 @@ fn log_skip(reason: &str, extra: serde_json::Value) {
     crate::log::stderr_log("pm-auth enrol skipped", Some(&ctx));
 }
 
+/// Force one enrolment attempt when a request has no token, bypassing the
+/// backoff window. The normal throttle is right for a steady-state install, but
+/// on a cold dyno it can leave the process tokenless for a minute while every
+/// resolve is deferred. The latch still keeps this to one attempt at a time.
+pub async fn ensure_enrolled_now() -> bool {
+    if !auth_token().is_empty() {
+        return true;
+    }
+    let Some(_latch) = EnrolLatch::take() else {
+        return wait_for_enrolment(10).await;
+    };
+    matches!(ensure_enrolled().await, EnrolOutcome::Enrolled)
+}
+
 /// Wait for the in-flight boot enrolment to either mint a token or finish.
 ///
 /// The old `ensure_enrolled_throttled()` returned `false` the moment another

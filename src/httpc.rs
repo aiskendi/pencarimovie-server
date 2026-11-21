@@ -329,7 +329,8 @@ async fn http_json_h_status_inner(
         // request unauthenticated. The old path returned false immediately while
         // another attempt was in flight, so every range request during startup
         // went out with no token and got 401.
-        let enrolled = crate::credentials::ensure_enrolled_throttled().await;
+        let enrolled = crate::credentials::ensure_enrolled_throttled().await
+            || crate::credentials::ensure_enrolled_now().await;
         if !enrolled && !crate::credentials::wait_for_enrolment(10).await {
             // No token after the wait. Do not send an unauthenticated request:
             // that is what turns one cold dyno into a 401 storm and an origin
@@ -486,7 +487,9 @@ async fn http_json_h_status_inner(
         // immediately, so no enrolment happened and every retry repeated the
         // same 426.
         crate::credentials::clear_auth_token();
-        if crate::credentials::ensure_enrolled_throttled().await {
+        if crate::credentials::ensure_enrolled_throttled().await
+            || crate::credentials::ensure_enrolled_now().await
+        {
             extra = headers
                 .iter()
                 .cloned()

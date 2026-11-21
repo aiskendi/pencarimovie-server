@@ -1674,6 +1674,13 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── download ─────────────────────────────────────────────────────────── */
     if is_public_download_path(&p) {
+        // Public mode with PM_NODES: hand the media request to a node. Without
+        // this the main dyno joins split parts itself, which is what produced the
+        // 206 bytes=0 + H15 + R14 failures. `node_redirect_url` returns None when
+        // this instance is the only node or when a local node was chosen.
+        if let Some(target) = node_redirect_url(&ctx, &p) {
+            return redirect(&target);
+        }
         // The Eclipse web client lives on a public HTTPS origin and plays a
         // LOOPBACK url, so the media response itself must carry
         // `Access-Control-Allow-Private-Network` or Chrome drops it after the

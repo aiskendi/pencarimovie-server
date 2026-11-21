@@ -432,6 +432,12 @@ async fn http_json_h_status_inner(
     //     `400 MISSING_FILE_ID`. Nothing re-enrolled, because nothing thought it
     //     should.
     //
+    // 426 is the same refusal once the request also carries the retired
+    // X-API-Secret: the origin names the legacy client instead of answering 401.
+    // It must take this branch too, or every request keeps the dead secret and
+    // never re-enrols (measured 2026-11-21: 89 and 138 `no longer supported`
+    // resolves in one log window while PM-Auth was absent on those dynos).
+    //
     // One retry only: the retry's own status is not re-examined, so this can never
     // loop, and `ensure_enrolled_throttled()` still caps attempts at one a minute.
     // One clock probe per 10 minutes, process-wide.
@@ -443,7 +449,7 @@ async fn http_json_h_status_inner(
     // cannot drift meaningfully in 10 minutes, so this is free.
     static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(0);
-    if auto_enroll && status == 401 && origin_call {
+    if auto_enroll && (status == 401 || status == 426) && origin_call {
         // Re-learn the clock BEFORE re-signing, in BOTH cases.
         //
         // A skewed clock is the one fault that makes an install look tokenless: a
@@ -466,15 +472,16 @@ async fn http_json_h_status_inner(
             }
         }
         if had_auth {
-            log("wp 401 with a token, re-enrolling", &serde_json::json!({"url": target}));
+            log("wp auth refused with a token, re-enrolling", &serde_json::json!({"url": target, "status": status}));
             crate::credentials::clear_auth_token();
         } else {
             // The reason is the whole point: "without a token" alone cannot tell a
             // read-only volume from a clock that ate the token from a missing file.
             log(
-                "wp 401 without a token, enrolling",
+                "wp auth refused without a token, enrolling",
                 &serde_json::json!({
                     "url": target,
+                    "status": status,
                     "reason": crate::credentials::auth_token_reason(),
                 }),
             );
@@ -486,7 +493,10 @@ async fn http_json_h_status_inner(
                 .chain(crate::credentials::ticket_headers())
                 .chain(pm_auth_headers(method, &target))
                 .collect();
-            let r = call(&target, extra.clone(), secret.clone(), body.clone()).await;
+            // Never retry an auth refusal with X-API-Secret. It is the retired
+            // credential, and sending it again is what turns a missing PM-Auth
+            // token into a permanent 426 loop instead of a clear auth failure.
+            let r = call(&target, extra.clone(), String::new(), body.clone()).await;
             ok = r.0;
             status = r.1;
             text = r.2;

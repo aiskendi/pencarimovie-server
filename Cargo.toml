@@ -1,9 +1,9 @@
-[package]
+﻿[package]
 # Product name, not an engine name: this crate ships as `pencarimovie-server`
 # (Windows/Linux/macOS/Android), the same name as the Android app and the
 # published downloads. Do not reintroduce an engine suffix ("rust"/"port").
 name = "pencarimovie-server"
-version = "3.2.1"
+version = "3.1.6"
 edition = "2024"
 
 # Faithful port of backend.php onto grammers (Telegram) + axum.
@@ -17,7 +17,7 @@ base64 = "0.22"
 bcrypt = "0.17"
 bytes = "1"
 cbc = "0.1"
-# Matcher group: the PHP/Kotlin patterns use look-arounds (`(?<!…)`, `(?=…)`),
+# Matcher group: the PHP/Kotlin patterns use look-arounds (`(?<!â€¦)`, `(?=â€¦)`),
 # which the `regex` crate deliberately does not support. fancy-regex falls back
 # to `regex` for every pattern without one, so the cost is confined to the few
 # filename patterns that need it.
@@ -28,7 +28,7 @@ grammers-session = { version = "0.12.0", default-features = false, features = ["
 grammers-tl-types = "0.12.0"
 hex = "0.4"
 # The dashboard is EMBEDDED into the binary (`include_dir!`), so the whole server
-# is one `pencarimovie-server.exe` — no `public/` folder beside it, no PHP.
+# is one `pencarimovie-server.exe` â€” no `public/` folder beside it, no PHP.
 include_dir = "0.7"
 # Android's cloudflared comes from the Termux repository, whose package payload is
 # `data.tar.xz`. Pure Rust so no C toolchain (and no `xz` binary on the device) is
@@ -73,7 +73,7 @@ tokio-stream = "0.1"
 url = "2"
 # fd_fold_latin_accents() is Unicode NFD + strip-combining-marks. `iconv` is not
 # available/portable here and the PHP's iconv attempt is documented as broken
-# (`Siccîn` -> `Sicc^in`), so the decomposition is done properly.
+# (`SiccÃ®n` -> `Sicc^in`), so the decomposition is done properly.
 unicode-normalization = "0.1"
 
 # Integration tests cannot import a bin crate's modules, so the two cache

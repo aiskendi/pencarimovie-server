@@ -215,6 +215,22 @@ pub fn invalidate_resolve_cache(short_code: &str, bot_id: &str) {
 /// `fd_resolve_shortcode_fresh()`: one refresh per burst, memoised 10 s so the
 /// player's other in-flight Range requests reuse it instead of re-resolving.
 pub async fn resolve_shortcode_fresh(short_code: &str, bot_id: &str) -> Value {
+    resolve_shortcode_fresh_from(short_code, bot_id, None).await
+}
+
+/// [`resolve_shortcode_fresh()`] that also carries the id the caller already
+/// holds, so the forced branch can re-send THAT id locally (CHANGE 1).
+///
+/// The reference-expired ladder in [`crate::download`] is the caller that has the
+/// id in hand: it passes it here instead of letting the resolve path fall back to
+/// the mint cache, and the local re-send happens BEFORE the origin's
+/// `force=1&nocache=1`. `None` (every other caller) means "use whatever local id
+/// this process has", which is the mint cache or nothing.
+pub async fn resolve_shortcode_fresh_from(
+    short_code: &str,
+    bot_id: &str,
+    held: Option<&str>,
+) -> Value {
     let key = cache_key(short_code, bot_id);
     if let Some(v) = cache::get("resolve_fresh", &key) {
         if has_id(&v) {
@@ -231,8 +247,10 @@ pub async fn resolve_shortcode_fresh(short_code: &str, bot_id: &str) -> Value {
     );
     // `force=1&nocache=1` IS the refresh: the origin drops the ephemeral caches,
     // re-mints the reference with one send and persists it. There is no separate
-    // `stale` parameter to send — one knob, one behaviour.
-    let res = resolve_shortcode(short_code, bot_id, true).await;
+    // `stale` parameter to send — one knob, one behaviour. The local re-send in
+    // [`resolve_shortcode_status_inner`] runs first and only a `None` from it
+    // reaches that knob.
+    let res = resolve_shortcode_from(short_code, bot_id, true, held).await;
     if has_id(&res) {
         cache::put("resolve_fresh", &key, &res, FRESH_MEMO_TTL, 0);
     }
@@ -294,7 +312,47 @@ fn retire_if_dead(bot: &str, res: &mut Value, status: u16) -> bool {
 
 /// `fd_resolve_shortcode()`: WordPress `/resolve-file` with the retry ladder.
 pub async fn resolve_shortcode(short_code: &str, bot_id: &str, bypass_cache: bool) -> Value {
-    resolve_shortcode_status(short_code, bot_id, bypass_cache).await.0
+    resolve_shortcode_from(short_code, bot_id, bypass_cache, None).await
+}
+
+/// [`resolve_shortcode()`] that carries the id the caller already holds.
+///
+/// `held` is only consulted on the forced branch ([`resolve_shortcode_fresh_from`]
+/// is its public caller); the cached branch and every other rung keep the id the
+/// origin answers.
+pub async fn resolve_shortcode_from(
+    short_code: &str,
+    bot_id: &str,
+    bypass_cache: bool,
+    held: Option<&str>,
+) -> Value {
+    resolve_shortcode_status_from(short_code, bot_id, bypass_cache, held)
+        .await
+        .0
+}
+
+/// Give the origin's answer a freshly MINTED `file_reference`, when one can be had.
+///
+/// This is the single seam every byte path passes through: `/api/download`'s
+/// pre-flight and its recovery ladder both come here ([`resolve_shortcode`] and
+/// [`resolve_shortcode_concurrent`], which is a loop over it), as do
+/// `/api/resolve-shortcode`, the stream-list prewarm's per-code fallback, `/thumb`
+/// and `/eclipse`. The batch endpoint is NOT a byte path — it answers metadata to
+/// build `/stream` lists from, and a Play re-resolves its own code here — so
+/// leaving `resolve_shortcodes_batch_ext` alone is deliberate: minting a 50-code
+/// chunk would send 50 messages for a list render.
+///
+/// `bypass_cache` SKIPS the mint. That branch is `force=1&nocache=1` — the origin
+/// has just re-minted the reference itself, so a send here would be a SECOND
+/// round-trip for the same reference, on the most latency-sensitive path in the
+/// engine. The local re-send the operator asked for (CHANGE 1) happens BEFORE
+/// that origin call, in [`resolve_shortcode_status_inner`], and a mint failure
+/// there falls through to this exact origin ladder.
+async fn mint_adopt(short_code: &str, bot: &str, res: Value, bypass_cache: bool) -> Value {
+    if bypass_cache || bot.trim().is_empty() {
+        return res;
+    }
+    crate::mint::adopt(short_code, bot, res).await
 }
 
 /// [`resolve_shortcode()`] that ALSO reports the last origin HTTP status
@@ -331,9 +389,20 @@ pub async fn resolve_shortcode_status(
     bot_id: &str,
     bypass_cache: bool,
 ) -> (Value, u16) {
+    resolve_shortcode_status_from(short_code, bot_id, bypass_cache, None).await
+}
+
+/// [`resolve_shortcode_status()`] that carries the id the caller already holds
+/// into the forced branch's local re-send.
+pub async fn resolve_shortcode_status_from(
+    short_code: &str,
+    bot_id: &str,
+    bypass_cache: bool,
+    held: Option<&str>,
+) -> (Value, u16) {
     match tokio::time::timeout(
         RESOLVE_BUDGET,
-        resolve_shortcode_status_inner(short_code, bot_id, bypass_cache),
+        resolve_shortcode_status_inner(short_code, bot_id, bypass_cache, held),
     )
     .await
     {
@@ -371,12 +440,22 @@ pub async fn resolve_shortcode_status(
 /// router headroom to send the answer.
 const RESOLVE_BUDGET: Duration = Duration::from_secs(20);
 
+/// Ceiling for the forced branch's LOCAL re-send (CHANGE 1).
+///
+/// A measured mint is 100-390 ms; this is only long enough for a slow one and
+/// short enough that a stuck send still leaves the origin's forced re-mint its
+/// turn — the download pre-flight gives this whole call 6 s
+/// (`download::PREFLIGHT_RESOLVE_SECS`). `mint::MINT_TIMEOUT` (6 s) is the ceiling
+/// on the adopt path, where the ladder around it still runs afterwards.
+const LOCAL_REFRESH_TIMEOUT: Duration = Duration::from_millis(2500);
+
 /// The body of [`resolve_shortcode_status()`]. Deliberately unbounded: the budget
 /// lives in the wrapper so there is exactly one place that can end a ladder early.
 async fn resolve_shortcode_status_inner(
     short_code: &str,
     bot_id: &str,
     bypass_cache: bool,
+    held: Option<&str>,
 ) -> (Value, u16) {
     let mut bot = bot_id.trim().to_string();
     if bot.is_empty() {
@@ -402,6 +481,70 @@ async fn resolve_shortcode_status_inner(
     if !bypass_cache {
         if let Some(cached) = resolve_shortcode_cached(short_code, &bot) {
             return (cached, 200);
+        }
+    }
+
+    // A REFUSED REFERENCE IS REFRESHED LOCALLY FIRST (CHANGE 1).
+    //
+    // `bypass_cache` is the ladder's `force=1&nocache=1` rung, which every caller
+    // reaches after Telegram said the reference is dead or stale. It used to go
+    // straight to the origin's own forced re-mint — the slowest, rate-limited way
+    // to get a fresh `file_reference` — while `mint_adopt` deliberately skipped the
+    // mint on this branch. The operator's rule is the other way round: re-send the
+    // id already in hand to a relay account (~100-390 ms measured, and the answer's
+    // document object carries a brand-new reference), and ask the origin for a
+    // forced re-mint only when there is no live local id left — `None` from
+    // `mint::refresh`, which includes a REFUSED send (Telegram's proof that the id
+    // is dead; it is never retried here).
+    //
+    // It sits BEFORE the origin-down gate on purpose: a local send needs Telegram,
+    // not WordPress, so a play can still recover while the origin is unreachable.
+    // Nothing here can change the request's outcome: on `None` the ladder below is
+    // byte-for-byte what it was, and one log line has already named the reason.
+    if bypass_cache {
+        // A wedged send must not spend the caller's whole resolve budget: the
+        // download pre-flight allows 6 s for this entire call, and today's
+        // behaviour (the origin's forced re-mint) has to keep its turn. A measured
+        // mint is 100-390 ms, so this ceiling only catches a stuck send.
+        let local = tokio::time::timeout(
+            LOCAL_REFRESH_TIMEOUT,
+            crate::mint::refresh(short_code, &bot, held),
+        )
+        .await;
+        let local_id = match local {
+            Ok(id) => id,
+            Err(_) => {
+                log(
+                    "local refresh did not finish in time - asking the origin",
+                    &serde_json::json!({
+                        "short_code": short_code,
+                        "bot_id": bot,
+                        "window_secs": LOCAL_REFRESH_TIMEOUT.as_secs_f64(),
+                    }),
+                );
+                None
+            }
+        };
+        if let Some(id) = local_id {
+            // The cached answer, when one survived, is what carries the metadata
+            // (`title`, `file_size`, `mime`) the callers of this branch may need;
+            // with none, the id and the bot are the whole answer the byte path
+            // reads.
+            let cached = resolve_shortcode_cached(short_code, &bot);
+            let mut body = cached
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"ok": 1, "short_code": short_code}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("file_id_mt".to_string(), serde_json::json!(id));
+                obj.insert("file_id".to_string(), serde_json::json!(id));
+                obj.insert("bot_id".to_string(), serde_json::json!(bot));
+            }
+            // Only a body that still knows the file is worth persisting; the id-only
+            // shape would be refused by `save_resolve_cache` anyway.
+            if cached.is_some() {
+                save_resolve_cache(short_code, &bot, &body);
+            }
+            return (body, 200);
         }
     }
 
@@ -437,6 +580,7 @@ async fn resolve_shortcode_status_inner(
 
     let (mut res, mut status) = http_json_h_status_body(&url, &params, "GET", 6, &[]).await;
     if has_id(&res) {
+        res = mint_adopt(short_code, &bot, res, bypass_cache).await;
         save_resolve_cache(short_code, &bot, &res);
         return (res, status);
     }
@@ -471,6 +615,7 @@ async fn resolve_shortcode_status_inner(
         res = r2;
         status = s2;
         if has_id(&res) {
+            res = mint_adopt(short_code, &bot, res, bypass_cache).await;
             save_resolve_cache(short_code, &bot, &res);
             return (res, status);
         }
@@ -495,6 +640,7 @@ async fn resolve_shortcode_status_inner(
         res = r;
         status = s;
         if has_id(&res) {
+            res = mint_adopt(short_code, &bot, res, bypass_cache).await;
             save_resolve_cache(short_code, &bot, &res);
             return (res, status);
         }

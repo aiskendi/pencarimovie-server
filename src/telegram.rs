@@ -386,6 +386,23 @@ pub struct TelegramPool {
     boot_lock: tokio::sync::Mutex<()>,
 }
 
+/// The pool the PROCESS boots from, for layers that hold no `AppState`.
+///
+/// `mint.rs` is one of those: it is reached from `resolve.rs`, which every byte
+/// path calls but which has no state handle. Publishing the same pool (instead of
+/// letting the mint construct its own) is load-bearing — a second pool would log
+/// the same bot session in again and hold a second set of connections for a
+/// session that already has one.
+static SHARED_POOL: std::sync::OnceLock<Arc<TelegramPool>> = std::sync::OnceLock::new();
+
+pub fn share_pool(pool: Arc<TelegramPool>) {
+    let _ = SHARED_POOL.set(pool);
+}
+
+pub fn shared_pool() -> Option<Arc<TelegramPool>> {
+    SHARED_POOL.get().cloned()
+}
+
 impl TelegramPool {
     pub fn new(workers: usize, inflight: usize) -> Self {
         Self {

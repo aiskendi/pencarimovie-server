@@ -2,6 +2,28 @@
 
 All notable changes to the PencariMovie Server / Downloader project will be documented in this file.
 
+## [3.1.6] - 2026-11-22
+
+### Fixed
+
+- **A dropped sender-pool runner is a retryable stall, not a dead file.** grammers reports a
+  torn-down sender-pool runner with none of the TCP phrasings `is_transport_reset()` looked
+  for, so it classified as a logical failure: the part ladder stopped after one attempt and
+  the request died as a fatal `500 DOWNLOAD_FAILED` — the one status a player never retries.
+  Measured on a MiTV (`5F6YHj`, a seek to 79 MB, elapsed 5249 ms). It now answers
+  `503 + Retry-After: 2`, the same bucket a stalled part already uses.
+- **A busy origin is a global verdict, so the bot-pool walk stops on it.**
+  `resolve_shortcode_concurrent` tried every bot in the pool and each attempt paid the 5 s
+  `retry_after` wait: one play against a busy origin made 7 `/resolve-file` calls across four
+  bots and took 20.0 s to answer `503`. It now breaks on the rate-limit verdict — 2 calls and
+  5.06 s for the same answer, with five fewer requests into an endpoint that is already
+  rate-limiting us.
+- **Uploaded diagnostics keep their detail.** `/report-diagnostic` reads a fixed set of
+  columns plus one `details` blob and drops every other top-level key, so all 17 rows in
+  `server_reports_idx` read `details: {}` while the local file carried `http_status`, `range`,
+  `elapsed_ms` and `bot_id`. Reports are now reshaped on upload: known columns stay, the rest
+  moves into `details`, and `elapsed_ms` fills the `duration_ms` column.
+
 ## [Unreleased]
 
 ### Added

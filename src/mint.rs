@@ -500,6 +500,47 @@ fn refresh_source(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<
 ///
 /// `None` also covers "nothing local to try", which is the ordinary cold refresh
 /// and earns no line; a failed attempt logs exactly one, naming the reason.
+/// Report a minted id to the origin so the next caller for this `(file, bot)` finds
+/// it in step 3 instead of paying another relay send. Fire-and-forget: spawned,
+/// logs at most one line, and can never fail a mint or a play.
+fn report(short_code: &str, bot_id: &str, file_id: &str) {
+    let sc = short_code.to_string();
+    let bid = bot_id.to_string();
+    let fid = file_id.to_string();
+    tokio::spawn(async move {
+        let url = format!(
+            "{}/file-id",
+            crate::config::wp_api_base().trim_end_matches('/')
+        );
+        let body = serde_json::json!({"short_code": sc, "bot_id": bid, "file_id": fid}).to_string();
+        let mut req = crate::httpc::client()
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(8))
+            .header("Content-Type", "application/json")
+            .body(body);
+        for (k, v) in crate::credentials::ticket_headers()
+            .into_iter()
+            .chain(crate::httpc::pm_auth_headers("POST", &url))
+        {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => log(
+                "reported the minted file id to the origin",
+                &serde_json::json!({"short_code": sc}),
+            ),
+            Ok(r) => log(
+                "origin refused the minted file id",
+                &serde_json::json!({"short_code": sc, "status": r.status().as_u16()}),
+            ),
+            Err(e) => log(
+                "reporting the minted file id failed",
+                &serde_json::json!({"short_code": sc, "error": e.to_string()}),
+            ),
+        }
+    });
+}
+
 pub async fn refresh(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<String> {
     if short_code.trim().is_empty() || bot_id.trim().is_empty() {
         return None;
@@ -513,6 +554,7 @@ pub async fn refresh(short_code: &str, bot_id: &str, held: Option<&str>) -> Opti
     match tokio::time::timeout(MINT_TIMEOUT, mint(bot_id, &source)).await {
         Ok(Ok(minted)) => {
             remember(short_code, bot_id, &minted.file_id);
+            report(short_code, bot_id, &minted.file_id);
             log(
                 "refreshed the file reference locally - no origin re-mint",
                 &serde_json::json!({
@@ -585,6 +627,7 @@ pub async fn ensure(short_code: &str, bot_id: &str, resolved: &Value) -> Option<
     match tokio::time::timeout(MINT_TIMEOUT, mint(bot_id, &source)).await {
         Ok(Ok(minted)) => {
             remember(short_code, bot_id, &minted.file_id);
+            report(short_code, bot_id, &minted.file_id);
             log(
                 "minted a fresh file id",
                 &serde_json::json!({
@@ -634,7 +677,11 @@ pub async fn adopt(short_code: &str, bot_id: &str, resolved: Value) -> Value {
     if source_id(&resolved).is_none() {
         return resolved;
     }
-    let Some(id) = ensure(short_code, bot_id, &resolved).await else {
+    // CACHE ONLY. Resolving must never send: the origin's id is used as-is, and the
+    // mint happens on `refresh` — after Telegram actually refuses the reference.
+    // Minting here cost one relay send per cold (code, bot) even when the stored id
+    // was perfectly good, which is the duplicate send this whole change removes.
+    let Some(id) = cached(short_code, bot_id) else {
         return resolved;
     };
     if resolved.get("file_id_mt").and_then(|v| v.as_str()) == Some(id.as_str()) {

@@ -1067,7 +1067,7 @@ impl std::fmt::Display for GramErr {
 /// condition as `Io`, `Transport` or `Deserialize` depending on where it broke.
 pub fn is_transport_reset(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    const NEEDLES: [&str; 10] = [
+    const NEEDLES: [&str; 11] = [
         "connection reset",
         "reset by peer",
         "read 0 bytes",
@@ -1078,6 +1078,11 @@ pub fn is_transport_reset(message: &str) -> bool {
         "connection closed",
         "connection aborted",
         "early eof",
+        // grammers tears the sender-pool runner down while it retries a send and
+        // reports that with no TCP phrasing at all, so it classified as a
+        // logical failure: the part ladder stopped after one attempt and the
+        // request died as a fatal 500 (MiTV, `5F6YHj`, 2026-11-22).
+        "dropped during retry at send",
     ];
     NEEDLES.iter().any(|n| m.contains(n))
 }
@@ -1507,6 +1512,20 @@ mod tests {
             .collect();
         assert_eq!(ports, DC_PORTS.iter().copied().chain([DC_PORTS[0]]).collect::<Vec<u16>>());
         let _ = fs::remove_file(&file);
+    }
+
+    /// A dropped sender-pool runner is a TRANSPORT fault.
+    ///
+    /// grammers reports the DC tearing the connection down while it retried a
+    /// send with no TCP phrasing at all (`SenderPoolRunner was dropped during
+    /// retry at send`), so `is_transport_reset()` used to classify it as a
+    /// logical failure. That stopped the part ladder after one attempt and
+    /// reached `giveup_status()`'s fatal arm (500) on a MiTV, 2026-11-22.
+    #[test]
+    fn a_dropped_sender_pool_runner_is_a_transport_reset() {
+        assert!(is_transport_reset(
+            "request error: dropped: SenderPoolRunner was dropped during retry at send"
+        ));
     }
 
     /// After the DC's own address has been tried on every port, the addresses

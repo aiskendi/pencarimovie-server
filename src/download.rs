@@ -687,10 +687,17 @@ fn mark_session_bad(bot: &str, why: &str) {
 fn giveup_status(err: &crate::telegram::GramErr) -> (u16, &'static str, Option<u64>) {
     if err.file_reference {
         (503, "FILE_REFERENCE_EXPIRED", Some(2))
-    } else if err.message.starts_with(PART_STALL_PREFIX) {
+    } else if err.message.starts_with(PART_STALL_PREFIX)
+        || err.message.contains("SenderPoolRunner was dropped")
+    {
         // The wire dropped the part, the FILE is fine, and the next attempt lands
         // on a different DC connection: retryable, with its own stage so a report
         // does not read "deleted" or "busy" for a transport fault.
+        //
+        // The second clause is grammers' other shape for the same event: a
+        // sender-pool runner torn down mid-retry, phrased with none of the TCP
+        // words `is_transport_reset()` looks for, so it fell through to the
+        // fatal 500 — the one status a player never retries.
         (503, "UPSTREAM_STALL", Some(2))
     } else {
         (500, "DOWNLOAD_FAILED", None)
@@ -5075,6 +5082,25 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(giveup_status(&busy).1, "UPSTREAM_STALL");
+    }
+
+    /// A torn-down sender-pool runner is the WIRE, not the file.
+    ///
+    /// MEASURED 2026-11-22 on a MiTV (`short_code 5F6YHj`, `libmpv`, seek to
+    /// 79 MB): grammers answered `SenderPoolRunner was dropped during retry at
+    /// send`, `is_transport_reset()` matched none of its TCP phrasings, so the
+    /// part ladder stopped after the first attempt and the pre-flight gave up
+    /// with `500 DOWNLOAD_FAILED` after 5.2 s — the one status a player never
+    /// retries, which reads to the user as "this file is broken".
+    #[test]
+    fn a_dropped_sender_pool_runner_is_a_retryable_stall() {
+        let dropped = crate::telegram::GramErr {
+            message: "request error: dropped: SenderPoolRunner was dropped during retry at send"
+                .to_string(),
+            transport: true,
+            ..Default::default()
+        };
+        assert_eq!(giveup_status(&dropped), (503, "UPSTREAM_STALL", Some(2)));
     }
 
     /// A stall extends the attempt budget; a saturated pool must not.

@@ -14,8 +14,8 @@
 //! mint cannot run, and one log line names the reason. A mint failure must never
 //! turn a playable file into an error.
 //!
-//! The send goes to a relay ACCOUNT, not a bot: Telegram refuses bot → bot
-//! outright (`400 USER_BOT_TO_BOT_DISABLED`, measured 2026-11-07 — see
+//! The send goes to a relay ACCOUNT, not a bot: Telegram refuses bot â†’ bot
+//! outright (`400 USER_BOT_TO_BOT_DISABLED`, measured 2026-11-07 â€” see
 //! `backfill::REQUEST_CAPTION`), so the peer list is the origin's userbot pool.
 
 use std::collections::HashMap;
@@ -123,13 +123,13 @@ fn mint_key(short_code: &str, bot_id: &str) -> String {
     format!("{}:{}", short_code, bot_id)
 }
 
-/* ── the relay peer list ─────────────────────────────────────────────────── */
+/* â”€â”€ the relay peer list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /// The relay accounts from `GET {wp_api_base}/userbots`, cached in-process.
 ///
 /// Authenticated exactly like `diagnostics::report_send`: the ticket plus the
 /// PM-Auth proof, which is what the origin's protected routes check. Never
-/// hardcoded — `backfill::RELAY_USERNAMES` is the backfill's own fixed pair, and a
+/// hardcoded â€” `backfill::RELAY_USERNAMES` is the backfill's own fixed pair, and a
 /// mint that inherited it would break the day the operator rotates the pool.
 pub async fn peers() -> Vec<String> {
     let now = crate::storage::now();
@@ -259,7 +259,7 @@ fn accounts_of(body: &Value) -> Vec<String> {
     names
 }
 
-/* ── the mint ────────────────────────────────────────────────────────────── */
+/* â”€â”€ the mint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 fn send_reason(e: &telegram::GramErr) -> MintError {
     let m = &e.message;
@@ -386,7 +386,7 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
             return Err(send_reason(&err));
         }
     };
-    let message_id = message.id();
+    let _kept_message_id = message.id();
 
     // Read the reply, then delete the message in BOTH cases: a send whose answer is
     // the wrong shape still put a document in the relay chat, and leaving it there
@@ -401,7 +401,10 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
         },
         _ => Err(MintError::new("send_failed", "the sent media is not a document")),
     };
-    let _ = client.delete_messages(peer_ref, &[message_id]).await;
+    // The message is KEPT. It is what holds the document in a chat, so deleting it
+    // can shorten the life of the very reference we just minted â€” and the origin
+    // leaves its relay messages in place for the same reason. It also costs an API
+    // call on the play path.
     let doc = replied?;
 
     // Version 4 / sub 0 is the wire shape this account's Bot API ids use (the live
@@ -434,7 +437,7 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
     })
 }
 
-/* ── the resolve-path seam ───────────────────────────────────────────────── */
+/* â”€â”€ the resolve-path seam â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 fn cached(short_code: &str, bot_id: &str) -> Option<String> {
     let g = minted().lock().ok()?;
@@ -461,14 +464,14 @@ fn remember(short_code: &str, bot_id: &str, file_id: &str) {
     );
 }
 
-/* ── local-first refresh (CHANGE 1) ──────────────────────────────────────── */
+/* â”€â”€ local-first refresh (CHANGE 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /// The id a LOCAL refresh should re-send, if this process has one.
 ///
 /// Preference: a reference this process minted for the pair (at most
 /// [`MINT_TTL_MS`] old, so it is live), else the id the caller already holds.
 /// `None` means there is nothing local to send and the origin's forced re-mint is
-/// the only source left — the caller must fall through to it, unchanged.
+/// the only source left â€” the caller must fall through to it, unchanged.
 ///
 /// This is the whole local-vs-origin decision, kept as a function with no network
 /// in it so a test can pin it: the operator's rule is that a LIVE id is refreshed
@@ -491,7 +494,7 @@ fn refresh_source(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<
 ///
 /// Exactly ONE send is attempted. A refused send is Telegram saying the id is
 /// DEAD (`reference_rejected`), and retrying it would spend another round-trip on
-/// the path that is already late — so the answer is `None` and the caller falls
+/// the path that is already late â€” so the answer is `None` and the caller falls
 /// through to the origin, which is exactly its behaviour before this function
 /// existed. A mint failure can never change a request's outcome.
 ///
@@ -623,7 +626,7 @@ pub async fn ensure(short_code: &str, bot_id: &str, resolved: &Value) -> Option<
 ///
 /// The CALLER persists the result (`resolve.rs` already calls
 /// `save_resolve_cache` on every branch where an id exists), and that save stamps
-/// `resolved_at` afresh — which is load-bearing: `download.rs` trusts an unverified
+/// `resolved_at` afresh â€” which is load-bearing: `download.rs` trusts an unverified
 /// id for 60 s from that stamp, and the origin's stamp would make a brand-new
 /// reference look stale. Both id fields are rewritten so nothing downstream can
 /// pick the pre-mint reference out of `file_id`.
@@ -705,7 +708,7 @@ mod tests {
     /// and the origin is asked only when there is nothing local left to send.
     ///
     /// `cached()` is what this process minted for the pair (<= 300 s, therefore
-    /// live), so it wins over the caller's id — that is what "a live id is
+    /// live), so it wins over the caller's id â€” that is what "a live id is
     /// refreshed by re-sending it locally" means in practice. With no minted row
     /// the caller's own id is the local source, and with neither the answer is
     /// `None`, which the callers read as "go to the origin" (today's behaviour).

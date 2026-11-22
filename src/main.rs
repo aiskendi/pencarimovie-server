@@ -1163,10 +1163,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-        // Best effort, and AFTER the read: deleting the message may take the
-        // reference with it, and a chat that forbids deletion must not cost the
-        // id the probe just minted.
-        let deleted = client.delete_messages(peer_ref, &[message_id]).await.is_ok();
+        // The probe no longer deletes: the message keeps the document referenced in
+        // the chat, and `mint::mint` keeps it for the same reason. Reported as
+        // `false` rather than dropped, so existing JSON readers keep a field.
+        let deleted = false;
 
         println!(
             "{}",

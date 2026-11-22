@@ -938,6 +938,71 @@ pub fn counts() -> Value {
     Value::Object(map)
 }
 
+/// The JSON body `/report-diagnostic` actually stores.
+///
+/// The route reads a fixed set of columns and ONE `details` blob, and silently
+/// drops every other top-level key (`fastdownloader_api_report_diagnostic`).
+/// The local file is the opposite shape: `http_status`, `range`, `elapsed_ms`,
+/// `user_agent`, `bot_id` and `retry_after` all live at the top level, so every
+/// stored row carried `details: {}` and the fleet table could not tell a seek
+/// from a start (measured 2026-11-22: 17 rows, all `{}`).
+///
+/// So reshape on the way out: known columns stay, everything else moves into
+/// `details`, and `elapsed_ms` is mirrored to the `duration_ms` column that
+/// exists for exactly that number.
+fn upload_body(text: &str) -> String {
+    const COLUMNS: [&str; 17] = [
+        "report_type",
+        "device_id",
+        "platform",
+        "app_version",
+        "os_version",
+        "model",
+        "brand",
+        "item_id",
+        "short_code",
+        "failure_reason",
+        "bot_id",
+        "client_ip",
+        "duration_ms",
+        "created_at",
+        "error_title",
+        "error_message",
+        "stack_trace",
+    ];
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    let Some(obj) = v.as_object() else {
+        return text.to_string();
+    };
+    let mut out = serde_json::Map::new();
+    let mut details = serde_json::Map::new();
+    for (k, val) in obj {
+        if COLUMNS.contains(&k.as_str()) {
+            out.insert(k.clone(), val.clone());
+        } else if k != "details" {
+            details.insert(k.clone(), val.clone());
+        }
+    }
+    // A file that already carries `details` keeps it; the extra keys win on a
+    // collision because they are the ones this reshape exists for.
+    if let Some(Value::Object(prior)) = obj.get("details") {
+        for (k, val) in prior {
+            details.entry(k.clone()).or_insert_with(|| val.clone());
+        }
+    }
+    if out.get("duration_ms").is_none() {
+        if let Some(ms) = details.get("elapsed_ms").and_then(|x| x.as_u64()) {
+            out.insert("duration_ms".to_string(), serde_json::json!(ms));
+        }
+    }
+    if !details.is_empty() {
+        out.insert("details".to_string(), Value::Object(details));
+    }
+    Value::Object(out).to_string()
+}
+
 /// `fd_diag_report_send()`: POST one report to WordPress and write the
 /// `<file>.sent` sidecar on success.
 ///
@@ -978,14 +1043,15 @@ pub async fn report_send(path: &std::path::Path) -> bool {
         req.send().await
     };
 
-    let mut result = send(url.clone(), text.clone()).await;
+    let body = upload_body(&text);
+    let mut result = send(url.clone(), body.clone()).await;
     if let Ok(r) = &result {
         if r.status().as_u16() == 401 {
             // Same recovery as http_json_h: a token the origin no longer accepts
             // must be replaced, not retried.
             crate::credentials::clear_auth_token();
             if crate::credentials::ensure_enrolled_throttled().await {
-                result = send(url, text).await;
+                result = send(url, body).await;
             }
         }
     }
@@ -1192,6 +1258,51 @@ ro.build.description=generic_x86-user 5.1.1 LMY48Z 30 test-keys
         // The raw file's bulk (short_code here) is what `?file=` serves instead.
         assert!(row.get("short_code").is_none());
         assert_eq!(summary_row("x_1.json", &raw, true)["sent"], true);
+    }
+
+    /// The origin stores `details`, and only `details`.
+    ///
+    /// MEASURED 2026-11-22: 17 rows in `server_reports_idx` all read
+    /// `details: {}` while the local files carried `http_status`, `range` and
+    /// `elapsed_ms` at the top level — `fastdownloader_api_report_diagnostic`
+    /// reads known columns plus one `details` blob and drops the rest.
+    #[test]
+    fn an_uploaded_report_moves_the_extra_fields_into_details() {
+        let local = serde_json::json!({
+            "report_type": "playback_incident",
+            "device_id": "0fd2a02dabb6",
+            "platform": "android",
+            "app_version": "1.0.137",
+            "created_at": 1795328307,
+            "error_title": "download refused (HTTP 500)",
+            "error_message": "request error: dropped",
+            "failure_reason": "DOWNLOAD_FAILED",
+            "short_code": "5F6YHj",
+            "item_id": "",
+            "http_status": 500,
+            "stage": "DOWNLOAD_FAILED",
+            "range": "bytes=82837504-",
+            "elapsed_ms": 5249,
+            "bot_id": 9041002996i64,
+        })
+        .to_string();
+        let out: Value = serde_json::from_str(&upload_body(&local)).expect("a body");
+        // The number the origin has a column for, filled from the local field.
+        assert_eq!(out["duration_ms"], 5249);
+        // Everything else survives inside `details`, which is what was empty.
+        assert_eq!(out["details"]["range"], "bytes=82837504-");
+        assert_eq!(out["details"]["http_status"], 500);
+        // `bot_id` is a real column, so it stays where the route can read it.
+        assert_eq!(out["bot_id"], 9041002996i64);
+        assert!(out.get("range").is_none(), "top-level extras are dropped by the origin");
+        assert_eq!(out["short_code"], "5F6YHj");
+    }
+
+    /// A body that is not JSON must still be uploaded byte-for-byte: a reshape
+    /// that fails open is better than an incident that never leaves the device.
+    #[test]
+    fn a_non_json_report_is_sent_unchanged() {
+        assert_eq!(upload_body("not json"), "not json");
     }
 
     /// A report file's `<name>.json.sent` sidecar must never be listed as its own

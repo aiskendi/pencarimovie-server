@@ -36,7 +36,7 @@ use crate::log::log;
 use crate::respond::json_response;
 use crate::resolve::{
     invalidate_resolve_cache, resolve_shortcode, resolve_shortcode_cached,
-    resolve_shortcode_concurrent, resolve_shortcode_fresh, save_resolve_cache,
+    resolve_shortcode_concurrent, resolve_shortcode_fresh_from, save_resolve_cache,
 };
 use crate::session::{
     auto_provision_guest, get_bot_id, has_local_session, is_guest_provision_in_progress,
@@ -163,6 +163,19 @@ fn id_of(v: &Value) -> String {
     } else {
         a
     }
+}
+
+/// The id a split-part window is already using, read from the resolve cache.
+///
+/// A split window holds a `DocTarget`, not a `file_id` string, so this is where the
+/// "id the caller already holds" comes from when the reference-expired ladder
+/// refreshes it (CHANGE 1: the local re-send gets this id, and the origin's forced
+/// re-mint runs only when that mint returns `None`). Empty when the cache has no
+/// usable row — the local send is then simply not attempted.
+fn held_id(short_code: &str, bot_id: &str) -> String {
+    resolve_shortcode_cached(short_code, bot_id)
+        .map(|v| id_of(&v))
+        .unwrap_or_default()
 }
 
 /// How many bytes the FIRST response writes before it starts streaming.
@@ -1766,11 +1779,20 @@ async fn serve_zip_split(
                             if e.file_reference && attempt == 0 {
                                 attempt += 1;
                                 let code = parts[w.part].short_code.clone();
+                                // CHANGE 1: re-send the id this window already
+                                // holds; the origin's forced re-mint only when
+                                // that mint returns None.
+                                let held = held_id(&code, &bot);
                                 invalidate_resolve_cache(&code, &bot);
                                 if let Ok(mut slot) = targets[w.part].try_lock() {
                                     *slot = None;
                                 }
-                                let fresh = resolve_shortcode_fresh(&code, &bot).await;
+                                let fresh = resolve_shortcode_fresh_from(
+                                    &code,
+                                    &bot,
+                                    Some(held.as_str()),
+                                )
+                                .await;
                                 let id = id_of(&fresh);
                                 if !id.is_empty() {
                                     if let Ok(t) = prepare_file_target(&id, parts[w.part].size) {
@@ -2185,8 +2207,12 @@ async fn serve_remux_split(
     })
 }
 
-/// Drop a cached reference and mint a live one. Used when Telegram answers
+/// Drop a cached reference and refresh it. Used when Telegram answers
 /// `FILE_REFERENCE_EXPIRED` — a normal event after the resolve cache ages out.
+///
+/// CHANGE 1: the local re-send goes first, from the id this part is already
+/// using, and the origin's `force=1&nocache=1` re-mint is reached only when the
+/// mint returns `None` (nothing local, or a refused send = a dead id).
 async fn refresh_split_target(
     i: usize,
     parts: &[SplitPart],
@@ -2194,11 +2220,12 @@ async fn refresh_split_target(
     bot_id: &str,
 ) -> Result<DocTarget, String> {
     let code = &parts[i].short_code;
+    let held = held_id(code, bot_id);
     invalidate_resolve_cache(code, bot_id);
     if let Ok(mut slot) = targets[i].try_lock() {
         *slot = None;
     }
-    let fresh = resolve_shortcode_fresh(code, bot_id).await;
+    let fresh = resolve_shortcode_fresh_from(code, bot_id, Some(held.as_str())).await;
     let id = id_of(&fresh);
     if id.is_empty() {
         return Err(format!("could not refresh part {}", code));
@@ -2596,11 +2623,19 @@ async fn handle_split_download(
                             if e.file_reference && attempt == 0 {
                                 attempt += 1;
                                 let code = parts[w.part].short_code.clone();
+                                // CHANGE 1: local re-send of the id in hand
+                                // first; the origin only when it returns None.
+                                let held = held_id(&code, &bot);
                                 invalidate_resolve_cache(&code, &bot);
                                 if let Ok(mut slot) = targets[w.part].try_lock() {
                                     *slot = None;
                                 }
-                                let fresh = resolve_shortcode_fresh(&code, &bot).await;
+                                let fresh = resolve_shortcode_fresh_from(
+                                    &code,
+                                    &bot,
+                                    Some(held.as_str()),
+                                )
+                                .await;
                                 let id = id_of(&fresh);
                                 if !id.is_empty() {
                                     if let Ok(t) = prepare_file_target(&id, parts[w.part].size) {
@@ -3790,11 +3825,17 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 if file_ref && !short_code.is_empty() {
                     invalidate_resolve_cache(&short_code, &bot_id);
                     log(
-                        "file reference expired, re-resolving short_code with nocache",
+                        "file reference expired, refreshing the id this request holds",
                         &serde_json::json!({"short_code": short_code, "attempt": attempt}),
                     );
-                    let Some(mut fresh) =
-                        resolve_bounded(resolve_shortcode_fresh(&short_code, &bot_id), &short_code).await
+                    // CHANGE 1: the local re-send of `file_id` runs first inside
+                    // this call, and the origin's `force=1&nocache=1` re-mint is
+                    // issued only when the mint returns None.
+                    let Some(mut fresh) = resolve_bounded(
+                        resolve_shortcode_fresh_from(&short_code, &bot_id, Some(file_id.as_str())),
+                        &short_code,
+                    )
+                    .await
                     else {
                         // The origin did not answer inside the budget: a retryable
                         // 503 now beats a first byte half a minute from now.
@@ -4443,6 +4484,8 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // The target is SHARED, because a `file_reference` can die in the middle
         // of a body and a refreshed one has to reach every window still queued.
         let target_shared = std::sync::Arc::new(tokio::sync::RwLock::new(target_for_task.clone()));
+        // The body's starting id, for the mid-body local re-send (CHANGE 1).
+        let held_for_body = persist_id.clone();
         // One refresh per body, and the id that actually worked gets persisted.
         let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let refreshed_id: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -4455,6 +4498,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let code_for_refresh = short_code_for_task.clone();
             let bot_for_refresh = bot_for_task.clone();
             let size_for_refresh = file_size_for_task;
+            // The id this body started with: the mid-body refresh (CHANGE 1)
+            // re-sends it locally before it asks the origin. A refreshed id from
+            // an earlier window is in the mint cache, which `mint::refresh` prefers.
+            let held_for_refresh = held_for_body.clone();
             async move {
                 // ONE BLINK MUST NOT KILL THE TRACK.
                 //
@@ -4500,9 +4547,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                     == 0
                             {
                                 invalidate_resolve_cache(&code_for_refresh, &bot_for_refresh);
-                                let fresh =
-                                    resolve_shortcode_fresh(&code_for_refresh, &bot_for_refresh)
-                                        .await;
+                                // CHANGE 1: local re-send first, from the id this
+                                // body holds; the origin only when it returns None.
+                                let fresh = resolve_shortcode_fresh_from(
+                                    &code_for_refresh,
+                                    &bot_for_refresh,
+                                    Some(held_for_refresh.as_str()),
+                                )
+                                .await;
                                 let new_id = id_of(&fresh);
                                 if !new_id.is_empty() {
                                     if let Ok(t) = prepare_file_target(&new_id, size_for_refresh) {

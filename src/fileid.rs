@@ -113,6 +113,32 @@ pub fn rle_decode(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Null-byte RLE encode, the exact inverse of [`rle_decode`].
+///
+/// The TL blob is RLE-encoded *before* base64url, so writing the TL bytes
+/// straight into the string produces an id Telegram rejects. A zero run becomes
+/// `0x00` + run length; the 255 cap makes a longer run several pairs, which
+/// `rle_decode` reads back identically because it consumes one pair per run.
+pub fn rle_encode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0 {
+            let mut n = 0usize;
+            while i < data.len() && data[i] == 0 && n < 255 {
+                n += 1;
+                i += 1;
+            }
+            out.push(0);
+            out.push(n as u8);
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -245,6 +271,71 @@ pub fn decode_file_id(file_id_mt: &str) -> Result<DecodedFileId, String> {
     })
 }
 
+/// TL string writer, the inverse of [`Reader::tl_string`].
+fn write_tl_string(out: &mut Vec<u8>, body: &[u8]) {
+    let len = body.len();
+    let prefix = if len < 254 {
+        out.push(len as u8);
+        1
+    } else {
+        out.push(254);
+        out.push(len as u8);
+        out.push((len >> 8) as u8);
+        out.push((len >> 16) as u8);
+        4
+    };
+    out.extend_from_slice(body);
+    // The pad counts the length PREFIX, the same rule the reader uses; `len % 4`
+    // here re-creates the off-by-one that shifted `id`/`access_hash` and made
+    // every download answer FILE_REFERENCE_EXPIRED.
+    let pad = (4 - ((prefix + len) % 4)) % 4;
+    out.resize(out.len() + pad, 0);
+}
+
+/// The exact inverse of [`decode_file_id`]: TL layout, null-byte RLE, base64url.
+///
+/// `size` is not on the wire — the caller fills it from the payload — so it is
+/// the only decoded field that cannot round-trip. A web-location id has no `id`
+/// field (its body stops at `access_hash`), which the decoder reports through
+/// `web_url` and this function mirrors. The document layout round-trips exactly
+/// (pinned against the live fixture); a PHOTO id also carries its size source
+/// between `access_hash` and the version bytes, which the decoder skips, so
+/// encoding one would not reproduce the input — `--mint-probe` rejects those.
+///
+/// `version`/`sub_version` come from the caller because a document received from
+/// `messages.sendMedia` carries no encoded version of its own: Bot API ids from
+/// this account are version 4 / sub 0, which is what `--mint-probe` uses.
+pub fn encode_file_id(d: &DecodedFileId) -> String {
+    let mut buf = Vec::with_capacity(64);
+    let mut type_raw = d.file_type as u32;
+    if d.file_reference.is_some() {
+        type_raw |= FILE_REFERENCE_FLAG;
+    }
+    if d.web_url.is_some() {
+        type_raw |= WEB_LOCATION_FLAG;
+    }
+    buf.extend_from_slice(&type_raw.to_le_bytes());
+    buf.extend_from_slice(&d.dc_id.to_le_bytes());
+    if let Some(reference) = d.file_reference.as_deref() {
+        write_tl_string(&mut buf, reference);
+    }
+    match d.web_url.as_deref() {
+        Some(url) => {
+            write_tl_string(&mut buf, url.as_bytes());
+            buf.extend_from_slice(&d.access_hash.to_le_bytes());
+        }
+        None => {
+            buf.extend_from_slice(&d.id.to_le_bytes());
+            buf.extend_from_slice(&d.access_hash.to_le_bytes());
+        }
+    }
+    if d.version == 4 {
+        buf.push(d.sub_version);
+    }
+    buf.push(d.version);
+    base64url_encode(&rle_encode(&buf))
+}
+
 pub fn is_document_file_id(d: &DecodedFileId) -> bool {
     DOCUMENT_TYPES.contains(&d.file_type)
 }
@@ -336,26 +427,6 @@ mod tests {
         // 25-byte payload: prefix 1 + 25 = 26 -> pad 2 (not 3).
         assert_eq!((4 - ((1 + 25) % 4)) % 4, 2);
 
-        fn rle_encode(data: &[u8]) -> Vec<u8> {
-            let mut out = Vec::new();
-            let mut i = 0;
-            while i < data.len() {
-                if data[i] == 0 {
-                    let mut n = 0usize;
-                    while i < data.len() && data[i] == 0 && n < 255 {
-                        n += 1;
-                        i += 1;
-                    }
-                    out.push(0);
-                    out.push(n as u8);
-                } else {
-                    out.push(data[i]);
-                    i += 1;
-                }
-            }
-            out
-        }
-
         let mut buf = Vec::new();
         // type_raw = document (5) with FILE_REFERENCE_FLAG (1 << 25) set.
         buf.extend_from_slice(&0x0200_0005u32.to_le_bytes());
@@ -373,6 +444,26 @@ mod tests {
         assert_eq!(d.id, 42);
         assert_eq!(d.access_hash, 43);
         assert_eq!(d.file_reference.unwrap().len(), 25);
+    }
+
+    /// `encode_file_id` must reproduce the exact Bot API string the decoder read.
+    /// Comparing fields alone would still accept a wrong RLE or a wrong base64
+    /// alphabet, and Telegram refuses both with BAD_REQUEST.
+    #[test]
+    fn encode_is_the_inverse_of_decode() {
+        let d = decode_file_id(LIVE_ID).unwrap();
+        assert_eq!(encode_file_id(&d), LIVE_ID);
+
+        // ...and the parts survive a second pass, which is what `--mint-probe`
+        // does with a document object that never had an encoded form.
+        let again = decode_file_id(&encode_file_id(&d)).unwrap();
+        assert_eq!(again.id, d.id);
+        assert_eq!(again.access_hash, d.access_hash);
+        assert_eq!(again.file_reference, d.file_reference);
+        assert_eq!(again.dc_id, d.dc_id);
+        assert_eq!(again.file_type, d.file_type);
+        assert_eq!(again.version, d.version);
+        assert_eq!(again.sub_version, d.sub_version);
     }
 
     #[test]

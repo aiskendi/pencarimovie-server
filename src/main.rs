@@ -38,6 +38,7 @@ mod httpc;
 mod log;
 mod matcher;
 mod media_probe;
+mod mint;
 mod music_upstreams;
 mod proc;
 mod public_config;
@@ -98,7 +99,10 @@ pub struct AppState {
     pub cold_starts_per_ip: usize,
     /// The cold-start window, in seconds.
     pub cold_start_window: u64,
-    pub telegram: telegram::TelegramPool,
+    /// `Arc` so `telegram::share_pool()` can publish the SAME pool (and therefore
+    /// the same bot sessions) to `mint.rs`, which is reached from the resolve
+    /// layer where no `AppState` exists.
+    pub telegram: Arc<telegram::TelegramPool>,
 }
 
 fn arg_value(flag: &str) -> Option<String> {
@@ -269,6 +273,398 @@ async fn probe_fetch(
         }
     }
     Err("probe: re-resolve retry did not settle".to_string())
+}
+
+/* ── mint drivers (`--mint-batch`, `--mint-streams`) ─────────────────────── */
+
+/// How many short codes `--mint-streams` mints in one run.
+///
+/// Hardcoded, not a flag: every row is a real Telegram send to a relay account,
+/// and the cap exists so pointing the driver at a 100-row `/stream` list cannot
+/// turn into 100 messages from one command. Ten is enough to measure a list.
+const MINT_STREAMS_CAP: usize = 10;
+
+/// The prologue both mint drivers share: bot, relay peers, one connection.
+///
+/// Which bot mints matters: a `file_id` is bot-specific, so the ids the driver
+/// prints are only usable by the bot that answered here. The peer list is the
+/// origin's (`GET /userbots`) unless one is passed, so nothing is hardcoded.
+///
+/// One connection, exactly like `--mint-probe`: a diagnostic must not open a
+/// second set of sessions for the same bot, and publishing it makes the mints run
+/// through the production path (`telegram::shared_pool`). Every failure exits with
+/// the same JSON `--mint-batch` has always printed.
+async fn mint_driver_setup(
+    peers_arg: Option<&str>,
+) -> (String, Vec<String>, grammers_client::Client) {
+    let bot = session::get_bot_id();
+    if bot.is_empty() {
+        eprintln!(
+            "{{\"ok\":0,\"error\":\"no bot_id in storage: start the server once so a bot session exists\"}}"
+        );
+        std::process::exit(2);
+    }
+    let peers: Vec<String> = match peers_arg {
+        Some(list) => list
+            .split(',')
+            .map(|p| p.trim().trim_start_matches('@').to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        None => mint::peers().await,
+    };
+    if peers.is_empty() {
+        eprintln!(
+            "{{\"ok\":0,\"error\":\"no relay peers: pass [peer,peer,...], or make GET {}/userbots answer accounts[]\"}}",
+            config::wp_api_base()
+        );
+        std::process::exit(2);
+    }
+    mint::seed_peers(peers.clone());
+    let pool = Arc::new(telegram::TelegramPool::new(1, 8));
+    telegram::share_pool(pool.clone());
+    let entry = match pool.boot(&bot, None).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{{\"ok\":0,\"error\":\"bot boot failed: {}\"}}", e);
+            std::process::exit(1);
+        }
+    };
+    let client = entry.pick();
+    (bot, peers, client)
+}
+
+/// One refused candidate in a row's `tried` list.
+fn tried_entry(field: &str, error: String) -> serde_json::Value {
+    serde_json::json!({"field": field, "error": error})
+}
+
+/// The id forms a resolve reply carries, in the engine's own order
+/// (`file_id_mt`, `file_id_tmp`, `file_id`).
+///
+/// Empties are dropped and duplicate VALUES are collapsed (the first field name
+/// wins), because the three fields usually name the same document and re-sending an
+/// identical id would only repeat the refusal. The order is preserved so
+/// `file_id_mt` — the form the engine itself prefers — is always tried first.
+fn resolve_id_candidates(resolved: &serde_json::Value) -> Vec<(&'static str, String)> {
+    let mut candidates: Vec<(&'static str, String)> = Vec::new();
+    for field in ["file_id_mt", "file_id_tmp", "file_id"] {
+        let id = resolved
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if id.is_empty() || candidates.iter().any(|(_, seen)| seen == id) {
+            continue;
+        }
+        candidates.push((field, id.to_string()));
+    }
+    candidates
+}
+
+/// ONE row of the mint drivers: resolve, mint, then read 512 KB through the
+/// MINTED id.
+///
+/// Shared by `--mint-batch` and `--mint-streams` on purpose (one function, not a
+/// copy per driver): a green run is evidence about production behaviour only if
+/// it calls the same functions the resolve path calls (`resolve::resolve_shortcode`,
+/// `mint::mint`, `telegram::fetch_range`).
+///
+/// The resolve reply can carry THREE id forms (`file_id_mt`, `file_id_tmp`,
+/// `file_id`) and Telegram does not accept them interchangeably: measured on a
+/// `/stream` list, `MEDIA_EMPTY (400)` for one form while another mints fine with
+/// the same bot and peers, and every form decodes cleanly (version 4, dc 4,
+/// document, 25-byte reference, access_hash present). So the row walks every
+/// DISTINCT value in the engine's own order until a send is accepted, records the
+/// field that won (`field`) and every refusal on the way (`tried`). A candidate is
+/// never retried.
+///
+/// Returns `(row, ok)`. Rows are independent: one unresolvable code, one refused
+/// send and one short read each carry their own reason, and a partial run is still
+/// a measurement.
+async fn mint_code_row(
+    code: &str,
+    bot: &str,
+    client: &grammers_client::Client,
+) -> (serde_json::Value, bool) {
+    let mut row = serde_json::json!({
+        "code": code,
+        "resolve_ms": 0,
+        "mint_ms": 0,
+        "fetch_ms": 0,
+        "bytes_fetched": 0,
+        "minted_differs": serde_json::Value::Null,
+        "peer": serde_json::Value::Null,
+        "error": serde_json::Value::Null,
+    });
+
+    // `true` = bypass: this forces the ORIGIN to re-mint its own reference, which
+    // is exactly the baseline the mint has to beat. With CHANGE 1 the bypass branch
+    // re-sends a locally held id first and only falls through to the origin when
+    // there is none — for a fresh code there is none, so the driver still measures
+    // the origin baseline it was written for.
+    let resolve_start = std::time::Instant::now();
+    let resolved = resolve::resolve_shortcode(code, bot, true).await;
+    row["resolve_ms"] = serde_json::json!(resolve_start.elapsed().as_millis() as u64);
+
+    // Every id form the reply carried, in the engine's own order (`source_id`),
+    // without empties and without duplicate values: the three fields usually name
+    // the same document, and re-sending an identical id would only repeat the
+    // refusal. The field name of the first occurrence is the one reported.
+    let candidates = resolve_id_candidates(&resolved);
+    if candidates.is_empty() {
+        let why = resolved
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the origin answered no file id");
+        row["error"] = serde_json::json!(format!("resolve_failed: {}", why));
+        return (row, false);
+    }
+
+    // ONE 20 s ceiling for the whole walk, exactly the budget the single send had:
+    // a diagnostic must not sit on a wedged datacentre, and three stuck forms must
+    // not multiply that by three.
+    let mint_start = std::time::Instant::now();
+    let mint_deadline = mint_start + std::time::Duration::from_secs(20);
+    let mut tried: Vec<serde_json::Value> = Vec::new();
+    let mut winner: Option<(&'static str, String, fileid::DecodedFileId, mint::Minted)> = None;
+    for (field, id) in &candidates {
+        let decoded = match fileid::decode_file_id(id) {
+            Ok(d) => d,
+            Err(e) => {
+                tried.push(tried_entry(*field, format!("decode_failed: {}", e)));
+                continue;
+            }
+        };
+        // A photo/thumbnail id has no document to resend; sending it through
+        // `inputMediaDocument` fails on the server naming the wrong object.
+        if !fileid::is_document_file_id(&decoded) {
+            tried.push(tried_entry(
+                *field,
+                format!("not_a_document: {}", decoded.type_name),
+            ));
+            continue;
+        }
+        let left = mint_deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            tried.push(tried_entry(
+                *field,
+                "mint_failed: timed out after 20s".to_string(),
+            ));
+            break;
+        }
+        // `mint::mint` keeps its own peer round-robin (`NEXT_PEER`), so each form
+        // goes to the next relay account exactly as a single send always did.
+        match tokio::time::timeout(left, mint::mint(bot, id)).await {
+            Ok(Ok(m)) => {
+                winner = Some((*field, id.clone(), decoded, m));
+                break;
+            }
+            Ok(Err(e)) => tried.push(tried_entry(*field, format!("mint_failed: {}", e))),
+            Err(_) => {
+                tried.push(tried_entry(
+                    *field,
+                    "mint_failed: timed out after 20s".to_string(),
+                ));
+                break;
+            }
+        }
+    }
+    row["mint_ms"] = serde_json::json!(mint_start.elapsed().as_millis() as u64);
+    // The last refusal is what the row's `error` names below, so read it before the
+    // walk moves into the JSON.
+    let last_refusal = tried.last().map(|t| t["error"].clone());
+    if !tried.is_empty() {
+        row["tried"] = serde_json::Value::Array(tried);
+    }
+    let Some((field, sent_id, decoded, minted)) = winner else {
+        // Every form was refused: `error` is the LAST refusal and `tried` carries
+        // the whole walk.
+        row["error"] = last_refusal
+            .unwrap_or_else(|| serde_json::json!("mint_failed: no id form was accepted"));
+        return (row, false);
+    };
+    row["field"] = serde_json::json!(field);
+    row["minted_differs"] = serde_json::json!(minted.file_id != sent_id);
+    row["peer"] = serde_json::json!(minted.peer);
+
+    // Bytes through the MINTED id are the only evidence the new reference is
+    // usable; `prepare_file_target` is the same gate the byte path uses.
+    let target = match telegram::prepare_file_target(&minted.file_id, decoded.size) {
+        Ok(t) => t,
+        Err(e) => {
+            row["error"] = serde_json::json!(format!("prepare_failed: {}", e));
+            return (row, false);
+        }
+    };
+    let fetch_start = std::time::Instant::now();
+    match telegram::fetch_range(client, &target, 0, telegram::MAX_CHUNK).await {
+        Ok(bytes) => {
+            row["fetch_ms"] = serde_json::json!(fetch_start.elapsed().as_millis() as u64);
+            row["bytes_fetched"] = serde_json::json!(bytes.len());
+            if bytes.len() as u64 >= telegram::MAX_CHUNK {
+                return (row, true);
+            }
+            // A SHORT read is not a failure of the mint, but it is not 512 KB of
+            // evidence either, so it is recorded rather than rounded up.
+            row["error"] = serde_json::json!(format!(
+                "short_read: {} of {} bytes",
+                bytes.len(),
+                telegram::MAX_CHUNK
+            ));
+        }
+        Err(e) => {
+            row["fetch_ms"] = serde_json::json!(fetch_start.elapsed().as_millis() as u64);
+            row["error"] = serde_json::json!(format!("fetch_failed: {}", e));
+        }
+    }
+    (row, false)
+}
+
+/// Every row the drivers ran, plus how many read a full 512 KB.
+async fn mint_code_rows(
+    codes: &[String],
+    bot: &str,
+    client: &grammers_client::Client,
+) -> (Vec<serde_json::Value>, usize) {
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(codes.len());
+    let mut ok_count = 0usize;
+    for code in codes {
+        let (row, ok) = mint_code_row(code, bot, client).await;
+        if ok {
+            ok_count += 1;
+        }
+        rows.push(row);
+    }
+    (rows, ok_count)
+}
+
+/// "ok" means no code ended SILENTLY: every row either read 512 KB or says why it
+/// did not. A partial run therefore reports `ok:1` with its failures counted,
+/// which is the point of a diagnostic over several codes.
+fn mint_rows_ok(rows: &[serde_json::Value]) -> bool {
+    rows.iter().all(|r| {
+        !r["error"].is_null()
+            || r["bytes_fetched"].as_u64().unwrap_or(0) >= telegram::MAX_CHUNK
+    })
+}
+
+/// GET a `/stream` list with the engine's plain HTTP client — no auth.
+///
+/// The driver's URL is the engine's own `http://127.0.0.1:<port>/stream/...` (or
+/// any other node's), which is a public route: the point is to measure the rows a
+/// player is actually handed, so no ticket, no PM-Auth proof, no token.
+async fn fetch_streams(url: &str) -> Result<serde_json::Value, String> {
+    let resp = crate::httpc::client()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(12))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", status));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("not json: {}", e))
+}
+
+/// Every short code a `/stream` list names, deduped, in list order, capped at
+/// [`MINT_STREAMS_CAP`].
+///
+/// Per row, in this order of preference (CHANGE 2):
+///   1. a `short_code=` query parameter in `streams[].url`;
+///   2. a `pm_file_<code>` (or `pm:file:<code>`) id anywhere in the row — the
+///      catalog publishes those on `id`;
+///   3. an `/api/download/<payload>` path segment whose base64 payload decodes to
+///      a `short_code` (the join token segment before it is skipped).
+///
+/// A row that names no code is skipped rather than guessed at.
+fn stream_codes(body: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(rows) = body.get("streams").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for row in rows {
+        let Some(code) = stream_row_code(row) else {
+            continue;
+        };
+        if !out.iter().any(|c| c == &code) {
+            out.push(code);
+        }
+        if out.len() >= MINT_STREAMS_CAP {
+            break;
+        }
+    }
+    out
+}
+
+fn stream_row_code(row: &serde_json::Value) -> Option<String> {
+    let url = row.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(code) = short_code_param(url) {
+        return Some(code);
+    }
+    if let Some(code) = pm_file_id(row) {
+        return Some(code);
+    }
+    download_payload_code(url)
+}
+
+/// `?short_code=<code>` (also accepts it as a later parameter or a fragment).
+fn short_code_param(url: &str) -> Option<String> {
+    let marker = "short_code=";
+    let start = url.find(marker)? + marker.len();
+    let rest = &url[start..];
+    let end = rest
+        .find(|c| c == '&' || c == '#' || c == ' ')
+        .unwrap_or(rest.len());
+    let code = rest[..end].trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// The first `pm_file_<code>` / `pm:file:<code>` token in the row, in any field.
+fn pm_file_id(row: &serde_json::Value) -> Option<String> {
+    fn from_text(text: &str) -> Option<String> {
+        for marker in ["pm_file_", "pm:file:"] {
+            if let Some(at) = text.find(marker) {
+                let rest = &text[at + marker.len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(rest.len());
+                if end > 0 {
+                    return Some(rest[..end].to_string());
+                }
+            }
+        }
+        None
+    }
+    match row {
+        serde_json::Value::String(s) => from_text(s),
+        serde_json::Value::Array(items) => items.iter().find_map(pm_file_id),
+        serde_json::Value::Object(map) => map.values().find_map(pm_file_id),
+        _ => None,
+    }
+}
+
+/// The `short_code` inside an `/api/download/<payload>` segment.
+fn download_payload_code(url: &str) -> Option<String> {
+    let marker = "/api/download/";
+    let at = url.find(marker)? + marker.len();
+    let segment = url[at..]
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    if segment.is_empty() {
+        return None;
+    }
+    let payload = crate::download::decode_download_payload(segment);
+    let code = payload
+        .get("short_code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    (!code.is_empty()).then(|| code.to_string())
 }
 
 #[tokio::main]
@@ -513,6 +909,416 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        return Ok(());
+    }
+
+    // `--mint-probe <file_id_mt> <user_id> [bot_id]`: mint a fresh `file_id` by
+    // RE-SENDING the document, then read with the new id.
+    //
+    // A `file_reference` lives about an hour and only the bot that owns the file
+    // can mint a replacement; that expiry is where every `FILE_REFERENCE_EXPIRED`
+    // recovery in `download.rs` starts. The Bot API's
+    // `sendDocument(chat_id, document)` is `messages.sendMedia` carrying an
+    // `inputMediaDocument` built from the SAME `(id, access_hash,
+    // file_reference)`, and the reply's document object holds the new reference.
+    // This probe performs that round-trip and reads 512 KB with the minted id, so
+    // "a resend mints a usable id" is measured instead of assumed.
+    if let Some(i) = arg_pos("--mint-probe") {
+        let args: Vec<String> = std::env::args().collect();
+        let (Some(raw), Some(user_arg)) = (args.get(i + 1), args.get(i + 2)) else {
+            eprintln!("usage: pencarimovie-server --mint-probe <file_id_mt> <@username|user_id> [bot_id]");
+            std::process::exit(2);
+        };
+        // A bot cannot enumerate dialogs (`messages.getDialogs` answers
+        // BOT_METHOD_INVALID), so a bare numeric id is unusable from a bot
+        // session — there is no `access_hash` to address it with. A username IS
+        // resolvable by a bot (`contacts.resolveUsername`), and that is how the
+        // origin addresses its relay peers too.
+        let peer_spec = user_arg.trim().to_string();
+        let peer_id: Option<i64> = peer_spec.parse::<i64>().ok();
+        let bot = args
+            .get(i + 3)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(session::get_bot_id);
+        if bot.is_empty() {
+            eprintln!("{{\"ok\":0,\"error\":\"no bot_id: pass one as the third argument\"}}");
+            std::process::exit(2);
+        }
+
+        let file_id = raw.trim().to_string();
+        let decoded = match fileid::decode_file_id(&file_id) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"not a file_id_mt: {}\"}}", e.replace('"', "'"));
+                std::process::exit(2);
+            }
+        };
+        // Only a document type has an `inputDocument` to resend: a photo id sent
+        // through `inputMediaDocument` is addressed as a document and fails on
+        // the server with an error that names the wrong object.
+        if !fileid::is_document_file_id(&decoded) {
+            eprintln!(
+                "{{\"ok\":0,\"error\":\"file_id type {} has no document to resend\"}}",
+                decoded.type_name
+            );
+            std::process::exit(2);
+        }
+        // A Bot API file_id carries no size (`decode_file_id` leaves it 0), so
+        // the target records what is known; 0 is valid for a read.
+        let file_size = decoded.size;
+        let input_target = match telegram::prepare_file_target(&file_id, file_size) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"{}\"}}", e.replace('"', "'"));
+                std::process::exit(1);
+            }
+        };
+
+        // Same bootstrap as `--thumb-probe`: one connection is enough for a probe
+        // and it keeps the session's other worker files untouched.
+        let pool = telegram::TelegramPool::new(1, 8);
+        let entry = match pool.boot(&bot, None).await {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"bot boot failed: {}\"}}", e);
+                std::process::exit(1);
+            }
+        };
+        let client = entry.pick();
+
+        // The premise is that the CURRENT reference may already be dead, so its
+        // state is recorded instead of assumed healthy.
+        let baseline_start = std::time::Instant::now();
+        let baseline = telegram::fetch_range(&client, &input_target, 0, telegram::MAX_CHUNK).await;
+        let baseline_ms = baseline_start.elapsed().as_millis() as u64;
+        let (input_bytes, input_error) = match &baseline {
+            Ok(b) => (b.len(), serde_json::Value::Null),
+            Err(e) => (0usize, serde_json::json!(e.to_string())),
+        };
+
+        // `@name` goes through contacts.resolveUsername (a bot may call it); a
+        // bare id would need an `access_hash` the bot has no way to obtain, so
+        // that branch only works when the id is already in the session's dialogs.
+        let peer = if peer_spec.starts_with('@') {
+            let name = peer_spec.trim_start_matches('@');
+            match client.resolve_username(name).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    eprintln!("{{\"ok\":0,\"error\":\"username @{} does not resolve\"}}", name);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{{\"ok\":0,\"error\":\"resolve @{}: {}\"}}",
+                        name,
+                        e.to_string().replace('"', "'")
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            let Some(id) = peer_id else {
+                eprintln!("{{\"ok\":0,\"error\":\"<peer> must be @username or a numeric user id\"}}");
+                std::process::exit(2);
+            };
+            match telegram::resolve_peer_by_id(&client, id).await {
+                // `PeerRef` → owned `Peer`: `resolve_username` answers `Peer`, so
+                // both branches share one type and `to_ref()` is taken per call.
+                Ok(p) => match client.resolve_peer(p).await {
+                    Ok(peer) => peer,
+                    Err(e) => {
+                        eprintln!(
+                            "{{\"ok\":0,\"error\":\"peer {}: {}\"}}",
+                            id,
+                            e.to_string().replace('"', "'")
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "{{\"ok\":0,\"error\":\"peer {}: {}\"}}",
+                        id,
+                        e.message.replace('"', "'")
+                    );
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        // `to_ref` is ASYNC in 0.12 and can answer `None` when the peer is not
+        // usable from this session (no access hash). A bot has no dialog list to
+        // fall back on, so that is a hard stop with the reason named.
+        let peer_ref = match peer.to_ref().await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!(
+                    "{{\"ok\":0,\"error\":\"peer {} is not addressable from this session (no access hash)\"}}",
+                    peer_spec
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "{{\"ok\":0,\"error\":\"peer {}: {}\"}}",
+                    peer_spec,
+                    e.to_string().replace('"', "'")
+                );
+                std::process::exit(1);
+            }
+        };
+
+        use grammers_client::media::Media;
+        use grammers_client::message::InputMessage;
+        use grammers_client::tl;
+
+        // No upload: the document already lives on Telegram, so this is a pure
+        // `messages.sendMedia`. `video_cover`/`video_timestamp` stay null because
+        // the probe is not editing a video's attributes.
+        let media = tl::types::InputMediaDocument {
+            spoiler: false,
+            id: tl::enums::InputDocument::Document(tl::types::InputDocument {
+                id: decoded.id,
+                access_hash: decoded.access_hash,
+                file_reference: decoded.file_reference.clone().unwrap_or_default(),
+            }),
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+            query: None,
+        };
+        let mint_start = std::time::Instant::now();
+        let sent = client
+            .send_message(peer_ref, InputMessage::new().media(media))
+            .await;
+        let mint_ms = mint_start.elapsed().as_millis() as u64;
+        let msg = match sent {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "{{\"ok\":0,\"error\":\"send failed: {}\"}}",
+                    e.to_string().replace('"', "'")
+                );
+                std::process::exit(1);
+            }
+        };
+        let message_id = msg.id();
+
+        // The triple the byte path needs comes from the SEND RESULT, never from a
+        // re-resolve: this is also the only object that carries the NEW
+        // `file_reference`.
+        let doc = match msg.media() {
+            Some(Media::Document(m)) => match m.raw.document {
+                Some(tl::enums::Document::Document(d)) => d,
+                _ => {
+                    eprintln!("{{\"ok\":0,\"error\":\"sent media has no document\"}}");
+                    std::process::exit(1);
+                }
+            },
+            _ => {
+                eprintln!("{{\"ok\":0,\"error\":\"sent media is not a document\"}}");
+                std::process::exit(1);
+            }
+        };
+
+        // The Bot API id for what came back, NOT a copy of the input: the reply's
+        // `file_reference` is the whole point. Version 4 / sub 0 is the wire shape
+        // this account's Bot API ids use (the live fixture in `fileid` is 4/0).
+        let minted = fileid::DecodedFileId {
+            id: doc.id,
+            access_hash: doc.access_hash,
+            file_reference: Some(doc.file_reference.clone()),
+            dc_id: doc.dc_id,
+            file_type: decoded.file_type,
+            type_name: decoded.type_name.clone(),
+            version: 4,
+            sub_version: 0,
+            web_url: None,
+            size: doc.size.max(0) as u64,
+            raw: String::new(),
+        };
+        let minted_file_id = fileid::encode_file_id(&minted);
+        let minted_differs = minted_file_id != file_id;
+
+        // Read through the NEW id: bytes from a resend are the only evidence the
+        // minted reference is usable for playback.
+        let (fetch_ms, fetched_bytes, fetch_error) =
+            match telegram::prepare_file_target(&minted_file_id, minted.size) {
+                Err(e) => (0u64, 0usize, serde_json::json!(e)),
+                Ok(target) => {
+                    let started = std::time::Instant::now();
+                    match telegram::fetch_range(&client, &target, 0, telegram::MAX_CHUNK).await {
+                        Ok(bytes) => (
+                            started.elapsed().as_millis() as u64,
+                            bytes.len(),
+                            serde_json::Value::Null,
+                        ),
+                        Err(e) => (
+                            started.elapsed().as_millis() as u64,
+                            0usize,
+                            serde_json::json!(e.to_string()),
+                        ),
+                    }
+                }
+            };
+
+        // Best effort, and AFTER the read: deleting the message may take the
+        // reference with it, and a chat that forbids deletion must not cost the
+        // id the probe just minted.
+        let deleted = client.delete_messages(peer_ref, &[message_id]).await.is_ok();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": 1,
+                "bot_id": bot,
+                "peer": peer_spec,
+                "input_file_id": file_id,
+                "input_fetch_bytes": input_bytes,
+                "input_fetch_ms": baseline_ms,
+                "input_fetch_error": input_error,
+                "minted_file_id": minted_file_id,
+                "minted_differs_from_input": minted_differs,
+                "document_id": doc.id.to_string(),
+                "access_hash": doc.access_hash.to_string(),
+                "dc_id": doc.dc_id,
+                "size": minted.size,
+                "mint_ms": mint_ms,
+                "fetch_ms": fetch_ms,
+                "bytes_fetched": fetched_bytes,
+                "fetch_error": fetch_error,
+                "message_id": message_id,
+                "message_deleted": deleted,
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    // `--mint-batch <code1,code2,...> [peer,peer,...]`: the warm path for several
+    // short codes in one run — resolve, mint, read 512 KB through the minted id.
+    //
+    // This is the E2E driver for `mint.rs`, and it calls the SAME functions the
+    // resolve path calls (`mint::mint`, `mint::peers`) instead of a copy: a green
+    // run is evidence about production behaviour, not about a diagnostic that
+    // happens to agree with it. The peer list is the origin's (`GET /userbots`)
+    // unless one is passed, so nothing here is hardcoded.
+    //
+    // Rows are independent on purpose: one unresolvable code, one refused send and
+    // one short read each carry their own reason, and the summary counts them. A
+    // partial run is still a measurement.
+    if let Some(i) = arg_pos("--mint-batch") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(codes_arg) = args.get(i + 1) else {
+            eprintln!("usage: pencarimovie-server --mint-batch <code1,code2,...> [peer,peer,...]");
+            std::process::exit(2);
+        };
+        let codes: Vec<String> = codes_arg
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if codes.is_empty() {
+            eprintln!("{{\"ok\":0,\"error\":\"no short codes in the first argument\"}}");
+            std::process::exit(2);
+        }
+        // The prologue (bot, peers, one connection) is shared with
+        // `--mint-streams` in `mint_driver_setup`: two drivers must not drift into
+        // two different measurements.
+        let (bot, peers, client) = mint_driver_setup(args.get(i + 2).map(|s| s.as_str())).await;
+
+        let (rows, ok_count) = mint_code_rows(&codes, &bot, &client).await;
+        let total = codes.len();
+        let ok = mint_rows_ok(&rows);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": if ok { 1 } else { 0 },
+                "codes_total": total,
+                "ok_count": ok_count,
+                "failed_count": total - ok_count,
+                "bot_id": bot,
+                "peers": peers,
+                "rows": rows,
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    // `--mint-streams <streams-url> [peer,peer,...]`: the same driver over a REAL
+    // `/stream` list instead of a hand-typed code list.
+    //
+    // The URL is this engine's own `http://127.0.0.1:<port>/stream/...` (or another
+    // node's), fetched with the plain HTTP client and NO auth: it is a public route,
+    // and the point is the exact rows a player is handed. Every short code the list
+    // names is extracted ([`stream_codes`]: `short_code=`, then a `pm_file_` id,
+    // then an `/api/download/<payload>` segment), deduped, order kept, capped at
+    // [`MINT_STREAMS_CAP`] = 10, and then run through the SAME per-code pipeline
+    // `--mint-batch` uses ([`mint_code_rows`]).
+    if let Some(i) = arg_pos("--mint-streams") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(url) = args
+            .get(i + 1)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("usage: pencarimovie-server --mint-streams <streams-url> [peer,peer,...]");
+            std::process::exit(2);
+        };
+        let body = match fetch_streams(&url).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": 0,
+                        "error": format!("streams fetch failed: {}", e),
+                        "source_url": url,
+                    })
+                );
+                std::process::exit(1);
+            }
+        };
+        let codes = stream_codes(&body);
+        if codes.is_empty() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "ok": 0,
+                    "error": "the streams list named no usable short code",
+                    "source_url": url,
+                    "streams_total": body
+                        .get("streams")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                })
+            );
+            std::process::exit(2);
+        }
+        let (bot, peers, client) = mint_driver_setup(args.get(i + 2).map(|s| s.as_str())).await;
+        let (rows, ok_count) = mint_code_rows(&codes, &bot, &client).await;
+        let total = codes.len();
+        let ok = mint_rows_ok(&rows);
+        // The batch arm's shape, plus what this driver was pointed at and what it
+        // pulled out of it (so a surprising `codes_total` is explainable).
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": if ok { 1 } else { 0 },
+                "codes_total": total,
+                "ok_count": ok_count,
+                "failed_count": total - ok_count,
+                "bot_id": bot,
+                "peers": peers,
+                "source_url": url,
+                "codes": codes,
+                "rows": rows,
+            }))
+            .unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -884,6 +1690,10 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
 
+    let telegram_pool = Arc::new(telegram::TelegramPool::new(workers, inflight));
+    // Published once, before the first request can resolve a short code: the mint
+    // that `resolve.rs` performs goes through this same pool.
+    telegram::share_pool(telegram_pool.clone());
     let state = Arc::new(AppState {
         port,
         workers,
@@ -895,7 +1705,7 @@ async fn main() -> anyhow::Result<()> {
         max_bodies_per_ip,
         cold_starts_per_ip,
         cold_start_window,
-        telegram: telegram::TelegramPool::new(workers, inflight),
+        telegram: telegram_pool,
     });
     storage::prune_cache_files(false);
 
@@ -1324,6 +2134,88 @@ mod tests {
                 "{marker} must select 0.0.0.0"
             );
         }
+    }
+
+    /// The candidate walk's list: every DISTINCT id form in the engine's order,
+    /// empties dropped and duplicate values collapsed (so a form is never re-sent),
+    /// which is what lets one refusal fall through to the next form.
+    #[test]
+    fn id_candidates_keep_every_distinct_form_in_order() {
+        let all = serde_json::json!({
+            "file_id_mt": "MT", "file_id_tmp": "TMP", "file_id": "PLAIN"
+        });
+        assert_eq!(
+            resolve_id_candidates(&all),
+            vec![
+                ("file_id_mt", "MT".to_string()),
+                ("file_id_tmp", "TMP".to_string()),
+                ("file_id", "PLAIN".to_string()),
+            ]
+        );
+        // The usual answer: `file_id_mt` and `file_id` are the SAME value, so the
+        // walk has exactly one candidate and sends once.
+        let same = serde_json::json!({"file_id_mt": "AQADx", "file_id": "AQADx"});
+        assert_eq!(
+            resolve_id_candidates(&same),
+            vec![("file_id_mt", "AQADx".to_string())]
+        );
+        // A reply that only carries the temp form still yields it, trimmed.
+        let tmp = serde_json::json!({"file_id_tmp": " TMP ", "file_id": ""});
+        assert_eq!(
+            resolve_id_candidates(&tmp),
+            vec![("file_id_tmp", "TMP".to_string())]
+        );
+        // No id at all: nothing to try (the row answers `resolve_failed`).
+        assert!(resolve_id_candidates(&serde_json::json!({"ok": 0})).is_empty());
+        assert!(resolve_id_candidates(&serde_json::json!({
+            "file_id_mt": "  ", "file_id_tmp": "", "file_id": null
+        }))
+        .is_empty());
+    }
+
+    /// CHANGE 2: `--mint-streams` reads a REAL `/stream` list, so the extractor
+    /// has to accept every shape that list has published — in this preference
+    /// order, per row: `short_code=` in the url, then a `pm_file_` id, then an
+    /// `/api/download/<payload>` segment.
+    #[test]
+    fn stream_codes_reads_the_three_shapes_in_order_of_preference() {
+        let payload = serde_json::json!({"short_code": "b64code", "file_name": "Movie.mkv"});
+        let b64 = crate::fileid::base64url_encode(payload.to_string().as_bytes());
+        let body = serde_json::json!({
+            "streams": [
+                {"name": "x", "url": "http://127.0.0.1:8088/stream/movie/pm%3Apost%3A1.json?short_code=querycode&x=1"},
+                {"id": "pm_file_pmcode", "name": "y", "url": "http://host/"},
+                {"name": "z", "url": format!("http://127.0.0.1:8088/api/download/{}/Movie.mkv", b64)},
+                {"name": "no-code", "url": "http://host/nothing"}
+            ]
+        });
+        assert_eq!(stream_codes(&body), vec!["querycode", "pmcode", "b64code"]);
+    }
+
+    /// Order is the list's, duplicates collapse, and the hard cap holds — every
+    /// code past it would be another real Telegram send.
+    #[test]
+    fn stream_codes_keeps_order_dedupes_and_caps_at_ten() {
+        assert_eq!(MINT_STREAMS_CAP, 10);
+        let streams: Vec<serde_json::Value> = (0..25)
+            .map(|i| serde_json::json!({"url": format!("http://h/api/download?short_code=c{}", i % 12)}))
+            .collect();
+        let codes = stream_codes(&serde_json::json!({ "streams": streams }));
+        assert_eq!(codes.len(), MINT_STREAMS_CAP);
+        assert_eq!(codes.first().map(String::as_str), Some("c0"));
+        assert_eq!(codes.last().map(String::as_str), Some("c9"));
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "no code may appear twice");
+    }
+
+    /// A list with no usable code is empty, not a panic and not a guess.
+    #[test]
+    fn stream_codes_answer_nothing_for_a_list_without_codes() {
+        assert!(stream_codes(&serde_json::json!({"streams": []})).is_empty());
+        assert!(stream_codes(&serde_json::json!({"streams": [{"name": "x"}]})).is_empty());
+        assert!(stream_codes(&serde_json::json!({"ok": 1})).is_empty());
     }
 
     #[test]

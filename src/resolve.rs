@@ -593,8 +593,24 @@ async fn resolve_shortcode_concurrent_inner(short_code: &str, candidates: &[Stri
         if not_found_result(&res) {
             return res;
         }
+        let busy = note_resolve_rate_limit(&res.to_string());
         if res.is_object() && !res.as_object().map(|o| o.is_empty()).unwrap_or(true) {
             last = res;
+        }
+        // A BUSY ORIGIN IS A GLOBAL VERDICT, not a per-bot miss.
+        //
+        // `resolve_shortcode` already waited out the advertised `retry_after` once
+        // per call (5 s), so walking the rest of the pool pays that wait again for
+        // every bot AND fires two requests per bot at the endpoint that is
+        // rate-limiting us. Neither can succeed: the answer is not about the bot.
+        //
+        // MEASURED 2026-11-22 against an always-busy origin (tools/stub_origin.mjs,
+        // FD_WP_API_BASE): ONE /api/download produced 7 `/resolve-file` calls across
+        // four bots and took **20.0 s** to answer 503 — and the walk had not
+        // finished the pool. Breaking here leaves the caller's existing
+        // `503 ORIGIN_BUSY + Retry-After` answer, ~5 s sooner, with 2 calls.
+        if busy {
+            break;
         }
     }
     last

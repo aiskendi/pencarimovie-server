@@ -2,6 +2,27 @@
 
 All notable changes to the PencariMovie Server / Downloader project will be documented in this file.
 
+## [3.2.0] - 2026-11-22
+
+### Added
+
+- **Local file-id minting.** A `file_reference` that Telegram refuses is now replaced by
+  *re-sending the document from the bot that will use it* to one of the relay accounts
+  (`GET /userbots`), and reading the fresh reference out of the send's response. Measured
+  100-390 ms against 1.5-2.3 s for an origin resolve, and a minted id can seed the next mint,
+  so one origin resolve per `(file, bot)` is the whole dependency. Wired at
+  `resolve_shortcode_status_inner`, upstream of every consumer (download pre-flight and its
+  recovery ladder, `/api/resolve-shortcode`, stream/meta/eclipse/music targets, `/thumb`), so
+  music gets it on the same seam. The origin's `force=1&nocache=1` re-mint is now the
+  fallback, used only when the local send is refused.
+- **Fallback is byte-identical.** A mint that cannot run returns the origin's answer
+  unchanged and logs one line with the reason (`no_peers`, `peer_unresolved`, `send_failed`,
+  `MEDIA_EMPTY`, `chat_not_found`, `flood_wait`, `decode_failed`, …). The mint is bounded at
+  6 s and sits inside the resolve budget; it can slow a play, never fail one.
+- Diagnostics: `--mint-batch <codes>` and `--mint-streams <url>` drive the same code path
+  end to end (resolve → mint → 512 KB read) and report per-code timings and which id form
+  (`file_id_mt` / `file_id_tmp` / `file_id`) was accepted.
+
 ## [3.1.6] - 2026-11-22
 
 ### Fixed

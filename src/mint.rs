@@ -464,46 +464,104 @@ fn remember(short_code: &str, bot_id: &str, file_id: &str) {
     );
 }
 
-/* â”€â”€ local-first refresh (CHANGE 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* â”€â”€ the local re-send (CHANGE 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
-/// The id a LOCAL refresh should re-send, if this process has one.
+/// The id THIS process minted for the pair, while it is still inside
+/// [`MINT_TTL_MS`] and therefore still live.
 ///
-/// Preference: a reference this process minted for the pair (at most
-/// [`MINT_TTL_MS`] old, so it is live), else the id the caller already holds.
-/// `None` means there is nothing local to send and the origin's forced re-mint is
-/// the only source left â€” the caller must fall through to it, unchanged.
-///
-/// This is the whole local-vs-origin decision, kept as a function with no network
-/// in it so a test can pin it: the operator's rule is that a LIVE id is refreshed
-/// by re-sending it locally, and the origin is asked only when there is no local
-/// id left to try.
-fn refresh_source(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<String> {
-    if let Some(id) = cached(short_code, bot_id) {
-        return Some(id);
-    }
-    let held = held.map(str::trim).filter(|s| !s.is_empty())?;
-    Some(held.to_string())
+/// It is the one source a local re-send can always address: the bot that sends is
+/// the bot the id was minted for (`mint` encodes the send's reply). An id the
+/// CALLER holds is not that guarantee â€” it may have been minted by a different bot,
+/// and `sendMedia` answers `MEDIA_EMPTY` for it. That is why `resolve` tries this
+/// rung first and the caller's id only after the origin's `fresh=1` mint has
+/// answered nothing usable.
+pub fn live(short_code: &str, bot_id: &str) -> Option<String> {
+    cached(short_code, bot_id)
 }
 
-/// Refresh a refused reference LOCALLY, by re-sending an id this process holds.
+/// Re-send `source` and return the NEW `file_id`, or `None` if the send did not
+/// produce one.
 ///
 /// `messages.sendMedia` carrying the SAME document returns a document object with
 /// a brand-new `file_reference` (~100-390 ms measured, and a minted id can seed
-/// the next mint), so the origin's `force=1&nocache=1` re-mint is not the first
-/// resort any more: it is what is left when there is no live local id.
+/// the next mint), so a live id is refreshed locally instead of paying the
+/// origin's `force=1&nocache=1` re-mint.
 ///
 /// Exactly ONE send is attempted. A refused send is Telegram saying the id is
-/// DEAD (`reference_rejected`), and retrying it would spend another round-trip on
-/// the path that is already late â€” so the answer is `None` and the caller falls
-/// through to the origin, which is exactly its behaviour before this function
-/// existed. A mint failure can never change a request's outcome.
+/// DEAD (`reference_rejected`) or not this bot's (`MEDIA_EMPTY`), and retrying it
+/// would spend another round-trip on the path that is already late â€” so the answer
+/// is `None` and the caller tries its next rung, which is exactly the behaviour
+/// before this function existed. A mint failure can never change a request's
+/// outcome.
 ///
-/// `None` also covers "nothing local to try", which is the ordinary cold refresh
-/// and earns no line; a failed attempt logs exactly one, naming the reason.
+/// `source_label` is `minted_id` / `caller_id` and exists only so the log line
+/// says WHICH rung's id was refused; the two are otherwise the same operation.
+pub async fn resend(
+    short_code: &str,
+    bot_id: &str,
+    source: &str,
+    source_label: &'static str,
+) -> Option<String> {
+    if short_code.trim().is_empty() || bot_id.trim().is_empty() {
+        return None;
+    }
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    match tokio::time::timeout(MINT_TIMEOUT, mint(bot_id, source)).await {
+        Ok(Ok(minted)) => {
+            remember(short_code, bot_id, &minted.file_id);
+            report(short_code, bot_id, &minted.file_id);
+            log(
+                "refreshed the file reference locally - no origin re-mint",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "peer": minted.peer,
+                    "source": source_label,
+                    "same_id": minted.file_id == source,
+                }),
+            );
+            Some(minted.file_id)
+        }
+        Ok(Err(e)) => {
+            // `reference_rejected` here is the proof the id is dead; every other
+            // reason is the same story for the caller: try the next rung.
+            log(
+                "local refresh failed - falling back",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "reason": e.reason,
+                    "detail": e.detail,
+                    "source": source_label,
+                }),
+            );
+            None
+        }
+        Err(_) => {
+            log(
+                "local refresh timed out - falling back",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "timeout_secs": MINT_TIMEOUT.as_secs(),
+                    "source": source_label,
+                }),
+            );
+            None
+        }
+    }
+}
+
 /// Report a minted id to the origin so the next caller for this `(file, bot)` finds
 /// it in step 3 instead of paying another relay send. Fire-and-forget: spawned,
 /// logs at most one line, and can never fail a mint or a play.
-fn report(short_code: &str, bot_id: &str, file_id: &str) {
+///
+/// The origin's own `fresh=1` mint reaches it too, so the next resolve for that
+/// pair is a step-3 hit rather than a second relay send.
+pub(crate) fn report(short_code: &str, bot_id: &str, file_id: &str) {
     let sc = short_code.to_string();
     let bid = bot_id.to_string();
     let fid = file_id.to_string();
@@ -541,59 +599,14 @@ fn report(short_code: &str, bot_id: &str, file_id: &str) {
     });
 }
 
-pub async fn refresh(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<String> {
-    if short_code.trim().is_empty() || bot_id.trim().is_empty() {
-        return None;
-    }
-    let Some(source) = refresh_source(short_code, bot_id, held) else {
-        // The ordinary cold refresh: no local id exists, so the origin is the
-        // only source. Not a failed mint, so it earns no line.
-        return None;
-    };
-    let from_caller = held.map(str::trim) == Some(source.as_str());
-    match tokio::time::timeout(MINT_TIMEOUT, mint(bot_id, &source)).await {
-        Ok(Ok(minted)) => {
-            remember(short_code, bot_id, &minted.file_id);
-            report(short_code, bot_id, &minted.file_id);
-            log(
-                "refreshed the file reference locally - no origin re-mint",
-                &serde_json::json!({
-                    "short_code": short_code,
-                    "bot_id": bot_id,
-                    "peer": minted.peer,
-                    "source": if from_caller { "caller_id" } else { "minted_id" },
-                    "same_id": minted.file_id == source,
-                }),
-            );
-            Some(minted.file_id)
-        }
-        Ok(Err(e)) => {
-            // `reference_rejected` here is the proof the id is dead; every other
-            // reason is the same story for the caller: go to the origin.
-            log(
-                "local refresh failed - falling back to the origin's re-mint",
-                &serde_json::json!({
-                    "short_code": short_code,
-                    "bot_id": bot_id,
-                    "reason": e.reason,
-                    "detail": e.detail,
-                    "source": if from_caller { "caller_id" } else { "minted_id" },
-                }),
-            );
-            None
-        }
-        Err(_) => {
-            log(
-                "local refresh timed out - falling back to the origin's re-mint",
-                &serde_json::json!({
-                    "short_code": short_code,
-                    "bot_id": bot_id,
-                    "timeout_secs": MINT_TIMEOUT.as_secs(),
-                }),
-            );
-            None
-        }
-    }
+/// Test-only: seed the mint cache as if this process had just minted `file_id`.
+///
+/// `remember` stays private — a caller that could cache an id it did not mint would
+/// defeat the one guarantee this cache makes (the id belongs to the bot that will
+/// re-send it). The resolve path's rung order is the thing the test needs to see.
+#[cfg(test)]
+pub(crate) fn seed_minted(short_code: &str, bot_id: &str, file_id: &str) {
+    remember(short_code, bot_id, file_id);
 }
 
 /// The id the origin answered, in the order the rest of the engine reads it.
@@ -677,8 +690,9 @@ pub async fn adopt(short_code: &str, bot_id: &str, resolved: Value) -> Value {
     if source_id(&resolved).is_none() {
         return resolved;
     }
-    // CACHE ONLY. Resolving must never send: the origin's id is used as-is, and the
-    // mint happens on `refresh` — after Telegram actually refuses the reference.
+    // CACHE ONLY. Resolving must never send: the origin's id is used as-is, and a
+    // mint happens only after Telegram actually refuses the reference
+    // (`resolve::refresh_before_origin`).
     // Minting here cost one relay send per cold (code, bot) even when the stored id
     // was perfectly good, which is the duplicate send this whole change removes.
     let Some(id) = cached(short_code, bot_id) else {
@@ -751,46 +765,24 @@ mod tests {
         assert!(cached("codeB", "botA").is_none());
     }
 
-    /// CHANGE 1's decision, with no network: a live local id is refreshed locally
-    /// and the origin is asked only when there is nothing local left to send.
-    ///
-    /// `cached()` is what this process minted for the pair (<= 300 s, therefore
-    /// live), so it wins over the caller's id â€” that is what "a live id is
-    /// refreshed by re-sending it locally" means in practice. With no minted row
-    /// the caller's own id is the local source, and with neither the answer is
-    /// `None`, which the callers read as "go to the origin" (today's behaviour).
+    /// CHANGE 1's first rung: only an id THIS process minted is offered as the one
+    /// a local re-send can always address. It is keyed like every other mint
+    /// (`code:bot`), so another pair's mint is never handed to this one.
     #[test]
-    fn a_local_refresh_prefers_the_mint_cache_over_the_callers_id() {
-        remember("refreshA", "botA", "minted-live");
-        assert_eq!(
-            refresh_source("refreshA", "botA", Some("caller-held")).as_deref(),
-            Some("minted-live"),
-            "a reference this process minted is the live one"
-        );
-        assert_eq!(
-            refresh_source("refreshB", "botA", Some("caller-held")).as_deref(),
-            Some("caller-held"),
-            "with no minted id the id the caller holds is the local source"
-        );
-        assert!(
-            refresh_source("refreshB", "botA", None).is_none(),
-            "nothing local -> the origin is the only source"
-        );
-        assert!(
-            refresh_source("refreshB", "botA", Some("   ")).is_none(),
-            "a blank held id is nothing to re-send"
-        );
-        // The cache is per (short_code, bot_id), like every other mint key.
-        assert!(refresh_source("refreshA", "botB", None).is_none());
+    fn a_live_mint_is_offered_only_for_its_own_pair() {
+        remember("liveA", "botA", "minted-live");
+        assert_eq!(live("liveA", "botA").as_deref(), Some("minted-live"));
+        assert!(live("liveA", "botB").is_none(), "a file id is bot-specific");
+        assert!(live("liveB", "botA").is_none(), "and it is code-specific");
     }
 
-    /// `refresh` with nothing local must not reach for a pool, a peer or a
-    /// network: it answers `None` so the caller keeps today's origin path.
+    /// `resend` with nothing to send must not reach for a pool, a peer or a
+    /// network: it answers `None` so the caller keeps its ladder.
     #[tokio::test]
-    async fn a_refresh_with_nothing_local_does_no_work() {
-        assert!(refresh("refreshC", "botC", None).await.is_none());
-        assert!(refresh("", "botC", Some("held")).await.is_none());
-        assert!(refresh("refreshC", "", Some("held")).await.is_none());
+    async fn a_resend_with_nothing_to_send_does_no_work() {
+        assert!(resend("", "botC", "held", "caller_id").await.is_none());
+        assert!(resend("codeC", "", "held", "caller_id").await.is_none());
+        assert!(resend("codeC", "botC", "   ", "caller_id").await.is_none());
     }
 
     /// `adopt` without a pool must not touch the body: that is the whole fallback

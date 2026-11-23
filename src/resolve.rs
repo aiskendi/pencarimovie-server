@@ -440,14 +440,251 @@ pub async fn resolve_shortcode_status_from(
 /// router headroom to send the answer.
 const RESOLVE_BUDGET: Duration = Duration::from_secs(20);
 
-/// Ceiling for the forced branch's LOCAL re-send (CHANGE 1).
+/// Ceiling for one rung's LOCAL re-send (CHANGE 1).
 ///
 /// A measured mint is 100-390 ms; this is only long enough for a slow one and
-/// short enough that a stuck send still leaves the origin's forced re-mint its
-/// turn — the download pre-flight gives this whole call 6 s
+/// short enough that a stuck send still leaves the next rung its turn — the
+/// download pre-flight gives this whole call 6 s
 /// (`download::PREFLIGHT_RESOLVE_SECS`). `mint::MINT_TIMEOUT` (6 s) is the ceiling
 /// on the adopt path, where the ladder around it still runs afterwards.
 const LOCAL_REFRESH_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Ceiling for the `fresh=1` rung of a refused reference's refresh (CHANGE 2).
+///
+/// The pre-flight gives the whole refresh 6 s (`download::PREFLIGHT_RESOLVE_SECS`)
+/// and the local re-send keeps its own 2.5 s ([`LOCAL_REFRESH_TIMEOUT`]), so 3 s is
+/// the most this rung can take and still leave the local one its turn. A measured
+/// origin mint is 1.5-2.3 s cold and 0.2-0.8 s warm, and the rungs run sequentially
+/// only on FAILURE: the rung that answers ends the refresh, so an ordinary request
+/// pays one of them, never all.
+const FRESH_ORIGIN_SECS: u64 = 3;
+
+/// One way to get a live reference for a refused one, in the order they are tried.
+///
+/// Kept as data, not as control flow, so the ORDER — which is the whole change — is
+/// pinned by a test that touches no network.
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// Re-send an id this process holds. The label names the rung in the log line:
+    /// `minted_id` (this process minted it, so the bot can address it) or
+    /// `caller_id` (the id the caller was streaming when Telegram refused it).
+    Local(String, &'static str),
+    /// The origin's `fresh=1` mint, which returns an id minted for THIS bot.
+    OriginFresh,
+}
+
+/// The rungs, in order, for one refused reference.
+///
+/// 1. the id THIS process minted for the pair (<= 300 s, so live) — a send it can
+///    always address, ~100-390 ms;
+/// 2. the origin's `fresh=1` mint (CHANGE 2) — an id minted FOR this bot by
+///    construction, which is what the caller-id re-send could not produce:
+///    `sendMedia` only accepts an id the sending bot owns, and Telegram answers
+///    `MEDIA_EMPTY` otherwise (measured 39/19 on sinta/fikri, i.e. nearly every
+///    attempt, after which the origin was paid anyway);
+/// 3. the id the CALLER holds — the old first rung, kept as the fallback for an
+///    origin that does not answer `fresh` (or answers the same id), so this change
+///    can only add a rung, never remove one.
+///
+/// `origin_up` false drops rung 2 alone: rungs 1 and 3 need Telegram, not WordPress,
+/// so a play still recovers while the origin is unreachable.
+///
+/// Rung 3 is skipped when it is the SAME id rung 1 just re-sent: a refused send is
+/// Telegram saying that id is dead, and sending it twice would spend a second
+/// round-trip on the path that is already late.
+fn refresh_rungs(
+    short_code: &str,
+    bot_id: &str,
+    held: Option<&str>,
+    origin_up: bool,
+) -> Vec<Refresh> {
+    let minted = crate::mint::live(short_code, bot_id);
+    let held = held.map(str::trim).filter(|s| !s.is_empty());
+    let mut out: Vec<Refresh> = Vec::with_capacity(3);
+    if let Some(id) = &minted {
+        out.push(Refresh::Local(id.clone(), "minted_id"));
+    }
+    if origin_up {
+        out.push(Refresh::OriginFresh);
+    }
+    if let Some(id) = held {
+        if minted.as_deref() != Some(id) {
+            out.push(Refresh::Local(id.to_string(), "caller_id"));
+        }
+    }
+    out
+}
+
+/// Why a `fresh=1` answer cannot be used, or the id that can.
+///
+/// Two answers are unusable, and both must fall through to the local rungs:
+///
+///   * no id at all — the origin could not mint one;
+///   * THE id the caller already holds — that is the origin serving its own step-3
+///     row (`tg_file_id`), i.e. the very reference Telegram just refused. Accepting
+///     it would hand back a dead id AND skip the local send that might still work.
+///     Same-id-means-cache is the rule a forced refresh already follows elsewhere
+///     (`download.rs`, `--thumb-probe`).
+fn fresh_id(res: &Value, held: Option<&str>) -> Result<String, &'static str> {
+    let id = ["file_id_mt", "file_id_tmp", "file_id"]
+        .iter()
+        .map(|k| jstr(res, k))
+        .find(|s| !s.is_empty())
+        .ok_or("no_id")?;
+    let held = held.map(str::trim).filter(|s| !s.is_empty());
+    if held == Some(id.as_str()) {
+        return Err("same_id");
+    }
+    Ok(id)
+}
+
+/// A usable `fresh=1` body, normalised so the byte path can read it.
+///
+/// The origin's step 4 answers `file_id_tmp` with `file_id_mt: null`
+/// (core-files.php:4475-4628) — that IS the fresh Bot-API id, but every consumer
+/// here reads `file_id_mt` then `file_id` (`download::id_of`, `mint::source_id`), so
+/// a tmp-only answer would look like "no id". Both fields are rewritten to the one
+/// id that names the new reference, exactly as [`crate::mint::adopt`] does.
+fn fresh_body(res: Value, held: Option<&str>) -> Result<Value, &'static str> {
+    let id = fresh_id(&res, held)?;
+    let mut out = res;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("file_id_mt".to_string(), serde_json::json!(id));
+        obj.insert("file_id".to_string(), serde_json::json!(id));
+    }
+    Ok(out)
+}
+
+/// The origin's `fresh=1` mint for this `(file, bot)` (CHANGE 2).
+///
+/// `fresh=1` skips the origin's step-3 row lookup and runs step 4 unconditionally:
+/// inputfilebot sends the document to `@B`, and the id in the send response is
+/// minted FOR B. That is the reference the local re-send was trying to produce and
+/// could not, because `sendMedia` only works when the id belongs to the sending bot.
+///
+/// The id is reported back to the origin: whether the origin's fresh branch writes
+/// `tg_file_id` itself is not documented, and a duplicate upsert is cheap while a
+/// cold next resolve is not.
+async fn origin_fresh(short_code: &str, bot_id: &str, held: Option<&str>) -> Option<Value> {
+    let url = format!("{}/resolve-file", wp_api_base());
+    let params = vec![
+        ("short_code".to_string(), short_code.to_string()),
+        ("bot_id".to_string(), bot_id.to_string()),
+        ("fresh".to_string(), "1".to_string()),
+    ];
+    let (res, status) =
+        http_json_h_status_body(&url, &params, "GET", FRESH_ORIGIN_SECS, &[]).await;
+    match fresh_body(res, held) {
+        Ok(body) => {
+            let id = jstr(&body, "file_id_mt");
+            crate::mint::report(short_code, bot_id, &id);
+            // Self-guards on "a size AND a name", so a fresh-mint body that carries
+            // only the id is returned without being cached as a resolve.
+            save_resolve_cache(short_code, bot_id, &body);
+            log(
+                "origin minted a fresh file id for this bot - no local re-send",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "status": status,
+                }),
+            );
+            Some(body)
+        }
+        Err(why) => {
+            log(
+                "origin fresh mint gave nothing usable - trying the local re-send",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot_id,
+                    "status": status,
+                    "reason": why,
+                }),
+            );
+            None
+        }
+    }
+}
+
+/// ONE local re-send, bounded so a wedged send cannot spend the caller's budget.
+async fn one_local(
+    short_code: &str,
+    bot: &str,
+    source: &str,
+    label: &'static str,
+) -> Option<String> {
+    match tokio::time::timeout(
+        LOCAL_REFRESH_TIMEOUT,
+        crate::mint::resend(short_code, bot, source, label),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(_) => {
+            log(
+                "local refresh did not finish in time - asking the origin",
+                &serde_json::json!({
+                    "short_code": short_code,
+                    "bot_id": bot,
+                    "window_secs": LOCAL_REFRESH_TIMEOUT.as_secs_f64(),
+                }),
+            );
+            None
+        }
+    }
+}
+
+/// The body a locally refreshed id is returned in.
+///
+/// The cached answer, when one survived, is what carries the metadata (`title`,
+/// `file_size`, `mime`) the callers of this branch may need; with none, the id and
+/// the bot are the whole answer the byte path reads.
+fn id_body(short_code: &str, bot: &str, id: &str) -> Value {
+    let cached = resolve_shortcode_cached(short_code, bot);
+    let mut body = cached
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({"ok": 1, "short_code": short_code}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("file_id_mt".to_string(), serde_json::json!(id));
+        obj.insert("file_id".to_string(), serde_json::json!(id));
+        obj.insert("bot_id".to_string(), serde_json::json!(bot));
+    }
+    // Only a body that still knows the file is worth persisting; the id-only shape
+    // would be refused by `save_resolve_cache` anyway.
+    if cached.is_some() {
+        save_resolve_cache(short_code, bot, &body);
+    }
+    body
+}
+
+/// A REFUSED reference, refreshed before the origin's forced ladder (CHANGE 1+2).
+///
+/// Walks [`refresh_rungs`] and returns the body for the first rung that produced a
+/// live id. `None` means every rung declined, and the caller's forced ladder
+/// (`force=1&nocache=1`) is the only source left — byte-for-byte the behaviour
+/// before this existed, so a mint failure can never change a request's outcome.
+async fn refresh_before_origin(
+    short_code: &str,
+    bot: &str,
+    held: Option<&str>,
+) -> Option<Value> {
+    let rungs = refresh_rungs(short_code, bot, held, crate::httpc::wp_origin_down_secs() == 0);
+    for rung in rungs {
+        match rung {
+            Refresh::Local(id, label) => {
+                if let Some(new_id) = one_local(short_code, bot, &id, label).await {
+                    return Some(id_body(short_code, bot, &new_id));
+                }
+            }
+            Refresh::OriginFresh => {
+                if let Some(body) = origin_fresh(short_code, bot, held).await {
+                    return Some(body);
+                }
+            }
+        }
+    }
+    None
+}
 
 /// The body of [`resolve_shortcode_status()`]. Deliberately unbounded: the budget
 /// lives in the wrapper so there is exactly one place that can end a ladder early.
@@ -484,66 +721,24 @@ async fn resolve_shortcode_status_inner(
         }
     }
 
-    // A REFUSED REFERENCE IS REFRESHED LOCALLY FIRST (CHANGE 1).
+    // A REFUSED REFERENCE IS REFRESHED BEFORE THE ORIGIN'S FORCED LADDER (CHANGE 1+2).
     //
     // `bypass_cache` is the ladder's `force=1&nocache=1` rung, which every caller
     // reaches after Telegram said the reference is dead or stale. It used to go
-    // straight to the origin's own forced re-mint — the slowest, rate-limited way
-    // to get a fresh `file_reference` — while `mint_adopt` deliberately skipped the
-    // mint on this branch. The operator's rule is the other way round: re-send the
-    // id already in hand to a relay account (~100-390 ms measured, and the answer's
-    // document object carries a brand-new reference), and ask the origin for a
-    // forced re-mint only when there is no live local id left — `None` from
-    // `mint::refresh`, which includes a REFUSED send (Telegram's proof that the id
-    // is dead; it is never retried here).
+    // straight to the origin's own forced re-mint — the slowest, rate-limited way to
+    // get a fresh `file_reference` — while `mint_adopt` deliberately skipped the mint
+    // on this branch. [`refresh_before_origin`] runs first now: this process's own
+    // live mint, then the origin's `fresh=1` mint (an id minted FOR this bot, the one
+    // thing the local re-send could not produce — `MEDIA_EMPTY`), then the id the
+    // caller holds; only when all of them decline is the forced ladder paid.
     //
-    // It sits BEFORE the origin-down gate on purpose: a local send needs Telegram,
-    // not WordPress, so a play can still recover while the origin is unreachable.
-    // Nothing here can change the request's outcome: on `None` the ladder below is
-    // byte-for-byte what it was, and one log line has already named the reason.
+    // It sits BEFORE the origin-down gate on purpose: rungs 1 and 3 need Telegram,
+    // not WordPress, so a play can still recover while the origin is unreachable —
+    // `refresh_before_origin` drops only the rung that needs the origin. Nothing here
+    // can change the request's outcome: on `None` the ladder below is byte-for-byte
+    // what it was, and one log line has already named the reason.
     if bypass_cache {
-        // A wedged send must not spend the caller's whole resolve budget: the
-        // download pre-flight allows 6 s for this entire call, and today's
-        // behaviour (the origin's forced re-mint) has to keep its turn. A measured
-        // mint is 100-390 ms, so this ceiling only catches a stuck send.
-        let local = tokio::time::timeout(
-            LOCAL_REFRESH_TIMEOUT,
-            crate::mint::refresh(short_code, &bot, held),
-        )
-        .await;
-        let local_id = match local {
-            Ok(id) => id,
-            Err(_) => {
-                log(
-                    "local refresh did not finish in time - asking the origin",
-                    &serde_json::json!({
-                        "short_code": short_code,
-                        "bot_id": bot,
-                        "window_secs": LOCAL_REFRESH_TIMEOUT.as_secs_f64(),
-                    }),
-                );
-                None
-            }
-        };
-        if let Some(id) = local_id {
-            // The cached answer, when one survived, is what carries the metadata
-            // (`title`, `file_size`, `mime`) the callers of this branch may need;
-            // with none, the id and the bot are the whole answer the byte path
-            // reads.
-            let cached = resolve_shortcode_cached(short_code, &bot);
-            let mut body = cached
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({"ok": 1, "short_code": short_code}));
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("file_id_mt".to_string(), serde_json::json!(id));
-                obj.insert("file_id".to_string(), serde_json::json!(id));
-                obj.insert("bot_id".to_string(), serde_json::json!(bot));
-            }
-            // Only a body that still knows the file is worth persisting; the id-only
-            // shape would be refused by `save_resolve_cache` anyway.
-            if cached.is_some() {
-                save_resolve_cache(short_code, &bot, &body);
-            }
+        if let Some(body) = refresh_before_origin(short_code, &bot, held).await {
             return (body, 200);
         }
     }
@@ -1381,6 +1576,107 @@ mod tests {
         });
         save_resolve_cache("noname1", "test-bot", &id_only);
         assert!(resolve_shortcode_cached("noname1", "test-bot").is_none());
+    }
+
+    /// CHANGE 2's order: the origin's `fresh=1` mint runs BEFORE the caller's own
+    /// id, because the caller's id is the one Telegram keeps answering
+    /// `MEDIA_EMPTY` for. The order IS the change, so it is pinned with no network.
+    #[test]
+    fn a_refused_reference_tries_the_fresh_mint_before_the_callers_id() {
+        // Nothing local: the origin's fresh mint is the only rung left.
+        assert_eq!(
+            refresh_rungs("rungA", "botA", None, true),
+            vec![Refresh::OriginFresh]
+        );
+        assert!(
+            refresh_rungs("rungA", "botA", None, false).is_empty(),
+            "an origin that is down leaves nothing local to try"
+        );
+        // The caller's id alone: fresh first, then that id as the fallback, so an
+        // origin that ignores `fresh` costs one call and loses nothing.
+        assert_eq!(
+            refresh_rungs("rungA", "botA", Some("caller-held"), true),
+            vec![
+                Refresh::OriginFresh,
+                Refresh::Local("caller-held".into(), "caller_id")
+            ]
+        );
+        // A blank held id is nothing to re-send.
+        assert_eq!(
+            refresh_rungs("rungA", "botA", Some("   "), true),
+            vec![Refresh::OriginFresh]
+        );
+    }
+
+    /// An id THIS process minted goes first (the bot can always address it), and it
+    /// is never re-sent a second time as the caller's id: one refused send is
+    /// Telegram's verdict on that id.
+    #[test]
+    fn a_live_mint_is_tried_first_and_never_re_sent_as_the_callers_id() {
+        crate::mint::seed_minted("rungB", "botB", "minted-live");
+        assert_eq!(
+            refresh_rungs("rungB", "botB", Some("minted-live"), true),
+            vec![
+                Refresh::Local("minted-live".into(), "minted_id"),
+                Refresh::OriginFresh
+            ],
+            "the same id must not be sent twice"
+        );
+        assert_eq!(
+            refresh_rungs("rungB", "botB", Some("caller-held"), true),
+            vec![
+                Refresh::Local("minted-live".into(), "minted_id"),
+                Refresh::OriginFresh,
+                Refresh::Local("caller-held".into(), "caller_id")
+            ]
+        );
+        assert_eq!(
+            refresh_rungs("rungB", "botB", Some("caller-held"), false),
+            vec![
+                Refresh::Local("minted-live".into(), "minted_id"),
+                Refresh::Local("caller-held".into(), "caller_id")
+            ],
+            "both local rungs still run with the origin down - a play can recover"
+        );
+    }
+
+    /// The `fresh=1` answer is usable only when it is a NEW id. The origin serving
+    /// its own step-3 row is the reference Telegram just refused, and accepting it
+    /// would skip the local rungs that might still work.
+    #[test]
+    fn a_fresh_mint_is_accepted_only_when_it_is_a_new_id() {
+        let body = serde_json::json!({"ok": 1, "file_id_mt": "fresh-mt"});
+        assert_eq!(fresh_id(&body, Some("stale")).as_deref(), Ok("fresh-mt"));
+        assert_eq!(
+            fresh_id(&body, Some("fresh-mt")),
+            Err("same_id"),
+            "the origin served its row - that is the dead reference"
+        );
+        assert_eq!(fresh_id(&body, Some("   ")).as_deref(), Ok("fresh-mt"));
+        assert_eq!(fresh_id(&body, None).as_deref(), Ok("fresh-mt"));
+        assert_eq!(fresh_id(&serde_json::json!({"ok": 0}), None), Err("no_id"));
+        // Step 4 answers `file_id_tmp` with `file_id_mt: null`, so tmp must be read.
+        let tmp = serde_json::json!({"ok": 1, "file_id_mt": null, "file_id_tmp": "fresh-tmp"});
+        assert_eq!(fresh_id(&tmp, None).as_deref(), Ok("fresh-tmp"));
+    }
+
+    /// A tmp-only mint has to be normalised, or the byte path (`download::id_of`,
+    /// which reads `file_id_mt` then `file_id`) sees "no id" and re-resolves a code
+    /// the origin just answered.
+    #[test]
+    fn a_fresh_mint_body_names_the_new_reference_in_both_id_fields() {
+        let body = serde_json::json!({
+            "ok": 1, "file_id_mt": null, "file_id_tmp": "fresh-tmp", "file_id": "stale"
+        });
+        let out = fresh_body(body, Some("stale")).expect("a tmp-only mint is usable");
+        assert_eq!(out.get("file_id_mt").and_then(|v| v.as_str()), Some("fresh-tmp"));
+        assert_eq!(out.get("file_id").and_then(|v| v.as_str()), Some("fresh-tmp"));
+        // `file_id_mt` stays the preferred key, in the order the engine reads.
+        let both = serde_json::json!({"file_id_mt": "MT", "file_id_tmp": "TMP"});
+        assert_eq!(
+            fresh_body(both, None).unwrap().get("file_id_mt").and_then(|v| v.as_str()),
+            Some("MT")
+        );
     }
 
     /// The origin NEVER relays inside `/resolve-files` — it parks the code in its

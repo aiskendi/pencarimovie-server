@@ -169,9 +169,10 @@ fn id_of(v: &Value) -> String {
 ///
 /// A split window holds a `DocTarget`, not a `file_id` string, so this is where the
 /// "id the caller already holds" comes from when the reference-expired ladder
-/// refreshes it (CHANGE 1: the local re-send gets this id, and the origin's forced
-/// re-mint runs only when that mint returns `None`). Empty when the cache has no
-/// usable row — the local send is then simply not attempted.
+/// refreshes it (CHANGE 1: the local re-send gets this id as its LAST rung — the
+/// origin's `fresh=1` mint and its forced re-mint are issued only when no local rung
+/// produced one). Empty when the cache has no usable row — the local send is then
+/// simply not attempted.
 fn held_id(short_code: &str, bot_id: &str) -> String {
     resolve_shortcode_cached(short_code, bot_id)
         .map(|v| id_of(&v))
@@ -3828,9 +3829,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         "file reference expired, refreshing the id this request holds",
                         &serde_json::json!({"short_code": short_code, "attempt": attempt}),
                     );
-                    // CHANGE 1: the local re-send of `file_id` runs first inside
-                    // this call, and the origin's `force=1&nocache=1` re-mint is
-                    // issued only when the mint returns None.
+                    // CHANGE 1+2: the local re-send of `file_id` is the LAST rung
+                    // inside this call — the origin's `fresh=1` mint runs first, and
+                    // its `force=1&nocache=1` re-mint only when neither produced an id.
                     let Some(mut fresh) = resolve_bounded(
                         resolve_shortcode_fresh_from(&short_code, &bot_id, Some(file_id.as_str())),
                         &short_code,

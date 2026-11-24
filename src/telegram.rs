@@ -648,6 +648,7 @@ impl TelegramPool {
             &serde_json::json!({
                 "bot_id": key,
                 "username": identity.username,
+                "home_dc": session_home_dc(&base).unwrap_or(0),
                 "workers": entry.client_count(),
                 "inflight_per_connection": self.inflight,
                 "inflight_total": entry.client_count() * self.inflight
@@ -659,6 +660,11 @@ impl TelegramPool {
     pub async fn boot_with_token(&self, token: &str, hint: &str) -> Result<Arc<BotEntry>, String> {
         self.boot(hint, Some(token)).await
     }
+}
+
+fn session_home_dc(path: &Path) -> Option<i32> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<DiskSession>(&raw).ok()?.home_dc
 }
 
 async fn make_client(path: &Path, api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>), String> {

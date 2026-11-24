@@ -522,7 +522,7 @@ impl TelegramPool {
             .map_err(|e| format!("could not create session dir {}: {}", dir.display(), e))?;
         let base = dir.join(SESSION_FILE);
 
-        let (client, task) = make_client(&base, api_id).await?;
+        let (mut client, mut task) = make_client(&base, api_id).await?;
         // Bounded: a fresh `Client` connects lazily on its first request, and the
         // runner retries that connection forever instead of failing.
         let authorized = tokio::time::timeout(Self::BOOT_RPC_TIMEOUT, client.is_authorized())
@@ -553,14 +553,49 @@ impl TelegramPool {
             // auth.importBotAuthorization, exactly what grammers sends.
             // Bounded, and a timeout must NOT arm the flood gate: grammers never
             // reached Telegram, so there is no FLOOD_WAIT to honour.
-            tokio::time::timeout(Self::BOOT_RPC_TIMEOUT, client.bot_sign_in(tok, &api_hash))
-                .await
-                .map_err(|_| Self::telegram_unreachable("auth.ImportBotAuthorization"))?
-                .map_err(|e| {
-                    let msg = format!("bot sign-in failed: {}", e);
-                    crate::session::note_flood_for(&key, &msg);
-                    msg
-                })?;
+            //
+            // ── WHICH DC ───────────────────────────────────────────────────────
+            // Telegram only answers this call on the bot's OWN datacentre. From
+            // any other one it now answers `500 RPC_CALL_FAIL` where it used to
+            // answer `303 USER_MIGRATE_<dc>` and let the client follow, so the
+            // migration that used to hide the difference no longer happens.
+            // MEASURED 2026-11-24 through Telethon at a fixed DC, one fresh bot:
+            // DC1 500, DC2 500, DC3 500, DC4 500, DC5 OK — and two random pool
+            // bots gave the same shape. Every bot in this fleet is DC5 (a bot
+            // inherits its owner's DC), while a fresh session starts on DC2, so
+            // EVERY new login failed while every existing session kept working.
+            //
+            // So the login walks the DCs instead of trusting the default: the
+            // session's current one first, then DC5 (the measured fleet DC), then
+            // the rest. A probe uses its own session file and only the winner is
+            // moved into place, so the worker clients below are never disturbed.
+            task.abort();
+            let first_dc = session_home_dc(&base).unwrap_or(2);
+            let mut last_err = String::new();
+            let mut signed_in = false;
+            for dc in dc_login_order(first_dc) {
+                match Self::login_on_dc(&base, api_id, &api_hash, tok, dc).await {
+                    Ok(()) => {
+                        log(
+                            "bot signed in",
+                            &serde_json::json!({"bot_id": key, "dc": dc}),
+                        );
+                        signed_in = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = format!("bot sign-in failed: {}", e);
+                        crate::session::note_flood_for(&key, &msg);
+                        last_err = msg;
+                    }
+                }
+            }
+            if !signed_in {
+                return Err(last_err);
+            }
+            let (c, t) = make_client(&base, api_id).await?;
+            client = c;
+            task = t;
         }
 
         let users = tokio::time::timeout(
@@ -660,11 +695,70 @@ impl TelegramPool {
     pub async fn boot_with_token(&self, token: &str, hint: &str) -> Result<Arc<BotEntry>, String> {
         self.boot(hint, Some(token)).await
     }
+
+    /// Try one bot login on ONE datacentre, in a throwaway session file.
+    ///
+    /// Telegram answers `auth.importBotAuthorization` only on the bot's own DC
+    /// (see the walk in [`Self::boot`]), so each candidate needs its own attempt.
+    /// The probe writes `<base file>.dcN`, and only the winner is moved onto the
+    /// real path: the worker clients hold that path, and re-pointing a live
+    /// session's DC under them is how a working session gets broken.
+    async fn login_on_dc(
+        base: &Path,
+        api_id: i32,
+        api_hash: &str,
+        token: &str,
+        dc: i32,
+    ) -> Result<(), String> {
+        let probe = base.with_file_name(format!("login.dc{}.json", dc));
+        let _ = fs::remove_file(&probe);
+        // A minimal session pins the DC; every other field falls back to the
+        // known DC options, which is all a fresh login needs.
+        fs::write(&probe, serde_json::json!({ "home_dc": dc }).to_string())
+            .map_err(|e| format!("could not seed a DC{} session: {}", dc, e))?;
+        let (client, task) = make_client(&probe, api_id).await?;
+        let res = tokio::time::timeout(Self::BOOT_RPC_TIMEOUT, client.bot_sign_in(token, api_hash))
+            .await;
+        // Stop the runner before moving the file it persists to.
+        task.abort();
+        match res {
+            Ok(Ok(_)) => {
+                fs::rename(&probe, base)
+                    .map_err(|e| format!("could not keep the DC{} session: {}", dc, e))?;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = fs::remove_file(&probe);
+                Err(e.to_string())
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&probe);
+                Err(Self::telegram_unreachable("auth.ImportBotAuthorization"))
+            }
+        }
+    }
 }
 
 fn session_home_dc(path: &Path) -> Option<i32> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<DiskSession>(&raw).ok()?.home_dc
+}
+
+/// The DCs to try a bot login on, best guess first.
+///
+/// The session's current DC comes first so a bot already on it costs one
+/// attempt. DC5 is next because that is the measured fleet DC (2026-11-24, all
+/// six working bots plus a freshly created one import there), and trying it
+/// before the remaining three saves four refused round-trips on every lease.
+/// The rest are kept so a bot on another DC still signs in.
+fn dc_login_order(current: i32) -> Vec<i32> {
+    let mut order = vec![current];
+    for dc in [5, 4, 3, 1, 2] {
+        if !order.contains(&dc) {
+            order.push(dc);
+        }
+    }
+    order
 }
 
 async fn make_client(path: &Path, api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>), String> {

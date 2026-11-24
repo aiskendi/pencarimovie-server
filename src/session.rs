@@ -1296,6 +1296,33 @@ mod tests {
         assert_eq!(GUEST_BOTS_PER_INSTANCE, 1);
     }
 
+    /// A 500 is Telegram's internal error, not a verdict on the bot. Reporting it
+    /// as a failed lease quarantines a HEALTHY bot for 24 h at the origin, which
+    /// is how one broken method emptied the pool on 2026-11-24.
+    #[test]
+    fn a_telegram_500_never_retires_the_lease() {
+        assert!(is_transient_login_error(
+            "bot sign-in failed: request error: rpc error 500: RPC_CALL_FAIL caused by auth.importBotAuthorization"
+        ));
+        assert!(is_transient_login_error(
+            "Telegram did not answer the session check within 20s: this host cannot reach a Telegram datacentre"
+        ));
+        assert!(is_transient_login_error("ecONNREFUSED connecting to 149.154.167.41:443"));
+    }
+
+    /// The documented 400s ARE verdicts on the token, so those still retire it:
+    /// a dead token handed to every guest is the other half of the bug.
+    #[test]
+    fn a_refused_token_still_retires_the_lease() {
+        assert!(!is_transient_login_error(
+            "bot sign-in failed: request error: rpc error 400: ACCESS_TOKEN_INVALID caused by auth.importBotAuthorization"
+        ));
+        assert!(!is_transient_login_error(
+            "bot sign-in failed: request error: rpc error 400: ACCESS_TOKEN_EXPIRED caused by auth.importBotAuthorization"
+        ));
+        assert!(!is_transient_login_error(""));
+    }
+
     /// Removing the primary must hand the role to a bot that can log in.
     /// Picking the first row regardless is what sent the dashboard into the
     /// endless "Provisioning guest bot..." spinner: `/api/session` answered
@@ -1554,6 +1581,40 @@ pub fn is_clock_or_authkey_error(message: &str) -> bool {
         || s.contains("time delta")
         || s.contains("clock")
         || s.contains("sync your date")
+}
+
+/// Is this login failure TELEGRAM'S fault rather than this bot's?
+///
+/// `report_failed_lease` retires a bot at the origin for 24 h, so it may only be
+/// sent when the answer was a verdict ON THE TOKEN. A 500 is not one: Telegram
+/// defines `RPC_CALL_FAIL` as "an internal server error occurred", and
+/// `auth.importBotAuthorization` documents exactly four possible errors, all 400
+/// (`ACCESS_TOKEN_INVALID`, `ACCESS_TOKEN_EXPIRED`, `API_ID_INVALID`,
+/// `API_ID_PUBLISHED_FLOOD`).
+///
+/// MEASURED 2026-11-24: a bot created in BotFather minutes earlier answered 500
+/// for BOTH credential pairs, from two hosts, through two libraries, while every
+/// established session kept authorizing normally. Each of those 500s was reported
+/// as a failed lease, so a healthy bot was quarantined for a day per attempt and
+/// the pool drained itself while Telegram was the broken part.
+pub fn is_transient_login_error(error: &str) -> bool {
+    let s = error.to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    // A flood wait has its own branch; it is temporary too.
+    s.contains("rpc error 500")
+        || s.contains("rpc_call_fail")
+        || s.contains("api_call_error")
+        || s.contains("internal issues")
+        || s.contains("did not answer")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("connection")
+        || s.contains("connect ")
+        || s.contains("econnrefused")
+        || s.contains("network is unreachable")
+        || s.contains("cannot reach")
 }
 
 pub fn friendly_login_error(message: &str) -> String {
@@ -2162,6 +2223,21 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                         }),
                     );
                     continue;
+                }
+                if is_transient_login_error(&e) {
+                    // Telegram is failing the LOGIN, not refusing this token.
+                    // Retiring the bot would quarantine a healthy one for 24 h at
+                    // the origin, and leasing another only repeats the same
+                    // server-side failure, so stop and quote what Telegram said.
+                    log(
+                        "guest login failed on Telegram's side; lease not retired",
+                        &serde_json::json!({
+                            "bot_id": target,
+                            "attempt": attempt + 1,
+                            "error": &e,
+                        }),
+                    );
+                    break;
                 }
                 if is_clock_or_authkey_error(&e) {
                     return Err(friendly_login_error(&e));

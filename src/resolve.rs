@@ -106,6 +106,23 @@ fn miss_key(short_code: &str, bot_id: &str) -> String {
     cache_key(short_code, bot_id)
 }
 
+/// `PM_FRESH_FIRST=1` enables the cold-miss mint rung (off by default).
+///
+/// Measured 2026-11-25: for a code that is cold everywhere the mint is a real
+/// relay (1.7-3.5 s), so it only front-loads the same cost and adds one call when
+/// it fails. For a code that is warm at the origin, the plain ask already answers
+/// from the stored row in ~0.2 s, so there is nothing to win either. The rung stays
+/// available for a caller that expects mostly warm-but-stale codes.
+fn fresh_first_enabled() -> bool {
+    match std::env::var("PM_FRESH_FIRST") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "yes"
+        }
+        Err(_) => false,
+    }
+}
+
 fn cache_key(short_code: &str, bot_id: &str) -> String {
     format!("{}:{}", short_code, bot_id)
 }
@@ -763,6 +780,20 @@ async fn resolve_shortcode_status_inner(
         return origin_unreachable_result();
     }
 
+    // Cold miss: try the mint before the origin's plain relay.
+    //
+    // OFF BY DEFAULT (`PM_FRESH_FIRST=1` enables it). Measured 2026-11-25: the
+    // origin-wide p50 for `fresh=1` is 0.139 s, but that average is dominated by
+    // codes that are already warm somewhere; for a code that is cold everywhere the
+    // mint is a real relay and cost 1.7-3.5 s, no better than the plain ask and one
+    // extra call when it fails. Kept as an opt-in rung for callers that expect
+    // mostly warm-but-stale codes.
+    if !bypass_cache && fresh_first_enabled() {
+        if let Some(body) = refresh_before_origin(short_code, &bot, None).await {
+            return (body, 200);
+        }
+    }
+
     let url = format!("{}/resolve-file", wp_api_base());
     let mut params = vec![
         ("short_code".to_string(), short_code.to_string()),
@@ -824,10 +855,17 @@ async fn resolve_shortcode_status_inner(
     }
 
     // Telegram background relay was just triggered: poll 3x (1.2s, 1.5s, 1.5s).
+    //
+    // The rungs ask for `fresh=1` (mint now) instead of `force=1&nocache=1`
+    // (refresh the stored reference). Measured on production origin traffic
+    // 2026-11-25 (400 samples each): fresh p50 0.139 s with 75 % 200s, force p50
+    // 0.485 s with 40 % 200s. A retry exists to OBTAIN an id, and the mint is the
+    // cheap way to get one; the forced refresh was the expensive way and it failed
+    // twice as often.
     let mut retry = params.clone();
-    if !retry.iter().any(|(k, _)| k == "force") {
-        retry.push(("force".to_string(), "1".to_string()));
-        retry.push(("nocache".to_string(), "1".to_string()));
+    retry.retain(|(k, _)| k != "force" && k != "nocache");
+    if !retry.iter().any(|(k, _)| k == "fresh") {
+        retry.push(("fresh".to_string(), "1".to_string()));
     }
     for delay in [1200u64, 1500, 1500] {
         tokio::time::sleep(Duration::from_millis(delay)).await;

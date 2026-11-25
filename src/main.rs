@@ -1626,10 +1626,20 @@ async fn main() -> anyhow::Result<()> {
     // 200 concurrent `upload.getFile` on one `Client` get reset by the DC
     // (measured: 914 x "Connection reset by peer (os error 104)"). The default
     // 8 is the shape the TS port holds 200/200 with (4 sessions x 4 in flight).
+    //
+    // 2026-11-25: default lowered 8 -> 3. Telegram does not refuse the extra
+    // requests, it silently stops answering on that session — measured on a
+    // one-bot install as `part stalled: no part in 12001ms with 12 of 12 permits
+    // free`, i.e. OUR gate was idle while the server had gone quiet (502 reports
+    // across 140 devices). MadelineProto reached the same conclusion in
+    // danog/MadelineProto#1948 and now puts at most 2 file requests on a media
+    // socket, learning the real limit per DC. grammers multiplexes a DC over one
+    // connection, so `inflight` IS that per-socket count: 4x3 = 12 parts in flight
+    // is the conservative shape that keeps a normal install playing.
     let inflight: usize = arg_value("--inflight")
         .or_else(|| storage::env("PM_INFLIGHT"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8)
+        .unwrap_or(3)
         .max(1);
     // Global cap on concurrent download responses: beyond it viewers get a
     // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.

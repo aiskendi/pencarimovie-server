@@ -256,6 +256,276 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     (skip0, want)
 }
 
+/* ── learned per-bot part window ─────────────────────────────────────────── */
+
+/// A LEARNED ceiling on concurrent `upload.getFile` parts for ONE bot.
+///
+/// WHY this exists (ported from MadelineProto 8.17.0, PR
+/// danog/MadelineProto#1948, 2026-11-01): `--inflight` is a LOCAL budget, and it
+/// was never the number the server measures. MEASURED 2026-11-25 on one bot
+/// (`pool_size: 1`), with the gate COMPLETELY free:
+///
+/// ```text
+/// download attempt failed {"error":"part stalled: no part in 12001ms with 12 of 12 permits free"}
+/// pre-flight stalled - rotating the worker before the retry {gate_free:12, gate_parts:12, next_wait_s:12}
+/// ```
+///
+/// Nothing was queueing for a permit, so the wait was not contention: the
+/// session already had too many file requests outstanding and the DC had stopped
+/// answering. The fix is the one MadelineProto shipped for the same bug — a
+/// window per bot that starts at the two requests a media socket carries, HALVES
+/// on every rejection (a stalled part, a dropped socket, a `FLOOD_WAIT`, a
+/// `-429`) and GROWS by one per full window of answers while requests are
+/// waiting, exactly like a TCP congestion window. No fixed number fits every
+/// session, so the number is learned.
+///
+/// Deliberately pure and deterministic: the socket side (the per-bot map, the
+/// queue and the clock) lives in [`file_window_slot()`], so this arithmetic is
+/// testable without a bot and without a clock.
+struct FileWindow {
+    limit: u32,
+    in_flight: u32,
+    answers_since_grow: u32,
+    /// `min(FILE_WINDOW_MAX, --inflight)` for this process. A field and not a
+    /// constant so `--inflight 1` is never exceeded even on paper.
+    cap: u32,
+}
+
+/// Where a bot's window starts: one media socket, two file requests — the shape
+/// MadelineProto gives `upload.getFile`.
+const FILE_WINDOW_START: u32 = 2;
+
+/// How far a window may grow before the process `--inflight` is applied. 8 is
+/// the default `--inflight`, i.e. the old fixed assumption is now the ceiling,
+/// not the starting point.
+const FILE_WINDOW_MAX: u32 = 8;
+
+impl FileWindow {
+    fn new() -> Self {
+        Self {
+            limit: FILE_WINDOW_START,
+            in_flight: 0,
+            answers_since_grow: 0,
+            cap: FILE_WINDOW_MAX,
+        }
+    }
+
+    fn with_cap(cap: u32) -> Self {
+        let cap = cap.clamp(1, FILE_WINDOW_MAX);
+        let mut w = Self::new();
+        w.cap = cap;
+        w.limit = FILE_WINDOW_START.min(cap);
+        w
+    }
+
+    fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// Take one part slot. `false` means the learned ceiling is reached — the
+    /// caller QUEUES for the next slot, it does not fail the part.
+    fn try_acquire(&mut self) -> bool {
+        if self.in_flight >= self.limit {
+            return false;
+        }
+        self.in_flight += 1;
+        true
+    }
+
+    fn release(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
+    /// One part came back. Grow by one after a FULL window of answers, and only
+    /// while every slot is taken: a fully used window is the evidence that
+    /// demand exceeds the limit, which is the probe TCP makes once per RTT. An
+    /// idle window must not creep upward, or a limit learned under load would
+    /// never be tested again.
+    ///
+    /// Call this BEFORE [`Self::release`] (the guard in [`file_window_slot()`]
+    /// does) so `in_flight` still counts the answer that just landed.
+    fn on_answer(&mut self) {
+        self.answers_since_grow = self.answers_since_grow.saturating_add(1);
+        if self.answers_since_grow >= self.limit
+            && self.in_flight >= self.limit
+            && self.limit < self.cap
+        {
+            self.limit += 1;
+            self.answers_since_grow = 0;
+        }
+    }
+
+    /// The server rejected a part (a stall, a dropped socket, a `FLOOD_WAIT`).
+    /// Halve with a floor of one, and reset the growth count: the next window
+    /// must be earned against the NEW limit, not resumed from a count that
+    /// belonged to the old one.
+    fn on_reject(&mut self) {
+        self.limit = (self.limit / 2).max(1);
+        self.answers_since_grow = 0;
+    }
+}
+
+/// A window per bot id, process-wide.
+///
+/// Bounded on purpose: on a fleet every device boots its own bot, so the set of
+/// ids is larger than the set that can be streaming at once. 64 is several times
+/// any real pool; past it IDLE windows are dropped first (a window with parts in
+/// flight is still counting) and the map is only cleared outright if every entry
+/// is live, which cannot happen with more than 64 concurrent bots.
+const FILE_WINDOW_BOTS: usize = 64;
+
+fn file_windows() -> std::sync::MutexGuard<'static, HashMap<String, FileWindow>> {
+    static WINDOWS: OnceLock<Mutex<HashMap<String, FileWindow>>> = OnceLock::new();
+    let map = WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    match map.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The key a bot id is learned under. An empty id is a real case (a request that
+/// has not settled on a bot yet), and one shared bucket is better than no
+/// backpressure at all.
+fn file_window_key(bot_id: &str) -> String {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        "*".to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// `min(FILE_WINDOW_MAX, --inflight)`: the window may never ask for more parts
+/// than the process is configured to run. Read once per window; the pool is
+/// published at boot and never resized.
+fn file_window_cap() -> u32 {
+    let inflight = crate::telegram::shared_pool()
+        .map(|p| p.inflight())
+        .unwrap_or(FILE_WINDOW_MAX as usize);
+    FILE_WINDOW_MAX.min(inflight.max(1) as u32)
+}
+
+fn file_window_try(key: &str) -> bool {
+    let mut map = file_windows();
+    if !map.contains_key(key) {
+        if map.len() >= FILE_WINDOW_BOTS {
+            map.retain(|_, w| w.in_flight > 0);
+            if map.len() >= FILE_WINDOW_BOTS {
+                map.clear();
+            }
+        }
+        map.insert(key.to_string(), FileWindow::with_cap(file_window_cap()));
+    }
+    match map.get_mut(key) {
+        Some(w) => w.try_acquire(),
+        None => false,
+    }
+}
+
+fn file_window_answer(bot_id: &str) {
+    if let Some(w) = file_windows().get_mut(&file_window_key(bot_id)) {
+        w.on_answer();
+    }
+}
+
+fn file_window_reject(bot_id: &str) {
+    if let Some(w) = file_windows().get_mut(&file_window_key(bot_id)) {
+        w.on_reject();
+    }
+}
+
+fn file_window_release(bot_id: &str) {
+    if let Some(w) = file_windows().get_mut(&file_window_key(bot_id)) {
+        w.release();
+    }
+}
+
+/// `in_flight of limit`, for the refusal message: a report has to show whether
+/// the bot's own window was the thing that was full.
+fn file_window_state(bot_id: &str) -> String {
+    match file_windows().get(&file_window_key(bot_id)) {
+        Some(w) => format!("{} of {} in flight", w.in_flight, w.limit()),
+        None => "no window".to_string(),
+    }
+}
+
+/// A held part slot. Releases on drop, INCLUDING when the fetch future is
+/// dropped mid-flight (the pre-flight's 12 s timeout, a cancelled body): a slot
+/// that leaked would shrink the window forever.
+struct FileWindowSlot(String);
+
+impl FileWindowSlot {
+    /// Record the answer BEFORE the slot is returned — see [`FileWindow::on_answer`].
+    fn answered(&self) {
+        file_window_answer(&self.0);
+    }
+
+    /// Record a rejection before the slot is returned.
+    fn rejected(&self) {
+        file_window_reject(&self.0);
+    }
+}
+
+impl Drop for FileWindowSlot {
+    fn drop(&mut self) {
+        file_window_release(&self.0);
+    }
+}
+
+/// Queue until this bot's learned window admits one more part.
+///
+/// No bound: this is the same contract as the `--inflight` gate ("requests
+/// queue, they never fail"), and every holder releases through
+/// [`FileWindowSlot`], including on cancellation.
+async fn file_window_slot(bot_id: &str) -> FileWindowSlot {
+    let key = file_window_key(bot_id);
+    let _ = file_window_queue(&key, None).await;
+    FileWindowSlot(key)
+}
+
+/// The same, bounded by `wait`, for the PRE-FLIGHT: a first byte has a router
+/// deadline in front of it, so waiting for a slot past that deadline has to
+/// become the pool-side "busy" answer instead of silence.
+async fn file_window_slot_within(
+    bot_id: &str,
+    wait: std::time::Duration,
+) -> Option<FileWindowSlot> {
+    let key = file_window_key(bot_id);
+    file_window_queue(&key, Some(wait))
+        .await
+        .then(|| FileWindowSlot(key))
+}
+
+async fn file_window_queue(key: &str, wait: Option<std::time::Duration>) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if file_window_try(key) {
+            return true;
+        }
+        if let Some(wait) = wait {
+            if started.elapsed() >= wait {
+                return false;
+            }
+        }
+        // Short poll: the window is a few integers under a mutex and the release
+        // that frees a slot happens on another task. 20 ms is below a part
+        // round-trip and keeps this from becoming a spin lock.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Does this part failure tell the window to BACK OFF?
+///
+/// A stall, a dropped socket and a rate limit are the server saying "too much".
+/// A dead `file_reference`, a bad auth key, or our own synthesized "busy" are
+/// not about rate at all, and must never shrink the window.
+fn window_rejects(e: &crate::telegram::GramErr) -> bool {
+    e.transport
+        || e.flood_wait.is_some()
+        || e.message.starts_with(PART_STALL_PREFIX)
+        || e.message.contains("(429)")
+}
+
 /// Fetch the preflight range in PARALLEL whenever it needs more than one part.
 ///
 /// WHICH requests this affects: `prime_window()` hands back 512 KB only when
@@ -286,6 +556,7 @@ async fn fetch_prime_gated(
     pos: u64,
     want: u64,
     wait: u64,
+    bot_id: &str,
 ) -> Result<Vec<u8>, crate::telegram::GramErr> {
     // BOUNDED, because this gate is shared with every other stream on the
     // connection and `fetch_range_core` waits for a permit FOREVER ("requests
@@ -299,7 +570,29 @@ async fn fetch_prime_gated(
     // A queued first byte has to become a fast, retryable answer instead of a
     // 30 s hang the router turns into a 503 the player cannot retry.
     let started = std::time::Instant::now();
-    match tokio::time::timeout(
+    // THE BOT'S OWN WINDOW IS TAKEN BEFORE THE STALL WINDOW STARTS.
+    //
+    // A part queued behind our own learned limit has not touched the wire, so it
+    // must not be reported as a stalled part: that would rotate a healthy socket
+    // AND halve the window — feeding the stall it was mistaken for. Waiting for
+    // a slot therefore has its own answer, `parts busy`, which the caller already
+    // knows to wait out, and its own bounded window.
+    let Some(window_slot) =
+        file_window_slot_within(bot_id, std::time::Duration::from_secs(wait)).await
+    else {
+        let waited = started.elapsed().as_millis();
+        return Err(crate::telegram::GramErr {
+            message: format!(
+                "{GATE_BUSY_PREFIX}: waited {waited}ms for this bot's part window ({}); not a stalled part",
+                file_window_state(bot_id)
+            ),
+            ..Default::default()
+        });
+    };
+    // Measured separately from `started`: the wire window must not include the
+    // time spent queueing behind our own limit.
+    let fetch_started = std::time::Instant::now();
+    let result = match tokio::time::timeout(
         std::time::Duration::from_secs(wait),
         prime_parts(client, prime_gate(), target, pos, want),
     )
@@ -319,7 +612,7 @@ async fn fetch_prime_gated(
         // they get different names. Reporting both as "parts busy" is what kept a
         // dead socket looking like a saturated pool.
         Err(_) => {
-            let waited = started.elapsed().as_millis();
+            let waited = fetch_started.elapsed().as_millis();
             let free = prime_gate().available_permits();
             let message = if free > 0 {
                 format!(
@@ -338,7 +631,45 @@ async fn fetch_prime_gated(
                 ..Default::default()
             })
         }
+    };
+    // Teach the learned window from the outcome. A SPLIT prime holds ONE slot
+    // and counts as one answer although it landed two parts: the split exists
+    // only to halve the first-byte wait, and growth is driven by body parts.
+    match &result {
+        Ok(_) => window_slot.answered(),
+        Err(e) if window_rejects(e) => window_slot.rejected(),
+        Err(_) => {}
     }
+    result
+}
+
+/// One part fetch under the bot's learned window.
+///
+/// This is the only way a body part is issued on the download paths below: the
+/// `--inflight` gate still bounds parts per CONNECTION exactly as before, and the
+/// window adds the per-BOT ceiling the DC actually measures. The result is
+/// returned unchanged — every caller's retry ladder (file reference, transport,
+/// busy) stays as it is; only the window learns from it.
+///
+/// The window slot is taken BEFORE the connection permit, so a part waiting on
+/// the bot's ceiling cannot sit on a permit that another part could use. There is
+/// no lock cycle: no path holds a connection permit while waiting for a window.
+async fn fetch_part_windowed(
+    entry: &crate::telegram::BotEntry,
+    bot_id: &str,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, crate::telegram::GramErr> {
+    let window_slot = file_window_slot(bot_id).await;
+    let (client, gate) = entry.pick_slot();
+    let result = crate::telegram::fetch_range_gated(&client, gate.as_ref(), target, pos, want).await;
+    match &result {
+        Ok(_) => window_slot.answered(),
+        Err(e) if window_rejects(e) => window_slot.rejected(),
+        Err(_) => {}
+    }
+    result
 }
 
 /// The prime itself, with no timeout: two parts in parallel when the head spans
@@ -1579,10 +1910,7 @@ pub async fn zip_probe_ok(
                 .await?;
                 let mut attempt = 0u32;
                 loop {
-                    let (client, gate) = entry.pick_slot();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
-                        .await
-                    {
+                    match fetch_part_windowed(&entry, &bot, &target, pos, want).await {
                         Ok(v) => return Ok(v),
                         Err(e) if e.file_reference && attempt == 0 => {
                             attempt += 1;
@@ -1651,10 +1979,7 @@ async fn serve_zip_split(
                 .await?;
                 let mut attempt = 0u32;
                 loop {
-                    let (client, gate) = entry.pick_slot();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
-                        .await
-                    {
+                    match fetch_part_windowed(&entry, &bot, &target, pos, want).await {
                         Ok(v) => return Ok(v),
                         Err(e) if e.file_reference && attempt == 0 => {
                             attempt += 1;
@@ -1801,10 +2126,7 @@ async fn serve_zip_split(
                         Ok(t) => t,
                         Err(e) => return Err(e),
                     };
-                    let (client, gate) = entry.pick_slot();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, w.pos, w.want)
-                        .await
-                    {
+                    match fetch_part_windowed(&entry, &bot, &target, w.pos, w.want).await {
                         Ok(v) => return Ok((w, v)),
                         Err(e) => {
                             if e.file_reference && attempt == 0 {
@@ -2100,10 +2422,7 @@ async fn serve_remux_split(
                 .await?;
                 let mut attempt = 0u32;
                 loop {
-                    let (client, gate) = entry.pick_slot();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, pos, want)
-                        .await
-                    {
+                    match fetch_part_windowed(&entry, &bot, &target, pos, want).await {
                         Ok(v) => return Ok(v),
                         Err(e) if e.file_reference && attempt == 0 => {
                             attempt += 1;
@@ -2646,9 +2965,7 @@ async fn handle_split_download(
                             Ok(t) => t,
                             Err(e) => return Err(e),
                         };
-                    let (client, gate) = entry.pick_slot();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, w.pos, w.want).await
-                    {
+                    match fetch_part_windowed(&entry, &bot, &target, w.pos, w.want).await {
                         Ok(v) => return Ok((w, v)),
                         Err(e) => {
                             if e.file_reference && attempt == 0 {
@@ -3749,7 +4066,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             Ok(guard) => Some(guard),
             Err(_) => None,
         };
-        match fetch_prime_gated(&client, &target, aligned, prime_want, prime_wait).await {
+        match fetch_prime_gated(&client, &target, aligned, prime_want, prime_wait, &bot_id).await {
             Ok(buf) => {
                 // The reference is PROVEN here, which is the earliest it can be
                 // proven — see [`mark_reference_verified`] for the measured loop
@@ -4596,11 +4913,8 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // is still final.
                 let mut attempt = 0u32;
                 loop {
-                    let (client, gate) = entry.pick_slot();
                     let target = target_shared.read().await.clone();
-                    match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w)
-                        .await
-                    {
+                    match fetch_part_windowed(&entry, &bot_for_refresh, &target, p, w).await {
                         Ok(v) => return (i, Ok(v)),
                         Err(e) => {
                             // A DEAD REFERENCE MID-BODY IS RECOVERABLE — refresh it
@@ -5401,5 +5715,176 @@ mod tests {
         // 7. Short buffers must NOT panic and return false
         assert!(!is_disguised_executable(&[b'M', b'Z'], "movie.mp4", "video/mp4"));
         assert!(!is_disguised_executable(&[], "movie.mp4", "video/mp4"));
+    }
+
+    /* learned per-bot part window -------------------------------------------- */
+
+    /// A window starts at the two requests one media socket carries: the third
+    /// part waits, and the first release admits exactly one more.
+    #[test]
+    fn a_file_window_starts_at_two_and_makes_the_third_part_wait() {
+        let mut w = FileWindow::new();
+        assert_eq!(w.limit(), 2, "MadelineProto's media-socket budget");
+        assert!(w.try_acquire());
+        assert!(w.try_acquire());
+        assert!(!w.try_acquire(), "a third part must wait for a release");
+        w.release();
+        assert!(w.try_acquire(), "the freed slot admits the queued part");
+        assert!(!w.try_acquire());
+    }
+
+    /// One more slot per full window of answers — never more than one, and only
+    /// while the window is saturated, so an idle bot does not creep to the cap.
+    #[test]
+    fn a_file_window_grows_one_per_saturated_window_of_answers() {
+        // One answer against a half-empty window proves nothing about demand.
+        let mut idle = FileWindow::new();
+        assert!(idle.try_acquire());
+        idle.on_answer();
+        assert_eq!(idle.limit(), 2, "an idle window must not grow");
+
+        let mut w = FileWindow::new();
+        assert!(w.try_acquire());
+        assert!(w.try_acquire());
+        w.on_answer();
+        assert_eq!(w.limit(), 2, "one answer is not a 2-wide window");
+        w.on_answer();
+        assert_eq!(w.limit(), 3, "two answers filled the 2-wide window");
+
+        // The next window is three answers wide.
+        assert!(w.try_acquire());
+        w.on_answer();
+        w.on_answer();
+        assert_eq!(w.limit(), 3, "two answers are not a 3-wide window");
+        w.on_answer();
+        assert_eq!(w.limit(), 4);
+
+        // And growth stops at the cap, never above it.
+        for _ in 0..64 {
+            while w.try_acquire() {}
+            w.on_answer();
+            w.release();
+        }
+        assert_eq!(w.limit(), FILE_WINDOW_MAX);
+
+        // `--inflight` below the cap is a hard ceiling, not a starting point.
+        let mut small = FileWindow::with_cap(3);
+        for _ in 0..64 {
+            while small.try_acquire() {}
+            small.on_answer();
+            small.release();
+        }
+        assert_eq!(small.limit(), 3, "the process inflight wins over the cap");
+    }
+
+    /// A rejection halves the window with a floor of ONE part, and a window that
+    /// is already at one stays there.
+    #[test]
+    fn a_file_window_halves_on_a_reject_with_a_floor_of_one() {
+        let mut w = FileWindow::new();
+        for _ in 0..64 {
+            while w.try_acquire() {}
+            w.on_answer();
+            w.release();
+        }
+        assert_eq!(w.limit(), FILE_WINDOW_MAX);
+        for _ in 0..64 {
+            w.release();
+        }
+        w.on_reject();
+        assert_eq!(w.limit(), 4);
+        w.on_reject();
+        assert_eq!(w.limit(), 2);
+        w.on_reject();
+        assert_eq!(w.limit(), 1);
+        w.on_reject();
+        assert_eq!(w.limit(), 1, "the floor is one part, never zero");
+
+        // A halving below the parts already out must not corrupt the count.
+        let mut held = FileWindow::new();
+        assert!(held.try_acquire());
+        assert!(held.try_acquire());
+        held.on_reject();
+        assert_eq!(held.limit(), 1);
+        assert!(!held.try_acquire(), "two parts are still out");
+        held.release();
+        assert!(!held.try_acquire(), "one part is still out");
+        held.release();
+        assert!(held.try_acquire());
+    }
+
+    /// A rejection restarts the growth count: answers counted against the old,
+    /// larger limit must not grow the new one early.
+    #[test]
+    fn a_reject_restarts_the_growth_window() {
+        let mut w = FileWindow::new();
+        for _ in 0..64 {
+            while w.try_acquire() {}
+            w.on_answer();
+            w.release();
+        }
+        assert_eq!(w.limit(), FILE_WINDOW_MAX);
+        // Five answers against the (capped) 8-wide window: still short of it.
+        for _ in 0..5 {
+            while w.try_acquire() {}
+            w.on_answer();
+            w.release();
+        }
+        assert_eq!(w.limit(), FILE_WINDOW_MAX);
+
+        // A rejection halves to 4 and must discard those five answers.
+        for _ in 0..64 {
+            w.release();
+        }
+        w.on_reject();
+        assert_eq!(w.limit(), 4);
+        // Three answers against a 4-wide window stay short of it. With the stale
+        // count (5 + 1 already >= 4) the FIRST of them would have grown it.
+        for _ in 0..3 {
+            while w.try_acquire() {}
+            w.on_answer();
+            w.release();
+        }
+        assert_eq!(w.limit(), 4, "growth must not resume from the stale count");
+        // The fourth answer completes the new window and earns the next slot.
+        while w.try_acquire() {}
+        w.on_answer();
+        w.release();
+        assert_eq!(w.limit(), 5);
+    }
+
+    /// Only the server's "too much" answers may shrink a window; our own busy
+    /// refusal and a dead reference are not rate signals.
+    #[test]
+    fn only_a_stall_flood_or_dropped_socket_shrinks_the_window() {
+        let stall = crate::telegram::GramErr {
+            message: format!("{PART_STALL_PREFIX}: no part in 12000ms with 12 of 12 permits free"),
+            transport: true,
+            ..Default::default()
+        };
+        assert!(window_rejects(&stall));
+        let flood = crate::telegram::GramErr {
+            message: "FLOOD_WAIT (420)".to_string(),
+            flood_wait: Some(30),
+            ..Default::default()
+        };
+        assert!(window_rejects(&flood));
+        let dropped = crate::telegram::GramErr {
+            message: "request error: connection reset by peer (os error 104)".to_string(),
+            transport: true,
+            ..Default::default()
+        };
+        assert!(window_rejects(&dropped));
+        let busy = crate::telegram::GramErr {
+            message: format!("{GATE_BUSY_PREFIX}: waited 12000ms for this bot's part window"),
+            ..Default::default()
+        };
+        assert!(!window_rejects(&busy), "our own queue must not halve the window");
+        let dead = crate::telegram::GramErr {
+            message: "FILE_REFERENCE_EXPIRED (400)".to_string(),
+            file_reference: true,
+            ..Default::default()
+        };
+        assert!(!window_rejects(&dead));
     }
 }

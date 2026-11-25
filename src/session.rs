@@ -2093,6 +2093,73 @@ pub async fn auto_provision_guest(
     }
 }
 
+/// Sign in ONE api_id lane's bot.
+///
+/// A lane's bot is deliberately NOT written to `bot_pool.json`: that file is the
+/// candidate list for the DEFAULT lane, and a bot signed in on another api_id
+/// cannot use the default lane's `file_reference` (it answers 410). The binding
+/// lives in `api_ids.json` (`bot_id`), which also survives a restart.
+///
+/// Costs one origin lease when the lane has no usable session, which is why the
+/// caller runs this detached and per lane.
+pub async fn provision_lane(
+    lane: &std::sync::Arc<crate::lanes::Lane>,
+) -> Result<ProvisionResult, String> {
+    let stored = lane.bot_id();
+    if !stored.is_empty() && !is_bot_dead(&stored) && crate::telegram::has_session_file(&stored) {
+        match lane.pool.boot(&stored, None).await {
+            Ok(entry) => {
+                let id = if entry.identity.id.is_empty() {
+                    stored
+                } else {
+                    entry.identity.id.clone()
+                };
+                lane.set_bot_id(&id);
+                crate::lanes::set_lane_bot(lane.api_id, &id);
+                if let Some(reg) = crate::lanes::registry() {
+                    reg.register_bot(&id, lane);
+                }
+                return Ok(ProvisionResult {
+                    bot_id: id,
+                    bot_username: entry.identity.username.clone(),
+                    bot_name: entry.identity.first_name.clone(),
+                    error: None,
+                });
+            }
+            Err(e) => log(
+                "lane bot could not resume its stored session",
+                &serde_json::json!({"api_id": lane.api_id, "bot_id": stored, "error": e}),
+            ),
+        }
+    }
+    let res = lease_guest_bot_with(&lane.pool, true).await?;
+    let id = res.bot_id.trim().to_string();
+    if id.is_empty() {
+        return Err("the origin leased a bot with no id".to_string());
+    }
+    // Two lanes sharing a bot is two clients on ONE session file and one
+    // api_id — the exact shape lanes must not have.
+    if id == get_bot_id() {
+        return Err(format!(
+            "the origin leased the default lane's bot ({}) to a second api_id",
+            id
+        ));
+    }
+    lane.set_bot_id(&id);
+    crate::lanes::set_lane_bot(lane.api_id, &id);
+    if let Some(reg) = crate::lanes::registry() {
+        reg.register_bot(&id, lane);
+    }
+    log(
+        "lane bot ready",
+        &serde_json::json!({"api_id": lane.api_id, "bot_id": id}),
+    );
+    Ok(ProvisionResult {
+        bot_id: id,
+        ..res
+    })
+}
+
 /// How many guest logins ONE call may attempt.
 ///
 /// A lease is one bot token, so a `FLOOD_WAIT` on it says nothing about the
@@ -2120,6 +2187,19 @@ fn token_already_tried(tried: &[String], token: &str) -> bool {
 /// becomes the active one (provisioning takes the first, `ensure_pool_size()`
 /// keeps the bot that is already active).
 async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<ProvisionResult, String> {
+    lease_guest_bot_with(tg, false).await
+}
+
+/// [`lease_guest_bot()`], with `beside_pool` for an API LANE.
+///
+/// A lane needs its own bot even though the install's default lane already has a
+/// working one — that is the whole point of a lane (a bot on another api_id).
+/// The pool guard below exists to stop an install growing a second guest bot
+/// beside the one it already owns, which is not what a lane lease is.
+async fn lease_guest_bot_with(
+    tg: &crate::telegram::TelegramPool,
+    beside_pool: bool,
+) -> Result<ProvisionResult, String> {
     // A POOL IS THE OPERATOR'S. Never lease next to one that can still serve.
     //
     // `/api/provision` used to lease whenever the *active* bot could not be
@@ -2130,7 +2210,7 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
     // once nothing on file can serve — which includes the case where every
     // `BOT_TOKENS` entry is retired (that variable cannot be edited at runtime).
     let pool = get_bot_pool();
-    if !pool.is_empty() && !pool_is_all_dead(&pool) {
+    if !beside_pool && !pool.is_empty() && !pool_is_all_dead(&pool) {
         return Err(
             "The bot pool still has a usable bot, so no guest bot was leased. Remove the dead ones and add a working token."
                 .to_string(),

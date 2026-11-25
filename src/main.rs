@@ -36,6 +36,7 @@ mod music;
 mod music_addon;
 mod fileid;
 mod httpc;
+mod lanes;
 mod log;
 mod matcher;
 mod media_probe;
@@ -1740,14 +1741,97 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
 
-    let telegram_pool = Arc::new(telegram::TelegramPool::new(workers, inflight));
-    // Published once, before the first request can resolve a short code: the mint
-    // that `resolve.rs` performs goes through this same pool.
-    telegram::share_pool(telegram_pool.clone());
     // The per-response read-ahead, published for `download.rs` (which holds no
     // state handle). Printed in the banner below, so a throughput report always
     // names the depth it was measured at.
     download::set_stream_prefetch(stream_prefetch);
+
+    // ── api_id lanes ────────────────────────────────────────────────────────
+    //
+    // ONE process, several Telegram applications. Measured on the VPS
+    // (2026-11-26): four api_ids in four processes did 37.9 MB/s while one lane
+    // never passed ~11, and two bots on ONE api_id added up to nothing (5.74
+    // combined). So a second lane is only worth opening on a DIFFERENT api_id —
+    // which is what `api_ids.json` holds (or the legacy credential, alone).
+    //
+    // An install with one api_id gets exactly one lane, whose pool IS the process
+    // pool, so every existing behaviour (candidate order, mint, provisioning) is
+    // untouched and `download.rs` keeps its single-lane path.
+    let lane_workers: usize = arg_value("--lane-workers")
+        .or_else(|| storage::env("PM_LANE_WORKERS"))
+        .and_then(|s| s.parse().ok())
+        // 8, not `workers`: 4 lanes x 16 would be 64 sockets, the width that
+        // already measured SLOWER than 4 x 8 (one lane saturates long before 16
+        // connections; the ceiling is the api_id).
+        .unwrap_or(8)
+        .max(1);
+    let stream_lanes: Option<usize> = match arg_value("--stream-lanes")
+        .or_else(|| storage::env("PM_STREAM_LANES"))
+    {
+        Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("auto") => v.parse::<usize>().ok(),
+        _ => None,
+    };
+    let lane_entries = lanes::load_entries();
+    let lane_specs: Vec<(i32, String)> = lane_entries
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| (e.api_id, e.api_hash.clone()))
+        .collect();
+    let default_spec = lane_specs.first().cloned();
+    let default_api_id = default_spec.as_ref().map(|s| s.0).unwrap_or(0);
+
+    // The PROCESS pool is lane 1, and it carries that lane's credentials. With
+    // lanes configured, letting `boot()` re-read the credential file could sign
+    // lane 1's bot in under a DIFFERENT api_id than the dispatcher believes —
+    // i.e. two lanes quietly sharing one ceiling. `None` (no credential at all)
+    // keeps the legacy path, where boot fetches them from the origin.
+    let telegram_pool = match &default_spec {
+        Some((api_id, hash)) => Arc::new(telegram::TelegramPool::for_lane(
+            *api_id,
+            hash,
+            workers,
+            inflight,
+        )),
+        None => Arc::new(telegram::TelegramPool::new(workers, inflight)),
+    };
+    // Published once, before the first request can resolve a short code: the mint
+    // that `resolve.rs` performs goes through this same pool.
+    telegram::share_pool(telegram_pool.clone());
+
+    let default_lane =
+        lanes::Lane::new(default_api_id, telegram_pool.clone(), &session::get_bot_id());
+    let mut extra_lanes: Vec<std::sync::Arc<lanes::Lane>> = Vec::new();
+    for (api_id, hash) in lane_specs.iter().skip(1) {
+        let stored_bot = lane_entries
+            .iter()
+            .find(|e| e.api_id == *api_id)
+            .map(|e| e.bot_id.clone())
+            .unwrap_or_default();
+        let pool = Arc::new(telegram::TelegramPool::for_lane(
+            *api_id,
+            hash,
+            lane_workers,
+            inflight,
+        ));
+        extra_lanes.push(lanes::Lane::new(*api_id, pool, &stored_bot));
+    }
+    // `--stream-lanes N` forces a subset (1 = the legacy single-lane path).
+    if let Some(n) = stream_lanes {
+        extra_lanes.truncate(n.saturating_sub(1));
+    }
+    let lane_count = 1 + extra_lanes.len();
+    lanes::publish(lanes::LaneRegistry::new(default_lane, extra_lanes));
+    if lane_count > 1 {
+        log::stderr_log(
+            "api_id lanes configured",
+            Some(&serde_json::json!({
+                "lanes": lane_count,
+                "lane_workers": lane_workers,
+                "parts_per_lane": lane_workers * inflight,
+                "parts_total": lane_count * lane_workers * inflight,
+            })),
+        );
+    }
     let state = Arc::new(AppState {
         port,
         workers,
@@ -1848,11 +1932,65 @@ async fn main() -> anyhow::Result<()> {
     // anyone who wants a bigger pool adds their own bots via `BOT_TOKENS`.
     {
         let pool_state = state.clone();
+        let lanes_total = lane_count;
         tokio::spawn(async move {
             let have = session::ensure_guest_bot(&pool_state.telegram).await;
             log::stderr_log(
                 "guest bot ready",
                 Some(&serde_json::json!({ "bots": have })),
+            );
+            // The default lane follows the ACTIVE bot, which a fresh provision
+            // may have just replaced: a lane pinned to the old id would boot a
+            // dead session on every part.
+            if let Some(reg) = lanes::registry() {
+                let active = session::get_bot_id();
+                if !active.is_empty() {
+                    let lane = reg.default_lane();
+                    lane.set_bot_id(&active);
+                    reg.register_bot(&active, &lane);
+                }
+            }
+            // Extra lanes, AFTER the default one: a lane lease is an origin
+            // round-trip plus a Telegram login, and the two are independent, so
+            // they run in parallel with each other but not with the install's
+            // own bot (which the origin has just counted).
+            let Some(reg) = lanes::registry() else {
+                return;
+            };
+            let all = reg.lanes();
+            if all.len() < 2 {
+                return;
+            }
+            let mut handles = Vec::new();
+            for lane in all.into_iter().skip(1) {
+                handles.push(tokio::spawn(async move {
+                    match session::provision_lane(&lane).await {
+                        Ok(res) => {
+                            log::stderr_log(
+                                "lane bot ready",
+                                Some(&serde_json::json!({
+                                    "api_id": lane.api_id,
+                                    "bot_id": res.bot_id,
+                                    "username": res.bot_username,
+                                })),
+                            );
+                        }
+                        Err(e) => log::stderr_log(
+                            "lane provision failed",
+                            Some(&serde_json::json!({"api_id": lane.api_id, "error": e})),
+                        ),
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+            let ready = lanes::registry()
+                .map(|r| r.lanes().iter().filter(|l| l.has_bot()).count())
+                .unwrap_or(0);
+            log::stderr_log(
+                "api_id lanes ready",
+                Some(&serde_json::json!({ "ready": ready, "lanes": lanes_total })),
             );
         });
     }
@@ -1923,9 +2061,21 @@ async fn main() -> anyhow::Result<()> {
     // (`FreeConsole`), so a banner here would only flash and vanish. The same
     // information already goes to storage/server.log (tray "Open log"), and it has
     // already gone to stderr above in the "listening" line.
+    // Lanes only print when there is more than one: a single-lane install has
+    // nothing to say on the subject, and the line would read as a new knob.
+    let lanes_banner = if lane_count > 1 {
+        format!(
+            "\n  Lanes:       {} api_id(s) x {} workers = {} parts in flight",
+            lane_count,
+            lane_workers,
+            lane_count * lane_workers * inflight
+        )
+    } else {
+        String::new()
+    };
     if !tray_requested {
         println!(
-            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Prefetch:    {} part(s) in flight per response\n  Max streams: {}\n  Public mode: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
+            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total){}\n  Prefetch:    {} part(s) in flight per response\n  Max streams: {}\n  Public mode: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
             shown,
             port,
             host,
@@ -1934,6 +2084,7 @@ async fn main() -> anyhow::Result<()> {
             workers,
             inflight,
             workers * inflight,
+            lanes_banner,
             stream_prefetch,
             max_streams,
             if public {

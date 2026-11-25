@@ -353,7 +353,10 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
             format!("file_id type {} has no document to resend", decoded.type_name),
         ));
     }
-    let Some(pool) = telegram::shared_pool() else {
+    // The pool that OWNS this bot: with api_id lanes, a bot belongs to the lane
+    // whose credentials it signed in with, and booting it on the default pool
+    // would be a second login for the same session under another application.
+    let Some(pool) = crate::lanes::pool_for_bot(bot_id) else {
         return Err(MintError::new(
             "no_pool",
             "this process has published no Telegram pool yet",

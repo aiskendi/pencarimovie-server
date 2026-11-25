@@ -135,6 +135,16 @@ fn diagnostics_payload(reports: Vec<Value>) -> Value {
             "resolve_cooldown_s": crate::resolve::resolve_cooldown_remaining_sec(),
         },
         "reports": reports,
+        // Per-lane speed: the SAME numbers the dispatcher weights by, so a
+        // throughput report can name the lane that was slow instead of guessing.
+        // One entry on a single-api_id install; empty only before boot publishes
+        // a registry.
+        "lanes": crate::lanes::registry()
+            .map(|r| r.lanes().iter().map(|l| l.to_json()).collect::<Vec<Value>>())
+            .unwrap_or_default(),
+        "lanes_total_mbps": crate::lanes::registry()
+            .map(|r| (r.total_mbps() * 100.0).round() / 100.0)
+            .unwrap_or(0.0),
     })
 }
 
@@ -1157,6 +1167,137 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     /* ── bots (backend.php:18928-19112) ───────────────────────────────────── */
+    /* ── api_id lanes ─────────────────────────────────────────────────────── */
+    //
+    // `api_ids.json` holds Telegram application credentials. The HASH is a secret
+    // of the same class as a bot token, so it only ever leaves in masked form:
+    // a route body gets pasted into chats, bug reports and screenshots.
+    if p == "/api/api-ids" && m == "GET" {
+        if let Some(resp) = require_trusted_device(&ctx) {
+            return resp;
+        }
+        let rows = crate::lanes::public_rows();
+        let reg = crate::lanes::registry();
+        let lanes: Vec<Value> = reg
+            .as_ref()
+            .map(|r| r.lanes().iter().map(|l| l.to_json()).collect())
+            .unwrap_or_default();
+        let total = reg.as_ref().map(|r| r.total_mbps()).unwrap_or(0.0);
+        return json_response(
+            200,
+            &serde_json::json!({
+                "ok": 1,
+                "total": rows.len(),
+                "enabled": rows
+                    .iter()
+                    .filter(|r| r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .count(),
+                "api_ids": rows,
+                "active_lanes": lanes,
+                "lanes_total_mbps": (total * 100.0).round() / 100.0,
+            }),
+        );
+    }
+
+    if p == "/api/api-ids/add" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
+        let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let api_id = input
+            .get("api_id")
+            .map(|v| match v {
+                Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
+                Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        let api_hash = input.get("api_hash").and_then(|v| v.as_str()).unwrap_or("");
+        return match crate::lanes::add_entry(api_id, api_hash) {
+            Ok(e) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "api_id": e.api_id,
+                    "api_hash": crate::lanes::masked_hash(&e.api_hash),
+                    // The registry is built once, at boot: a lane added now would
+                    // otherwise look active while nothing opened a connection for
+                    // it. Say so instead of implying it took effect.
+                    "restart_required": true,
+                    "message": "Saved. This lane opens on the next start of the server.",
+                }),
+            ),
+            Err(e) => json_response(400, &serde_json::json!({"ok": 0, "message": e})),
+        };
+    }
+
+    if p == "/api/api-ids/remove" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
+        let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let api_id = input
+            .get("api_id")
+            .map(|v| match v {
+                Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
+                Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            })
+            .or_else(|| ctx.qs("api_id").trim().parse().ok())
+            .unwrap_or(0);
+        return match crate::lanes::remove_entry(api_id) {
+            Ok(true) => json_response(
+                200,
+                &serde_json::json!({"ok": 1, "api_id": api_id, "restart_required": true}),
+            ),
+            Ok(false) => json_response(
+                404,
+                &serde_json::json!({"ok": 0, "message": format!("api_id {} is not in the pool", api_id)}),
+            ),
+            Err(e) => json_response(500, &serde_json::json!({"ok": 0, "message": e})),
+        };
+    }
+
+    if p == "/api/api-ids/set-enabled" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
+        }
+        let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
+        let api_id = input
+            .get("api_id")
+            .map(|v| match v {
+                Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
+                Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            })
+            .unwrap_or(0);
+        let enabled = input
+            .get("enabled")
+            .and_then(|v| {
+                v.as_bool().or_else(|| {
+                    v.as_str()
+                        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+                })
+            })
+            .unwrap_or(false);
+        return match crate::lanes::set_enabled(api_id, enabled) {
+            Ok(true) => json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "api_id": api_id,
+                    "enabled": enabled,
+                    "restart_required": true,
+                }),
+            ),
+            Ok(false) => json_response(
+                404,
+                &serde_json::json!({"ok": 0, "message": format!("api_id {} is not in the pool", api_id)}),
+            ),
+            Err(e) => json_response(500, &serde_json::json!({"ok": 0, "message": e})),
+        };
+    }
+
     if p == "/api/bots" && m == "GET" {
         // Bot ids and usernames are the install's Telegram identity. They are not
         // secrets, but they are not for strangers either.

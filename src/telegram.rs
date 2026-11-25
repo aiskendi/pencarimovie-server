@@ -384,6 +384,16 @@ pub struct TelegramPool {
     inflight: usize,
     bots: tokio::sync::Mutex<HashMap<String, Arc<BotEntry>>>,
     boot_lock: tokio::sync::Mutex<()>,
+    /// The api_id/api_hash this pool's connections are opened with.
+    ///
+    /// `None` is the process pool: it keeps the legacy behaviour of reading
+    /// `storage/api_credentials.json` (or `FD_API_ID`) at boot and falling back
+    /// to the origin, which is what every single-api_id install relies on.
+    /// `Some(..)` is a LANE pool: it uses exactly this pair and never falls back,
+    /// because silently signing a lane's bot in under another application's
+    /// api_id would put two lanes back on one ceiling — the thing lanes exist to
+    /// get away from.
+    creds: Option<(i32, String)>,
 }
 
 /// The pool the PROCESS boots from, for layers that hold no `AppState`.
@@ -410,7 +420,21 @@ impl TelegramPool {
             inflight: inflight.max(1),
             bots: tokio::sync::Mutex::new(HashMap::new()),
             boot_lock: tokio::sync::Mutex::new(()),
+            creds: None,
         }
+    }
+
+    /// A pool whose connections belong to ONE api_id (a lane).
+    pub fn for_lane(api_id: i32, api_hash: &str, workers: usize, inflight: usize) -> Self {
+        Self {
+            creds: Some((api_id, api_hash.trim().to_string())),
+            ..Self::new(workers, inflight)
+        }
+    }
+
+    /// The api_id this pool signs in with, or `0` for the process pool.
+    pub fn api_id(&self) -> i32 {
+        self.creds.as_ref().map(|c| c.0).unwrap_or(0)
     }
 
     pub fn workers(&self) -> usize {
@@ -499,6 +523,8 @@ impl TelegramPool {
                 "bot_id": key,
                 "login": token.is_some(),
                 "workers": self.workers,
+                // The lane identity: an api_id, never the hash.
+                "api_id": self.api_id(),
             }),
         );
         let _guard = self.boot_lock.lock().await;
@@ -506,10 +532,13 @@ impl TelegramPool {
             return Ok(entry);
         }
 
-        let mut creds = load_cached_api_credentials();
+        let mut creds = self.creds.clone();
         if creds.is_none() {
-            if let Some(t) = token {
-                creds = fetch_credentials_from_wordpress(t).await;
+            creds = load_cached_api_credentials();
+            if creds.is_none() {
+                if let Some(t) = token {
+                    creds = fetch_credentials_from_wordpress(t).await;
+                }
             }
         }
         let (api_id, api_hash) = creds.ok_or_else(|| {

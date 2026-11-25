@@ -659,9 +659,12 @@ impl LaneRegistry {
     }
 
     pub fn total_mbps(&self) -> f64 {
+        // Only lanes that have actually carried a part: an unmeasured lane holds
+        // the neutral starting EWMA, and summing those invented 24 MB/s on a
+        // four-lane box whose only working lane was doing 5.6.
         self.lanes
             .iter()
-            .filter(|l| l.usable())
+            .filter(|l| l.usable() && l.stats.parts_ok() > 0)
             .map(|l| l.stats.ewma_mbps())
             .sum()
     }

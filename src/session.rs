@@ -880,10 +880,13 @@ pub fn flood_seconds_in(text: &str) -> i64 {
     parse_flood_seconds(text)
 }
 
-/// Seconds left on the recorded INSTANCE-wide wait (0 = nothing / expired).
+/// Seconds left on the recorded ID-LESS wait (0 = nothing / expired).
 ///
-/// Only the guest lease uses this: a guest bot has no id to key a per-token wait
-/// on until the lease answers. Every named bot uses [`flood_remaining_for()`].
+/// This is the fallback record for a failure that carries NO bot identity to key
+/// on ([`note_flood_for()`] with an empty id). Every known bot — including a
+/// leased guest, whose token names its bot — uses [`flood_remaining_for()`]. The
+/// guest lease deliberately does NOT read this record: a fresh lease is another
+/// bot, so one bot's wait cannot gate it.
 pub fn flood_remaining() -> i64 {
     crate::cache::get(FLOOD_NS, FLOOD_KEY)
         .and_then(|v| v.get("until").and_then(|u| u.as_i64()))
@@ -901,8 +904,23 @@ pub fn flood_last_error() -> String {
         .unwrap_or_default()
 }
 
-/// Record a `FLOOD_WAIT` seen in a boot error. Returns the seconds recorded
-/// (0 when the error was not a flood wait). Never shortens an existing wait.
+/// The Telegram error text recorded for ONE bot, verbatim (same record
+/// [`flood_remaining_for()`] reads). Used when a refused login has to quote
+/// Telegram instead of this code's own wording.
+fn flood_last_error_for(bot_id: &str) -> String {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return flood_last_error();
+    }
+    crate::cache::get(FLOOD_NS, &format!("bot:{}", id))
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Record a `FLOOD_WAIT` seen in a boot error when NO bot identity is known.
+/// Returns the seconds recorded (0 when the error was not a flood wait). Never
+/// shortens an existing wait. Prefer [`note_flood_for()`], which keys the record
+/// to the bot Telegram actually refused.
 pub fn note_flood(error: &str) -> i64 {
     let secs = parse_flood_seconds(error);
     if secs <= 0 {
@@ -1418,6 +1436,65 @@ mod tests {
         assert!(flood_remaining() <= 30);
     }
 
+    /// A FLOOD_WAIT belongs to ONE bot and every guest lease is another bot, so a
+    /// flooded attempt must not end the call — only the per-call budget stops it.
+    /// This is the 2026-11-25 report: one bot waited while every guest attempt was
+    /// refused before it started, even though the next lease would have signed in.
+    #[test]
+    fn a_flooded_attempt_does_not_stop_the_next_one() {
+        assert!(
+            should_try_next_attempt(1, GUEST_LOGIN_ATTEMPTS, true),
+            "the second lease is a different bot and must be attempted"
+        );
+        assert!(should_try_next_attempt(2, 3, true));
+        assert!(
+            !should_try_next_attempt(3, 3, true),
+            "the third attempt is the budget, not the wait"
+        );
+        assert!(
+            !should_try_next_attempt(0, 3, false),
+            "a non-flood failure is not retried by this decision"
+        );
+        assert_eq!(GUEST_LOGIN_ATTEMPTS, 3, "the retry budget is a constant");
+    }
+
+    /// A lease that comes back with the SAME token cannot be attempted again: the
+    /// wait is per bot, so that login is refused before Telegram is reached.
+    #[test]
+    fn a_token_already_tried_is_not_reused() {
+        let tried = vec!["8582733572:AAfirst".to_string()];
+        assert!(token_already_tried(&tried, "8582733572:AAfirst"));
+        assert!(
+            !token_already_tried(&tried, "8990816622:AAsecond"),
+            "a different bot is a fresh attempt"
+        );
+        assert!(!token_already_tried(&[], "8582733572:AAfirst"));
+        assert!(
+            !token_already_tried(&tried, ""),
+            "an empty token is handled by the missing-token branch, not here"
+        );
+    }
+
+    /// The refusal must quote Telegram, not this code's own wording, and it must
+    /// read the record of the bot that refused — never the id-less one.
+    #[test]
+    fn the_flood_refusal_quotes_the_refused_bot() {
+        let _guard = flood_test_guard();
+        note_flood_for(
+            "bot_quote_probe",
+            "bot sign-in failed: request error: rpc error 420: FLOOD_WAIT caused by \
+             auth.importBotAuthorization (value: 900)",
+        );
+        let said = flood_last_error_for("bot_quote_probe");
+        assert!(said.contains("FLOOD_WAIT"), "quote Telegram, not our wording: {said}");
+        assert!(said.contains("value: 900"));
+        assert_eq!(
+            flood_last_error_for("bot_not_refused"),
+            "",
+            "a different bot's record must not be quoted"
+        );
+    }
+
     /// Each lock test drives its OWN file under the temp dir.
     ///
     /// `storage/guest_provision.lock` is process-global: the runtime writes it, and
@@ -1689,29 +1766,20 @@ fn random_suffix() -> String {
 pub async fn auto_provision_guest(
     tg: &crate::telegram::TelegramPool,
 ) -> Result<ProvisionResult, ProvisionResult> {
-    // ── login flood guard ─────────────────────────────────────────────────
-    // Never attempt a login while Telegram's FLOOD_WAIT is still running: the
-    // attempt would fail AND push the wait further out, which is how a retrying
-    // public addon locks itself out. Answer instantly instead.
-    // Only the GUEST lease is gated instance-wide: it has no bot id to key on
-    // yet. A named bot's wait is per token, so a BOT_TOKENS deploy never blocks
-    // its healthy bots behind an unrelated bot's FLOOD_WAIT.
-    let flood = if env_bot_tokens().is_empty() { flood_remaining() } else { 0 };
-    if flood > 0 {
-        let last = flood_last_error();
-        return Err(ProvisionResult::error(if last.is_empty() {
-            format!(
-                "Telegram rate limit: bot login paused for another {}s. Please retry shortly.",
-                flood
-            )
-        } else {
-            // Quote Telegram, do not paraphrase it.
-            format!(
-                "Telegram rate limit: bot login paused for another {}s.\nTelegram said: {}",
-                flood, last
-            )
-        }));
-    }
+    // ── NO instance-wide login gate ───────────────────────────────────────
+    // A `420 FLOOD_WAIT` on `auth.importBotAuthorization` belongs to ONE bot.
+    // Measured live: a flooded bot sat in its wait while a DIFFERENT token signed
+    // in immediately. Every guest attempt below leases a fresh token from the
+    // origin, which is a different bot — so another bot's wait must never stop
+    // this call, and the attempt runs.
+    //
+    // The wait is recorded where the identity is known (`lease_guest_bot()` ->
+    // `note_flood_for()`), and `TelegramPool::boot()` still refuses to re-login
+    // a bot that already has a wait, so nothing here re-arms a throttle. Only a
+    // failure with no bot id at all falls back to the id-less record.
+    //
+    // The error shape that used to be returned here is now produced when every
+    // attempt in one call was flooded (see `lease_guest_bot`), quoting Telegram.
 
     // ── clock pre-check ───────────────────────────────────────────────────
     let clock = measure_clock_offset().await;
@@ -2025,6 +2093,28 @@ pub async fn auto_provision_guest(
     }
 }
 
+/// How many guest logins ONE call may attempt.
+///
+/// A lease is one bot token, so a `FLOOD_WAIT` on it says nothing about the
+/// next lease — the origin hands out a different bot each time. The budget is
+/// per call on purpose: a background loop would be the very retry storm that
+/// arms a longer wait.
+const GUEST_LOGIN_ATTEMPTS: u32 = 3;
+
+/// Keep trying after a flood while attempts remain. A non-flood failure has its
+/// own branch (transient = stop and quote Telegram, refused token = retire at
+/// the origin and lease another), so it never asks this.
+fn should_try_next_attempt(attempts: u32, max: u32, flooded: bool) -> bool {
+    flooded && attempts < max
+}
+
+/// A token the origin already handed out in THIS call is not attempted again:
+/// a flood is per bot, so the same bot can only fail the same way, and
+/// `boot()` would refuse it from its per-bot record before Telegram is reached.
+fn token_already_tried(tried: &[String], token: &str) -> bool {
+    !token.is_empty() && tried.iter().any(|t| t == token)
+}
+
 /// One lease from the origin's bot pool: `GET /provision-session`, then log that
 /// bot in here. Never touches `session_meta.json` — the caller decides which bot
 /// becomes the active one (provisioning takes the first, `ensure_pool_size()`
@@ -2047,6 +2137,15 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
         );
     }
     let mut last_error: Option<String> = None;
+    // Every token this call has already attempted. A fresh lease is normally a
+    // different bot; if the origin hands the same one back, skip it instead of
+    // spending an attempt on a login that cannot succeed.
+    let mut tried_tokens: Vec<String> = Vec::new();
+    // How many logins were attempted, and how many of those Telegram refused
+    // with a flood — "all attempts flooded" returns the rate-limit shape below.
+    let mut login_failures: u32 = 0;
+    let mut flood_failures: u32 = 0;
+    let mut last_flooded_bot: Option<String> = None;
     // One keypair per install: the origin seals the bot token to it, so a
     // captured response (proxy log, CDN, another install) cannot be reused.
     let (provision_pk, provision_sk) = crate::credentials::provision_keypair();
@@ -2060,10 +2159,9 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
         ("X-PM-Device".to_string(), device_id.clone()),
     ];
 
-    // Up to three DIFFERENT bots. A refused token retires that bot at the origin
-    // (report_failed_lease below), so the next iteration leases another one
-    // instead of failing the guest.
-    for attempt in 0..3 {
+    // Up to GUEST_LOGIN_ATTEMPTS different bots. A flooded or refused token ends
+    // only ITS attempt: the next lease is another bot, so it gets its own login.
+    for attempt in 0..GUEST_LOGIN_ATTEMPTS {
         if attempt > 0 {
             // A failed login already cost the origin a lease; do not hammer it.
             tokio::time::sleep(std::time::Duration::from_millis(250 * attempt as u64)).await;
@@ -2139,6 +2237,17 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
             );
             continue;
         }
+        if token_already_tried(&tried_tokens, &token) {
+            // The origin handed back a bot this call already tried. Attempting
+            // it again cannot succeed — a flood is per bot — so ask for another
+            // lease instead of spending the attempt.
+            log(
+                "guest lease returned a bot already tried in this call; leasing another",
+                &serde_json::json!({"attempt": attempt + 1, "tried": tried_tokens.len()}),
+            );
+            continue;
+        }
+        tried_tokens.push(token.clone());
         if let Some(secret) = resp.get("api_secret").and_then(|v| v.as_str()) {
             save_api_secret(secret);
         }
@@ -2152,7 +2261,18 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
         let target = match resp.get("bot_id") {
             Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
             Some(Value::Number(n)) => n.to_string(),
-            _ => format!("prov_{}", random_suffix()),
+            // A bot token IS `"<bot id>:<secret>"`, so the id is known even when
+            // the origin omits `bot_id`. Keying the session and any FLOOD_WAIT on
+            // that id keeps one bot's wait off every other bot; a random `prov_`
+            // placeholder would make the record unreachable and gap the wait.
+            _ => {
+                let id_part = token.split(':').next().unwrap_or("").trim();
+                if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
+                    id_part.to_string()
+                } else {
+                    format!("prov_{}", random_suffix())
+                }
+            }
         };
 
         // Keep the bot-scoped ticket: it is what authorises /resolve-file(s)
@@ -2197,9 +2317,18 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
             Err(e) => {
                 // PER TOKEN, and then straight on to the NEXT lease. A FLOOD_WAIT
                 // belongs to the one bot Telegram refused, so it must never end the
-                // provision — and it must never arm the instance-wide gate, which is
-                // what made the following attempt fail before it even started.
-                let flood_secs = note_flood_for(&target, &e);
+                // provision — and it must never arm a wait for a different bot.
+                login_failures += 1;
+                let recorded = note_flood_for(&target, &e);
+                // `boot()` refuses a bot that ALREADY has a wait with its own paused
+                // sentence ("... for another 1365s (FLOOD_WAIT)"), whose number sits
+                // before the marker and so does not parse as a `value:`. The per-bot
+                // record is the authority then — the id-less record never is.
+                let flood_secs = if recorded > 0 {
+                    recorded
+                } else {
+                    flood_remaining_for(&target)
+                };
                 log(
                     "auto provision login failed",
                     &serde_json::json!({
@@ -2211,6 +2340,15 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                 );
                 last_error = Some(e.clone());
                 if flood_secs > 0 {
+                    flood_failures += 1;
+                    last_flooded_bot = Some(target.clone());
+                    // Quote the RAW Telegram text from the record: our own paused
+                    // sentence puts the seconds before `(FLOOD_WAIT)`, so the
+                    // callers' flood parser (`flood_seconds_in`) cannot number it.
+                    let said = flood_last_error_for(&target);
+                    if !said.is_empty() {
+                        last_error = Some(said);
+                    }
                     // Do NOT report this bot as failed at the origin: the wait is
                     // temporary, and retiring it would permanently remove a healthy
                     // bot from every guest's pool. Just lease a different one.
@@ -2218,11 +2356,16 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                         "leased guest bot is flood-waited; leasing the next bot",
                         &serde_json::json!({
                             "bot_id": target,
-                            "remaining_secs": flood_remaining_for(&target),
+                            "remaining_secs": flood_secs,
                             "attempt": attempt + 1,
                         }),
                     );
-                    continue;
+                    if should_try_next_attempt(attempt + 1, GUEST_LOGIN_ATTEMPTS, true) {
+                        continue;
+                    }
+                    // The last attempt of this call is flooded too: report the
+                    // wait below, quoting Telegram.
+                    break;
                 }
                 if is_transient_login_error(&e) {
                     // Telegram is failing the LOGIN, not refusing this token.
@@ -2274,6 +2417,29 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
             )
         };
         return Err(message);
+    }
+    // Every login this call attempted was flooded. Answer with the same shape the
+    // instance-wide gate used to, but quote the bot that refused: the per-bot
+    // record keeps Telegram's own text ("rpc error 420: FLOOD_WAIT ... value: N").
+    // The id-less record is NOT consulted — it may belong to a different bot.
+    if login_failures > 0 && flood_failures == login_failures {
+        if let Some(bot) = last_flooded_bot.as_deref() {
+            let secs = flood_remaining_for(bot);
+            if secs > 0 {
+                let said = flood_last_error_for(bot);
+                return Err(if said.is_empty() {
+                    format!(
+                        "Telegram rate limit: bot login paused for another {}s. Please retry shortly.",
+                        secs
+                    )
+                } else {
+                    format!(
+                        "Telegram rate limit: bot login paused for another {}s.\nTelegram said: {}",
+                        secs, said
+                    )
+                });
+            }
+        }
     }
     Err(last_error
         .unwrap_or_else(|| "Could not obtain guest bot session from server.".to_string()))

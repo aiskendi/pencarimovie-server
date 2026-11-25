@@ -2,7 +2,8 @@
 //!
 //! ```text
 //!   pencarimovie-server --port 8088 [--host 127.0.0.1] [--workers N]
-//!                     [--inflight 8] [--max-streams 256] [--public] [--tray]
+//!                     [--inflight 8] [--stream-prefetch 20] [--max-streams 256]
+//!                     [--public] [--tray]
 //!   pencarimovie-server --decode <file_id_mt> [expected_id]
 //! ```
 //!
@@ -1665,6 +1666,21 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_INFLIGHT)
         .max(1);
+    // How many Telegram parts ONE `/api/download` response keeps in flight.
+    //
+    // NOT a second budget: `workers x inflight` (32 at the defaults) stays the
+    // process-wide part budget, enforced by the per-connection gate and the bot's
+    // learned window. This is only what a single response ASKS for, which is what
+    // stops one viewer being latency-bound at one 512 KB part per round trip
+    // (measured 0.31 MB/s sequentially against 3.74 MB/s aggregate for four
+    // concurrent streams on the same bot). 20 is MadelineProto's
+    // `downloadParallelChunks`; `1` is the sequential escape hatch and the A/B
+    // baseline, and the value is printed in the banner so a report shows it.
+    let stream_prefetch: usize = arg_value("--stream-prefetch")
+        .or_else(|| storage::env("PM_STREAM_PREFETCH"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(download::DEFAULT_STREAM_PREFETCH)
+        .clamp(1, download::MAX_STREAM_PREFETCH);
     // Global cap on concurrent download responses: beyond it viewers get a
     // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.
     //
@@ -1728,6 +1744,10 @@ async fn main() -> anyhow::Result<()> {
     // Published once, before the first request can resolve a short code: the mint
     // that `resolve.rs` performs goes through this same pool.
     telegram::share_pool(telegram_pool.clone());
+    // The per-response read-ahead, published for `download.rs` (which holds no
+    // state handle). Printed in the banner below, so a throughput report always
+    // names the depth it was measured at.
+    download::set_stream_prefetch(stream_prefetch);
     let state = Arc::new(AppState {
         port,
         workers,
@@ -1905,7 +1925,7 @@ async fn main() -> anyhow::Result<()> {
     // already gone to stderr above in the "listening" line.
     if !tray_requested {
         println!(
-            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n  Public mode: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
+            "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Prefetch:    {} part(s) in flight per response\n  Max streams: {}\n  Public mode: {}\n  Per client:  {} title(s) and {} connection(s) at once, {} new stream(s) per {}s\n",
             shown,
             port,
             host,
@@ -1914,6 +1934,7 @@ async fn main() -> anyhow::Result<()> {
             workers,
             inflight,
             workers * inflight,
+            stream_prefetch,
             max_streams,
             if public {
                 "ON  (users: /configure, admin: /admin)"

@@ -295,9 +295,9 @@ struct FileWindow {
 /// MadelineProto gives `upload.getFile`.
 const FILE_WINDOW_START: u32 = 2;
 
-/// How far a window may grow before the process `--inflight` is applied. 8 is
-/// the default `--inflight`, i.e. the old fixed assumption is now the ceiling,
-/// not the starting point.
+/// The window's ceiling when this process has published no Telegram pool at all
+/// (a unit test, a probe). A live process bounds it at `workers x inflight`
+/// instead — see [`file_window_cap()`]; this is NOT a per-bot hard limit.
 const FILE_WINDOW_MAX: u32 = 8;
 
 impl FileWindow {
@@ -399,14 +399,29 @@ fn file_window_key(bot_id: &str) -> String {
 /// than the process is configured to run. Read once per window; the pool is
 /// published at boot and never resized.
 fn file_window_cap() -> u32 {
-    let inflight = crate::telegram::shared_pool()
-        .map(|p| p.inflight())
-        .unwrap_or(FILE_WINDOW_MAX as usize);
-    // The window may never exceed the small ceiling: per-socket concurrency is what
-    // the server punishes (danog/MadelineProto#1948 settles on 2 per socket and
-    // answers a too-busy socket by DROPPING it, not with an error). Throughput comes
-    // from more sockets, not from more parts on one socket.
-    FILE_WINDOW_MAX.min(inflight.max(1) as u32)
+    // THE WINDOW IS PER BOT, NOT PER SOCKET.
+    //
+    // Every part this bot serves passes this one counter, across ALL of its
+    // grammers connections, so the ceiling it may grow to is the process' whole
+    // part budget: `--workers` sockets x `--inflight` parts each (32 at the
+    // shipped 16 x 2). This used to be `min(FILE_WINDOW_MAX, --inflight)`, which
+    // read a per-CONNECTION limit as a per-BOT one and pinned a bot at 2 parts in
+    // flight. No read-ahead can exceed that, and 14 of the 16 sockets sat idle on
+    // every stream while one response measured ~0.5 MB/s: the window, not the bot,
+    // was the ceiling.
+    //
+    // The small START and the halving on a reject are untouched — they are what
+    // keeps a bad DC from being overrun while the window learns.
+    let Some(pool) = crate::telegram::shared_pool() else {
+        return FILE_WINDOW_MAX;
+    };
+    window_cap_from(pool.workers(), pool.inflight())
+}
+
+/// The per-bot ceiling for a process with `workers` sockets of `inflight` parts
+/// each. Pure, so the arithmetic is testable without a published pool.
+fn window_cap_from(workers: usize, inflight: usize) -> u32 {
+    workers.saturating_mul(inflight).clamp(1, u32::MAX as usize) as u32
 }
 
 fn file_window_try(key: &str) -> bool {
@@ -868,7 +883,8 @@ fn prime_split_allowed(free: usize) -> bool {
 /// never plays" report. BitChord asks for ONE track with three ranges at once
 /// (`bytes=0-65535` for its container sniff, then `65536-1048575`, then the
 /// open-ended body). Every one of those primes first, and every live body holds
-/// up to `PM_PIPELINE` (16) windows against a per-connection budget of
+/// up to a whole read-ahead (`--stream-prefetch`, 16 windows in the build that
+/// measured this) against a per-connection budget of
 /// `--inflight` (8) parts. Once those are held, the pre-flight queued behind
 /// them for the full [`PRIME_GATE_WAIT_SECS`] and answered `503 parts busy`; the
 /// app then restarted the download from byte 0 and never reached audio.
@@ -1089,8 +1105,23 @@ fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
     (w > 0).then_some((p, w))
 }
 
-/// How many 1 MB windows to keep in flight per stream (`PM_PIPELINE` overrides,
-/// clamped to 1..=64).
+/// How many Telegram parts one response keeps in flight: `--stream-prefetch` /
+/// `PM_STREAM_PREFETCH`, clamped to 1..=[`MAX_STREAM_PREFETCH`].
+///
+/// WHY a read-ahead exists at all, and WHY it is a PART count: a part is capped at
+/// [`crate::telegram::MAX_CHUNK`] (512 KB) by grammers' parser, so at ~1 s per
+/// round trip a response that fetches one part at a time moves ~0.5 MB/s however
+/// fast the bot's pipe is — measured here on a 2160p ZIP entry, 4 MB range:
+/// **0.31 MB/s** sequentially, against 3.74 MB/s aggregate for FOUR concurrent
+/// streams on the same single bot. The bot was never the ceiling. So several parts
+/// of the SAME response stay in flight and are emitted in file order.
+///
+/// 20 is MadelineProto's number, not a guess: `Settings/Files.php` sets
+/// `downloadParallelChunks = 20`, spread over `maxMediaSocketCount = 10` sockets at
+/// `MAX_FILE_REQUESTS_PER_SOCKET = 2` each. Our equivalent budget is
+/// `--workers x --inflight` (16 x 2 = 32 at the defaults), enforced by the
+/// per-connection gate and the bot's learned window: this is only how much ONE
+/// response ASKS for, and those gates decide how much it gets.
 ///
 /// **The part size is not tunable.** grammers' parser asserts
 /// `len < MessageContainer::MAXIMUM_SIZE`
@@ -1105,18 +1136,50 @@ fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
 /// Measured on a phone (OnePlus CPH2581, 32 MB range mid-file, same 4K MKV):
 /// `1 x 8` (the old defaults) **0.81 MB/s**; `4 x 8` 1.44; `8 x 8` 1.56;
 /// `1 x 32` 1.40-1.62; `8 x 32` 1.46-1.82; `16 x 32` 1.40 (over-subscribed).
-/// **Pipeline depth is NOT a reliable knob**: `8 x 32` measured 1.93 MB/s with
-/// `PM_PIPELINE=64` in one run and 0.52 MB/s with the same settings in the next â€”
-/// the phone's Telegram path varies far more than the depth helps. Hence the
-/// modest default of 16, and 8 connections x 32 parts as the app's setting.
-fn pipeline_depth() -> usize {
-    static DEPTH: OnceLock<usize> = OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        crate::storage::env("PM_PIPELINE")
+/// **Depth is not a reliable knob on its own**: measured on a phone (OnePlus
+/// CPH2581, 32 MB range, same 4K MKV) `1 x 8` gave **0.81 MB/s**, `8 x 8` 1.56,
+/// `8 x 32` 1.46-1.82, and one deeper-pipeline run measured 1.93 MB/s while the
+/// next measured 0.52 — the phone's Telegram path varies far more than the depth
+/// helps. What a depth CAN fix is the latency-bound single response measured
+/// above; what it must not do is overrun the sockets, which is why `1` stays a
+/// supported setting and the gates still decide the real concurrency.
+/// `PM_PIPELINE` remains as the pre-2026-11-26 name for this knob (see
+/// [`stream_prefetch()`]).
+pub const DEFAULT_STREAM_PREFETCH: usize = 20;
+
+/// Upper clamp for [`stream_prefetch()`]. Past the process part budget
+/// (`workers x inflight`) a larger ask only queues inside the same gates, so the
+/// knob stops here instead of pretending to buy concurrency the sockets lack.
+pub const MAX_STREAM_PREFETCH: usize = 32;
+
+static STREAM_PREFETCH: OnceLock<usize> = OnceLock::new();
+
+/// The one place the accepted range is applied, so the flag, the environment and
+/// the tests cannot disagree about it.
+fn clamp_prefetch(parts: usize) -> usize {
+    parts.clamp(1, MAX_STREAM_PREFETCH)
+}
+
+/// Publish `--stream-prefetch` from `main`, which parses the flag and
+/// `PM_STREAM_PREFETCH` once at boot (the banner prints what was accepted).
+pub fn set_stream_prefetch(parts: usize) {
+    let _ = STREAM_PREFETCH.set(clamp_prefetch(parts));
+}
+
+/// The read-ahead depth in PARTS, `1..=MAX_STREAM_PREFETCH`. Read per body, so a
+/// `--stream-prefetch 1` run and a default run can be compared without a rebuild.
+fn stream_prefetch() -> usize {
+    if let Some(parts) = STREAM_PREFETCH.get() {
+        return *parts;
+    }
+    // No `main` (a unit test, a probe): the environment is the whole contract, and
+    // `PM_PIPELINE` keeps working as this knob's older name.
+    clamp_prefetch(
+        crate::storage::env("PM_STREAM_PREFETCH")
+            .or_else(|| crate::storage::env("PM_PIPELINE"))
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|v| v.clamp(1, 64))
-            .unwrap_or(16)
-    })
+            .unwrap_or(DEFAULT_STREAM_PREFETCH),
+    )
 }
 use crate::telegram::{DocTarget, prepare_file_target};
 use crate::AppState;
@@ -1822,6 +1885,56 @@ fn split_windows(parts: &[SplitPart], start: u64, end: u64) -> Vec<SplitWindow> 
     out
 }
 
+/// Cut a single-file window plan into the PARTS `upload::getFile` will really be
+/// asked for, so the read-ahead depth counts parts instead of 1 MB windows.
+///
+/// The cut uses [`crate::telegram::plan_limit`] — the same function
+/// `fetch_range_core()` itself uses — so each entry here is exactly ONE
+/// `upload::getFile`, and handing it to `fetch_part_windowed()` cannot silently
+/// turn into several 4 KB chunks. The BYTES are unchanged: same ranges, same
+/// order, only scheduled further ahead. `1 MB window -> at most two 512 KB parts`,
+/// which is why a depth in parts and the old depth in windows differ by ~2x.
+fn plan_parts(plan: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(plan.len() * 2);
+    for (pos, want) in plan {
+        let limit = crate::telegram::plan_limit(pos, want);
+        let mut at = pos;
+        let mut left = want;
+        while left > 0 {
+            let take = limit.min(left);
+            out.push((at, take));
+            at += take;
+            left -= take;
+        }
+    }
+    out
+}
+
+/// [`plan_parts()`] for a split plan: one `SplitWindow` per Telegram part. `skip`
+/// (the bytes a 4096-aligned over-read carries) belongs to the FIRST part only.
+fn split_plan_parts(plan: Vec<SplitWindow>) -> Vec<SplitWindow> {
+    let mut out = Vec::with_capacity(plan.len() * 2);
+    for w in plan {
+        let limit = crate::telegram::plan_limit(w.pos, w.want);
+        let mut at = w.pos;
+        let mut left = w.want;
+        let mut skip = w.skip;
+        while left > 0 {
+            let take = limit.min(left);
+            out.push(SplitWindow {
+                part: w.part,
+                pos: at,
+                want: take,
+                skip,
+            });
+            skip = 0;
+            at += take;
+            left -= take;
+        }
+    }
+    out
+}
+
 /// Resolve one part to a live `DocTarget`, once. The mutex is what makes a
 /// background prefetch and a window that needs the same part share one resolve.
 async fn ensure_split_target(
@@ -2104,7 +2217,9 @@ async fn serve_zip_split(
     let targets_task = targets.clone();
     let bot_task = bot_id.clone();
     let code_for_task = first_code.clone();
-    let pipeline = pipeline_depth();
+    let prefetch = stream_prefetch();
+    // Schedule PARTS, not 1 MB windows — see [`split_plan_parts()`].
+    let plan = split_plan_parts(plan);
     tokio::spawn(async move {
         let _stream_permit = stream_permit;
         let _limit_guard = limit_guard;
@@ -2164,7 +2279,7 @@ async fn serve_zip_split(
                 }
             }
         }))
-        .buffered(pipeline);
+        .buffered(prefetch);
 
         futures_util::pin_mut!(stream);
         while let Some(item) = stream.next().await {
@@ -2946,7 +3061,9 @@ async fn handle_split_download(
     let parts_task = parts.clone();
     let targets_task = targets.clone();
     let bot_task = bot_id.clone();
-    let pipeline = pipeline_depth();
+    let prefetch = stream_prefetch();
+    // Schedule PARTS, not 1 MB windows — see [`split_plan_parts()`].
+    let plan = split_plan_parts(plan);
     let code_for_task = first_code.clone();
     tokio::spawn(async move {
         let _stream_permit = stream_permit;
@@ -3002,7 +3119,7 @@ async fn handle_split_download(
                 }
             }
         }))
-        .buffered(pipeline);
+        .buffered(prefetch);
 
         futures_util::pin_mut!(stream);
         while let Some(item) = stream.next().await {
@@ -4782,20 +4899,19 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // Reported to the app as "streaming" activity for the whole body.
         let _activity = ActivityGuard::new(&ACTIVE_STREAMS);
         let _titles = TitleGuard::new(&short_code_for_task);
-        // PIPELINE the chunks: fetch up to `pipeline_depth()` 1 MB windows
-        // concurrently and emit them IN ORDER (`StreamExt::buffered`). Fetching one
-        // chunk at a time made every megabyte pay a full Telegram round-trip â€”
-        // measured ~870 KiB/s, below what a 1080p stream needs, so the player sat at
-        // `readyState 2 / networkState 2` and reported a playback stall.
+        // PIPELINE the parts: fetch up to `stream_prefetch()` of them at once and
+        // emit them IN ORDER (`StreamExt::buffered`), which is the whole contract —
+        // a later part that lands early waits, nothing is reordered or dropped.
+        // Fetching one part at a time made every 512 KB pay a full Telegram
+        // round-trip â€” measured ~870 KiB/s, below what a 1080p stream needs, so the
+        // player sat at `readyState 2 / networkState 2` and reported a stall.
         //
-        // The DEPTH is the throughput knob, and it is per-stream: measured on a
-        // phone (Android 16, loopback so the Wi-Fi is out of the picture) a single
-        // 8 MB range ran at 0.3-0.7 MiB/s with 4 windows, while the PHP port
-        // measured 7.5-9.7 MiB/s with 8 parallel chunks. The per-connection
-        // `--inflight` gate still bounds the real parts in flight, so raising this
-        // fills the pipe rather than raising load. `PM_PIPELINE` overrides it
-        // (1..=32) for tuning without a rebuild.
-        let pipeline = pipeline_depth();
+        // The DEPTH is per RESPONSE: `--stream-prefetch`, default 20 parts, and `1`
+        // is the sequential escape hatch the same file can be A/B'd against. The
+        // per-connection `--inflight` gate and the bot's learned window still bound
+        // the real parts in flight, so asking for more fills the pipe instead of
+        // raising load — it cannot bypass either one.
+        let prefetch = stream_prefetch();
         use futures_util::StreamExt as _;
 
         let mut skip = start.saturating_sub(aligned) as usize;
@@ -4869,6 +4985,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 }
             }
         }
+        // The plan above is in 1 MB windows so every later window starts on an
+        // exact 1 MB boundary (full-size legal parts). The PIPELINE counts parts, so
+        // cut them here — same bytes, same order, scheduled further ahead.
+        let plan = plan_parts(plan);
 
         // STRIPE the windows across the bot's connections instead of pinning the
         // whole stream to ONE of them.
@@ -4997,16 +5117,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 }
             }
         }))
-        .buffered(pipeline);
+        .buffered(prefetch);
 
         futures_util::pin_mut!(stream);
         loop {
             // A seek or a closed tab drops the receiver. Detecting it only when
-            // the next WINDOW is ready to send means up to `pipeline_depth`
-            // megabytes of Telegram parts keep holding their `--inflight`
-            // permits while the request the player just opened queues behind
-            // them (seen on a phone as ttfb 1.0-5.2 s with a second stream
-            // open). `is_closed()` is a plain non-blocking check â€” deliberately
+            // the next PART is ready to send means up to `stream_prefetch()` parts
+            // keep holding their `--inflight` permits while the request the player
+            // just opened queues behind them (seen on a phone as ttfb 1.0-5.2 s
+            // with a second stream open). Dropping this task drops every in-flight
+            // part future, so a cancelled body abandons the read-ahead instead of
+            // waiting for it to land.
+            // `is_closed()` is a plain non-blocking check â€” deliberately
             // NOT a `select!`, which could end a body while the client is still
             // reading and make playback look slow instead.
             if tx.is_closed() {
@@ -5820,6 +5942,120 @@ mod tests {
         assert!(!held.try_acquire(), "one part is still out");
         held.release();
         assert!(held.try_acquire());
+    }
+
+    /// The window's ceiling is the PROCESS part budget, not one connection's.
+    ///
+    /// This is the whole reason a read-ahead can work at all: with
+    /// `min(FILE_WINDOW_MAX, inflight)` a bot was pinned to `--inflight` (2)
+    /// parts, so a response asking for 20 got 2 and 14 of the 16 sockets stayed
+    /// idle.
+    #[test]
+    fn the_file_window_cap_is_the_whole_process_budget() {
+        let shipped = window_cap_from(crate::DEFAULT_WORKERS, crate::DEFAULT_INFLIGHT);
+        assert_eq!(
+            shipped,
+            (crate::DEFAULT_WORKERS * crate::DEFAULT_INFLIGHT) as u32,
+            "16 sockets x 2 parts = 32 parts, the advertised total"
+        );
+        assert!(
+            shipped > crate::DEFAULT_INFLIGHT as u32,
+            "a per-bot ceiling equal to the per-CONNECTION count is the bug"
+        );
+        assert_eq!(window_cap_from(16, 3), 48);
+        assert_eq!(window_cap_from(4, 8), 32);
+        assert_eq!(window_cap_from(1, 2), 2, "one socket really is 2 parts");
+        // Degenerate configurations still get a usable window.
+        assert_eq!(window_cap_from(0, 0), 1);
+        assert_eq!(window_cap_from(1, 0), 1);
+    }
+
+    /* per-response read-ahead ------------------------------------------------- */
+
+    /// The knob's contract: default 20, `1` is the sequential escape hatch, and
+    /// nothing above 32 (the process budget's shape) is believed.
+    #[test]
+    fn the_stream_prefetch_depth_is_clamped_to_the_supported_range() {
+        assert_eq!(DEFAULT_STREAM_PREFETCH, 20, "MadelineProto's downloadParallelChunks");
+        assert_eq!(MAX_STREAM_PREFETCH, 32);
+        assert_eq!(clamp_prefetch(0), 1, "0 would stop the body");
+        assert_eq!(clamp_prefetch(1), 1, "1 = one part at a time");
+        assert_eq!(clamp_prefetch(20), 20);
+        assert_eq!(clamp_prefetch(32), 32);
+        assert_eq!(clamp_prefetch(33), MAX_STREAM_PREFETCH);
+        assert_eq!(clamp_prefetch(usize::MAX), MAX_STREAM_PREFETCH);
+    }
+
+    /// A 1 MB window becomes exactly the parts `upload.getFile` will be asked
+    /// for: same bytes, same order, each one legal on its own.
+    #[test]
+    fn a_one_mb_window_plan_is_cut_into_its_parts() {
+        let mb = crate::telegram::MB;
+        let chunk = crate::telegram::MAX_CHUNK;
+        let parts = plan_parts(vec![(0, mb), (mb, mb), (2 * mb, 700 * 1024)]);
+
+        // Two 512 KB parts per whole window; a 700 KB tail is 512 KB + 188 KB,
+        // exactly as `fetch_range_core()` would have asked for it.
+        assert_eq!(
+            &parts[..4],
+            &[(0, chunk), (chunk, chunk), (mb, chunk), (mb + chunk, chunk)],
+            "a 1 MB window is two 512 KB parts, in file order"
+        );
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[4], (2 * mb, chunk));
+        assert_eq!(parts[5], (2 * mb + chunk, 700 * 1024 - chunk));
+
+        // Contiguous, in order, and not one byte more or less than the plan.
+        let mut cursor = 0u64;
+        for (pos, want) in &parts {
+            assert_eq!(*pos, cursor, "the part plan must not leave a gap or overlap");
+            assert!(*want > 0);
+            assert!(*want <= chunk, "512 KB is grammers' ceiling");
+            assert_eq!(
+                pos / mb,
+                (pos + want - 1) / mb,
+                "a part must never cross a 1 MB boundary"
+            );
+            // A FULL part is exactly ONE `upload.getFile`: handing it to
+            // `fetch_range_core()` cannot collapse it into several 4 KB chunks.
+            // A partial tail (the window's last bytes) may need two aligned
+            // requests — the same two the old window-level code asked for, because
+            // Telegram's limit must be a power-of-two multiple of 4096.
+            let one_request = crate::telegram::plan_limit(*pos, *want);
+            assert!(one_request > 0);
+            if *want == chunk {
+                assert_eq!(one_request, chunk, "a full part must be one request at {pos}");
+            } else {
+                assert!(
+                    want.div_ceil(one_request) <= 2,
+                    "a tail part must not cost more requests than before ({pos} want {want})"
+                );
+            }
+            cursor += want;
+        }
+        assert_eq!(cursor, 2 * mb + 700 * 1024);
+    }
+
+    /// The split plan splits the same way, and the 4096-alignment `skip` belongs
+    /// to the first part of a window only.
+    #[test]
+    fn a_split_window_is_cut_into_parts_and_keeps_its_skip_first() {
+        let chunk = crate::telegram::MAX_CHUNK;
+        let mb = crate::telegram::MB;
+        let plan = vec![
+            SplitWindow { part: 0, pos: 0, want: mb, skip: 4096 },
+            SplitWindow { part: 1, pos: 0, want: 512 * 1024, skip: 0 },
+        ];
+        let parts = split_plan_parts(plan);
+        assert_eq!(parts.len(), 3);
+        assert_eq!((parts[0].part, parts[0].pos, parts[0].want, parts[0].skip), (0, 0, chunk, 4096));
+        assert_eq!(parts[1].skip, 0, "the skip is not repeated on the second part");
+        assert_eq!((parts[1].pos, parts[1].want), (chunk, chunk));
+        assert_eq!((parts[2].part, parts[2].pos), (1, 0), "the next split part starts at 0");
+        assert_eq!(parts[2].want, chunk);
+        // The client's bytes are the sum of (want - skip), exactly as before.
+        let delivered: u64 = parts.iter().map(|w| w.want - w.skip).sum();
+        assert_eq!(delivered, mb + chunk - 4096);
     }
 
     /// A rejection restarts the growth count: answers counted against the old,

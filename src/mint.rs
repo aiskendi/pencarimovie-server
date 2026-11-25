@@ -193,9 +193,22 @@ async fn fetch_peers() -> (Vec<String>, u16, String) {
         // the same in the log. The 401 recovery has already run inside
         // `http_json_h_status`, so a 401 here means the lease could not be replaced.
         if (200..300).contains(&status) {
+            // Say WHAT arrived, not just that it was empty: a 200 with no `bots[]`
+            // and a 200 whose `bots[]` is empty are different faults, and three
+            // rounds of fixes went by without either being visible in a device log.
+            let keys: Vec<&str> = body
+                .as_object()
+                .map(|o| o.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
             log(
                 "userbots answered no accounts",
-                &serde_json::json!({"url": url, "status": status}),
+                &serde_json::json!({
+                    "url": url,
+                    "status": status,
+                    "keys": keys.join(","),
+                    "bytes": body.to_string().len(),
+                    "is_array": body.is_array(),
+                }),
             );
         } else {
             log(
@@ -231,21 +244,24 @@ fn userbots_detail(status: u16) -> String {
 /// cost nothing and keep a wrapper change on the origin from silently emptying the
 /// peer list (an empty list means the mint never runs at all).
 fn accounts_of(body: &Value) -> Vec<String> {
-    let rows = body
-        .get("accounts")
-        .and_then(|v| v.as_array())
-        .or_else(|| {
-            body.get("data")
-                .and_then(|d| d.get("accounts"))
-                .and_then(|v| v.as_array())
-        })
-        // 2026-11-25: the origin's `/userbots` now answers `bots[]` (build
-        // `bots-not-pool-1`: `{bot_id, username, chat}`) instead of `accounts[]`.
-        // Same list, different envelope — without this the mint saw a 200 and
-        // still reported "no accounts", which is the failure that took a device
-        // out of playback.
-        .or_else(|| body.get("bots").and_then(|v| v.as_array()))
-        .or_else(|| body.as_array());
+    // FIRST NON-EMPTY LIST WINS. The origin answers both keys at once — `bots[]`
+    // with the live bots and `"accounts": []` kept for shape compatibility — so
+    // taking the first *present* key stopped on the empty one and reported "no
+    // accounts" on a 200 that carried 50 bots (measured 2026-11-25: bytes 5007,
+    // keys accounts,bots,build,mode,note,ok,relay_bot_id).
+    let candidates = [
+        body.get("accounts").and_then(|v| v.as_array()),
+        body.get("bots").and_then(|v| v.as_array()),
+        body.get("data")
+            .and_then(|d| d.get("accounts"))
+            .and_then(|v| v.as_array()),
+        body.get("data").and_then(|d| d.get("bots")).and_then(|v| v.as_array()),
+        body.as_array(),
+    ];
+    let rows = candidates
+        .into_iter()
+        .flatten()
+        .find(|a| !a.is_empty());
     let Some(rows) = rows else {
         return Vec::new();
     };

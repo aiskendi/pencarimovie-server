@@ -1,4 +1,4 @@
-//! HTTP entry point. `axum` + `tokio`, `127.0.0.1:8088` by default.
+﻿//! HTTP entry point. `axum` + `tokio`, `127.0.0.1:8088` by default.
 //!
 //! ```text
 //!   pencarimovie-server --port 8088 [--host 127.0.0.1] [--workers N]
@@ -62,8 +62,10 @@ mod tray;
 mod tray_unix;
 #[cfg(windows)]
 use crate::tray as tray_impl;
+
 #[cfg(all(unix, not(target_os = "android")))]
 use crate::tray_unix as tray_impl;
+
 mod tunnel;
 mod update;
 mod upstream;
@@ -71,14 +73,26 @@ mod wp_data;
 mod zip_split;
 
 use std::io::IsTerminal;
+
 use std::net::SocketAddr;
+
 use std::process::Stdio;
+
 use std::sync::Arc;
 
 use axum::Router;
+
 use axum::extract::Request;
+
 use axum::response::Response;
+
 use tokio::net::TcpListener;
+
+/// Parts per connection when nothing else says otherwise. One number for the server
+/// and every CLI probe: the probes used to hardcode 8, so a diagnostic run measured a
+/// shape no user install had (2026-11-25, seen as `inflight_per_connection: 8` in the
+/// boot line of a mint probe while the server ran with 3).
+pub const DEFAULT_INFLIGHT: usize = 3;
 
 pub struct AppState {
     pub port: u16,
@@ -88,7 +102,7 @@ pub struct AppState {
     /// Global cap on concurrent `/api/download` responses (`--max-streams`).
     pub download_gate: Arc<tokio::sync::Semaphore>,
     pub max_streams: usize,
-    /// Per-client abuse limits (`ratelimit`). In-memory, so per process — the same
+    /// Per-client abuse limits (`ratelimit`). In-memory, so per process â€” the same
     /// caveat the resolve and catalog caches carry.
     pub limits: Arc<ratelimit::Limiter>,
     /// Distinct short codes one client may have in flight (`0` = off).
@@ -208,7 +222,7 @@ fn jpeg_dims(b: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// `--thumb-probe` read: one `upload.getFile`, and on `FILE_REFERENCE_EXPIRED`
-/// exactly one re-resolve + retry — the recovery `/api/download` performs
+/// exactly one re-resolve + retry â€” the recovery `/api/download` performs
 /// (`resolve_shortcode_fresh` = `force=1&nocache=1`).
 ///
 /// Without it the probe reports the resolve CACHE's expired reference as if it
@@ -275,7 +289,7 @@ async fn probe_fetch(
     Err("probe: re-resolve retry did not settle".to_string())
 }
 
-/* ── mint drivers (`--mint-batch`, `--mint-streams`) ─────────────────────── */
+/* â”€â”€ mint drivers (`--mint-batch`, `--mint-streams`) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /// How many short codes `--mint-streams` mints in one run.
 ///
@@ -320,7 +334,7 @@ async fn mint_driver_setup(
         std::process::exit(2);
     }
     mint::seed_peers(peers.clone());
-    let pool = Arc::new(telegram::TelegramPool::new(1, 8));
+    let pool = Arc::new(telegram::TelegramPool::new(1, DEFAULT_INFLIGHT));
     telegram::share_pool(pool.clone());
     let entry = match pool.boot(&bot, None).await {
         Ok(e) => e,
@@ -344,7 +358,7 @@ fn tried_entry(field: &str, error: String) -> serde_json::Value {
 /// Empties are dropped and duplicate VALUES are collapsed (the first field name
 /// wins), because the three fields usually name the same document and re-sending an
 /// identical id would only repeat the refusal. The order is preserved so
-/// `file_id_mt` — the form the engine itself prefers — is always tried first.
+/// `file_id_mt` â€” the form the engine itself prefers â€” is always tried first.
 fn resolve_id_candidates(resolved: &serde_json::Value) -> Vec<(&'static str, String)> {
     let mut candidates: Vec<(&'static str, String)> = Vec::new();
     for field in ["file_id_mt", "file_id_tmp", "file_id"] {
@@ -400,7 +414,7 @@ async fn mint_code_row(
     // `true` = bypass: this forces the ORIGIN to re-mint its own reference, which
     // is exactly the baseline the mint has to beat. With CHANGE 1 the bypass branch
     // re-sends a locally held id first and only falls through to the origin when
-    // there is none — for a fresh code there is none, so the driver still measures
+    // there is none â€” for a fresh code there is none, so the driver still measures
     // the origin baseline it was written for.
     let resolve_start = std::time::Instant::now();
     let resolved = resolve::resolve_shortcode(code, bot, true).await;
@@ -548,7 +562,7 @@ fn mint_rows_ok(rows: &[serde_json::Value]) -> bool {
     })
 }
 
-/// GET a `/stream` list with the engine's plain HTTP client — no auth.
+/// GET a `/stream` list with the engine's plain HTTP client â€” no auth.
 ///
 /// The driver's URL is the engine's own `http://127.0.0.1:<port>/stream/...` (or
 /// any other node's), which is a public route: the point is to measure the rows a
@@ -575,7 +589,7 @@ async fn fetch_streams(url: &str) -> Result<serde_json::Value, String> {
 ///
 /// Per row, in this order of preference (CHANGE 2):
 ///   1. a `short_code=` query parameter in `streams[].url`;
-///   2. a `pm_file_<code>` (or `pm:file:<code>`) id anywhere in the row — the
+///   2. a `pm_file_<code>` (or `pm:file:<code>`) id anywhere in the row â€” the
 ///      catalog publishes those on `id`;
 ///   3. an `/api/download/<payload>` path segment whose base64 payload decodes to
 ///      a `short_code` (the join token segment before it is skipped).
@@ -686,7 +700,7 @@ async fn main() -> anyhow::Result<()> {
     // the player gets whatever the edge substitutes and the operator gets nothing.
     // Measured on the Render instance (2026-11-03): `/stream/movie/pm%3Apost%3A9000016051.json`
     // answered **HTTP 502 with an empty body in ~130 ms**, reproducibly, while its
-    // neighbours answered 200 — and `debug.log` held no line for it at all. This
+    // neighbours answered 200 â€” and `debug.log` held no line for it at all. This
     // hook turns that class of failure into one always-on stderr line carrying the
     // message and the exact source location.
     std::panic::set_hook(Box::new(|info| {
@@ -798,8 +812,8 @@ async fn main() -> anyhow::Result<()> {
             }
             file_id = id;
             // Two separate questions this probe answers:
-            //   • is the origin's poster still a real per-file image at all;
-            //   • is `…/tgthumb/<n>.jpg` the MEDIA document's id (a thumb of the
+            //   â€¢ is the origin's poster still a real per-file image at all;
+            //   â€¢ is `â€¦/tgthumb/<n>.jpg` the MEDIA document's id (a thumb of the
             //     file we already resolve) or a SEPARATE thumbnail file id? The
             //     reply prints the decoded media id next to that number, so the two
             //     can be compared instead of assumed.
@@ -829,7 +843,7 @@ async fn main() -> anyhow::Result<()> {
                 (!thumb_n.is_empty() && thumb_n == doc_id)
             );
             // Every field the origin actually sent, with the two id fields elided.
-            // A dedicated `thumbnail_file_id` would show up here — and if it exists
+            // A dedicated `thumbnail_file_id` would show up here â€” and if it exists
             // it is a downloadable object in its own right, not just a `thumb_size`.
             let mut dump = res.clone();
             if let Some(o) = dump.as_object_mut() {
@@ -847,7 +861,7 @@ async fn main() -> anyhow::Result<()> {
 
         // One connection is enough for a probe, and it keeps the session's other
         // worker files untouched.
-        let pool = telegram::TelegramPool::new(1, 8);
+        let pool = telegram::TelegramPool::new(1, DEFAULT_INFLIGHT);
         let entry = match pool.boot(&bot, None).await {
             Ok(e) => e,
             Err(e) => {
@@ -931,7 +945,7 @@ async fn main() -> anyhow::Result<()> {
         };
         // A bot cannot enumerate dialogs (`messages.getDialogs` answers
         // BOT_METHOD_INVALID), so a bare numeric id is unusable from a bot
-        // session — there is no `access_hash` to address it with. A username IS
+        // session â€” there is no `access_hash` to address it with. A username IS
         // resolvable by a bot (`contacts.resolveUsername`), and that is how the
         // origin addresses its relay peers too.
         let peer_spec = user_arg.trim().to_string();
@@ -977,7 +991,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Same bootstrap as `--thumb-probe`: one connection is enough for a probe
         // and it keeps the session's other worker files untouched.
-        let pool = telegram::TelegramPool::new(1, 8);
+        let pool = telegram::TelegramPool::new(1, DEFAULT_INFLIGHT);
         let entry = match pool.boot(&bot, None).await {
             Ok(e) => e,
             Err(e) => {
@@ -1023,7 +1037,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             };
             match telegram::resolve_peer_by_id(&client, id).await {
-                // `PeerRef` → owned `Peer`: `resolve_username` answers `Peer`, so
+                // `PeerRef` â†’ owned `Peer`: `resolve_username` answers `Peer`, so
                 // both branches share one type and `to_ref()` is taken per call.
                 Ok(p) => match client.resolve_peer(p).await {
                     Ok(peer) => peer,
@@ -1197,7 +1211,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // `--mint-batch <code1,code2,...> [peer,peer,...]`: the warm path for several
-    // short codes in one run — resolve, mint, read 512 KB through the minted id.
+    // short codes in one run â€” resolve, mint, read 512 KB through the minted id.
     //
     // This is the E2E driver for `mint.rs`, and it calls the SAME functions the
     // resolve path calls (`mint::mint`, `mint::peers`) instead of a copy: a green
@@ -1326,9 +1340,9 @@ async fn main() -> anyhow::Result<()> {
     // the file and report the audio and subtitle tracks the CONTAINER declares.
     //
     // `/stream` still labels a row from its filename: a list render must not spend
-    // MTProto parts, because `workers × inflight` is the part budget shared by every
-    // viewer (AGENTS.md §9) and probing a hundred rows would starve playback. This
-    // answers the earlier question — what the file itself says — without touching
+    // MTProto parts, because `workers Ã— inflight` is the part budget shared by every
+    // viewer (AGENTS.md Â§9) and probing a hundred rows would starve playback. This
+    // answers the earlier question â€” what the file itself says â€” without touching
     // that budget, and is what the filter work is waiting on.
     if let Some(i) = arg_pos("--probe-tracks") {
         let args: Vec<String> = std::env::args().collect();
@@ -1371,7 +1385,7 @@ async fn main() -> anyhow::Result<()> {
             }
             file_id = id;
         }
-        let pool = telegram::TelegramPool::new(1, 8);
+        let pool = telegram::TelegramPool::new(1, DEFAULT_INFLIGHT);
         let entry = match pool.boot(&bot, None).await {
             Ok(e) => e,
             Err(e) => {
@@ -1417,8 +1431,8 @@ async fn main() -> anyhow::Result<()> {
     // `--file-id-lifetime <file_id_mt|short_code> [bot_id] [interval_s] [horizon_min]`:
     // how long a `file_reference` REALLY lives.
     //
-    // Every timing decision in `download.rs` about re-resolving — the 60 s window
-    // for an unverified id, `verified_at`, the mid-body refresh — is a guess about a
+    // Every timing decision in `download.rs` about re-resolving â€” the 60 s window
+    // for an unverified id, `verified_at`, the mid-body refresh â€” is a guess about a
     // number Telegram never publishes. Its documentation says only that a
     // `file_reference` "can change at any moment", and MadelineProto is built on
     // that assumption rather than on a lifetime: it keeps the last reference per
@@ -1493,7 +1507,7 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
 
-        let pool = telegram::TelegramPool::new(1, 8);
+        let pool = telegram::TelegramPool::new(1, DEFAULT_INFLIGHT);
         let entry = match pool.boot(&bot, None).await {
             Ok(e) => e,
             Err(e) => {
@@ -1598,8 +1612,8 @@ async fn main() -> anyhow::Result<()> {
     }
     // DEFAULT: 4 connections, on every platform.
     //
-    // `workers × inflight` is the number of `upload.getFile` parts the engine can
-    // have in flight — a SHARED budget for every viewer, not a per-viewer one.
+    // `workers Ã— inflight` is the number of `upload.getFile` parts the engine can
+    // have in flight â€” a SHARED budget for every viewer, not a per-viewer one.
     // With the old default of ONE connection that budget was 8 parts for the whole
     // process, so a single player that seeks once while another stream is open kept
     // the route queued: a 55-request real session at `--workers 1` logged repeated
@@ -1607,8 +1621,8 @@ async fn main() -> anyhow::Result<()> {
     // `--workers 4` logged 55/55 served with `timed out: 0`, `gate saturated: 0`,
     // `attempt failed: 0`, `download refused: 0` (Telegram's `FLOOD_WAIT` 1-3 s on
     // individual parts is absorbed by the per-part retry path). 4 x 8 = 32 parts is
-    // also the shape the engine's own inflight note describes as correct — the TS
-    // port holds 200/200 with 4 sessions x 4 in flight — and `grammers` multiplexes
+    // also the shape the engine's own inflight note describes as correct â€” the TS
+    // port holds 200/200 with 4 sessions x 4 in flight â€” and `grammers` multiplexes
     // a whole DC over ONE connection, so parallel connections are the only way to
     // scale a busy host.
     //
@@ -1628,7 +1642,7 @@ async fn main() -> anyhow::Result<()> {
     // 8 is the shape the TS port holds 200/200 with (4 sessions x 4 in flight).
     //
     // 2026-11-25: default lowered 8 -> 3. Telegram does not refuse the extra
-    // requests, it silently stops answering on that session — measured on a
+    // requests, it silently stops answering on that session â€” measured on a
     // one-bot install as `part stalled: no part in 12001ms with 12 of 12 permits
     // free`, i.e. OUR gate was idle while the server had gone quiet (502 reports
     // across 140 devices). MadelineProto reached the same conclusion in
@@ -1639,23 +1653,23 @@ async fn main() -> anyhow::Result<()> {
     let inflight: usize = arg_value("--inflight")
         .or_else(|| storage::env("PM_INFLIGHT"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
+        .unwrap_or(DEFAULT_INFLIGHT)
         .max(1);
     // Global cap on concurrent download responses: beyond it viewers get a
     // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.
     //
     // DEFAULT IS 0 = NO CAP, because this product is self-hosted: on a desktop,
     // an Android box or a VPS the real throttle is already the Telegram pool
-    // (`workers × inflight` parts), and there is no 30 s router to kill queued
+    // (`workers Ã— inflight` parts), and there is no 30 s router to kill queued
     // requests. A cap there only turns "slightly slower" into "refused".
     //
     // Hosts that DO have a short request timeout should set it explicitly: on
-    // Heroku a 1× Basic dyno measured 250/400 served with `PM_MAX_STREAMS=256`
+    // Heroku a 1Ã— Basic dyno measured 250/400 served with `PM_MAX_STREAMS=256`
     // (clean JSON 503 + retry_after for the rest) versus 312/400 uncapped where
     // the 88 losers died on `H12` after 30 s and got an HTML error page.
     //
     // NOTE: `.max(1)` used to sit here and turned an explicit `0` into a gate of
-    // ONE — one viewer, everyone else 503. Do not put it back.
+    // ONE â€” one viewer, everyone else 503. Do not put it back.
     let max_streams: usize = arg_value("--max-streams")
         .or_else(|| storage::env("PM_MAX_STREAMS"))
         .and_then(|s| s.parse().ok())
@@ -1672,7 +1686,7 @@ async fn main() -> anyhow::Result<()> {
     // seek, a 16-connection download manager and a preload of the next episode all
     // operate on the same code and therefore all cost one; 40 different titles in
     // parallel cost 40, which is the scraper signature. Without that distinction a
-    // capability limit would break segmented downloads — see the tests in
+    // capability limit would break segmented downloads â€” see the tests in
     // `ratelimit::tests`.
     //
     // `--max-bodies-per-ip` is the socket-flood backstop and sits above every real
@@ -1681,7 +1695,7 @@ async fn main() -> anyhow::Result<()> {
     // `--cold-starts-per-ip` is charged only where a resolve is actually issued, so
     // a `Range` request, a seek and a warm short code are free.
     //
-    // `0` disables a counter entirely — one integer compare, no map touched. A
+    // `0` disables a counter entirely â€” one integer compare, no map touched. A
     // self-hosted box that wants today's behaviour exactly sets all of them to 0.
     let max_titles_per_ip: usize = arg_value("--max-titles-per-ip")
         .or_else(|| storage::env("PM_MAX_TITLES_PER_IP"))
@@ -1723,7 +1737,7 @@ async fn main() -> anyhow::Result<()> {
     // instance holds a session for all of them and `pick_pool_bot()` can spread
     // downloads across the pool. Detached and best-effort: a slow or expired
     // token must never delay the listener. Why an env list at all is explained on
-    // `session::env_bot_tokens()` — the pool file is per-instance disk state.
+    // `session::env_bot_tokens()` â€” the pool file is per-instance disk state.
     {
         let boot_state = state.clone();
         tokio::spawn(async move {
@@ -1778,7 +1792,7 @@ async fn main() -> anyhow::Result<()> {
     // `/provision-session` used to be the only enrolment path, so an install that
     // already held a bot session never got a token and authenticated with the
     // fleet-wide `X-API-Secret` instead. Retiring that secret would therefore have
-    // broken playback on every existing install — including this build — not just
+    // broken playback on every existing install â€” including this build â€” not just
     // on old ones. Detached: a slow origin must not delay the listener.
     {
         tokio::spawn(async move {
@@ -1800,7 +1814,7 @@ async fn main() -> anyhow::Result<()> {
     // Make sure this instance holds ONE guest bot. Detached for the same reason as
     // the warm above: a lease is an HTTP round-trip plus a Telegram login and must
     // not delay the listener. One per instance is a hard rule (a pooled fleet may
-    // not multiply our provisioning — see `session::GUEST_BOTS_PER_INSTANCE`);
+    // not multiply our provisioning â€” see `session::GUEST_BOTS_PER_INSTANCE`);
     // anyone who wants a bigger pool adds their own bots via `BOT_TOKENS`.
     {
         let pool_state = state.clone();
@@ -1916,7 +1930,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // `--tray` is background mode and implies `--no-open`: no browser, because
     // start-tray and the login entry are "start it and get out of the way". A
-    // double-click still opens the browser — that is what opening the app means —
+    // double-click still opens the browser â€” that is what opening the app means â€”
     // it just also drops the console once the icon exists.
     let url = format!("http://{shown}:{port}/");
     let tray_flag = arg_pos("--tray").is_some();
@@ -1934,7 +1948,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The icon is this process, not a script beside it: `--tray` (start-tray,
     // the login entry) or a plain double-click. On Windows it must be the same
-    // process because the shell stores tray settings per HOSTING executable — the
+    // process because the shell stores tray settings per HOSTING executable â€” the
     // old PowerShell-hosted icon shared `powershell.exe`'s entry and could only
     // ever sit in the hidden-icons flyout.
     #[cfg(not(target_os = "android"))]
@@ -2006,7 +2020,7 @@ pub(crate) fn open_browser(url: &str) {
 
 /// One-line build identity, printed by `--version`:
 /// `pencarimovie-server 1.0.50-3-g9fc84e1 (build 9fc84e1, rustc 1.99.1, x86_64-windows)`.
-/// The first field is what this install reports (`/api/version` → `current_version`);
+/// The first field is what this install reports (`/api/version` â†’ `current_version`);
 /// the second is the git state the binary was compiled from.
 fn version_line() -> String {
     // `rustc` is only reported when it can actually be detected: a packaged
@@ -2029,7 +2043,7 @@ fn version_line() -> String {
 
 /// The default bind address.
 ///
-/// `127.0.0.1` is the documented desktop default (Windows, Linux, macOS) — do
+/// `127.0.0.1` is the documented desktop default (Windows, Linux, macOS) â€” do
 /// not change it, `stop.bat` / `stop.sh` and every doc assume a loopback
 /// listener. Two deployments need `0.0.0.0` instead:
 ///
@@ -2081,7 +2095,7 @@ pub fn paas_env_present() -> bool {
 ///
 /// `tokio::signal::unix` is `#[cfg(unix)]` inside tokio, so the previous
 /// unconditionally-unix version of this block was the ONLY thing that stopped
-/// the Windows (MSVC) build — every dependency, including grammers, compiled.
+/// the Windows (MSVC) build â€” every dependency, including grammers, compiled.
 /// Windows has no SIGTERM: `stop.bat` kills the listener and a console close
 /// event is not interceptable from a background process, so Ctrl-C is the
 /// graceful path there.
@@ -2184,7 +2198,7 @@ mod tests {
     }
 
     /// CHANGE 2: `--mint-streams` reads a REAL `/stream` list, so the extractor
-    /// has to accept every shape that list has published — in this preference
+    /// has to accept every shape that list has published â€” in this preference
     /// order, per row: `short_code=` in the url, then a `pm_file_` id, then an
     /// `/api/download/<payload>` segment.
     #[test]
@@ -2202,7 +2216,7 @@ mod tests {
         assert_eq!(stream_codes(&body), vec!["querycode", "pmcode", "b64code"]);
     }
 
-    /// Order is the list's, duplicates collapse, and the hard cap holds — every
+    /// Order is the list's, duplicates collapse, and the hard cap holds â€” every
     /// code past it would be another real Telegram send.
     #[test]
     fn stream_codes_keeps_order_dedupes_and_caps_at_ten() {

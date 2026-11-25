@@ -176,7 +176,7 @@ pub fn seed_peers(list: Vec<String>) {
 /// `GET /userbots`, as `(accounts, http_status, empty_detail)`.
 async fn fetch_peers() -> (Vec<String>, u16, String) {
     let url = format!(
-        "{}/userbots",
+        "{}/bots",
         crate::config::wp_api_base().trim_end_matches('/')
     );
     // The origin's protected route: `http_json_h_status` attaches the ticket and the
@@ -239,6 +239,12 @@ fn accounts_of(body: &Value) -> Vec<String> {
                 .and_then(|d| d.get("accounts"))
                 .and_then(|v| v.as_array())
         })
+        // 2026-11-25: the origin's `/userbots` now answers `bots[]` (build
+        // `bots-not-pool-1`: `{bot_id, username, chat}`) instead of `accounts[]`.
+        // Same list, different envelope — without this the mint saw a 200 and
+        // still reported "no accounts", which is the failure that took a device
+        // out of playback.
+        .or_else(|| body.get("bots").and_then(|v| v.as_array()))
         .or_else(|| body.as_array());
     let Some(rows) = rows else {
         return Vec::new();
@@ -262,7 +268,11 @@ fn accounts_of(body: &Value) -> Vec<String> {
         // A relay account without a username is still addressable when the bot
         // already has a chat with it (`telegram::resolve_peer` walks the dialog list
         // for a numeric id), and the pool manifest has published ids only.
-        let id = match a.get("id").or_else(|| a.get("user_id")) {
+        let id = match a
+            .get("id")
+            .or_else(|| a.get("user_id"))
+            .or_else(|| a.get("bot_id"))
+        {
             Some(Value::Number(n)) => n.to_string(),
             Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
             _ => continue,

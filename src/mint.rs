@@ -62,8 +62,15 @@ fn minted() -> &'static Mutex<HashMap<String, (String, i64)>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn peer_cache() -> &'static Mutex<Option<(i64, Vec<String>)>> {
-    static P: std::sync::OnceLock<Mutex<Option<(i64, Vec<String>)>>> = std::sync::OnceLock::new();
+/// `(fetched_at, accounts, status, detail)` for the last `GET /userbots`.
+///
+/// The STATUS travels with the list because an empty list has two completely
+/// different causes — the origin refused the lease (401) or it has no relay
+/// accounts (200 + `accounts: []`) — and the caller is the one that has to say
+/// which. `detail` is the sentence to report when the list is empty.
+fn peer_cache() -> &'static Mutex<Option<(i64, Vec<String>, u16, String)>> {
+    static P: std::sync::OnceLock<Mutex<Option<(i64, Vec<String>, u16, String)>>> =
+        std::sync::OnceLock::new();
     P.get_or_init(|| Mutex::new(None))
 }
 
@@ -127,85 +134,95 @@ fn mint_key(short_code: &str, bot_id: &str) -> String {
 
 /// The relay accounts from `GET {wp_api_base}/userbots`, cached in-process.
 ///
-/// Authenticated exactly like `diagnostics::report_send`: the ticket plus the
-/// PM-Auth proof, which is what the origin's protected routes check. Never
-/// hardcoded â€” `backfill::RELAY_USERNAMES` is the backfill's own fixed pair, and a
-/// mint that inherited it would break the day the operator rotates the pool.
+/// Authenticated by [`crate::httpc::http_json_h_status`] — the engine's own helper —
+/// rather than by assembling the ticket and PM-Auth headers here. That is what gives
+/// this request the 401 recovery every other origin call already had (clear the
+/// refused lease, re-enrol, retry once): the hand-rolled version answered 401 until
+/// the process restarted, and every mint in that window failed for the wrong reason.
 pub async fn peers() -> Vec<String> {
+    peers_with_detail().await.0
+}
+
+/// The accounts PLUS the sentence to report when there are none.
+async fn peers_with_detail() -> (Vec<String>, String) {
     let now = crate::storage::now();
     if let Ok(g) = peer_cache().lock() {
-        if let Some((at, list)) = &*g {
+        if let Some((at, list, _status, detail)) = &*g {
             let ttl = if list.is_empty() {
                 PEERS_RETRY_SECS
             } else {
                 PEERS_TTL_SECS
             };
             if now - *at < ttl {
-                return list.clone();
+                return (list.clone(), detail.clone());
             }
         }
     }
-    let list = fetch_peers().await;
+    let (list, status, detail) = fetch_peers().await;
     if let Ok(mut g) = peer_cache().lock() {
-        *g = Some((now, list.clone()));
+        *g = Some((now, list.clone(), status, detail.clone()));
     }
-    list
+    (list, detail)
 }
 
 /// Pin the peer list for this process (`--mint-batch` with explicit peers, and
 /// nothing else). Writing the cache is the whole point: every mint reads it.
 pub fn seed_peers(list: Vec<String>) {
     if let Ok(mut g) = peer_cache().lock() {
-        *g = Some((crate::storage::now(), list));
+        *g = Some((crate::storage::now(), list, 200, String::new()));
     }
 }
 
-async fn fetch_peers() -> Vec<String> {
+/// `GET /userbots`, as `(accounts, http_status, empty_detail)`.
+async fn fetch_peers() -> (Vec<String>, u16, String) {
     let url = format!(
         "{}/userbots",
         crate::config::wp_api_base().trim_end_matches('/')
     );
-    let mut req = crate::httpc::client()
-        .get(&url)
-        .timeout(Duration::from_secs(12))
-        .header("Accept", "application/json");
-    for (k, v) in crate::credentials::ticket_headers()
-        .into_iter()
-        .chain(crate::httpc::pm_auth_headers("GET", &url))
-    {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            log(
-                "userbots fetch failed",
-                &serde_json::json!({"url": url, "error": e.to_string()}),
-            );
-            return Vec::new();
-        }
+    // The origin's protected route: `http_json_h_status` attaches the ticket and the
+    // PM-Auth proof, and on 401 it clears the refused lease, re-enrols and retries
+    // once — none of which the hand-rolled request did. `0` means it never completed.
+    let (body, status) = crate::httpc::http_json_h_status(&url, &[], "GET", 12, &[]).await;
+    let names = if (200..300).contains(&status) {
+        accounts_of(&body)
+    } else {
+        Vec::new()
     };
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        // 401 here means the PM-Auth token is not accepted; the short retry window
-        // is what keeps that from disabling the mint for the whole hour.
-        log(
-            "userbots fetch rejected",
-            &serde_json::json!({"url": url, "status": status}),
-        );
-        return Vec::new();
-    }
-    let body: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
+    if names.is_empty() {
+        // Always with the status: an empty pool and a refused lease must never read
+        // the same in the log. The 401 recovery has already run inside
+        // `http_json_h_status`, so a 401 here means the lease could not be replaced.
+        if (200..300).contains(&status) {
             log(
-                "userbots answered no json",
-                &serde_json::json!({"url": url, "error": e.to_string()}),
+                "userbots answered no accounts",
+                &serde_json::json!({"url": url, "status": status}),
             );
-            return Vec::new();
+        } else {
+            log(
+                "userbots fetch rejected",
+                &serde_json::json!({"url": url, "status": status}),
+            );
         }
+    }
+    let detail = if names.is_empty() {
+        userbots_detail(status)
+    } else {
+        String::new()
     };
-    accounts_of(&body)
+    (names, status, detail)
+}
+
+/// What to report when `GET /userbots` produced no relay accounts.
+///
+/// The status is the point. The old sentence — "GET /userbots answered no usable
+/// accounts" — read as "the operator's pool is empty" when the truth was a refused
+/// lease (`401`), which is exactly the log line this change exists to kill.
+fn userbots_detail(status: u16) -> String {
+    if (200..300).contains(&status) {
+        format!("GET /userbots answered {status} without any accounts")
+    } else {
+        format!("GET /userbots answered {status}")
+    }
 }
 
 /// `accounts[]`, plus the shapes the same route has been seen behind.
@@ -327,12 +344,11 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
     };
     let client = entry.pick();
 
-    let names = peers().await;
+    // The detail carries the STATUS of the fetch, so this rejection can never read
+    // "no usable accounts" when the origin actually refused the lease.
+    let (names, no_peers) = peers_with_detail().await;
     if names.is_empty() {
-        return Err(MintError::new(
-            "no_peers",
-            "GET /userbots answered no usable accounts",
-        ));
+        return Err(MintError::new("no_peers", no_peers));
     }
     let start = NEXT_PEER.fetch_add(1, Ordering::Relaxed) % names.len();
     let mut tried = String::new();
@@ -745,6 +761,28 @@ mod tests {
     fn an_answer_without_accounts_is_empty_not_a_panic() {
         assert!(accounts_of(&serde_json::json!({"ok": 0})).is_empty());
         assert!(accounts_of(&serde_json::json!("nope")).is_empty());
+    }
+
+    /// The fallback sentence a mint reports must name the HTTP status.
+    ///
+    /// The bug it closes: a refused lease (`401`) and an empty relay pool (`200`)
+    /// both produced "GET /userbots answered no usable accounts", so a device log
+    /// pointed at the operator's pool while the truth was PM-Auth.
+    #[test]
+    fn an_empty_peer_list_names_the_http_status() {
+        let refused = userbots_detail(401);
+        assert_eq!(refused, "GET /userbots answered 401");
+        assert!(refused.contains("401"));
+        assert!(!refused.contains("no usable accounts"));
+
+        // A call that never completed has no status; `0` is the engine's own word
+        // for that everywhere else, and it must not read as an empty pool either.
+        assert_eq!(userbots_detail(0), "GET /userbots answered 0");
+
+        // A genuine 200 with no accounts says so, and still names the status.
+        let empty = userbots_detail(200);
+        assert!(empty.contains("200"));
+        assert!(!empty.contains("no usable accounts"));
     }
 
     /// The three id keys, in the order the engine reads them.

@@ -282,10 +282,18 @@ pub fn auth_token() -> String {
     };
     let token = v.get("token").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let exp = v.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
+    let now = crate::storage::now();
     // A minute of slack so a token does not expire mid-flight.
-    if token.is_empty() || exp <= crate::storage::now() + 60 {
+    if token.is_empty() || exp <= now + 60 {
         return String::new();
     }
+    // This function IS the answer to "does a valid lease exist", so it is where the
+    // lease's state is reported (once per lease) and where a renewal is kicked
+    // before the lease dies. Doing it here rather than at one call site is what
+    // makes every path that spends the credential cover it — the engine reads the
+    // token from a dozen places, and a long-running install that only ever reads it
+    // would otherwise sit on a dead lease until the first 401.
+    note_lease(&v, now, exp);
     token
 }
 
@@ -302,7 +310,16 @@ pub fn save_auth_token(token: &str, expires_at: i64) -> bool {
         return false;
     }
     let path = auth_token_path();
-    let body = serde_json::json!({"token": token, "expires_at": expires_at});
+    // Record the LIFETIME with the lease, not just its expiry: a renewal is due in
+    // the last fifth of the life, and "the last fifth" needs to know the whole.
+    // `saved_at` is what makes that readable back off the file.
+    let now = crate::storage::now();
+    let body = serde_json::json!({
+        "token": token,
+        "expires_at": expires_at,
+        "saved_at": now,
+        "lifetime": (expires_at - now).max(0),
+    });
     // Write beside the target, then rename over it. `fs::write` truncates first,
     // so a concurrent `auth_token()` (boot enrolment, the 401 path, the download
     // path and the music pre-warm all read it) could see an EMPTY file, answer
@@ -408,6 +425,136 @@ pub fn auth_token_reason() -> String {
 
 pub fn clear_auth_token() {
     let _ = std::fs::remove_file(auth_token_path());
+}
+
+/* ── lease state: report it, and renew before it dies ─────────────────────── */
+
+/// Fraction of the minted lifetime left at which a renewal is started.
+///
+/// A 60-minute lease is renewed in its last ~12 minutes: late enough that an
+/// ordinary request pays nothing for it, early enough that a failed attempt has
+/// minutes of room before the token the install is holding actually expires.
+const RENEW_AT_RATIO: f64 = 0.2;
+
+/// Minimum gap between expiry-driven renewal kicks, in seconds.
+const RENEW_KICK_GAP_SECS: i64 = 30;
+
+/// `expires_at` of the lease last reported (`0` = none yet), so `auth: lease valid`
+/// is one line per lease instead of one per request.
+static LEASE_REPORTED_EXP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// When the last expiry-driven renewal was kicked (`0` = never).
+static RENEW_KICKED_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The origin's last answer to an enrolment POST (`0` = it never completed).
+static LAST_ENROL_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Is a lease this close to its end worth replacing now?
+fn renewal_due(remaining: i64, lifetime: i64) -> bool {
+    lifetime > 0 && (remaining as f64) < RENEW_AT_RATIO * (lifetime as f64)
+}
+
+/// `(seconds left, lifetime the lease was minted with)`, when both are known.
+///
+/// A lease written by an older build carries no `lifetime`; `saved_at` is the
+/// fallback, and a file with neither is simply not renewed early — the 401 path
+/// still replaces it.
+fn lease_life(v: &Value, now: i64) -> Option<(i64, i64)> {
+    let token = v.get("token").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if token.is_empty() {
+        return None;
+    }
+    let exp = v.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
+    let lifetime = v.get("lifetime").and_then(|x| x.as_i64()).unwrap_or(0);
+    let saved_at = v.get("saved_at").and_then(|x| x.as_i64()).unwrap_or(0);
+    let life = if lifetime > 0 {
+        lifetime
+    } else if saved_at > 0 && exp > saved_at {
+        exp - saved_at
+    } else {
+        0
+    };
+    if exp <= now + 60 || life <= 0 {
+        return None;
+    }
+    Some((exp - now, life))
+}
+
+/// Report the lease once per lease, and start a renewal when it is near its end.
+fn note_lease(v: &Value, now: i64, exp: i64) {
+    use std::sync::atomic::Ordering;
+    if LEASE_REPORTED_EXP.swap(exp, Ordering::SeqCst) != exp {
+        log(
+            &format!("auth: lease valid {}s", exp - now),
+            &serde_json::json!({}),
+        );
+    }
+    let Some((remaining, lifetime)) = lease_life(v, now) else {
+        return;
+    };
+    if !renewal_due(remaining, lifetime) {
+        return;
+    }
+    // SINGLE FLIGHT through machinery that already exists: `ensure_enrolled_throttled()`
+    // holds `EnrolLatch`, and an enrolment already in flight IS the renewal.
+    if ENROLLING.load(Ordering::SeqCst) {
+        return;
+    }
+    // A claim, not a lock: exactly one caller of a burst spawns the task, and a
+    // timestamp cannot wedge the way a held bool can.
+    if RENEW_KICKED_AT.swap(now + RENEW_KICK_GAP_SECS, Ordering::SeqCst) > now {
+        return;
+    }
+    // A test process must not fire a live enrolment from the lease file it shares
+    // with the developer's own install.
+    if cfg!(test) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(renew_lease());
+}
+
+/// Replace the lease early, without leaving the install tokenless beyond the
+/// enrolment itself.
+async fn renew_lease() {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    let previous = std::fs::read(auth_token_path()).ok();
+    // `ensure_enrolled_throttled()` is the ONLY enrolment entry point and it refuses
+    // to mint while a valid lease exists, hence the clear. The old token is written
+    // back if the renewal fails, so an attempt that could not reach the origin never
+    // costs a lease that still had minutes of life left — the 401 path then takes
+    // over at its leisure.
+    clear_auth_token();
+    if ensure_enrolled_throttled().await {
+        log(
+            &format!("auth: renewed ({} ms)", started.elapsed().as_millis()),
+            &serde_json::json!({}),
+        );
+        return;
+    }
+    if let Some(bytes) = previous {
+        restore_auth_token(&bytes);
+    }
+    log(
+        &format!("auth: renew failed ({})", LAST_ENROL_STATUS.load(Ordering::SeqCst)),
+        &serde_json::json!({}),
+    );
+}
+
+/// Put a lease file back BYTE FOR BYTE after a failed renewal.
+///
+/// Not `save_auth_token()`: that would re-stamp `saved_at`, which would make the
+/// restored lease look freshly minted and push the next renewal deadline out by a
+/// whole lifetime. The original fields are what the retry schedule depends on.
+fn restore_auth_token(bytes: &[u8]) {
+    let path = auth_token_path();
+    let tmp = path.with_file_name("auth_token.json.restore");
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Sign `METHOD\nendpoint\nts\nnonce` with the install key.
@@ -674,6 +821,9 @@ pub async fn ensure_enrolled() -> EnrolOutcome {
     // two need different retry policies.
     let (resp, status) =
         Box::pin(crate::httpc::http_json_h_status_no_enroll(&url, &params, "POST", 20, &[])).await;
+    // The origin's answer, for the `auth: renew failed (N)` state line — `0` means
+    // the call never completed.
+    LAST_ENROL_STATUS.store(status as u32, std::sync::atomic::Ordering::SeqCst);
     let ok = resp
         .get("ok")
         .map(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) != 0)
@@ -1263,5 +1413,49 @@ mod provision_tests {
             status != 401 && status != 403,
             "ticket was refused by the protected route (status {status})"
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    /// Renew in the last fifth of the life, never before — and never on a lease
+    /// whose lifetime nothing recorded (that one is still recovered by the 401
+    /// path, which is the behaviour before this existed).
+    #[test]
+    fn a_lease_is_renewed_only_in_its_last_fifth() {
+        assert!(!renewal_due(3_600, 3_600), "a fresh lease is left alone");
+        assert!(!renewal_due(900, 3_600), "25 % left is not yet due");
+        assert!(renewal_due(600, 3_600), "10 % left is due");
+        assert!(renewal_due(1, 60), "the last second of a short lease is due");
+        assert!(!renewal_due(30, 60), "half of a short lease is not due");
+        assert!(!renewal_due(10, 0), "no recorded lifetime: no early renewal");
+    }
+
+    /// The lifetime read back off the token file: recorded by a current build, or
+    /// inferred from `saved_at` for one written before the field existed.
+    #[test]
+    fn the_recorded_lifetime_is_read_back_off_the_lease() {
+        let now = 1_000_000;
+        let current = serde_json::json!({
+            "token": "v1.t", "expires_at": now + 3_000,
+            "saved_at": now - 600, "lifetime": 3_600,
+        });
+        assert_eq!(lease_life(&current, now), Some((3_000, 3_600)));
+
+        let legacy = serde_json::json!({
+            "token": "v1.t", "expires_at": now + 3_000, "saved_at": now - 600,
+        });
+        assert_eq!(lease_life(&legacy, now), Some((3_000, 3_600)));
+
+        let unknown = serde_json::json!({"token": "v1.t", "expires_at": now + 3_000});
+        assert_eq!(lease_life(&unknown, now), None);
+
+        // An expired or tokenless lease is not a lease at all.
+        let expired = serde_json::json!({"token": "v1.t", "expires_at": now - 1, "lifetime": 60});
+        assert_eq!(lease_life(&expired, now), None);
+        let empty = serde_json::json!({"token": "", "expires_at": now + 3_000, "lifetime": 60});
+        assert_eq!(lease_life(&empty, now), None);
     }
 }

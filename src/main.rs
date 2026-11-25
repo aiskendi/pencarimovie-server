@@ -92,7 +92,7 @@ use tokio::net::TcpListener;
 /// and every CLI probe: the probes used to hardcode 8, so a diagnostic run measured a
 /// shape no user install had (2026-11-25, seen as `inflight_per_connection: 8` in the
 /// boot line of a mint probe while the server ran with 3).
-pub const DEFAULT_INFLIGHT: usize = 3;
+pub const DEFAULT_INFLIGHT: usize = 2;
 
 /// Telegram connections (sockets) per bot, for every platform.
 ///

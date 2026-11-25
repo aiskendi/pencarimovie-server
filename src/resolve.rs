@@ -835,8 +835,22 @@ async fn resolve_shortcode_status_inner(
     // An origin 5xx (or a request that never completed) is NOT a miss: the relay
     // is still running and the origin advertised `retry_after: 5`. Wait that out
     // once before the fast ladder, or a busy origin looks like a dead track.
+    //
+    // 2026-11-25: was a flat 5 s. The origin's own `retry_after` is what should be
+    // honoured, and its cold resolve now answers in ~2.96 s (stored miss -> single
+    // handover) — so 5 s of blind sleep ran longer than the work it was waiting
+    // for. Use the advertised value when present, capped, else a short default.
     if status >= 500 || status == 0 {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let advertised = res
+            .get("retry_after")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let wait_ms = if advertised > 0 {
+            (advertised * 1000).min(3_000)
+        } else {
+            1_500
+        };
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         let (r2, s2) = http_json_h_status_body(&url, &params, "GET", 6, &[]).await;
         res = r2;
         status = s2;
@@ -862,12 +876,18 @@ async fn resolve_shortcode_status_inner(
     // 0.485 s with 40 % 200s. A retry exists to OBTAIN an id, and the mint is the
     // cheap way to get one; the forced refresh was the expensive way and it failed
     // twice as often.
+    //
+    // 2026-11-25: the delays were [1200, 1500, 1500] = 4.2 s of sleeping. `fresh=1`
+    // is SYNCHRONOUS — the origin performs the handover and returns the id in the
+    // same call (measured 0.139 s p50, 2.96 s worst on a cold code) — so waiting
+    // 1.2 s before asking again costs more than the answer takes. Short, rising
+    // delays keep the retry cheap without hammering: total 1.7 s instead of 4.2 s.
     let mut retry = params.clone();
     retry.retain(|(k, _)| k != "force" && k != "nocache");
     if !retry.iter().any(|(k, _)| k == "fresh") {
         retry.push(("fresh".to_string(), "1".to_string()));
     }
-    for delay in [1200u64, 1500, 1500] {
+    for delay in [300u64, 500, 900] {
         tokio::time::sleep(Duration::from_millis(delay)).await;
         let (r, s) = http_json_h_status_body(&url, &retry, "GET", 6, &[]).await;
         res = r;

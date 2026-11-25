@@ -442,6 +442,36 @@ fn stall_attempt_budget(attempt: u32, budget: u32) -> u32 {
     budget.max(attempt.saturating_add(PRIME_STALL_EXTRA_ATTEMPTS))
 }
 
+/// Is a stalled part on a pool this small beyond what rotation can fix?
+///
+/// [`BotEntry::pick_slot`] moves to the next WORKER, which is the whole recovery
+/// for a stall — but a one-bot install has no second session, so the pick hands
+/// back the same dead socket. MEASURED 2026-11-25 (`short_code 96wp5L`,
+/// `download served by bot {"pool_size":1}`): nine attempts of 12 s each, every
+/// one re-picking the connection that had stopped answering, and the player
+/// never got a first byte. The second consecutive stall is where a retry has
+/// proven it cannot recover by itself; the first still earns the ordinary
+/// rotate-and-retry, because a single blip is not worth dropping the session.
+fn stall_needs_reconnect(stalled_part: bool, consecutive_stalls: u32, pool_bots: usize) -> bool {
+    stalled_part && consecutive_stalls >= 2 && pool_bots <= 1
+}
+
+/// Evict the bot from the shared pool and boot it again, so the retry gets new
+/// sockets instead of the dead ones the cached entry keeps handing out.
+///
+/// A failed `evict` is a failure of the whole thing: `boot()` would find the
+/// entry still cached and return it unchanged, which looks like a reconnect in
+/// the log while the retry lands on the same dead session again.
+async fn reboot_stalled_bot(bot_id: &str) -> Result<Arc<crate::telegram::BotEntry>, String> {
+    let Some(pool) = crate::telegram::shared_pool() else {
+        return Err("this process has published no Telegram pool".to_string());
+    };
+    if !pool.evict(bot_id).await {
+        return Err(format!("{} was not cached in the pool", bot_id));
+    }
+    pool.boot(bot_id, None).await
+}
+
 /// The same wait, on a host with a request timeout in front of it.
 ///
 /// Heroku's router kills a request that has produced nothing in **30 s** (`H12`),
@@ -3498,7 +3528,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             Err(prov) => boot_err = prov.error,
         }
     }
-    let Some(entry) = entry else {
+    // `mut`, because a one-bot pool has to evict and re-boot this entry when a
+    // stall repeats — see [`stall_needs_reconnect`].
+    let Some(mut entry) = entry else {
         // A Telegram login flood is retryable and must NOT look like "your bot is
         // gone": answer 429 + retry_after so a player backs off instead of
         // hammering the login (each retry re-arms FLOOD_WAIT).
@@ -3679,6 +3711,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // [`PRIME_GATE_RETRY_WAIT_SECS`], because a stalled pipe is not going to
     // answer just because we waited longer.
     let mut prime_wait = prime_gate_wait_secs();
+    // CONSECUTIVE stalls in THIS request. A busy pool recovers by waiting, but a
+    // stalled part is a dead socket, so the streak is the evidence that waiting
+    // and re-picking have already failed — see [`stall_needs_reconnect`].
+    let mut stall_streak = 0u32;
+    // One bot means `pick_slot()` has nowhere to rotate to, which is the install
+    // that burned nine 12 s windows on one stall (measured: `pool_size: 1`).
+    let one_bot_pool = candidates.len() <= 1;
     // The plugin's own `retry_after` when its relay refused to mint a fresh
     // reference. Carried to the give-up branch so the client gets a 503 it can
     // act on instead of a 500 that reads as "this track is broken".
@@ -3734,6 +3773,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 break;
             }
             Err(e) => {
+                // A STALL IS THE WIRE, and the streak only counts stalls: any
+                // other outcome means the connection answered, so the evidence
+                // that a reconnect is needed has to start over.
+                let stalled_part = e.message.starts_with(PART_STALL_PREFIX);
+                stall_streak = if stalled_part { stall_streak + 1 } else { 0 };
                 log(
                     "download attempt failed",
                     &serde_json::json!({
@@ -3752,14 +3796,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // deeper queue. So one saturation is waited out and retried, and
                 // only the second one is refused. The hard deadline still bounds
                 // this, so a genuinely stuck connection cannot hold a worker.
-                if e.message.starts_with(GATE_BUSY_PREFIX)
-                    || e.message.starts_with(PART_STALL_PREFIX)
-                {
+                if stalled_part || e.message.starts_with(GATE_BUSY_PREFIX) {
                     // ONLY THE EMPTY POOL earns a budget. A stalled part is a dead
                     // socket: waiting again cannot help, and spending the same two
                     // tries on it would turn a carrier blip into a refused play
                     // exactly like the pool case did.
-                    let stalled_part = e.message.starts_with(PART_STALL_PREFIX);
                     if !stalled_part {
                         prime_busy += 1;
                         if prime_busy >= 2 {
@@ -3791,12 +3832,47 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     // stalled part now gets here in about 2 s.
                     let (next_client, _next_gate) = entry.pick_slot();
                     client = next_client;
+                    // …BUT A ONE-BOT POOL HAS NOTHING TO ROTATE TO, and the pick
+                    // above hands back the same dead session. MEASURED 2026-11-25
+                    // (`short_code 96wp5L`, `pool_size: 1`): nine attempts of 12 s
+                    // each on one socket that had stopped answering, with all 12
+                    // permits free, and the player never got a first byte.
+                    // Evicting the cached entry and booting the bot again is the
+                    // only thing that produces new sockets here.
+                    if stall_needs_reconnect(stalled_part, stall_streak, candidates.len()) {
+                        match reboot_stalled_bot(&bot_id).await {
+                            Ok(fresh) => {
+                                client = fresh.pick_slot().0;
+                                entry = fresh;
+                                stall_streak = 0;
+                                log(
+                                    "stalled session evicted - reconnecting the bot",
+                                    &serde_json::json!({
+                                        "short_code": short_code,
+                                        "bot_id": bot_id,
+                                        "attempt": attempt,
+                                    }),
+                                );
+                            }
+                            Err(e) => log(
+                                "reconnect after a stall failed",
+                                &serde_json::json!({
+                                    "short_code": short_code,
+                                    "bot_id": bot_id,
+                                    "attempt": attempt,
+                                    "error": e,
+                                }),
+                            ),
+                        }
+                    }
                     // A busy pool is retried with a SHORT window (waiting longer
                     // cannot free a permit). A stalled part gets the FULL window
-                    // back: the part ladder inside already spends ~2.2 s, and a
-                    // silent wire is the one case where waiting longer is exactly
-                    // what MadelineProto does.
-                    let next_wait = if stalled_part {
+                    // back on a multi-bot pool: the part ladder inside already
+                    // spends ~2.2 s, and a silent wire is the one case where
+                    // waiting longer is exactly what MadelineProto does. A one-bot
+                    // pool has nowhere to rotate to, so the full window only buys
+                    // another 12 s of the same dead socket — it gets 3 s.
+                    let next_wait = if stalled_part && !one_bot_pool {
                         prime_gate_wait_secs()
                     } else {
                         PRIME_GATE_RETRY_WAIT_SECS
@@ -5166,6 +5242,28 @@ mod tests {
         assert_eq!(stall_attempt_budget(9, 4), 9 + PRIME_STALL_EXTRA_ATTEMPTS);
         // An already-generous budget is left alone.
         assert_eq!(stall_attempt_budget(1, 20), 20);
+    }
+
+    /// On a one-bot pool a repeated stall must evict and re-boot the bot.
+    ///
+    /// MEASURED 2026-11-25 (`short_code 96wp5L`, `pool_size: 1`): rotating the
+    /// worker re-picked the same dead session nine times, at 12 s each, while all
+    /// 12 permits were free — the player hung instead of playing.
+    #[test]
+    fn a_stalled_part_on_a_one_bot_pool_needs_a_reconnect() {
+        assert!(stall_needs_reconnect(true, 2, 1));
+        // A long stall only makes the case stronger.
+        assert!(stall_needs_reconnect(true, 9, 1));
+        // The FIRST stall still earns the ordinary rotate-and-retry: one blip is
+        // not worth dropping the session.
+        assert!(!stall_needs_reconnect(true, 1, 1));
+        // With a second bot there is somewhere to rotate to, so nothing is
+        // evicted — that path must keep behaving exactly as it did.
+        assert!(!stall_needs_reconnect(true, 2, 2));
+        assert!(!stall_needs_reconnect(true, 9, 8));
+        // A saturated pool is not a dead session and must never evict a bot.
+        assert!(!stall_needs_reconnect(false, 2, 1));
+        assert!(!stall_needs_reconnect(false, 9, 1));
     }
 
     /// The two prefixes must never collapse into one string.

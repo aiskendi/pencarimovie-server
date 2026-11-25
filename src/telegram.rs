@@ -692,6 +692,14 @@ impl TelegramPool {
         Ok(entry)
     }
 
+    /// Drop a bot's cached entry so the next [`Self::boot`] builds a fresh
+    /// client with new sockets. A stalled part on a one-bot install cannot
+    /// rotate anywhere; re-picking the same dead session is what turned one
+    /// stall into nine 12 s windows (measured: short_code 96wp5L, 2026-11-25).
+    pub async fn evict(&self, bot_id: &str) -> bool {
+        self.bots.lock().await.remove(bot_id.trim()).is_some()
+    }
+
     pub async fn boot_with_token(&self, token: &str, hint: &str) -> Result<Arc<BotEntry>, String> {
         self.boot(hint, Some(token)).await
     }
@@ -1781,6 +1789,25 @@ mod tests {
         assert_eq!(bot_b.total_available_permits(), 0);
         drop(held_permits_b);
         assert_eq!(bot_b.total_available_permits(), 32);
+    }
+
+    /// `evict()` is what gives a one-bot install new sockets, so it has to
+    /// actually remove the entry — `boot()` answers from this map, and a silent
+    /// miss (or a leftover copy) puts the retry straight back on the session
+    /// that stalled.
+    #[tokio::test]
+    async fn evict_drops_the_cached_entry_and_reports_it() {
+        let pool = TelegramPool::new(1, 1);
+        let entry = Arc::new(BotEntry::new_test_entry("bot_evict", 1, 1));
+        pool.insert_test_entry("bot_evict", entry).await;
+        assert!(pool.get("bot_evict").await.is_some());
+        // Trimmed, exactly like `get()`/`boot()` key it.
+        assert!(pool.evict(" bot_evict ").await);
+        assert!(pool.get("bot_evict").await.is_none());
+        // Gone already: `false`, which the stall handler logs as a failed
+        // reconnect instead of pretending the session was rebuilt.
+        assert!(!pool.evict("bot_evict").await);
+        assert!(!pool.evict("   ").await);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Port of the download path: backend.php:1884 (payload decode), 11107-11126
+﻿//! Port of the download path: backend.php:1884 (payload decode), 11107-11126
 //! (payload-from-path) and 19699-20360 (the `/api/download` handler), with
 //! `downloadToBrowser()` replaced by grammers' `iter_download()`.
 //!
@@ -136,15 +136,15 @@ impl Drop for ActivityGuard {
 /// resolve finishes in ~1-3 s.
 ///
 /// The budget REFRESHES when an attempt makes progress (a re-resolve returned a
-/// new `file_id`, or an alternate bot was found) — see `hard_deadline` below.
+/// new `file_id`, or an alternate bot was found) â€” see `hard_deadline` below.
 const PREFLIGHT_BUDGET_SECS: u64 = 20;
 
 /// How long ONE resolve may take inside the download pre-flight.
 ///
 /// The origin answers a busy relay with `503 {"retry_after":5}`, and every
 /// `resolve-file` call is allowed 15 s by the shared HTTP helper. Two of those
-/// back to back is 30 s of a first byte the player has already given up on —
-/// MEASURED 2026-11-09 on `R1kYa6` (TUIDE · SUN KISS): two ranges answered `503`
+/// back to back is 30 s of a first byte the player has already given up on â€”
+/// MEASURED 2026-11-09 on `R1kYa6` (TUIDE Â· SUN KISS): two ranges answered `503`
 /// after **36 s** and **24 s**, carrying `retry_after:5` in the answer they
 /// eventually got, i.e. the client was told to retry in five seconds half a
 /// minute late. A resolve that needs longer than this is the origin being busy,
@@ -169,9 +169,9 @@ fn id_of(v: &Value) -> String {
 ///
 /// A split window holds a `DocTarget`, not a `file_id` string, so this is where the
 /// "id the caller already holds" comes from when the reference-expired ladder
-/// refreshes it (CHANGE 1: the local re-send gets this id as its LAST rung — the
+/// refreshes it (CHANGE 1: the local re-send gets this id as its LAST rung â€” the
 /// origin's `fresh=1` mint and its forced re-mint are issued only when no local rung
-/// produced one). Empty when the cache has no usable row — the local send is then
+/// produced one). Empty when the cache has no usable row â€” the local send is then
 /// simply not attempted.
 fn held_id(short_code: &str, bot_id: &str) -> String {
     resolve_shortcode_cached(short_code, bot_id)
@@ -185,10 +185,10 @@ fn held_id(short_code: &str, bot_id: &str) -> String {
 /// (~2.5 s at the throughput a phone sees), which reads as buffering after a
 /// seek. 512 KB halves that wait and still costs exactly the SAME two parts for
 /// window 0 (512 KB prime + 512 KB remainder), so steady-state throughput is
-/// untouched — 256 KB was one part more per window 0 for no extra benefit.
+/// untouched â€” 256 KB was one part more per window 0 for no extra benefit.
 const PRIME_BYTES: u64 = 512 * 1024;
 
-/// `(skip0, prime_want)` — how much to pull from `aligned` so a body that must
+/// `(skip0, prime_want)` â€” how much to pull from `aligned` so a body that must
 /// start at `start` can be produced.
 ///
 /// `aligned` sits up to 1 MB BELOW `start`, so priming with just `prime` bytes
@@ -209,12 +209,12 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     let prime = total.min(PRIME_BYTES);
     let skip0 = start.saturating_sub(aligned);
 
-    // Round the head up to a whole part (`MAX_CHUNK`, 512 KB — the largest part
+    // Round the head up to a whole part (`MAX_CHUNK`, 512 KB â€” the largest part
     // grammers' parser can accept), then never beyond one 1 MB block.
     //
     // This is not cosmetic. `plan_limit()` can only pick a big part when the
     // position DIVIDES by it, so a head that ends on an arbitrary offset leaves
-    // the next window at an offset only 4 KB can divide — and that window is then
+    // the next window at an offset only 4 KB can divide â€” and that window is then
     // fetched as 128-256 tiny parts instead of one. Measured on a seek
     // (`start = aligned + 1`, 8 MB): **245 KB/s**, against 2.9 MB/s for the same
     // request one byte earlier. Rounding the head keeps every following window at
@@ -231,8 +231,8 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     let head_end = skip0.saturating_add(prime);
     // A SHORT RANGE GETS ONLY WHAT IT ASKED FOR.
     //
-    // A player's first request is a container sniff — BitChord sends
-    // `bytes=0-65535` — and rounding that up to a whole 512 KB part made it cost
+    // A player's first request is a container sniff â€” BitChord sends
+    // `bytes=0-65535` â€” and rounding that up to a whole 512 KB part made it cost
     // eight times the data and hold a part permit eight times as long, on an
     // uplink where that is the difference between a first byte and a stall.
     // MadelineProto shrinks its part the same way for short ranges, in
@@ -256,7 +256,7 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
     (skip0, want)
 }
 
-/* ── learned per-bot part window ─────────────────────────────────────────── */
+/* â”€â”€ learned per-bot part window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /// A LEARNED ceiling on concurrent `upload.getFile` parts for ONE bot.
 ///
@@ -272,7 +272,7 @@ fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u
 ///
 /// Nothing was queueing for a permit, so the wait was not contention: the
 /// session already had too many file requests outstanding and the DC had stopped
-/// answering. The fix is the one MadelineProto shipped for the same bug — a
+/// answering. The fix is the one MadelineProto shipped for the same bug â€” a
 /// window per bot that starts at the two requests a media socket carries, HALVES
 /// on every rejection (a stalled part, a dropped socket, a `FLOOD_WAIT`, a
 /// `-429`) and GROWS by one per full window of answers while requests are
@@ -291,7 +291,7 @@ struct FileWindow {
     cap: u32,
 }
 
-/// Where a bot's window starts: one media socket, two file requests — the shape
+/// Where a bot's window starts: one media socket, two file requests â€” the shape
 /// MadelineProto gives `upload.getFile`.
 const FILE_WINDOW_START: u32 = 2;
 
@@ -322,7 +322,7 @@ impl FileWindow {
         self.limit
     }
 
-    /// Take one part slot. `false` means the learned ceiling is reached — the
+    /// Take one part slot. `false` means the learned ceiling is reached â€” the
     /// caller QUEUES for the next slot, it does not fail the part.
     fn try_acquire(&mut self) -> bool {
         if self.in_flight >= self.limit {
@@ -402,6 +402,10 @@ fn file_window_cap() -> u32 {
     let inflight = crate::telegram::shared_pool()
         .map(|p| p.inflight())
         .unwrap_or(FILE_WINDOW_MAX as usize);
+    // The window may never exceed the small ceiling: per-socket concurrency is what
+    // the server punishes (danog/MadelineProto#1948 settles on 2 per socket and
+    // answers a too-busy socket by DROPPING it, not with an error). Throughput comes
+    // from more sockets, not from more parts on one socket.
     FILE_WINDOW_MAX.min(inflight.max(1) as u32)
 }
 
@@ -455,7 +459,7 @@ fn file_window_state(bot_id: &str) -> String {
 struct FileWindowSlot(String);
 
 impl FileWindowSlot {
-    /// Record the answer BEFORE the slot is returned — see [`FileWindow::on_answer`].
+    /// Record the answer BEFORE the slot is returned â€” see [`FileWindow::on_answer`].
     fn answered(&self) {
         file_window_answer(&self.0);
     }
@@ -562,11 +566,11 @@ async fn fetch_prime_gated(
     // connection and `fetch_range_core` waits for a permit FOREVER ("requests
     // queue, they never fail").
     //
-    // MEASURED 2026-11-08 19:33–19:34 UTC on v31: 31 of 100 `/api/download`
+    // MEASURED 2026-11-08 19:33â€“19:34 UTC on v31: 31 of 100 `/api/download`
     // requests were killed by Heroku's router at 30 s (`H12`) and **8 of those
-    // 31 were music** — `The.Weeknd.Out.of.Time.flac` (49 MB),
+    // 31 were music** â€” `The.Weeknd.Out.of.Time.flac` (49 MB),
     // `04.BIRDS.OF.A.FEATHER.Explicit.flac` (41 MB), `PinkPantheress.Illegal.flac`
-    // and others — while the dyno's 32 parts were all streaming something else.
+    // and others â€” while the dyno's 32 parts were all streaming something else.
     // A queued first byte has to become a fast, retryable answer instead of a
     // 30 s hang the router turns into a 503 the player cannot retry.
     let started = std::time::Instant::now();
@@ -574,7 +578,7 @@ async fn fetch_prime_gated(
     //
     // A part queued behind our own learned limit has not touched the wire, so it
     // must not be reported as a stalled part: that would rotate a healthy socket
-    // AND halve the window — feeding the stall it was mistaken for. Waiting for
+    // AND halve the window â€” feeding the stall it was mistaken for. Waiting for
     // a slot therefore has its own answer, `parts busy`, which the caller already
     // knows to wait out, and its own bounded window.
     let Some(window_slot) =
@@ -603,7 +607,7 @@ async fn fetch_prime_gated(
         // discriminator, and it has to be read there, not guessed afterwards.
         //
         // `free == 0` is genuine contention: every permit is held, so the request
-        // really did queue for one. `free > 0` is the opposite — the pool was idle
+        // really did queue for one. `free > 0` is the opposite â€” the pool was idle
         // and some PART never came back. The 2026-11-13 phone log finally showed
         // that directly: `gate_free: 12` printed next to `Connection reset by peer
         // (os error 104)` and `Timeout (-503)` on DC3, i.e. the wire, not the pool.
@@ -648,7 +652,7 @@ async fn fetch_prime_gated(
 /// This is the only way a body part is issued on the download paths below: the
 /// `--inflight` gate still bounds parts per CONNECTION exactly as before, and the
 /// window adds the per-BOT ceiling the DC actually measures. The result is
-/// returned unchanged — every caller's retry ladder (file reference, transport,
+/// returned unchanged â€” every caller's retry ladder (file reference, transport,
 /// busy) stays as it is; only the window learns from it.
 ///
 /// The window slot is taken BEFORE the connection permit, so a part waiting on
@@ -689,7 +693,7 @@ async fn prime_parts(
     // serial vs 723 ms split on a 406 MB 4K source). When the pool is nearly
     // empty it does the opposite: two pre-flights per request empty a 12-permit
     // pool, and every request behind them waits the full
-    // [`PRIME_GATE_WAIT_SECS`] window and then answers `parts busy` — the
+    // [`PRIME_GATE_WAIT_SECS`] window and then answers `parts busy` â€” the
     // 2026-11-13 phone log, three stalls 80 s apart on ONE 552 MB file with a
     // single bot. One permit, fetched serially by `fetch_range_core`, returns
     // byte-identical data and leaves the pool depth for the requests already
@@ -732,7 +736,7 @@ async fn prime_parts(
 /// platform router's 30 s timeout.
 ///
 /// A 1 MB part is fetched in well under a second at the measured rates, so a
-/// wait this long means the connection is saturated — but waiting is still the
+/// wait this long means the connection is saturated â€” but waiting is still the
 /// better answer than refusing: MEASURED 2026-11-09 at 6 s, the fleet turned 17
 /// streams in 34 s into `parts busy` 503s (4 of 22 music files got nothing else),
 /// and a player that does not retry reads that as "this song will not play".
@@ -744,7 +748,7 @@ pub const PRIME_GATE_WAIT_SECS: u64 = 12;
 ///
 /// Paying a second full window was measurably useless: in the 2026-11-13 phone
 /// log every stalled request spent 12 s, rotated the worker, spent another 12 s
-/// and then answered `503` — 24 s of silence, after which the player starts
+/// and then answered `503` â€” 24 s of silence, after which the player starts
 /// another body and queues behind its own abandoned request. The retry is worth
 /// trying (a rotated worker is a different TCP connection and often answers at
 /// once); it is not worth another twelve seconds.
@@ -756,10 +760,10 @@ pub const PRIME_GATE_RETRY_WAIT_SECS: u64 = 3;
 /// MadelineProto's `downloadPart()` has no attempt counter at all: it retries
 /// `upload.getFile` in place, `delay(1)` on `FLOOD_WAIT`, and exits only when the
 /// client disconnects. A first byte that has not been sent yet is in the same
-/// position — no bytes means nothing to corrupt — so instead of the pool's two
+/// position â€” no bytes means nothing to corrupt â€” so instead of the pool's two
 /// tries it keeps rotating workers until [`PREFLIGHT_HARD_CAP_SECS`] runs out.
 /// Measured on the phone 2026-11-13: DC3 was reset continuously for ~60 s
-/// (`dc candidate … step:` 8 → 21) while the 4-attempt engine gave up inside the
+/// (`dc candidate â€¦ step:` 8 â†’ 21) while the 4-attempt engine gave up inside the
 /// first blip and answered `503`.
 const PRIME_STALL_EXTRA_ATTEMPTS: u32 = 8;
 
@@ -767,7 +771,7 @@ const PRIME_STALL_EXTRA_ATTEMPTS: u32 = 8;
 ///
 /// Only ever GROWS. A saturated pool must not extend anything (two tries is the
 /// whole point of [`GATE_BUSY_PREFIX`]), while a stalled part always leaves
-/// [`PRIME_STALL_EXTRA_ATTEMPTS`] more tries on the table — which is the closest
+/// [`PRIME_STALL_EXTRA_ATTEMPTS`] more tries on the table â€” which is the closest
 /// a bounded engine can come to MadelineProto retrying a part forever.
 fn stall_attempt_budget(attempt: u32, budget: u32) -> u32 {
     budget.max(attempt.saturating_add(PRIME_STALL_EXTRA_ATTEMPTS))
@@ -776,7 +780,7 @@ fn stall_attempt_budget(attempt: u32, budget: u32) -> u32 {
 /// Is a stalled part on a pool this small beyond what rotation can fix?
 ///
 /// [`BotEntry::pick_slot`] moves to the next WORKER, which is the whole recovery
-/// for a stall — but a one-bot install has no second session, so the pick hands
+/// for a stall â€” but a one-bot install has no second session, so the pick hands
 /// back the same dead socket. MEASURED 2026-11-25 (`short_code 96wp5L`,
 /// `download served by bot {"pool_size":1}`): nine attempts of 12 s each, every
 /// one re-picking the connection that had stopped answering, and the player
@@ -811,7 +815,7 @@ async fn reboot_stalled_bot(bot_id: &str) -> Result<Arc<crate::telegram::BotEntr
 /// bounded resolve is 22 s, which fits and is checked by
 /// `a_paas_first_byte_fits_inside_the_router_timeout`. A desktop has no router and
 /// waiting is still better than refusing there, so the wide value stands unless a
-/// PaaS marker is present — see [`crate::paas_env_present`].
+/// PaaS marker is present â€” see [`crate::paas_env_present`].
 ///
 /// 8, not 6, after MEASURED 2026-11-09 on the fleet: with `PRIME_PARTS` at 12 and
 /// the worker rotating on a stall, ~20 refusals per 40 s still had a part that
@@ -839,7 +843,7 @@ fn prime_gate_wait_secs() -> u64 {
 pub const GATE_BUSY_PREFIX: &str = "parts busy";
 
 /// Prefix of the error that means "a PART never came back and the POOL was not
-/// the reason" — permits were free while the fetch failed.
+/// the reason" â€” permits were free while the fetch failed.
 ///
 /// This is the wire: `Connection reset by peer`, `Timeout (-503)`, a connection
 /// runner dropped mid-receive. Waiting cannot fix it, so the answer is to rotate
@@ -860,7 +864,7 @@ fn prime_split_allowed(free: usize) -> bool {
 /// How many parts the PRE-FLIGHT may hold, in its own pool, apart from the
 /// streaming budget.
 ///
-/// MEASURED 2026-11-09 — this was the whole of the "stuck on upgrading quality,
+/// MEASURED 2026-11-09 â€” this was the whole of the "stuck on upgrading quality,
 /// never plays" report. BitChord asks for ONE track with three ranges at once
 /// (`bytes=0-65535` for its container sniff, then `65536-1048575`, then the
 /// open-ended body). Every one of those primes first, and every live body holds
@@ -869,8 +873,8 @@ fn prime_split_allowed(free: usize) -> bool {
 /// them for the full [`PRIME_GATE_WAIT_SECS`] and answered `503 parts busy`; the
 /// app then restarted the download from byte 0 and never reached audio.
 ///
-/// Reproduced on an idle desktop server with one command —
-/// `node tools/probe_music_ranges.mjs --bodies 10 --read-mb 12` — which answered
+/// Reproduced on an idle desktop server with one command â€”
+/// `node tools/probe_music_ranges.mjs --bodies 10 --read-mb 12` â€” which answered
 /// `head bytes=65536-1048575 -> HTTP 503 110B ttfb 12050ms` on every run.
 ///
 /// A first byte is not negotiable against throughput: it is what the player is
@@ -882,7 +886,7 @@ fn prime_split_allowed(free: usize) -> bool {
 ///
 /// 12, not 6, after MEASURED 2026-11-09 on the five-dyno fleet: `download
 /// refused {"stage":"PARTS_BUSY"}` for four different players (libmpv, okhttp,
-/// Chrome on a TV, BitChord) inside 25 s, every one at `attempt:1` — the pool was
+/// Chrome on a TV, BitChord) inside 25 s, every one at `attempt:1` â€” the pool was
 /// empty before the request arrived, and a cold dyno's part takes longer than the
 /// 6 s window to come back.
 pub const PRIME_PARTS: usize = 12;
@@ -896,12 +900,12 @@ fn prime_gate() -> &'static tokio::sync::Semaphore {
 ///
 /// A player asks for ONE track with three ranges at once (`bytes=0-65535` for its
 /// container sniff, `65536-1048575`, then the open-ended body), so every track
-/// start used to fire three primes in the same instant — on top of the bodies
+/// start used to fire three primes in the same instant â€” on top of the bodies
 /// already streaming other tracks. MEASURED 2026-11-09 with the desktop server
 /// and BitChord: with four tracks switching quickly, `TPHzRh`'s
 /// `bytes=0-65535` waited the full [`PRIME_GATE_WAIT_SECS`] and answered
 /// `503 parts busy`, and the app's answer to a 503 is to restart the download
-/// from byte zero — which added another body and more primes. Serialising the
+/// from byte zero â€” which added another body and more primes. Serialising the
 /// primes of one file is what breaks that cycle.
 fn prime_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     static MAP: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -919,7 +923,7 @@ fn prime_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// One resolve, bounded — `None` when it outran the pre-flight's budget.
+/// One resolve, bounded â€” `None` when it outran the pre-flight's budget.
 async fn resolve_bounded<F>(fut: F, what: &str) -> Option<Value>
 where
     F: std::future::Future<Output = Value>,
@@ -949,13 +953,13 @@ where
 ///
 /// ```text
 /// cached file_id refused as stale {resolved_age_s:73, verified_age_s:-1}
-/// download served by bot           … only the prime arrived
+/// download served by bot           â€¦ only the prime arrived
 /// download attempt failed          FILE_REFERENCE_EXPIRED (400)
 /// ```
 ///
 /// No body ever completed, so no id ever became verified, so every id stayed on
 /// the 60 s window, so the next range 61 s later dropped it and asked the origin
-/// for a NEW `file_reference` — which invalidates the one the body still
+/// for a NEW `file_reference` â€” which invalidates the one the body still
 /// streaming is using. Recoding the proof at the PRIME breaks that loop at the
 /// first byte instead of at the last. The write is skipped when the entry is
 /// already verified for this exact id: every request primes, and a cache write
@@ -1002,7 +1006,7 @@ pub const BODY_WINDOW_ATTEMPTS: u32 = 3;
 ///
 /// MEASURED 2026-11-09 from the live log, `web.3`: `download stream aborted
 /// mid-body {"error":"AUTH_BYTES_INVALID (400)","short_code":"XPkhD3"}` twice for
-/// the same track. Telegram is saying the auth key itself is bad — a retry, a
+/// the same track. Telegram is saying the auth key itself is bad â€” a retry, a
 /// reconnect and a worker rotation all change nothing, and the bot then poisons
 /// every stream it is picked for.
 fn is_auth_failure(message: &str) -> bool {
@@ -1051,13 +1055,13 @@ fn mark_session_bad(bot: &str, why: &str) {
 /// `FILE_REFERENCE_EXPIRED (400)` the ROW IS FINE and a resolve seconds later
 /// returns a working reference. MEASURED 2026-11-09 from the live log, after the
 /// part-budget work landed: two music files (`Bring Me The Horizon LosT.flac`,
-/// `02.Jangan.Pernah.Berubah.flac`) reached the client as **410** in one window —
+/// `02.Jangan.Pernah.Berubah.flac`) reached the client as **410** in one window â€”
 /// and a player treats 410 as "deleted" and never asks again, which is the last
 /// way a healthy lossless row still looked unplayable.
 ///
 /// So a dead reference answers `503` + `Retry-After: 2`: retryable, and short
 /// enough that the player's own retry lands inside the resolve's wake-up. A bare
-/// transport/unknown failure stays `500` with no `Retry-After` — that one is not
+/// transport/unknown failure stays `500` with no `Retry-After` â€” that one is not
 /// a promise that a retry will help.
 fn giveup_status(err: &crate::telegram::GramErr) -> (u16, &'static str, Option<u64>) {
     if err.file_reference {
@@ -1072,7 +1076,7 @@ fn giveup_status(err: &crate::telegram::GramErr) -> (u16, &'static str, Option<u
         // The second clause is grammers' other shape for the same event: a
         // sender-pool runner torn down mid-retry, phrased with none of the TCP
         // words `is_transport_reset()` looks for, so it fell through to the
-        // fatal 500 — the one status a player never retries.
+        // fatal 500 â€” the one status a player never retries.
         (503, "UPSTREAM_STALL", Some(2))
     } else {
         (500, "DOWNLOAD_FAILED", None)
@@ -1094,15 +1098,15 @@ fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
 /// where that limit is `1_044_456 - SIZE_OVERHEAD`, so a FULL 1 MB
 /// `upload::GetFile` reply aborts the connection's runner
 /// (`SenderPoolRunner was dropped during retry at send`) and 512 KB
-/// (`telegram::MAX_CHUNK`) is a hard ceiling. MadelineProto's 1 MB parts — the
-/// reason the PHP build felt faster — are out of reach without a custom MTProto
+/// (`telegram::MAX_CHUNK`) is a hard ceiling. MadelineProto's 1 MB parts â€” the
+/// reason the PHP build felt faster â€” are out of reach without a custom MTProto
 /// client, so concurrency is the only lever here.
 ///
 /// Measured on a phone (OnePlus CPH2581, 32 MB range mid-file, same 4K MKV):
 /// `1 x 8` (the old defaults) **0.81 MB/s**; `4 x 8` 1.44; `8 x 8` 1.56;
 /// `1 x 32` 1.40-1.62; `8 x 32` 1.46-1.82; `16 x 32` 1.40 (over-subscribed).
 /// **Pipeline depth is NOT a reliable knob**: `8 x 32` measured 1.93 MB/s with
-/// `PM_PIPELINE=64` in one run and 0.52 MB/s with the same settings in the next —
+/// `PM_PIPELINE=64` in one run and 0.52 MB/s with the same settings in the next â€”
 /// the phone's Telegram path varies far more than the depth helps. Hence the
 /// modest default of 16, and 8 connections x 32 parts as the app's setting.
 fn pipeline_depth() -> usize {
@@ -1117,7 +1121,7 @@ fn pipeline_depth() -> usize {
 use crate::telegram::{DocTarget, prepare_file_target};
 use crate::AppState;
 
-/* ── payload ─────────────────────────────────────────────────────────────── */
+/* â”€â”€ payload â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 pub fn decode_download_payload(payload: &str) -> Value {
     let mut s = payload.replace('-', "+").replace('_', "/");
@@ -1304,7 +1308,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/* ── Range ───────────────────────────────────────────────────────────────── */
+/* â”€â”€ Range â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 #[derive(Debug, Clone, Copy)]
 pub struct ByteRange {
@@ -1352,7 +1356,7 @@ pub fn parse_range_header(header: &str, size: u64) -> Option<ByteRange> {
     Some(ByteRange { start, end })
 }
 
-/* ── mime / filename helpers ─────────────────────────────────────────────── */
+/* â”€â”€ mime / filename helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 pub fn mime_by_ext(ext: &str) -> Option<&'static str> {
     Some(match ext {
@@ -1437,7 +1441,7 @@ pub fn stream_filename(file_name: &str, mime: &str) -> String {
     name
 }
 
-/* ── handler ─────────────────────────────────────────────────────────────── */
+/* â”€â”€ handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 fn jstr(v: &Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").trim().to_string()
@@ -1453,12 +1457,12 @@ fn jnum(v: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/* ── diagnostics ─────────────────────────────────────────────────────────── */
+/* â”€â”€ diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 /// Record a request the client is about to see fail.
 ///
-/// `http_status` is the number the PLAYER renders verbatim — Nuvio shows
-/// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and nothing else — so
+/// `http_status` is the number the PLAYER renders verbatim â€” Nuvio shows
+/// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and nothing else â€” so
 /// it is what turns a screenshot back into a request. It is also the field the
 /// old incidents never carried: the two **400** payload refusals below left no
 /// trace at all, which is why "the stream source is blocked or restricted" was
@@ -1510,7 +1514,7 @@ fn record_refusal(
 /// Answer a per-client abuse refusal (`ratelimit`).
 ///
 /// Always `429` + `Retry-After`: a player reads `5xx` and `404` as fatal and never
-/// retries, while `403` reads as "your account is gone" — AGENTS.md is explicit that
+/// retries, while `403` reads as "your account is gone" â€” AGENTS.md is explicit that
 /// a rate limit must answer 429. `Retry-After` is what makes a well-behaved client
 /// back off instead of hammering, which would keep its own budget spent.
 fn refuse_limit(
@@ -1547,14 +1551,14 @@ fn refuse_limit(
 /// What an empty resolve MEANS.
 ///
 /// A short_code that resolved to nothing is the client's fault only when the origin
-/// ANSWERED. When it never answered — DNS, TCP, timeout — the fault is upstream, and
+/// ANSWERED. When it never answered â€” DNS, TCP, timeout â€” the fault is upstream, and
 /// saying so is the whole difference between a recoverable stream and a dead one:
 /// ExoPlayer retries a `5xx` on its own, while it renders a `400` verbatim as
 /// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and gives up. Measured on a
 /// phone (2026-11-02) where the origin timed out: every play showed exactly that 400.
 ///
 /// ponytail: reads the 20 s origin gate, so a genuine miss arriving right after an
-/// outage also answers 503 for at most those 20 s — the retry gets the real 400/404.
+/// outage also answers 503 for at most those 20 s â€” the retry gets the real 400/404.
 fn resolve_busy_wait(v: &Value) -> Option<i64> {
     let retry = jnum(v, "retry_after");
     if retry > 0 {
@@ -1630,7 +1634,7 @@ pub fn plan_download_candidates(
 /// Wall-clock second this process started.
 ///
 /// A Telegram `file_reference` is bound to the session that minted it, so an id
-/// stamped before this instant cannot be used by this process at all — the
+/// stamped before this instant cannot be used by this process at all â€” the
 /// session that owned it is gone. Lazily fixed at the first download, which is
 /// also the first moment the value matters.
 fn boot_at() -> i64 {
@@ -1644,7 +1648,7 @@ fn download_allowed(addon_open: bool, authenticated: bool, node_public: bool) ->
     addon_open || authenticated || node_public
 }
 
-/* ── split (byte-concatenated) streams ───────────────────────────────────── */
+/* â”€â”€ split (byte-concatenated) streams â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Container {
@@ -1704,7 +1708,7 @@ struct SplitPart {
     size: u64,
 }
 
-/// `parts: [{short_code, file_size}, …]`, or `None` for an ordinary single file.
+/// `parts: [{short_code, file_size}, â€¦]`, or `None` for an ordinary single file.
 fn split_parts_from_payload(payload: &Value) -> Result<Option<Vec<SplitPart>>, String> {
     let Some(value) = payload.get("parts") else {
         return Ok(None);
@@ -2558,7 +2562,7 @@ async fn serve_remux_split(
 }
 
 /// Drop a cached reference and refresh it. Used when Telegram answers
-/// `FILE_REFERENCE_EXPIRED` — a normal event after the resolve cache ages out.
+/// `FILE_REFERENCE_EXPIRED` â€” a normal event after the resolve cache ages out.
 ///
 /// CHANGE 1: the local re-send goes first, from the id this part is already
 /// using, and the origin's `force=1&nocache=1` re-mint is reached only when the
@@ -2589,7 +2593,7 @@ async fn refresh_split_target(
 ///
 /// One batch `/resolve-files` call queues the whole set at the origin, then each
 /// part is resolved into a `DocTarget`. The stream itself stays lazy: if a part
-/// is still cold at a boundary, `ensure_split_target` waits on the same mutex —
+/// is still cold at a boundary, `ensure_split_target` waits on the same mutex â€”
 /// but in the normal case the boundary never pays a resolve.
 async fn warm_split_targets(
     parts: &[SplitPart],
@@ -2810,7 +2814,7 @@ async fn handle_split_download(
             return json_response(503, &serde_json::json!({"ok": 0, "message": e, "retry_after": 3}));
         }
     };
-    // A ZIP volume (`…mkv.zip.001`) is not Matroska and not a byte split: the
+    // A ZIP volume (`â€¦mkv.zip.001`) is not Matroska and not a byte split: the
     // movie is one stored entry inside a ZIP64 archive. Probe the central
     // directory and serve the entry directly when it is stored.
     if head.starts_with(&[0x50, 0x4B, 0x03, 0x04]) || head.starts_with(&[0x50, 0x4B, 0x05, 0x06]) {
@@ -3180,7 +3184,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     //
     // This used to run only when the payload carried an id (`!file_id.is_empty()`).
     // Stream URLs built by this addon carry only the short_code, so the condition
-    // was false for every real Play and each Range request resolved again — the
+    // was false for every real Play and each Range request resolved again â€” the
     // player then re-asks on every seek, so a single playback fired a resolve per
     // range. That is what the user saw as "while playing it keeps requesting a new
     // file_id", and against a busy origin (HTTP 503 on `/resolve-file`) it is what
@@ -3202,27 +3206,27 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // with it (and the reference inside it is not interchangeable either).
             // The cache is already keyed `short_code:bot_id`, and this second check
             // rejects an entry that names a different bot than the one we are about
-            // to use — belt and braces, because using a foreign id can only fail
+            // to use â€” belt and braces, because using a foreign id can only fail
             // later (FILE_REFERENCE_EXPIRED) after a wasted round-trip.
             let entry_bot = jstr(&entry, "bot_id");
             let same_bot = entry_bot.is_empty() || entry_bot == eff_bot;
             let verified = entry.get("verified_at").and_then(|v| v.as_i64()).unwrap_or(0);
             let resolved = entry.get("resolved_at").and_then(|v| v.as_i64()).unwrap_or(0);
             // A `file_reference` lives ~1 h, so an id is trusted only while it is
-            // younger than that — measured, not guessed:
-            //   • the reference inside a 2 h-cached id was ALWAYS dead, so every
+            // younger than that â€” measured, not guessed:
+            //   â€¢ the reference inside a 2 h-cached id was ALWAYS dead, so every
             //     Eclipse track logged `FILE_REFERENCE_EXPIRED` on its first byte
             //     and then re-resolved;
-            //   • the browser's `<audio>` gives the response ~20 s before it fires
+            //   â€¢ the browser's `<audio>` gives the response ~20 s before it fires
             //     `error` ("Playback error - stream unavailable"), and the forced
             //     re-resolve can take longer than that.
             // An id that was never PROVEN by a real fetch (`verified_at == 0`) is
-            // therefore only trusted while it is minutes old; anything older — or
-            // any entry saved by an older build, which has neither stamp — is
+            // therefore only trusted while it is minutes old; anything older â€” or
+            // any entry saved by an older build, which has neither stamp â€” is
             // refreshed BEFORE the first byte instead of after a failed one.
             // Two windows, not one 3000 s window: a Telegram `file_reference`
             // dies well inside an hour, so a 50-minute "fresh enough" test let a
-            // dead reference start a Play and answer 400 on the first chunk —
+            // dead reference start a Play and answer 400 on the first chunk â€”
             // measured on the phone (`F2tdzm`, `pVid3z`, `q8RbRv`). A PROVEN id
             // gets 20 minutes; one that was never fetched yet (prewarm output)
             // gets 10, because nobody has checked it.
@@ -3237,7 +3241,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // MEASURED 2026-11-07 on the production build, from the live log: 7 of
             // 7 Eclipse plays started from an UNVERIFIED cached id and every one of
             // them died with `FILE_REFERENCE_EXPIRED (400)` before the first byte,
-            // then recovered on a forced re-resolve — and the client had already
+            // then recovered on a forced re-resolve â€” and the client had already
             // moved to the next song by then. That failure IS the "it skips the
             // song" symptom, so the 600 s trust window for an unverified id was
             // 600 s too generous: a `file_reference` is minted per send and is
@@ -3247,25 +3251,25 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // and the normal resolve mints a live reference: one origin call
             // (~0.4 s measured) instead of a guaranteed 400 plus a recovery the
             // player does not wait for. A PROVEN id (verified_at > 0) keeps its
-            // 20-minute window — those are the ones that actually stream.
+            // 20-minute window â€” those are the ones that actually stream.
             // 60 s, not 0, for an UNVERIFIED id.
             //
             // MEASURED 2026-11-09, local log with a real player (BitChord walking
             // a 60 MB FLAC in ranges): `window = 0` means every request throws the
-            // cached id away and asks the origin for a new one — and the origin
+            // cached id away and asks the origin for a new one â€” and the origin
             // mints a NEW `file_reference` each time, which invalidates the one the
             // body currently streaming is still using. The result is a body that
-            // dies at 64 KB–1 MB on its next window:
+            // dies at 64 KBâ€“1 MB on its next window:
             //
             //   cached file_id refused as stale {resolved_age_s:73, verified_age_s:-1}
-            //   download served by bot            … only the prime arrived
+            //   download served by bot            â€¦ only the prime arrived
             //   download attempt failed           FILE_REFERENCE_EXPIRED (400)
             //
             // and the client sits on "upgrading quality" forever because the
             // buffer it is filling keeps being thrown away.
             //
             // The 0 came from a real measurement too (2026-11-07: 7 of 7 plays
-            // began with an unverified id and died before the first byte) — but
+            // began with an unverified id and died before the first byte) â€” but
             // that was a TEN-MINUTE-old id. 60 s covers a normal playback burst
             // (one resolve per minute per track instead of one per range) while
             // still refusing anything old enough to be dead on arrival. A genuinely
@@ -3285,7 +3289,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         "resolved_age_s": if resolved > 0 { now() - resolved } else { -1 },
                     }),
                 );
-                // THE ID IN HAND IS THAT SAME STALE ONE — let go of it.
+                // THE ID IN HAND IS THAT SAME STALE ONE â€” let go of it.
                 //
                 // This route arrives holding a `file_id` from the caller's payload,
                 // and that payload was built from the very cache entry just judged
@@ -3330,12 +3334,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
 
-    /* ── per-client abuse limits ────────────────────────────────────────── */
+    /* â”€â”€ per-client abuse limits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
     // Checked HERE, not at request entry: by now the short code (or the minted
     // file_id) is known, so a seek, a segmented download and a preload of the SAME
     // file fold onto one slot instead of spending the client's whole budget. That
     // is what keeps a 16-connection download manager and a scrub bar from ever
-    // looking like a scraper — see `ratelimit.rs`.
+    // looking like a scraper â€” see `ratelimit.rs`.
     //
     // The guard MUST travel with the response body (it is moved into the streaming
     // task far below). Released when this function returns, it would cap *requests*
@@ -3444,7 +3448,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // WHEN to come back: `429` + `retry_after` (the remaining wait), not
                 // a `403` that reads like "connect your bot". Logging in again before
                 // that duration ends is what extends it, so nothing here retries the
-                // login — it only reports the deadline the login has to wait for.
+                // login â€” it only reports the deadline the login has to wait for.
                 let flood =
                     crate::session::flood_seconds_in(prov.error.as_deref().unwrap_or(""))
                         .max(crate::session::flood_remaining_for(&bot_id));
@@ -3501,12 +3505,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // the environment supplies its token (`BOT_TOKENS`) and it can be logged in
     // here on demand. Without the second half a scaled-out deploy only ever uses
     // the bots whose session happens to live on the instance the request landed
-    // on — measured on Heroku: 5 dynos, 5 independent pools, the added bot used
+    // on â€” measured on Heroku: 5 dynos, 5 independent pools, the added bot used
     // by one dyno in five.
     //
     // The second half is gated on THIS bot having no recorded login wait. Telegram
-    // applies the wait per token — measured on the six `BOT_TOKENS` bots: four were
-    // waiting (1365/1369/1379/1381 s) while two signed in in under 400 ms — so a
+    // applies the wait per token â€” measured on the six `BOT_TOKENS` bots: four were
+    // waiting (1365/1369/1379/1381 s) while two signed in in under 400 ms â€” so a
     // session-less bot whose token is NOT waiting is perfectly usable and must stay
     // a candidate. Judging every bot by one bot's wait is what took the healthy
     // ones offline with the sick ones.
@@ -3528,8 +3532,8 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 && crate::session::env_token_for(id).is_some())
     };
 
-    // A Bot API `file_id` belongs to the bot that MINTED it — its embedded
-    // `file_reference` is not interchangeable — so rotating bots for a request
+    // A Bot API `file_id` belongs to the bot that MINTED it â€” its embedded
+    // `file_reference` is not interchangeable â€” so rotating bots for a request
     // that already carries a file_id is guaranteed to fail. Measured on a pool
     // burst against one stream URL: 5 of 12 ranges returned `410
     // FILE_REFERENCE_EXPIRED`, and every 410 body named a DIFFERENT bot than the
@@ -3646,7 +3650,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     if file_id.is_empty() {
         if let Some(reason) = resolve_bot_dead {
             // 410, NOT 503: a deleted bot is permanent. No `Retry-After`, because
-            // there is no future moment at which this token relays again — the
+            // there is no future moment at which this token relays again â€” the
             // answer tells the caller to swap the token, and `/api/bots` has
             // already dropped the row (`mark_bot_dead`).
             record_refusal(
@@ -3755,7 +3759,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         );
     }
 
-    /* ── global stream cap ──────────────────────────────────────────────── */
+    /* â”€â”€ global stream cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
     // At most `--max-streams` (default 256) downloads run at once; the rest
     // QUEUE for up to 5 s and then answer 503 + Retry-After, so 400+ viewers
     // queue deterministically instead of all opening a Telegram part at once.
@@ -3799,7 +3803,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     };
 
-    /* ── pick a bot ─────────────────────────────────────────────────────── */
+    /* â”€â”€ pick a bot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
     let mut boot_err: Option<String> = None;
     let mut entry = None;
     let mut tried: Vec<String> = Vec::new();
@@ -3810,7 +3814,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // The SAME predicate the candidate planner used, so planning and booting
         // cannot disagree: `has_local_session` alone would skip an env-supplied bot
         // on an instance that has not logged it in yet, so accept it and pass its
-        // token through — unless a login flood makes that login impossible, in
+        // token through â€” unless a login flood makes that login impossible, in
         // which case skipping it is the whole point.
         let env_token = crate::session::env_token_for(&candidate);
         if candidate.is_empty() || !usable(&candidate) || tried.contains(&candidate) {
@@ -3825,7 +3829,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             }
             Err(e) => {
                 // Recorded against THIS bot: the wait is per token, so the next
-                // candidate — and the next request — may sign in fine. `boot()`
+                // candidate â€” and the next request â€” may sign in fine. `boot()`
                 // records it too; this keeps the caller's view honest.
                 crate::session::note_flood_for(&candidate, &e);
                 log("download boot failed for bot", &serde_json::json!({"bot_id": candidate, "error": e}));
@@ -3846,7 +3850,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
     // `mut`, because a one-bot pool has to evict and re-boot this entry when a
-    // stall repeats — see [`stall_needs_reconnect`].
+    // stall repeats â€” see [`stall_needs_reconnect`].
     let Some(mut entry) = entry else {
         // A Telegram login flood is retryable and must NOT look like "your bot is
         // gone": answer 429 + retry_after so a player backs off instead of
@@ -3881,7 +3885,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // The verbatim Telegram error, always present so nothing is hidden
             // behind a friendly line: "rpc error 420: FLOOD_WAIT caused by
             // auth.importBotAuthorization (value: 460)", "API credentials are
-            // missing: …", "bot sign-in failed: …".
+            // missing: â€¦", "bot sign-in failed: â€¦".
             "error_detail": detail,
             "hint": if flood > 0 {
                 "Telegram rate limited the bot login. This clears by itself; retry shortly."
@@ -3896,7 +3900,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     };
 
     // Which bot actually serves this request. `pick_pool_bot()` round-robins over
-    // the pool, so a burst must show several bot ids here — that is how streaming
+    // the pool, so a burst must show several bot ids here â€” that is how streaming
     // load balancing is verified (group the lines by bot_id in the logs).
     log(
         "download served by bot",
@@ -3911,7 +3915,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     file_name = stream_filename(&file_name, &file_mime);
     file_mime = guess_video_mime(&file_name, &file_mime);
 
-    /* ── stream ─────────────────────────────────────────────────────────── */
+    /* â”€â”€ stream â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
     let range_header = ctx.hdr("range");
     let range = if range_header.is_empty() {
         None
@@ -3941,7 +3945,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // `plan_limit(pos, MB)` picks the largest `4096 << k` that divides `pos` and
     // does not cross a 1 MB boundary. For a 4096-only-aligned `pos` that can
     // collapse to 4 KB, and `fetch_range_once()` then has to SKIP `pos / 4 KB`
-    // chunks — for a seek to ~900 MB that is ~220,000 skipped parts, i.e. the
+    // chunks â€” for a seek to ~900 MB that is ~220,000 skipped parts, i.e. the
     // request hangs (measured: `bytes=900000000-` returned 0 bytes in 15 s).
     // 1 MB alignment makes every window start a legal full-size part, so a seek
     // costs at most one discarded chunk instead of a 220k-step walk.
@@ -3958,7 +3962,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     };
 
-    // NO ALAC TRANSCODE — every file takes the byte-for-byte path below.
+    // NO ALAC TRANSCODE â€” every file takes the byte-for-byte path below.
     //
     // There used to be a branch here that pulled the whole `.m4a`, decoded ALAC
     // to ~150 MB of PCM and served it as WAV, because symphonia 0.5 has no ALAC
@@ -3971,20 +3975,20 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     //   * a cold cache was slower than the player's patience, so the track was
     //     skipped and the next one started;
     //   * the background warm-up answered 503 forever (`L5vw9B`).
-    // The same recording is indexed as FLAC — which every Android build plays
-    // natively and which streams raw with Range support — so the search ranking
+    // The same recording is indexed as FLAC â€” which every Android build plays
+    // natively and which streams raw with Range support â€” so the search ranking
     // now prefers the playable containers (see `fastdownloader_api_search_music`
     // on the origin) and `.m4a` is served like any other file. An AAC `.m4a`
     // plays natively; an ALAC one is no longer ranked first, and nothing tries
     // to transcode it.
 
     // Only the CLIENT comes from the slot: the pre-flight no longer draws its
-    // parts from that connection's `--inflight` budget — see [`PRIME_PARTS`] for
+    // parts from that connection's `--inflight` budget â€” see [`PRIME_PARTS`] for
     // the measurement that made sharing it answer `503 parts busy` to a player's
     // first byte.
     let mut client = entry.pick_slot().0;
 
-    // `mut`, because a STALLED PART earns extra attempts — see the
+    // `mut`, because a STALLED PART earns extra attempts â€” see the
     // `PART_STALL_PREFIX` arm: MadelineProto retries a part in place until the
     // client disconnects (`downloadPart()` has no attempt counter), and the
     // closest a bounded engine can get is "keep trying while the hard cap lasts".
@@ -4007,12 +4011,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // answered `FILE_REFERENCE_EXPIRED (400)` after ~140 s, the forced re-resolve
     // then returned a valid id, and the loop-top check compared against the
     // ORIGINAL 20 s deadline, broke out immediately, and the player got
-    // `410 FILE_REFERENCE_EXPIRED` — with a working reference sitting in `target`.
+    // `410 FILE_REFERENCE_EXPIRED` â€” with a working reference sitting in `target`.
     let hard_deadline = preflight_started + std::time::Duration::from_secs(PREFLIGHT_HARD_CAP_SECS);
 
     // Prime with ONE chunk, never with `total`. `total` is the whole remaining
     // range, so a plain GET of a 4 GB file (which is what `<video>` sends on
-    // startup — no Range header) tried to download 4 GB into memory before the
+    // startup â€” no Range header) tried to download 4 GB into memory before the
     // response headers were written: the player sat at `readyState 0 /
     // networkState 2` forever and Nuvio logged "still downloading data".
     // A Range request looked fine only because there `total` was already small.
@@ -4020,7 +4024,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // `aligned` and `start`, or the prime is discarded and the tail range stalls.
     let (skip0, prime_want) = prime_window(start, aligned, total, file_size);
     let _ = skip0;
-    // How many times a saturated connection has already been waited out — see
+    // How many times a saturated connection has already been waited out â€” see
     // the `GATE_BUSY_PREFIX` arm below.
     let mut prime_busy = 0u32;
     // The window the NEXT prime attempt may spend. The first attempt gets the
@@ -4030,7 +4034,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let mut prime_wait = prime_gate_wait_secs();
     // CONSECUTIVE stalls in THIS request. A busy pool recovers by waiting, but a
     // stalled part is a dead socket, so the streak is the evidence that waiting
-    // and re-picking have already failed — see [`stall_needs_reconnect`].
+    // and re-picking have already failed â€” see [`stall_needs_reconnect`].
     let mut stall_streak = 0u32;
     // One bot means `pick_slot()` has nowhere to rotate to, which is the install
     // that burned nine 12 s windows on one stall (measured: `pool_size: 1`).
@@ -4049,7 +4053,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             );
             break;
         }
-        // One prime at a time for this file — see [`prime_lock`]. Bounded, and on
+        // One prime at a time for this file â€” see [`prime_lock`]. Bounded, and on
         // timeout the prime goes ahead anyway: waiting forever behind a sibling
         // range of the same track is worse than a little overlap.
         let prime_slot = prime_lock(if short_code.is_empty() {
@@ -4069,13 +4073,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         match fetch_prime_gated(&client, &target, aligned, prime_want, prime_wait, &bot_id).await {
             Ok(buf) => {
                 // The reference is PROVEN here, which is the earliest it can be
-                // proven — see [`mark_reference_verified`] for the measured loop
+                // proven â€” see [`mark_reference_verified`] for the measured loop
                 // this breaks.
                 mark_reference_verified(&short_code, &bot_id, &file_id, file_size);
                 // THE FILE'S OWN HEADER, READ ONCE AND CACHED.
                 //
                 // A FLAC or ALAC sent as a Telegram `document` carries no Audio
-                // attribute, so nothing downstream knows how long it is — and
+                // attribute, so nothing downstream knows how long it is â€” and
                 // every quality signal is derived from the length, so such a
                 // track could never present as hi-res. These bytes are already
                 // here (this is the 512 KB prime, for a FLAC header that ends at
@@ -4109,7 +4113,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // MEASURED 2026-11-09: `503 parts busy` was the single thing that
                 // turned a busy connection into a track that never played, because
                 // BitChord's reaction to a refused range is to restart the whole
-                // download from byte 0 — which is another body, more parts, and a
+                // download from byte 0 â€” which is another body, more parts, and a
                 // deeper queue. So one saturation is waited out and retried, and
                 // only the second one is refused. The hard deadline still bounds
                 // this, so a genuinely stuck connection cannot hold a worker.
@@ -4132,10 +4136,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         // only on client cancellation; its whole answer to
                         // `FloodWait`, `Timeout (-503)` and a reset socket is
                         // "wait, then ask again". A request whose FIRST BYTE has
-                        // not been sent is in the same position — nothing can be
-                        // corrupted by another attempt — so the honest bound is the
+                        // not been sent is in the same position â€” nothing can be
+                        // corrupted by another attempt â€” so the honest bound is the
                         // hard cap, not a 12 s window. Measured on the phone: DC3
-                        // was reset for ~60 s (`dc candidate … step:` 8 → 21) and a
+                        // was reset for ~60 s (`dc candidate â€¦ step:` 8 â†’ 21) and a
                         // 4-attempt engine gave up inside the first blip.
                         max_attempts = stall_attempt_budget(attempt, max_attempts);
                     }
@@ -4149,7 +4153,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     // stalled part now gets here in about 2 s.
                     let (next_client, _next_gate) = entry.pick_slot();
                     client = next_client;
-                    // …BUT A ONE-BOT POOL HAS NOTHING TO ROTATE TO, and the pick
+                    // â€¦BUT A ONE-BOT POOL HAS NOTHING TO ROTATE TO, and the pick
                     // above hands back the same dead session. MEASURED 2026-11-25
                     // (`short_code 96wp5L`, `pool_size: 1`): nine attempts of 12 s
                     // each on one socket that had stopped answering, with all 12
@@ -4188,11 +4192,16 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     // spends ~2.2 s, and a silent wire is the one case where
                     // waiting longer is exactly what MadelineProto does. A one-bot
                     // pool has nowhere to rotate to, so the full window only buys
-                    // another 12 s of the same dead socket — it gets 3 s.
-                    let next_wait = if stalled_part && !one_bot_pool {
-                        prime_gate_wait_secs()
-                    } else {
-                        PRIME_GATE_RETRY_WAIT_SECS
+                    // another 12 s of the same dead socket â€” it gets 3 s.
+                    // HONOUR THE WAIT THE SERVER ASKED FOR. A flood on a file part is
+                    // not "come back in 12 s": MadelineProto measured that the next
+                    // request after a FLOOD_WAIT_1/2 goes through, and over-waiting is
+                    // what turns one stall into nine windows (danog/MadelineProto#1948).
+                    // Capped so a pathological value cannot park the request.
+                    let next_wait = match last_err.as_ref().and_then(|e| e.flood_wait) {
+                        Some(secs) => secs.clamp(1, 30),
+                        None if stalled_part && !one_bot_pool => prime_gate_wait_secs(),
+                        None => PRIME_GATE_RETRY_WAIT_SECS,
                     };
                     log(
                         "pre-flight stalled - rotating the worker before the retry",
@@ -4223,7 +4232,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         &serde_json::json!({"short_code": short_code, "attempt": attempt}),
                     );
                     // CHANGE 1+2: the local re-send of `file_id` is the LAST rung
-                    // inside this call — the origin's `fresh=1` mint runs first, and
+                    // inside this call â€” the origin's `fresh=1` mint runs first, and
                     // its `force=1&nocache=1` re-mint only when neither produced an id.
                     let Some(mut fresh) = resolve_bounded(
                         resolve_shortcode_fresh_from(&short_code, &bot_id, Some(file_id.as_str())),
@@ -4243,7 +4252,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     let mut retry_after = jnum(&fresh, "retry_after");
                     // The FORCED resolve can fail upstream while the plain one still
                     // works. Measured on the phone: every
-                    // `resolve-file?…&force=1&nocache=1` answered **HTTP 503** while
+                    // `resolve-file?â€¦&force=1&nocache=1` answered **HTTP 503** while
                     // `/api/resolve-shortcode` for the same short_code returned a
                     // valid file_id, so all four attempts re-tried the same expired
                     // reference and playback died with
@@ -4351,12 +4360,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     // `503 {"ok":0,"message":"Server busy resolving file, please
                     // retry shortly.","retry_after":5}` when its relay is busy.
                     // Four attempts fired back-to-back all land inside that same
-                    // window (measured: 4 × 503 in ~20 s, then
+                    // window (measured: 4 Ã— 503 in ~20 s, then
                     // `410 FILE_REFERENCE_EXPIRED`), so the wait it asks for is
                     // the difference between "plays" and "this title is broken".
                     if attempt < max_attempts {
                         // http_json() drops the body of a non-2xx, so the plugin's
-                        // own `retry_after` (5 s) is usually lost — fall back to a
+                        // own `retry_after` (5 s) is usually lost â€” fall back to a
                         // short linear backoff. Without it the four attempts run
                         // back-to-back (~2 s apart, measured) inside one "Server
                         // busy resolving file" window and the stream dies with 410.
@@ -4370,12 +4379,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         // The plugin has just said "busy, retry shortly" and named
                         // the wait. Sleeping here spends a first byte the player
                         // has already given up on: MEASURED 2026-11-09 on
-                        // `R1kYa6` (TUIDE · SUN KISS), two ranges answered 503
+                        // `R1kYa6` (TUIDE Â· SUN KISS), two ranges answered 503
                         // after **36 s** and **24 s** with `retry_after:5` in the
                         // answer we eventually sent. A player retries on that
                         // header in five seconds; waiting thirty-five to say it is
                         // the worst of both. MadelineProto does the same thing with
-                        // `FloodWaitError` — the wait is the caller's, not the
+                        // `FloodWaitError` â€” the wait is the caller's, not the
                         // transport's.
                         origin_busy = origin_busy.max(secs as i64);
                         log(
@@ -4388,7 +4397,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 }
                 // Not a reference error: a TRANSPORT reset. grammers reports it
                 // as `request error: read 0 bytes` / `reset by peer` /
-                // `broken pipe` — the TCP connection to the datacentre went away
+                // `broken pipe` â€” the TCP connection to the datacentre went away
                 // mid-read, which the file itself has nothing to do with.
                 //
                 // MEASURED 2026-11-08 from the live log: one music short_code
@@ -4414,7 +4423,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     // A retry that survived a dead connection is progress, so it
-                    // gets its own window (bounded by the hard cap) — same rule as
+                    // gets its own window (bounded by the hard cap) â€” same rule as
                     // the reference-expiry path above.
                     preflight_deadline = (std::time::Instant::now()
                         + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
@@ -4443,9 +4452,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // Same answer as saturation, and for the same reason: the origin is busy
         // for a few seconds, so `500` ("this track is broken") is the one thing
         // the client must not be told. MEASURED 2026-11-09 on `R1kYa6`
-        // (TUIDE · SUN KISS): the pre-flight spent 27 s inside the resolve ladder
+        // (TUIDE Â· SUN KISS): the pre-flight spent 27 s inside the resolve ladder
         // while `resolve-file` answered 503 with `retry_after:5`, gave up, and
-        // answered `500` — the player re-requested the same range straight after
+        // answered `500` â€” the player re-requested the same range straight after
         // and it played, which reads to a listener as the track looping.
         if origin_busy > 0 || err.message.contains("-503") {
             let retry_after = origin_busy.clamp(2, 10) as u64;
@@ -4598,7 +4607,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         if is_auth_failure(&err.message) {
             mark_session_bad(&bot_id, &err.message);
         }
-        // THE ORIGIN IS UNREACHABLE — say so, and say it ONCE.
+        // THE ORIGIN IS UNREACHABLE â€” say so, and say it ONCE.
         //
         // MEASURED 2026-11-09, local log while BitChord walked a track in 32 KB
         // ranges: one `/resolve-file` timeout armed the origin gate, and every
@@ -4608,7 +4617,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         //   download failed {"error":"FILE_REFERENCE_EXPIRED (400)"}
         //   download refused {"http_status":503,"stage":"FILE_REFERENCE_EXPIRED"}
         //
-        // — a DEAD REFERENCE reported for a file that is perfectly fine, because
+        // â€” a DEAD REFERENCE reported for a file that is perfectly fine, because
         // the reference could not be refreshed. Meanwhile four attempts burned
         // 1 + 2 + 3 s inside the blackout. The honest answer is the wait itself:
         // `Retry-After` equal to what is left of the gate, which a player obeys.
@@ -4737,7 +4746,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         );
     }
 
-    /* ── commit headers, then stream ────────────────────────────────────── */
+    /* â”€â”€ commit headers, then stream â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     let target_for_task = target.clone();
     // The whole connection pool, not one slot: a single stream must STRIPE its
@@ -4764,7 +4773,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let _stream_permit = stream_permit;
         // Same lifetime rule for the per-client slot: the counter must cover the
         // LIVE BODY, so it is released when this task ends, not when the handler
-        // returned. That end is prompt but NOT instant — `tx.is_closed()` is checked
+        // returned. That end is prompt but NOT instant â€” `tx.is_closed()` is checked
         // before the next window fetch, so a cancelled body (a seek, a closed tab)
         // can hold its slot for up to one window. The default title cap is 8 rather
         // than 1 or 2 for exactly that reason: overlap must never be able to look
@@ -4775,7 +4784,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let _titles = TitleGuard::new(&short_code_for_task);
         // PIPELINE the chunks: fetch up to `pipeline_depth()` 1 MB windows
         // concurrently and emit them IN ORDER (`StreamExt::buffered`). Fetching one
-        // chunk at a time made every megabyte pay a full Telegram round-trip —
+        // chunk at a time made every megabyte pay a full Telegram round-trip â€”
         // measured ~870 KiB/s, below what a 1080p stream needs, so the player sat at
         // `readyState 2 / networkState 2` and reported a playback stall.
         //
@@ -4823,19 +4832,19 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let mut p = aligned + plen;
             // `+ skip`: the windows start at an ALIGNED base, so they must cover
             // the bytes discarded before `start` as well. Without it every seek
-            // answered `total - skip` bytes — up to 1 MB SHORT of the
+            // answered `total - skip` bytes â€” up to 1 MB SHORT of the
             // Content-Length we just sent, and a player reads a short body as a
             // truncated stream (the "buffers after fast-forward" symptom).
             let mut rem = remaining + skip as u64;
             let mb = crate::telegram::MB;
             // Finish the CURRENT 1 MB window first, so every later window starts on
-            // an exact 1 MB boundary — full-size Telegram parts.
+            // an exact 1 MB boundary â€” full-size Telegram parts.
             //
             // This used to be `plen < mb`, which silently skipped the step whenever
             // the prime crossed a whole window. `prime_window()` now fetches
             // `skip0 + PRIME` (up to ~1.5 MB), so `p` could stay unaligned;
             // `plan_limit()` then collapses the part size to 4 KB and one 1 MB
-            // window costs 256 parts instead of 2 — measured as the "speed is not
+            // window costs 256 parts instead of 2 â€” measured as the "speed is not
             // full speed" regression after the tail-range fix.
             //
             // MadelineProto keeps the same invariant: `downloadToCallable()` plans
@@ -4867,7 +4876,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // This is the throughput fix, and it is NOT the same thing as the pipeline
         // depth. MEASURED from a phone with a 240-250 ms RTT to the remote: ONE
         // connection tops out at ~0.4-0.5 MB/s whatever the destination and
-        // whatever the depth — Telegram direct 0.33-0.38 MB/s, and the Heroku
+        // whatever the depth â€” Telegram direct 0.33-0.38 MB/s, and the Heroku
         // addon (which is itself next to Telegram and measured 4.85 MB/s from a
         // wired PC) 0.49 MB/s from that same phone. That is a TCP window/BDP
         // limit (`window / RTT`), so the only way past it is parallel connections:
@@ -4902,7 +4911,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // MEASURED 2026-11-09 from the live log: in 42 s, 27 distinct
                 // audio files were requested and EVERY one answered 200/206, yet
                 // nine bodies died mid-stream (`download stream aborted mid-body`)
-                // — which a player sees as "this song is broken" even though it
+                // â€” which a player sees as "this song is broken" even though it
                 // had the right rows and the right bytes started arriving.
                 //
                 // The pre-flight gives up fast on purpose (the router kills the
@@ -4917,14 +4926,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                     match fetch_part_windowed(&entry, &bot_for_refresh, &target, p, w).await {
                         Ok(v) => return (i, Ok(v)),
                         Err(e) => {
-                            // A DEAD REFERENCE MID-BODY IS RECOVERABLE — refresh it
+                            // A DEAD REFERENCE MID-BODY IS RECOVERABLE â€” refresh it
                             // and keep the same response going.
                             //
                             // MEASURED 2026-11-09, local log with BitChord: it asks
                             // for `bytes=0-65535`, `65536-1048575`, then an
                             // open-ended range, and every body that died on a
                             // `FILE_REFERENCE_EXPIRED` window made the app RESTART
-                            // the whole download from 0 — which is what its
+                            // the whole download from 0 â€” which is what its
                             // "upgrading quality" spinner is showing, forever, on a
                             // 195 MB FLAC.
                             //
@@ -4997,7 +5006,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // megabytes of Telegram parts keep holding their `--inflight`
             // permits while the request the player just opened queues behind
             // them (seen on a phone as ttfb 1.0-5.2 s with a second stream
-            // open). `is_closed()` is a plain non-blocking check — deliberately
+            // open). `is_closed()` is a plain non-blocking check â€” deliberately
             // NOT a `select!`, which could end a body while the client is still
             // reading and make playback look slow instead.
             if tx.is_closed() {
@@ -5113,13 +5122,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0, "message": "response build failed"})))
 }
 
-// The ALAC → WAV transcoder lived here (`probe_codec`, `serve_alac`,
+// The ALAC â†’ WAV transcoder lived here (`probe_codec`, `serve_alac`,
 // `write_wav_cache`, `alac_serve_cached`, `alac_wav_path`, `is_alac_target`).
 // It is GONE on purpose: it existed only to make an ALAC `.m4a` playable, and
 // the same recordings are indexed as FLAC, which streams raw with Range support
 // and plays on every Android build. Keeping it meant a codec probe that could
 // not tell "not ALAC" from "could not read the file", which served raw ALAC as
-// `audio/mp4` to a player that cannot decode it — the "track does not play" bug.
+// `audio/mp4` to a player that cannot decode it â€” the "track does not play" bug.
 // `crate::audio` still owns `mp4_audio_fourcc` and the WAV helpers, which the
 // engine's own audio-probe diagnostics use.
 
@@ -5177,7 +5186,7 @@ mod tests {
     }
 
     /// Measured on `OFiNzc`: the origin said `application/zip`, so the old path
-    /// answered ZIP + `….001.mp4`. The bytes say Matroska; the name must follow.
+    /// answered ZIP + `â€¦.001.mp4`. The bytes say Matroska; the name must follow.
     #[test]
     fn retype_media_fixes_the_zip_mkv_part() {
         let (name, mime) = retype_media("Show.mkv.001.mp4", Container::Matroska);
@@ -5245,7 +5254,7 @@ mod tests {
     /// The stream URL advertises `.wav` for an ALAC source, but the PAYLOAD
     /// names the file that will actually be read. If the renamed `.wav` leaks
     /// into the payload, this says "not ALAC" and the raw MP4 goes out under
-    /// `content-type: audio/wav` — the player's "stream unavailable".
+    /// `content-type: audio/wav` â€” the player's "stream unavailable".
     #[test]
     fn stream_filename_and_mime_fallbacks() {
         let name = stream_filename("video", "video/mp4");
@@ -5396,7 +5405,7 @@ mod tests {
     /// This is the bug that made BitChord sit on "upgrading quality" forever: the
     /// pre-flight and every live body shared one `--inflight` budget, so a
     /// player's first byte queued behind a full pipeline, waited
-    /// `PRIME_GATE_WAIT_SECS`, and got `503 parts busy` — after which the app
+    /// `PRIME_GATE_WAIT_SECS`, and got `503 parts busy` â€” after which the app
     /// restarted the download from byte 0. Reproduced and fixed against
     /// `node tools/probe_music_ranges.mjs --bodies 10 --read-mb 12`, which
     /// answered `503 110B ttfb 12050ms` before and `206 983040B` after. This
@@ -5449,7 +5458,7 @@ mod tests {
     /// The one behaviour this change exists for: an outage must not be reported as a
     /// client error, because the player does not retry a 400.
     /// Only a broken auth KEY quarantines a bot. A dead `file_reference` is
-    /// per-send and a transport reset is per-connection — neither should cost the
+    /// per-send and a transport reset is per-connection â€” neither should cost the
     /// bot 30 minutes of work.
     /// A split prime costs TWO permits while it runs, so it must not run when the
     /// pool cannot afford both.
@@ -5457,7 +5466,7 @@ mod tests {
     /// 2026-11-13 phone log, one bot, one 552 MB episode: three stalls 80 s apart,
     /// every one `parts busy` after the full window, while the player held several
     /// ranges open on the same file. Under that pressure the split is what emptied
-    /// the pool — the bytes are byte-identical either way, only the latency trade
+    /// the pool â€” the bytes are byte-identical either way, only the latency trade
     /// changes, so starvation has to win.
     #[test]
     fn a_split_prime_is_refused_when_the_pool_cannot_afford_two() {
@@ -5465,7 +5474,7 @@ mod tests {
         assert!(prime_split_allowed(2), "two free permits are exactly enough");
         assert!(
             !prime_split_allowed(1),
-            "one free permit must fetch serially — a split would queue its own second part"
+            "one free permit must fetch serially â€” a split would queue its own second part"
         );
         assert!(!prime_split_allowed(0), "an empty pool must never split");
     }
@@ -5533,7 +5542,7 @@ mod tests {
     /// 79 MB): grammers answered `SenderPoolRunner was dropped during retry at
     /// send`, `is_transport_reset()` matched none of its TCP phrasings, so the
     /// part ladder stopped after the first attempt and the pre-flight gave up
-    /// with `500 DOWNLOAD_FAILED` after 5.2 s — the one status a player never
+    /// with `500 DOWNLOAD_FAILED` after 5.2 s â€” the one status a player never
     /// retries, which reads to the user as "this file is broken".
     #[test]
     fn a_dropped_sender_pool_runner_is_a_retryable_stall() {
@@ -5552,7 +5561,7 @@ mod tests {
         // First attempt stalls: the budget grows past the original 4.
         assert_eq!(stall_attempt_budget(1, 4), 1 + PRIME_STALL_EXTRA_ATTEMPTS);
         assert!(stall_attempt_budget(1, 4) > 4, "a stall must buy more tries");
-        // It only ever grows — a later stall cannot shrink it.
+        // It only ever grows â€” a later stall cannot shrink it.
         assert_eq!(stall_attempt_budget(9, 4), 9 + PRIME_STALL_EXTRA_ATTEMPTS);
         // An already-generous budget is left alone.
         assert_eq!(stall_attempt_budget(1, 20), 20);
@@ -5562,7 +5571,7 @@ mod tests {
     ///
     /// MEASURED 2026-11-25 (`short_code 96wp5L`, `pool_size: 1`): rotating the
     /// worker re-picked the same dead session nine times, at 12 s each, while all
-    /// 12 permits were free — the player hung instead of playing.
+    /// 12 permits were free â€” the player hung instead of playing.
     #[test]
     fn a_stalled_part_on_a_one_bot_pool_needs_a_reconnect() {
         assert!(stall_needs_reconnect(true, 2, 1));
@@ -5572,7 +5581,7 @@ mod tests {
         // not worth dropping the session.
         assert!(!stall_needs_reconnect(true, 1, 1));
         // With a second bot there is somewhere to rotate to, so nothing is
-        // evicted — that path must keep behaving exactly as it did.
+        // evicted â€” that path must keep behaving exactly as it did.
         assert!(!stall_needs_reconnect(true, 2, 2));
         assert!(!stall_needs_reconnect(true, 9, 8));
         // A saturated pool is not a dead session and must never evict a bot.
@@ -5584,7 +5593,7 @@ mod tests {
     ///
     /// `starts_with` is what routes every one of these decisions, so a prefix that
     /// is a prefix of the other would send a stalled part down the "wait, the pool
-    /// is saturated" arm — which is exactly the confusion this pair exists to end.
+    /// is saturated" arm â€” which is exactly the confusion this pair exists to end.
     #[test]
     fn a_stalled_part_and_an_empty_pool_are_different_errors() {
         assert_ne!(GATE_BUSY_PREFIX, PART_STALL_PREFIX);
@@ -5660,7 +5669,7 @@ mod tests {
     }
 
     /// With no flood recorded, an env-supplied bot that has not logged in yet is
-    /// still a legitimate candidate — a fresh dyno must be able to boot one.
+    /// still a legitimate candidate â€” a fresh dyno must be able to boot one.
     #[test]
     fn a_sessionless_env_bot_is_usable_when_no_flood_is_armed() {
         let pool = vec!["bot_env".to_string()];
@@ -5733,7 +5742,7 @@ mod tests {
         assert!(!w.try_acquire());
     }
 
-    /// One more slot per full window of answers — never more than one, and only
+    /// One more slot per full window of answers â€” never more than one, and only
     /// while the window is saturated, so an idle bot does not creep to the cap.
     #[test]
     fn a_file_window_grows_one_per_saturated_window_of_answers() {

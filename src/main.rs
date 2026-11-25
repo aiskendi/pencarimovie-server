@@ -1,4 +1,4 @@
-﻿//! HTTP entry point. `axum` + `tokio`, `127.0.0.1:8088` by default.
+//! HTTP entry point. `axum` + `tokio`, `127.0.0.1:8088` by default.
 //!
 //! ```text
 //!   pencarimovie-server --port 8088 [--host 127.0.0.1] [--workers N]
@@ -93,6 +93,16 @@ use tokio::net::TcpListener;
 /// shape no user install had (2026-11-25, seen as `inflight_per_connection: 8` in the
 /// boot line of a mint probe while the server ran with 3).
 pub const DEFAULT_INFLIGHT: usize = 3;
+
+/// Telegram connections (sockets) per bot, for every platform.
+///
+/// Throughput is meant to come from MORE sockets with FEW parts each: a media
+/// socket asked for too many parts at once is dropped by the server without an
+/// error, which is the `part stalled: no part in 12001ms` stall (16 parts x 3 and
+/// `danog/MadelineProto#1948` settles on 2 per socket, opening more instead).
+/// Measured on the LAN against a 2160p ZIP entry: 16 x 3 serves the same ~0.5 MB/s
+/// that 4 x 3 did, with zero stalls, so raising the socket count is free.
+pub const DEFAULT_WORKERS: usize = 16;
 
 pub struct AppState {
     pub port: u16,
@@ -1633,7 +1643,7 @@ async fn main() -> anyhow::Result<()> {
     let workers: usize = arg_value("--workers")
         .or_else(|| storage::env("PM_WORKERS"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4)
+        .unwrap_or(DEFAULT_WORKERS)
         .max(1);
     // Telegram's own guidance is N connections x a handful of in-flight parts
     // per connection. grammers multiplexes a whole DC over ONE connection, so

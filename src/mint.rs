@@ -14,8 +14,8 @@
 //! mint cannot run, and one log line names the reason. A mint failure must never
 //! turn a playable file into an error.
 //!
-//! The send goes to a relay ACCOUNT, not a bot: Telegram refuses bot â†’ bot
-//! outright (`400 USER_BOT_TO_BOT_DISABLED`, measured 2026-11-07 â€” see
+//! The send goes to a relay ACCOUNT, not a bot: Telegram refuses bot Ã¢â€ â€™ bot
+//! outright (`400 USER_BOT_TO_BOT_DISABLED`, measured 2026-11-07 Ã¢â‚¬â€ see
 //! `backfill::REQUEST_CAPTION`), so the peer list is the origin's userbot pool.
 
 use std::collections::HashMap;
@@ -65,8 +65,8 @@ fn minted() -> &'static Mutex<HashMap<String, (String, i64)>> {
 /// `(fetched_at, accounts, status, detail)` for the last `GET /userbots`.
 ///
 /// The STATUS travels with the list because an empty list has two completely
-/// different causes — the origin refused the lease (401) or it has no relay
-/// accounts (200 + `accounts: []`) — and the caller is the one that has to say
+/// different causes â€” the origin refused the lease (401) or it has no relay
+/// accounts (200 + `accounts: []`) â€” and the caller is the one that has to say
 /// which. `detail` is the sentence to report when the list is empty.
 fn peer_cache() -> &'static Mutex<Option<(i64, Vec<String>, u16, String)>> {
     static P: std::sync::OnceLock<Mutex<Option<(i64, Vec<String>, u16, String)>>> =
@@ -130,11 +130,11 @@ fn mint_key(short_code: &str, bot_id: &str) -> String {
     format!("{}:{}", short_code, bot_id)
 }
 
-/* â”€â”€ the relay peer list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* Ã¢â€â‚¬Ã¢â€â‚¬ the relay peer list Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 
 /// The relay accounts from `GET {wp_api_base}/userbots`, cached in-process.
 ///
-/// Authenticated by [`crate::httpc::http_json_h_status`] — the engine's own helper —
+/// Authenticated by [`crate::httpc::http_json_h_status`] â€” the engine's own helper â€”
 /// rather than by assembling the ticket and PM-Auth headers here. That is what gives
 /// this request the 401 recovery every other origin call already had (clear the
 /// refused lease, re-enrol, retry once): the hand-rolled version answered 401 until
@@ -181,7 +181,7 @@ async fn fetch_peers() -> (Vec<String>, u16, String) {
     );
     // The origin's protected route: `http_json_h_status` attaches the ticket and the
     // PM-Auth proof, and on 401 it clears the refused lease, re-enrols and retries
-    // once — none of which the hand-rolled request did. `0` means it never completed.
+    // once â€” none of which the hand-rolled request did. `0` means it never completed.
     let (body, status) = crate::httpc::http_json_h_status(&url, &[], "GET", 12, &[]).await;
     let names = if (200..300).contains(&status) {
         accounts_of(&body)
@@ -227,14 +227,14 @@ async fn fetch_peers() -> (Vec<String>, u16, String) {
 
 /// What to report when `GET /userbots` produced no relay accounts.
 ///
-/// The status is the point. The old sentence — "GET /userbots answered no usable
-/// accounts" — read as "the operator's pool is empty" when the truth was a refused
+/// The status is the point. The old sentence â€” "GET /userbots answered no usable
+/// accounts" â€” read as "the operator's pool is empty" when the truth was a refused
 /// lease (`401`), which is exactly the log line this change exists to kill.
 fn userbots_detail(status: u16) -> String {
     if (200..300).contains(&status) {
-        format!("GET /userbots answered {status} without any accounts")
+        format!("GET /bots answered {status} with no peers in accounts[], bots[] or data")
     } else {
-        format!("GET /userbots answered {status}")
+        format!("GET /bots answered {status}")
     }
 }
 
@@ -244,8 +244,8 @@ fn userbots_detail(status: u16) -> String {
 /// cost nothing and keep a wrapper change on the origin from silently emptying the
 /// peer list (an empty list means the mint never runs at all).
 fn accounts_of(body: &Value) -> Vec<String> {
-    // FIRST NON-EMPTY LIST WINS. The origin answers both keys at once — `bots[]`
-    // with the live bots and `"accounts": []` kept for shape compatibility — so
+    // FIRST NON-EMPTY LIST WINS. The origin answers both keys at once â€” `bots[]`
+    // with the live bots and `"accounts": []` kept for shape compatibility â€” so
     // taking the first *present* key stopped on the empty one and reported "no
     // accounts" on a 200 that carried 50 bots (measured 2026-11-25: bytes 5007,
     // keys accounts,bots,build,mode,note,ok,relay_bot_id).
@@ -302,7 +302,7 @@ fn accounts_of(body: &Value) -> Vec<String> {
     names
 }
 
-/* â”€â”€ the mint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* Ã¢â€â‚¬Ã¢â€â‚¬ the mint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 
 fn send_reason(e: &telegram::GramErr) -> MintError {
     let m = &e.message;
@@ -444,7 +444,7 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
         _ => Err(MintError::new("send_failed", "the sent media is not a document")),
     };
     // The message is KEPT. It is what holds the document in a chat, so deleting it
-    // can shorten the life of the very reference we just minted â€” and the origin
+    // can shorten the life of the very reference we just minted Ã¢â‚¬â€ and the origin
     // leaves its relay messages in place for the same reason. It also costs an API
     // call on the play path.
     let doc = replied?;
@@ -479,7 +479,7 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
     })
 }
 
-/* â”€â”€ the resolve-path seam â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* Ã¢â€â‚¬Ã¢â€â‚¬ the resolve-path seam Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 
 fn cached(short_code: &str, bot_id: &str) -> Option<String> {
     let g = minted().lock().ok()?;
@@ -506,14 +506,14 @@ fn remember(short_code: &str, bot_id: &str, file_id: &str) {
     );
 }
 
-/* â”€â”€ the local re-send (CHANGE 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* Ã¢â€â‚¬Ã¢â€â‚¬ the local re-send (CHANGE 1) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 
 /// The id THIS process minted for the pair, while it is still inside
 /// [`MINT_TTL_MS`] and therefore still live.
 ///
 /// It is the one source a local re-send can always address: the bot that sends is
 /// the bot the id was minted for (`mint` encodes the send's reply). An id the
-/// CALLER holds is not that guarantee â€” it may have been minted by a different bot,
+/// CALLER holds is not that guarantee Ã¢â‚¬â€ it may have been minted by a different bot,
 /// and `sendMedia` answers `MEDIA_EMPTY` for it. That is why `resolve` tries this
 /// rung first and the caller's id only after the origin's `fresh=1` mint has
 /// answered nothing usable.
@@ -531,7 +531,7 @@ pub fn live(short_code: &str, bot_id: &str) -> Option<String> {
 ///
 /// Exactly ONE send is attempted. A refused send is Telegram saying the id is
 /// DEAD (`reference_rejected`) or not this bot's (`MEDIA_EMPTY`), and retrying it
-/// would spend another round-trip on the path that is already late â€” so the answer
+/// would spend another round-trip on the path that is already late Ã¢â‚¬â€ so the answer
 /// is `None` and the caller tries its next rung, which is exactly the behaviour
 /// before this function existed. A mint failure can never change a request's
 /// outcome.
@@ -643,7 +643,7 @@ pub(crate) fn report(short_code: &str, bot_id: &str, file_id: &str) {
 
 /// Test-only: seed the mint cache as if this process had just minted `file_id`.
 ///
-/// `remember` stays private — a caller that could cache an id it did not mint would
+/// `remember` stays private â€” a caller that could cache an id it did not mint would
 /// defeat the one guarantee this cache makes (the id belongs to the bot that will
 /// re-send it). The resolve path's rung order is the thing the test needs to see.
 #[cfg(test)]
@@ -665,6 +665,27 @@ fn source_id(v: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// An id the origin minted for THIS bot, via the handover (`fresh=1` skips the
+/// stored row and lets inputfilebot send the document to the requesting bot, so the
+/// id in the response belongs to the bot that will re-send it). `None` means the
+/// origin did not answer with anything usable, and the caller keeps what it had.
+async fn fresh_seed(short_code: &str, bot_id: &str) -> Option<String> {
+    let url = format!(
+        "{}/resolve-file",
+        crate::config::wp_api_base().trim_end_matches('/')
+    );
+    let params: Vec<(String, String)> = vec![
+        ("short_code".to_string(), short_code.to_string()),
+        ("bot_id".to_string(), bot_id.to_string()),
+        ("fresh".to_string(), "1".to_string()),
+    ];
+    let (body, status) = crate::httpc::http_json_h_status(&url, &params, "GET", 8, &[]).await;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    source_id(&body)
 }
 
 /// A minted id for this `(short_code, bot_id)`, minting one if the cache is cold.
@@ -695,6 +716,48 @@ pub async fn ensure(short_code: &str, bot_id: &str, resolved: &Value) -> Option<
             Some(minted.file_id)
         }
         Ok(Err(e)) => {
+            // A REFUSED SEND IS USUALLY THE WRONG OWNER, NOT A BAD FILE.
+            // The origin's answer can carry an id minted for another bot, and
+            // `messages.sendMedia` then answers MEDIA_EMPTY in ~125 ms — instant,
+            // before any network round trip. Measured repeatedly on 2026-11-25:
+            // the same code mints fine from the id `fresh=1` returns for THIS bot
+            // and fails from the one a plain resolve returns. So ask the origin for
+            // a bot-owned id once and retry, before giving up on the mint.
+            if let Some(fresh) = fresh_seed(short_code, bot_id).await {
+                if fresh != source {
+                    match tokio::time::timeout(MINT_TIMEOUT, mint(bot_id, &fresh)).await {
+                        Ok(Ok(minted)) => {
+                            remember(short_code, bot_id, &minted.file_id);
+                            report(short_code, bot_id, &minted.file_id);
+                            log(
+                                "minted a fresh file id",
+                                &serde_json::json!({
+                                    "short_code": short_code,
+                                    "bot_id": bot_id,
+                                    "peer": minted.peer,
+                                    "minted_differs": minted.file_id != fresh,
+                                    "seed": "fresh_handover",
+                                }),
+                            );
+                            return Some(minted.file_id);
+                        }
+                        Ok(Err(e2)) => log(
+                            "mint skipped - the bot-owned id was refused too",
+                            &serde_json::json!({
+                                "short_code": short_code,
+                                "bot_id": bot_id,
+                                "reason": e2.reason,
+                                "detail": e2.detail,
+                                "first": e.detail,
+                            }),
+                        ),
+                        Err(_) => log(
+                            "mint timed out on the bot-owned id",
+                            &serde_json::json!({"short_code": short_code, "bot_id": bot_id}),
+                        ),
+                    }
+                }
+            }
             log(
                 "mint skipped - keeping the origin's file id",
                 &serde_json::json!({
@@ -724,7 +787,7 @@ pub async fn ensure(short_code: &str, bot_id: &str, resolved: &Value) -> Option<
 ///
 /// The CALLER persists the result (`resolve.rs` already calls
 /// `save_resolve_cache` on every branch where an id exists), and that save stamps
-/// `resolved_at` afresh â€” which is load-bearing: `download.rs` trusts an unverified
+/// `resolved_at` afresh Ã¢â‚¬â€ which is load-bearing: `download.rs` trusts an unverified
 /// id for 60 s from that stamp, and the origin's stamp would make a brand-new
 /// reference look stale. Both id fields are rewritten so nothing downstream can
 /// pick the pre-mint reference out of `file_id`.
@@ -797,13 +860,13 @@ mod tests {
     #[test]
     fn an_empty_peer_list_names_the_http_status() {
         let refused = userbots_detail(401);
-        assert_eq!(refused, "GET /userbots answered 401");
+        assert_eq!(refused, "GET /bots answered 401");
         assert!(refused.contains("401"));
         assert!(!refused.contains("no usable accounts"));
 
         // A call that never completed has no status; `0` is the engine's own word
         // for that everywhere else, and it must not read as an empty pool either.
-        assert_eq!(userbots_detail(0), "GET /userbots answered 0");
+        assert_eq!(userbots_detail(0), "GET /bots answered 0");
 
         // A genuine 200 with no accounts says so, and still names the status.
         let empty = userbots_detail(200);

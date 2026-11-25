@@ -1,4 +1,4 @@
-﻿//! Port of the download path: backend.php:1884 (payload decode), 11107-11126
+//! Port of the download path: backend.php:1884 (payload decode), 11107-11126
 //! (payload-from-path) and 19699-20360 (the `/api/download` handler), with
 //! `downloadToBrowser()` replaced by grammers' `iter_download()`.
 //!
@@ -36,7 +36,8 @@ use crate::log::log;
 use crate::respond::json_response;
 use crate::resolve::{
     invalidate_resolve_cache, resolve_shortcode, resolve_shortcode_cached,
-    resolve_shortcode_concurrent, resolve_shortcode_fresh_from, save_resolve_cache,
+    resolve_shortcode_concurrent, resolve_shortcode_fresh_from, resolve_shortcode_forced,
+    save_resolve_cache,
 };
 use crate::session::{
     auto_provision_guest, get_bot_id, has_local_session, is_guest_provision_in_progress,
@@ -399,6 +400,15 @@ fn file_window_key(bot_id: &str) -> String {
 /// than the process is configured to run. Read once per window; the pool is
 /// published at boot and never resized.
 fn file_window_cap() -> u32 {
+    file_window_cap_for("")
+}
+
+/// [`file_window_cap()`] for the pool that OWNS `bot_id`.
+///
+/// With api_id lanes the process pool is only lane 1: each lane opens
+/// `--lane-workers` connections, so a lane bot's ceiling is ITS pool's
+/// `workers x inflight`, not the process pool's.
+fn file_window_cap_for(bot_id: &str) -> u32 {
     // THE WINDOW IS PER BOT, NOT PER SOCKET.
     //
     // Every part this bot serves passes this one counter, across ALL of its
@@ -412,7 +422,7 @@ fn file_window_cap() -> u32 {
     //
     // The small START and the halving on a reject are untouched — they are what
     // keeps a bad DC from being overrun while the window learns.
-    let Some(pool) = crate::telegram::shared_pool() else {
+    let Some(pool) = crate::lanes::pool_for_bot(bot_id) else {
         return FILE_WINDOW_MAX;
     };
     window_cap_from(pool.workers(), pool.inflight())
@@ -433,7 +443,7 @@ fn file_window_try(key: &str) -> bool {
                 map.clear();
             }
         }
-        map.insert(key.to_string(), FileWindow::with_cap(file_window_cap()));
+        map.insert(key.to_string(), FileWindow::with_cap(file_window_cap_for(key)));
     }
     match map.get_mut(key) {
         Some(w) => w.try_acquire(),
@@ -3185,6 +3195,248 @@ async fn handle_split_download(
         .unwrap_or_else(|_| json_response(500, &serde_json::json!({"ok": 0, "message": "response build failed"})))
 }
 
+/* ── api_id lanes: one response over several Telegram applications ───────── */
+
+/// One lane as a live body sees it: its bot, its OWN `file_reference`, and its
+/// learned speed. A `file_reference` is bound to the session that minted it, so
+/// each lane must hold its own — sharing one across lanes answers 410.
+struct LaneIo {
+    lane: std::sync::Arc<crate::lanes::Lane>,
+    entry: std::sync::Arc<crate::telegram::BotEntry>,
+    target: tokio::sync::RwLock<crate::telegram::DocTarget>,
+    bot: String,
+    /// Serialises mid-body refreshes on this lane, so N parts that all answer
+    /// 400 collapse into ONE refresh and then all retry. With
+    /// `--stream-prefetch 20` a dead reference fails a dozen parts in the same
+    /// millisecond; the old one-shot flag made every sibling a fatal error and
+    /// aborted the body while the single refresh was still in flight.
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// Bumped whenever `target` is replaced. A part retries after a refresh only
+    /// if the generation it used is no longer current.
+    generation: std::sync::atomic::AtomicU32,
+    /// Refreshes spent on this lane for this body (bounded: a lane that keeps
+    /// handing back dead references must fail over, not loop).
+    refreshes: std::sync::atomic::AtomicU32,
+}
+
+/// Mid-body reference refreshes allowed per lane per body.
+const LANE_REFRESH_MAX: u32 = 2;
+/// Times one part may wait for a refresh and retry on the SAME lane.
+const LANE_REFRESH_RETRIES: u32 = 2;
+
+impl LaneIo {
+    fn new(
+        lane: std::sync::Arc<crate::lanes::Lane>,
+        entry: std::sync::Arc<crate::telegram::BotEntry>,
+        target: crate::telegram::DocTarget,
+        bot: String,
+    ) -> Self {
+        Self {
+            lane,
+            entry,
+            target: tokio::sync::RwLock::new(target),
+            bot,
+            refresh_lock: tokio::sync::Mutex::new(()),
+            generation: std::sync::atomic::AtomicU32::new(0),
+            refreshes: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+/// Cost-ordered pick among the lanes not yet tried for THIS part.
+///
+/// Cost is expected seconds (`(in_flight + 1) / ewma_mbps`), so the fastest idle
+/// lane wins and a fast but loaded one can lose to a slower idle one. A congested
+/// lane (under 60% of the median) is charged as if it already held a part, which
+/// is the rule that stops one bad api_id setting the rate of the response.
+fn pick_lane(lanes: &[std::sync::Arc<LaneIo>], tried: &[usize]) -> Option<usize> {
+    // Congestion is judged against the MEDIAN of the lanes this body can use,
+    // not a fixed speed: 6 MB/s is healthy beside two 5 MB/s lanes and sick
+    // beside three 11 MB/s ones (that is the measured 2112408, which sits at ~6
+    // in every round).
+    let ewm: Vec<f64> = lanes.iter().map(|io| io.lane.stats.ewma_mbps()).collect();
+    let med = crate::lanes::median(&ewm);
+    let costs: Vec<Option<f64>> = lanes
+        .iter()
+        .enumerate()
+        .map(|(i, io)| {
+            if tried.contains(&i) {
+                return None;
+            }
+            let congested = crate::lanes::is_congested(io.lane.stats.ewma_mbps(), med);
+            io.lane.stats.set_congested(congested);
+            let in_flight = if congested {
+                io.lane.in_flight().max(1)
+            } else {
+                io.lane.in_flight()
+            };
+            Some(crate::lanes::lane_cost(in_flight, io.lane.stats.ewma_mbps()))
+        })
+        .collect();
+    crate::lanes::choose_lane(&costs)
+}
+
+/// Boot a lane's bot and mint ITS OWN reference for this file.
+///
+/// Bounded: a cold lane's mint is a resolve plus a send, and a lane that cannot
+/// answer in 8 s must not delay a body the other lanes could already serve.
+async fn lane_io_for(
+    lane: std::sync::Arc<crate::lanes::Lane>,
+    short_code: &str,
+    size: u64,
+    held: &str,
+) -> Option<LaneIo> {
+    let bot = lane.bot_id();
+    if bot.is_empty() {
+        return None;
+    }
+    let entry = match lane.pool.get(&bot).await {
+        Some(e) => e,
+        None => match lane.pool.boot(&bot, None).await {
+            Ok(e) => e,
+            Err(e) => {
+                log(
+                    "lane bot could not be booted",
+                    &serde_json::json!({"api_id": lane.api_id, "bot_id": bot, "error": e}),
+                );
+                return None;
+            }
+        },
+    };
+    // Mint through THIS bot's own session first.
+    //
+    // The origin's `fresh=1` mint re-sends the document from the ORIGIN's
+    // session, and the reference it returns is bound to that session: the first
+    // `upload.getFile` from ours answers 400 `FILE_REFERENCE_EXPIRED`. MEASURED
+    // 2026-11-26, every lane, every request: origin mint 200, first body part
+    // 400, at 512 KB (the primed head). `mint::resend` sends the same document
+    // from OUR session (~100-390 ms) and returns a reference that is ours.
+    let id = match crate::mint::resend(short_code, &bot, held, "lane").await {
+        Some(id) => id,
+        None => {
+            // No local re-send (a relay peer it cannot reach, or a source id this
+            // bot may not send): fall back to the origin's mint, which is the
+            // pre-lane path.
+            log(
+                "lane local re-send gave nothing - using the origin's mint",
+                &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                resolve_shortcode_fresh_from(short_code, &bot, Some(held)),
+            )
+            .await
+            {
+                Ok(v) => id_of(&v),
+                Err(_) => {
+                    log(
+                        "lane file_id mint timed out",
+                        &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
+                    );
+                    String::new()
+                }
+            }
+        }
+    };
+    if id.is_empty() {
+        log(
+            "lane could not mint a file id for this file",
+            &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
+        );
+        return None;
+    }
+    let target = match crate::telegram::prepare_file_target(&id, size) {
+        Ok(t) => t,
+        Err(e) => {
+            log(
+                "lane file target was refused",
+                &serde_json::json!({"api_id": lane.api_id, "error": e}),
+            );
+            return None;
+        }
+    };
+    // VERIFY the reference before the body depends on it.
+    //
+    // A freshly minted reference is not always accepted by the DC that serves
+    // this bot: MEASURED 2026-11-26, the first three body parts of a 2 MB body
+    // answered 400 FILE_REFERENCE_EXPIRED and only a second mint fixed it. One
+    // 4 KB probe here moves that recovery into the setup phase — in parallel
+    // across lanes and before the first body byte depends on it — instead of
+    // stalling the head of every response.
+    let mut target = target;
+    for attempt in 0..2u32 {
+        let (client, gate) = entry.pick_slot();
+        match crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, 0, 4096).await {
+            Ok(_) => break,
+            Err(e) => {
+                log(
+                    "lane reference probe failed",
+                    &serde_json::json!({
+                        "api_id": lane.api_id,
+                        "bot_id": bot,
+                        "attempt": attempt + 1,
+                        "error": e.message,
+                        "file_reference": e.file_reference,
+                        "flood_wait": e.flood_wait,
+                    }),
+                );
+                if attempt == 1 {
+                    // Park the lane instead of paying a mint + probe on every
+                    // body: the reason is a real Telegram answer, and it shows in
+                    // `/api/diagnostics` as `state: "cooling"` + `last_error`.
+                    lane.stats.cool_for(
+                        30,
+                        &format!("lane reference did not verify: {}", e.message),
+                    );
+                    log(
+                        "lane reference did not verify",
+                        &serde_json::json!({
+                            "api_id": lane.api_id,
+                            "bot_id": bot,
+                            "error": e.message,
+                        }),
+                    );
+                    return None;
+                }
+                let again = crate::mint::resend(short_code, &bot, held, "lane").await?;
+                target = match crate::telegram::prepare_file_target(&again, size) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                log(
+                    "lane re-minted its reference during verification",
+                    &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
+                );
+            }
+        }
+    }
+    log(
+        "lane reference minted for this body",
+        &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
+    );
+    Some(LaneIo::new(lane, entry, target, bot))
+}
+
+/// One selected lane for a body. The lane that already served the preflight
+/// keeps its entry and its id: re-minting would spend an origin round-trip AND
+/// invalidate the reference the primed head was read with.
+#[allow(clippy::too_many_arguments)]
+async fn body_lane(
+    lane: std::sync::Arc<crate::lanes::Lane>,
+    short_code: String,
+    size: u64,
+    held: String,
+    primary_api_id: i32,
+    primary_bot: String,
+    primary_entry: std::sync::Arc<crate::telegram::BotEntry>,
+    primary_target: crate::telegram::DocTarget,
+) -> Option<LaneIo> {
+    if lane.api_id == primary_api_id && !primary_bot.is_empty() {
+        return Some(LaneIo::new(lane, primary_entry, primary_target, primary_bot));
+    }
+    lane_io_for(lane, &short_code, size, &held).await
+}
+
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let started = std::time::Instant::now();
     // Public mode is the addon surface: the admin token is no longer embedded in
@@ -4873,6 +5125,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let bot_for_task = bot_id.clone();
     let file_size_for_task = file_size;
     let persist_id = file_id.clone();
+    // `?lane=<api_id>` pins this response to ONE lane.
+    //
+    // It exists so one lane can be measured inside a multi-lane process — the
+    // spike that decides "do lanes stack in one process" needs two requests
+    // pinned to two lanes, not two builds — and so an operator can A/B a lane
+    // that reports congestion without editing the pool.
+    let pinned_lane: Option<i32> = ctx
+        .qs("lane")
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|v| *v > 0);
     // Captured BEFORE the spawn: the streaming task cannot borrow `ctx`, and a
     // mid-body failure is only diagnosable with the Range it was serving.
     let status_code: u16 = if range.is_some() { 206 } else { 200 };
@@ -5006,118 +5270,284 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // connection.
         // The target is SHARED, because a `file_reference` can die in the middle
         // of a body and a refreshed one has to reach every window still queued.
-        let target_shared = std::sync::Arc::new(tokio::sync::RwLock::new(target_for_task.clone()));
+        // ── which lanes may serve THIS body ────────────────────────────────
+        //
+        // The preflight proved ONE lane (lane 1: the process pool). Every other
+        // enabled lane boots its bot and mints its own `file_reference` here, in
+        // parallel. A lane that cannot mint is left out rather than failing the
+        // body — with one lane left this is the pre-lane path exactly.
+        //
+        // A body addressed by a `file_id` alone has no short code to mint from,
+        // so it stays single-lane by construction.
+        let mut body_lanes: Vec<std::sync::Arc<LaneIo>> = Vec::new();
+        let primary_api_id = crate::lanes::registry()
+            .map(|r| r.default_lane().api_id)
+            .unwrap_or(0);
+        if !short_code_for_task.is_empty() {
+            if let Some(reg) = crate::lanes::registry() {
+                let selected: Vec<std::sync::Arc<crate::lanes::Lane>> = match pinned_lane {
+                    // A pinned lane runs even while cooling: the caller asked for
+                    // it by name, which is what a measurement of one lane needs.
+                    Some(api_id) => reg
+                        .lanes()
+                        .into_iter()
+                        .filter(|l| l.api_id == api_id)
+                        .collect(),
+                    None => reg
+                        .lanes()
+                        .into_iter()
+                        .filter(|l| l.usable() || l.api_id == primary_api_id)
+                        .collect(),
+                };
+                let wanted = selected.len();
+                // The id this body already holds: each new lane re-sends it
+                // locally, so its reference is minted by its OWN session.
+                let held_id = persist_id.clone();
+                let futures = selected.into_iter().map(|lane| {
+                    body_lane(
+                        lane,
+                        short_code_for_task.clone(),
+                        file_size_for_task,
+                        held_id.clone(),
+                        primary_api_id,
+                        bot_for_task.clone(),
+                        entry_for_task.clone(),
+                        target_for_task.clone(),
+                    )
+                });
+                body_lanes = futures_util::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .map(std::sync::Arc::new)
+                    .collect();
+                if body_lanes.len() > 1 {
+                    log(
+                        "download stream using api_id lanes",
+                        &serde_json::json!({
+                            "lanes": body_lanes.len(),
+                            "wanted": wanted,
+                            "api_ids": body_lanes
+                                .iter()
+                                .map(|l| l.lane.api_id)
+                                .collect::<Vec<i32>>(),
+                            "short_code": short_code_for_task,
+                        }),
+                    );
+                } else if wanted > 1 {
+                    log(
+                        "download stream fell back to one lane",
+                        &serde_json::json!({
+                            "wanted": wanted,
+                            "short_code": short_code_for_task,
+                            "reason": "no second lane could mint a file reference",
+                        }),
+                    );
+                }
+            }
+        }
+        if body_lanes.is_empty() {
+            // No registry, or nothing usable: the single-lane shape, using the
+            // entry and target the preflight already proved.
+            let pool = crate::telegram::shared_pool()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::telegram::TelegramPool::new(1, 1)));
+            let lane = crate::lanes::Lane::new(0, pool, &bot_for_task);
+            body_lanes.push(std::sync::Arc::new(LaneIo::new(
+                lane,
+                entry_for_task.clone(),
+                target_for_task.clone(),
+                bot_for_task.clone(),
+            )));
+        }
         // The body's starting id, for the mid-body local re-send (CHANGE 1).
         let held_for_body = persist_id.clone();
-        // One refresh per body, and the id that actually worked gets persisted.
-        let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // The id that actually worked gets persisted (whichever lane refreshed
+        // last is the one that proved a live reference).
         let refreshed_id: std::sync::Arc<std::sync::Mutex<Option<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
+        let body_lanes = std::sync::Arc::new(body_lanes);
+
         let stream = futures_util::stream::iter(plan.into_iter().enumerate().map(|(i, (p, w))| {
-            let entry = entry_for_task.clone();
-            let target_shared = target_shared.clone();
-            let refreshes = refreshes.clone();
+            let lanes = body_lanes.clone();
             let refreshed_id = refreshed_id.clone();
             let code_for_refresh = short_code_for_task.clone();
-            let bot_for_refresh = bot_for_task.clone();
-            let size_for_refresh = file_size_for_task;
-            // The id this body started with: the mid-body refresh (CHANGE 1)
-            // re-sends it locally before it asks the origin. A refreshed id from
-            // an earlier window is in the mint cache, which `mint::refresh` prefers.
             let held_for_refresh = held_for_body.clone();
+            let size_for_refresh = file_size_for_task;
             async move {
                 // ONE BLINK MUST NOT KILL THE TRACK.
                 //
-                // MEASURED 2026-11-09 from the live log: in 42 s, 27 distinct
-                // audio files were requested and EVERY one answered 200/206, yet
-                // nine bodies died mid-stream (`download stream aborted mid-body`)
-                // â€” which a player sees as "this song is broken" even though it
-                // had the right rows and the right bytes started arriving.
-                //
-                // The pre-flight gives up fast on purpose (the router kills the
-                // request at 30 s), but a window INSIDE a body is different: the
-                // client already holds the headers and the `Content-Length`, so a
-                // short pause is recoverable and aborting is not. Retry only what
-                // means "busy" or "the connection blinked"; a dead file reference
-                // is still final.
-                let mut attempt = 0u32;
-                loop {
-                    let target = target_shared.read().await.clone();
-                    match fetch_part_windowed(&entry, &bot_for_refresh, &target, p, w).await {
-                        Ok(v) => return (i, Ok(v)),
-                        Err(e) => {
-                            // A DEAD REFERENCE MID-BODY IS RECOVERABLE â€” refresh it
-                            // and keep the same response going.
-                            //
-                            // MEASURED 2026-11-09, local log with BitChord: it asks
-                            // for `bytes=0-65535`, `65536-1048575`, then an
-                            // open-ended range, and every body that died on a
-                            // `FILE_REFERENCE_EXPIRED` window made the app RESTART
-                            // the whole download from 0 â€” which is what its
-                            // "upgrading quality" spinner is showing, forever, on a
-                            // 195 MB FLAC.
-                            //
-                            // One refresh per body: mint a new reference, publish it
-                            // to every queued window, retry this one. If that also
-                            // fails the body is over, as before.
-                            if e.file_reference
-                                && !code_for_refresh.is_empty()
-                                && refreshes
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                                    == 0
-                            {
-                                invalidate_resolve_cache(&code_for_refresh, &bot_for_refresh);
-                                // CHANGE 1: local re-send first, from the id this
-                                // body holds; the origin only when it returns None.
-                                let fresh = resolve_shortcode_fresh_from(
-                                    &code_for_refresh,
-                                    &bot_for_refresh,
-                                    Some(held_for_refresh.as_str()),
-                                )
-                                .await;
-                                let new_id = id_of(&fresh);
-                                if !new_id.is_empty() {
-                                    if let Ok(t) = prepare_file_target(&new_id, size_for_refresh) {
-                                        *target_shared.write().await = t;
-                                        if let Ok(mut slot) = refreshed_id.lock() {
-                                            *slot = Some(new_id);
+                // This is the single-lane ladder with a lane dimension: a part is
+                // retried on the same lane (transport/busy) or after THAT lane
+                // refreshed its own reference, and only then handed to another
+                // lane. A part is never in flight twice, and
+                // `buffered(prefetch)` still emits strictly in file order.
+                let mut tried: Vec<usize> = Vec::new();
+                let mut last: Option<crate::telegram::GramErr> = None;
+                while tried.len() < lanes.len() {
+                    let Some(idx) = pick_lane(&lanes, &tried) else {
+                        break;
+                    };
+                    let io = &lanes[idx];
+                    // Counted while this lane works on the part, so the next pick
+                    // sees a loaded lane as loaded.
+                    let _in_flight = io.lane.begin_part();
+                    let mut attempt = 0u32;
+                    // How many times THIS part has waited for a refresh and
+                    // retried on the same lane.
+                    let mut refresh_retries = 0u32;
+                    loop {
+                        // The reference generation this attempt is using. A part
+                        // that fails while ANOTHER part already refreshes waits
+                        // for that refresh and retries instead of aborting the
+                        // body: with `--stream-prefetch 20` one dead reference
+                        // fails a dozen parts in the same millisecond, and a
+                        // one-shot flag turned every sibling into a fatal error
+                        // while the single refresh was still in flight.
+                        let generation = io.generation.load(std::sync::atomic::Ordering::Relaxed);
+                        let target = io.target.read().await.clone();
+                        let started = std::time::Instant::now();
+                        match fetch_part_windowed(&io.entry, &io.bot, &target, p, w).await {
+                            Ok(v) => {
+                                io.lane
+                                    .stats
+                                    .record_ok(v.len() as u64, started.elapsed().as_micros() as u64);
+                                return (i, Ok(v));
+                            }
+                            Err(e) => {
+                                io.lane.stats.record_fail(&e.message);
+                                log(
+                                    "download lane part failed",
+                                    &serde_json::json!({
+                                        "api_id": io.lane.api_id,
+                                        "bot_id": io.bot,
+                                        "pos": p,
+                                        "error": e.message,
+                                        "file_reference": e.file_reference,
+                                        "transport": e.transport,
+                                        "flood_wait": e.flood_wait,
+                                    }),
+                                );
+                                // A DEAD REFERENCE MID-BODY IS RECOVERABLE: that
+                                // lane refreshes its OWN id and retries ITS part.
+                                if e.file_reference && !code_for_refresh.is_empty() {
+                                    let mut refreshed_now = false;
+                                    {
+                                        let _refresh_guard = io.refresh_lock.lock().await;
+                                        if io.generation.load(std::sync::atomic::Ordering::Relaxed)
+                                            != generation
+                                        {
+                                            // Someone else refreshed while this
+                                            // part waited for the lock.
+                                            refreshed_now = true;
+                                        } else if io
+                                            .refreshes
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            < LANE_REFRESH_MAX
+                                        {
+                                            // FORCED: a refresh that reads the 10 s
+                                            // memo can hand back the reference
+                                            // that just died (see
+                                            // `resolve_shortcode_forced`).
+                                            // LOCAL first: the origin's mint
+                                            // sends from its own session, whose
+                                            // reference is dead for ours. The
+                                            // forced origin call stays as the
+                                            // fallback (`resolve_shortcode_forced`
+                                            // never reads the 10 s memo, which can
+                                            // hand back the reference that just
+                                            // died).
+                                            let new_id = match crate::mint::resend(
+                                                &code_for_refresh,
+                                                &io.bot,
+                                                held_for_refresh.as_str(),
+                                                "lane",
+                                            )
+                                            .await
+                                            {
+                                                Some(id) => id,
+                                                None => id_of(
+                                                    &resolve_shortcode_forced(
+                                                        &code_for_refresh,
+                                                        &io.bot,
+                                                        Some(held_for_refresh.as_str()),
+                                                    )
+                                                    .await,
+                                                ),
+                                            };
+                                            if !new_id.is_empty() {
+                                                if let Ok(t) = crate::telegram::prepare_file_target(
+                                                    &new_id,
+                                                    size_for_refresh,
+                                                ) {
+                                                    *io.target.write().await = t;
+                                                    io.generation.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if let Ok(mut slot) = refreshed_id.lock() {
+                                                        *slot = Some(new_id);
+                                                    }
+                                                    refreshed_now = true;
+                                                    log(
+                                                        "download stream refreshed a lane's file reference mid-body",
+                                                        &serde_json::json!({
+                                                            "short_code": code_for_refresh,
+                                                            "pos": p,
+                                                            "api_id": io.lane.api_id,
+                                                        }),
+                                                    );
+                                                }
+                                            }
                                         }
-                                        log(
-                                            "download stream refreshed the file reference mid-body",
-                                            &serde_json::json!({
-                                                "short_code": code_for_refresh,
-                                                "pos": p,
-                                            }),
-                                        );
+                                    }
+                                    if refreshed_now && refresh_retries < LANE_REFRESH_RETRIES {
+                                        refresh_retries += 1;
+                                        attempt = 0;
                                         continue;
                                     }
                                 }
+                                // A flood belongs to ONE bot: cool that lane and
+                                // let the part fail over instead of stalling it.
+                                if let Some(secs) = e.flood_wait {
+                                    io.lane.stats.cool_for(secs as i64, &e.message);
+                                }
+                                attempt += 1;
+                                let retryable =
+                                    e.transport || e.message.starts_with(GATE_BUSY_PREFIX);
+                                if retryable && attempt < BODY_WINDOW_ATTEMPTS {
+                                    log(
+                                        "download stream retrying a window",
+                                        &serde_json::json!({
+                                            "attempt": attempt,
+                                            "error": e.message,
+                                            "pos": p,
+                                            "wait_ms": 150 * attempt as u64,
+                                            "api_id": io.lane.api_id,
+                                        }),
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        150 * attempt as u64,
+                                    ))
+                                    .await;
+                                    continue;
+                                }
+                                last = Some(e);
+                                tried.push(idx);
+                                break;
                             }
-                            attempt += 1;
-                            let retryable =
-                                e.transport || e.message.starts_with(GATE_BUSY_PREFIX);
-                            if !retryable || attempt >= BODY_WINDOW_ATTEMPTS {
-                                return (i, Err(e));
-                            }
-                            log(
-                                "download stream retrying a window",
-                                &serde_json::json!({
-                                    "attempt": attempt,
-                                    "error": e.message,
-                                    "pos": p,
-                                    "wait_ms": 150 * attempt as u64,
-                                }),
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                150 * attempt as u64,
-                            ))
-                            .await;
                         }
                     }
+
                 }
+                let err = last.unwrap_or_else(|| crate::telegram::GramErr {
+                    message: "no api_id lane could serve this part".to_string(),
+                    ..Default::default()
+                });
+                (i, Err(err))
             }
         }))
         .buffered(prefetch);
+
 
         futures_util::pin_mut!(stream);
         loop {

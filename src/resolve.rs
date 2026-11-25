@@ -274,6 +274,27 @@ pub async fn resolve_shortcode_fresh_from(
     res
 }
 
+/// [`resolve_shortcode_fresh_from()`] that NEVER reads the 10 s memo.
+///
+/// The mid-body recovery needs an id minted AFTER the failure. The memo is
+/// written by the very mint that produced the dead id, and [`crate::cache`]
+/// buffers writes for up to 400 ms — so `invalidate_resolve_cache()` can run
+/// BEFORE that buffered put lands, and the "refresh" then hands back the same
+/// dead reference. MEASURED 2026-11-26 on the first request through a new
+/// api_id lane: mint, first body part 400 `FILE_REFERENCE_EXPIRED`, memo hit,
+/// same id, body aborted at 512 KB. A single-lane body outlives the 400 ms
+/// window, which is why this only showed up with a lane minted seconds before
+/// its own first part.
+pub async fn resolve_shortcode_forced(short_code: &str, bot_id: &str, held: Option<&str>) -> Value {
+    let key = cache_key(short_code, bot_id);
+    invalidate_resolve_cache(short_code, bot_id);
+    let res = resolve_shortcode_from(short_code, bot_id, true, held).await;
+    if has_id(&res) {
+        cache::put("resolve_fresh", &key, &res, FRESH_MEMO_TTL, 0);
+    }
+    res
+}
+
 fn not_found_result(v: &Value) -> bool {
     v.get("message")
         .and_then(|m| m.as_str())

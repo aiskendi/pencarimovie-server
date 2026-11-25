@@ -302,6 +302,172 @@ pub(crate) async fn http_json_h_status_no_enroll(
     http_json_h_status_inner(url, params, method, timeout_secs, headers, false, false).await
 }
 
+/// The part of one attempt the retry ladder looks at.
+#[derive(Debug, Clone, Copy)]
+struct Answer<'a> {
+    /// Did the attempt produce a 2xx body?
+    ok: bool,
+    /// The HTTP status, or `0` when the request never completed.
+    status: u16,
+    /// The transport failure, when there was one.
+    err: Option<&'a str>,
+}
+
+/// What the ladder does with the answer it is holding.
+#[derive(Debug)]
+enum Step {
+    /// Nothing left to try: log this answer and return it.
+    Done,
+    /// The request never completed and the failure looks like an in-path reset:
+    /// send the SAME request again through the DPI fallback host.
+    Fallback(String),
+    /// The origin refused the call: say why, clear the lease, re-enrol, and send
+    /// the SAME request once more with the new credential.
+    Enrol,
+}
+
+/// The whole retry budget for ONE origin call: one DPI-fallback retry and one
+/// auth recovery, never more of either, in whatever order the two faults arrive.
+///
+/// Both ladders are decided on the answer we are holding NOW. That is the point:
+/// the auth check used to run on the FIRST answer only, so a 401 that arrived on
+/// the fallback retry was returned to the caller untouched — the first attempt
+/// had status 0 (a reset), so the branch never matched, and the fallback's own
+/// answer was never examined. Measured on a real Android device (1.0.144 /
+/// a6be6d0), on every `/resolve-file`:
+///
+/// ```text
+/// wp request reset, retrying via fallback host {"url":"…/resolve-file?short_code=YeNPEv…"}
+/// http_json failed {"error":null,"status":401,…}
+/// resolve returned no file id {"message":"Sorry, you are not allowed to do that."}
+/// download refused {"http_status":503,"stage":"ORIGIN_BUSY"}
+/// ```
+///
+/// — not one `wp auth refused …` line and not one `enrol`, so nothing cleared
+/// the lease and nothing re-enrolled. A 401 now always goes through
+/// [`recover_auth_refused`], whichever attempt carried it.
+///
+/// Pure on purpose (no network, no credential store), so the sequence above is
+/// pinned by a test: `a_401_on_the_fallback_retry_still_enrols_once_and_retries_once`.
+#[derive(Debug, Default)]
+struct RetryBudget {
+    fallback_used: bool,
+    recovery_used: bool,
+}
+
+impl RetryBudget {
+    fn next(&mut self, url: &str, answer: Answer<'_>, auto_enroll: bool, origin_call: bool) -> Step {
+        // Ladder 1 — transport. Checked FIRST because a reset means the request
+        // never reached the origin at all, so the fallback is the only way to
+        // learn what the origin would have answered.
+        if !answer.ok && !self.fallback_used {
+            if answer.err.map(is_connection_reset).unwrap_or(false) {
+                if let Some(alt) = fallback_url(url) {
+                    self.fallback_used = true;
+                    return Step::Fallback(alt);
+                }
+            }
+        }
+        // Ladder 2 — auth. On the answer we hold NOW: the first attempt or the
+        // fallback retry, whichever it was. `origin_call` keeps a third-party 401
+        // out (that is a credential leak, not a stale lease) and `auto_enroll`
+        // keeps the enrolment request itself out (else it would recurse).
+        if auto_enroll && origin_call && !self.recovery_used && matches!(answer.status, 401 | 426) {
+            self.recovery_used = true;
+            return Step::Enrol;
+        }
+        Step::Done
+    }
+}
+
+/// The PM-Auth recovery for a refused origin call: re-learn the clock, say WHY
+/// in the one line operators grep for, drop the lease, re-enrol, and answer the
+/// headers to retry with.
+///
+/// `None` means no lease could be obtained, so a retry would only repeat the
+/// unauthenticated request that was just refused — the caller keeps the refusal.
+///
+/// This is the ONLY place a 401/426 becomes a recovery, so the answer to "why
+/// did nothing re-enrol?" is one function instead of a branch per send path.
+async fn recover_auth_refused(
+    caller_headers: &[(String, String)],
+    method: &str,
+    target: &str,
+    had_auth: bool,
+    status: u16,
+) -> Option<Vec<(String, String)>> {
+    // One clock probe per 10 minutes, process-wide.
+    //
+    // `measure_clock_offset()` is an extra round-trip to the origin, and a
+    // REVOKED install 401s on every single request while the player retries its
+    // ranges — probing per 401 meant one wasted request (radio wake, DNS, TLS)
+    // for each one, which is exactly the kind of thing that shows up as battery
+    // drain. The clock cannot drift meaningfully in 10 minutes, so this is free.
+    static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(0);
+    // Re-learn the clock BEFORE re-signing, in BOTH cases.
+    //
+    // A skewed clock is the one fault that makes an install look tokenless: a
+    // token minted with the ORIGIN's expiry is discarded by `auth_token()` the
+    // moment local time is past it, so `had_auth` is false on every request
+    // forever. Probing only when a token was sent meant the correction could
+    // never fire in exactly that state — the install re-enrolled once a minute,
+    // threw each token away, and logged nothing but 401s (issue #14).
+    let now_s = crate::storage::now();
+    let probe_due = now_s - LAST_CLOCK_PROBE.load(std::sync::atomic::Ordering::SeqCst) > 600;
+    if probe_due {
+        LAST_CLOCK_PROBE.store(now_s, std::sync::atomic::Ordering::SeqCst);
+        let probe = crate::session::measure_clock_offset().await;
+        if probe.ok {
+            crate::credentials::set_clock_offset(probe.offset);
+            log(
+                "pm-auth clock corrected",
+                &serde_json::json!({"offset_secs": probe.offset, "had_token": had_auth}),
+            );
+        }
+    }
+    if had_auth {
+        log(
+            "wp auth refused with a token, re-enrolling",
+            &serde_json::json!({"url": target, "status": status}),
+        );
+    } else {
+        // The reason is the whole point: "without a token" alone cannot tell a
+        // read-only volume from a clock that ate the token from a missing file.
+        log(
+            "wp auth refused without a token, enrolling",
+            &serde_json::json!({
+                "url": target,
+                "status": status,
+                "reason": crate::credentials::auth_token_reason(),
+            }),
+        );
+    }
+    // Clear even when `had_auth` was false. A token can exist on disk and still
+    // produce no proof (its signing key no longer matches this install). Leaving
+    // it made `ensure_enrolled_throttled()` return true immediately, so no
+    // enrolment happened and every retry repeated the same 426.
+    crate::credentials::clear_auth_token();
+    if crate::credentials::ensure_enrolled_throttled().await
+        || crate::credentials::ensure_enrolled_now().await
+    {
+        // Rebuilt the same way the first attempt built them — the caller's own
+        // headers plus the ticket and the fresh proof, and NOTHING carried over
+        // from the refused attempt. (The retired X-API-Secret in particular: it is
+        // sent by the caller or not at all, and resending it is what turns a
+        // missing PM-Auth token into a permanent 426 loop.)
+        return Some(
+            caller_headers
+                .iter()
+                .cloned()
+                .chain(crate::credentials::ticket_headers())
+                .chain(pm_auth_headers(method, target))
+                .collect(),
+        );
+    }
+    None
+}
+
 async fn http_json_h_status_inner(
     url: &str,
     params: &[(String, String)],
@@ -409,118 +575,46 @@ async fn http_json_h_status_inner(
     };
 
     let had_auth = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("X-PM-Auth"));
-    let (mut ok, mut status, mut text, mut err) =
-        call(&target, extra.clone(), body.clone()).await;
-
-    // A 401 means the origin refused this request, and there are TWO cases — both
-    // need the same recovery, and the second one used to get none:
-    //
-    //  1. we HELD a token and it is no longer accepted: the install is unknown or
-    //     revoked, the origin's signing key was regenerated, or the proof fell
-    //     outside the 60 s clock window. Without this, a stale token wedges the
-    //     install forever (measured on a CPH2581: every /resolve-file answered 401
-    //     while the UI showed a healthy session).
-    //  2. we held NO token at all, because enrolment had not happened yet or its
-    //     last attempt failed. `had_auth` was false, so this branch skipped — and
-    //     that is the intermittent "streaming / api/download sometimes not working":
-    //     the request went out unauthenticated, `/resolve-file` answered 401, the
-    //     resolve found no file id, and `/api/download` gave up with
-    //     `400 MISSING_FILE_ID`. Nothing re-enrolled, because nothing thought it
-    //     should.
-    //
-    // 426 is the same refusal once the request also carries the retired
-    // X-API-Secret: the origin names the legacy client instead of answering 401.
-    // It must take this branch too, or every request keeps the dead secret and
-    // never re-enrols (measured 2026-11-21: 89 and 138 `no longer supported`
-    // resolves in one log window while PM-Auth was absent on those dynos).
-    //
-    // One retry only: the retry's own status is not re-examined, so this can never
-    // loop, and `ensure_enrolled_throttled()` still caps attempts at one a minute.
-    // One clock probe per 10 minutes, process-wide.
-    //
-    // `measure_clock_offset()` is an extra round-trip to the origin, and a REVOKED
-    // install 401s on every single request while the player retries its ranges —
-    // probing per 401 meant one wasted request (radio wake, DNS, TLS) for each one,
-    // which is exactly the kind of thing that shows up as battery drain. The clock
-    // cannot drift meaningfully in 10 minutes, so this is free.
-    static LAST_CLOCK_PROBE: std::sync::atomic::AtomicI64 =
-        std::sync::atomic::AtomicI64::new(0);
-    if auto_enroll && (status == 401 || status == 426) && origin_call {
-        // Re-learn the clock BEFORE re-signing, in BOTH cases.
-        //
-        // A skewed clock is the one fault that makes an install look tokenless: a
-        // token minted with the ORIGIN's expiry is discarded by `auth_token()` the
-        // moment local time is past it, so `had_auth` is false on every request
-        // forever. Probing only when a token was sent meant the correction could
-        // never fire in exactly that state — the install re-enrolled once a minute,
-        // threw each token away, and logged nothing but 401s (issue #14).
-        let now_s = crate::storage::now();
-        let probe_due = now_s - LAST_CLOCK_PROBE.load(std::sync::atomic::Ordering::SeqCst) > 600;
-        if probe_due {
-            LAST_CLOCK_PROBE.store(now_s, std::sync::atomic::Ordering::SeqCst);
-            let probe = crate::session::measure_clock_offset().await;
-            if probe.ok {
-                crate::credentials::set_clock_offset(probe.offset);
+    // THE retry ladder for one origin call: attempt -> (reset) the DPI fallback
+    // host -> (refusal) one authenticated retry. `RetryBudget` decides when to
+    // stop, and `recover_auth_refused` is the only auth recovery there is, so a
+    // 401 is recovered the same way whichever attempt carried it.
+    let mut url = target.clone();
+    let mut budget = RetryBudget::default();
+    let mut recovered = false;
+    let (ok, status, text, err) = loop {
+        let (a_ok, a_status, a_text, a_err) = call(&url, extra.clone(), body.clone()).await;
+        let step = {
+            let answer = Answer {
+                ok: a_ok,
+                status: a_status,
+                err: a_err.as_deref(),
+            };
+            budget.next(&url, answer, auto_enroll, origin_call)
+        };
+        match step {
+            Step::Done => break (a_ok, a_status, a_text, a_err),
+            Step::Fallback(alt) => {
                 log(
-                    "pm-auth clock corrected",
-                    &serde_json::json!({"offset_secs": probe.offset, "had_token": had_auth}),
+                    "wp request reset, retrying via fallback host",
+                    &serde_json::json!({"url": url}),
                 );
+                url = alt;
             }
-        }
-        if had_auth {
-            log("wp auth refused with a token, re-enrolling", &serde_json::json!({"url": target, "status": status}));
-        } else {
-            // The reason is the whole point: "without a token" alone cannot tell a
-            // read-only volume from a clock that ate the token from a missing file.
-            log(
-                "wp auth refused without a token, enrolling",
-                &serde_json::json!({
-                    "url": target,
-                    "status": status,
-                    "reason": crate::credentials::auth_token_reason(),
-                }),
-            );
-        }
-        // Clear even when `had_auth` was false. A token can exist on disk and
-        // still produce no proof (its signing key no longer matches this
-        // install). Leaving it made `ensure_enrolled_throttled()` return true
-        // immediately, so no enrolment happened and every retry repeated the
-        // same 426.
-        crate::credentials::clear_auth_token();
-        if crate::credentials::ensure_enrolled_throttled().await
-            || crate::credentials::ensure_enrolled_now().await
-        {
-            extra = headers
-                .iter()
-                .cloned()
-                .chain(crate::credentials::ticket_headers())
-                .chain(pm_auth_headers(method, &target))
-                .collect();
-            // Never retry an auth refusal with X-API-Secret. It is the retired
-            // credential, and sending it again is what turns a missing PM-Auth
-            // token into a permanent 426 loop instead of a clear auth failure.
-            let r = call(&target, extra.clone(), body.clone()).await;
-            ok = r.0;
-            status = r.1;
-            text = r.2;
-            err = r.3;
-        }
-    }
-
-    if !ok {
-        if let Some(e) = &err {
-            if is_connection_reset(e) {
-                if let Some(alt) = fallback_url(&target) {
-                    log("wp request reset, retrying via fallback host", &serde_json::json!({"url": target}));
-                    let r = call(&alt, extra.clone(), body.clone()).await;
-                    ok = r.0;
-                    status = r.1;
-                    text = r.2;
-                    err = r.3;
+            Step::Enrol => {
+                recovered = true;
+                // Retried through the host that actually answered: when the reset
+                // was what sent us to the DPI fallback, that is where the
+                // credential gets checked, so that is where it must be retried
+                // (and the log line above says which host it was).
+                match recover_auth_refused(headers, method, &target, had_auth, a_status).await {
+                    Some(fresh) => extra = fresh,
+                    None => break (a_ok, a_status, a_text, a_err),
                 }
             }
         }
-    }
+    };
+
     // THE arming point for the origin-down gate.
     //
     // Every origin call outside the catalog path lands here — `resolve-file`,
@@ -533,9 +627,19 @@ async fn http_json_h_status_inner(
     // `400 MISSING_FILE_ID` — a client error for the origin's outage.
     wp_note_status(status);
     if !ok {
+        // `auth_recovered` says whether this refusal already went through the
+        // re-enrol branch — i.e. one of the `wp auth refused …` lines is in the
+        // log for it. Without it, `http_json failed 401` cannot be told apart
+        // from the state that wedged the device: a refusal that reached the
+        // caller with NO recovery at all.
         log(
             "http_json failed",
-            &serde_json::json!({"url": target, "status": status, "error": err}),
+            &serde_json::json!({
+                "url": target,
+                "status": status,
+                "error": err,
+                "auth_recovered": recovered,
+            }),
         );
         // The origin's 4xx body is the verdict — a dead bot, a refused lease, a
         // reset-the-token demand. Discarding it is what made every one of those
@@ -863,5 +967,162 @@ mod tests {
             "nor is the CDN the signed master comes from"
         );
         assert!(!is_origin_api("not a url"), "garbage is not the origin");
+    }
+
+    /* ── the retry ladder (a 401 on ANY attempt must re-enrol) ─────────────── */
+
+    /// A transport failure in the shape `err_text()` produces for a reset.
+    const RESET: Option<&str> =
+        Some("error sending request for url (…): connection reset by peer (os error 10054)");
+
+    /// One origin URL, derived from the configured base so `is_origin_api()` and
+    /// `fallback_url()` both agree it is the origin — the two predicates the
+    /// ladder keys on.
+    fn origin_url() -> String {
+        format!(
+            "{}/resolve-file?short_code=YeNPEv&bot_id=8971140168",
+            crate::config::wp_api_base()
+        )
+    }
+
+    /// Walks [`RetryBudget`] exactly the way the send loop does — one scripted
+    /// answer per attempt, one `Step` per answer — and reports what the ladder
+    /// cost as `(sends, enrols, final status)`.
+    ///
+    /// `sends` is the number of HTTP attempts; `enrols` is the number of
+    /// `Step::Enrol` turns, i.e. the number of `recover_auth_refused()` calls.
+    fn drive_at(
+        start: &str,
+        script: &[(bool, u16, Option<&'static str>)],
+        auto_enroll: bool,
+    ) -> (usize, usize, u16) {
+        let mut budget = RetryBudget::default();
+        let mut url = start.to_string();
+        let origin_call = is_origin_api(&url);
+        let (mut sends, mut enrols, mut i) = (0usize, 0usize, 0usize);
+        loop {
+            let (ok, status, err) = script[i.min(script.len() - 1)];
+            sends += 1;
+            assert!(sends <= 3, "the ladder must never fan out past one of each");
+            let answer = Answer { ok, status, err };
+            match budget.next(&url, answer, auto_enroll, origin_call) {
+                Step::Done => return (sends, enrols, status),
+                Step::Fallback(alt) => {
+                    assert!(
+                        alt.starts_with(&crate::config::wp_api_base_fallback()),
+                        "a reset retry must go through the DPI fallback host, got {alt}"
+                    );
+                    url = alt;
+                    i += 1;
+                }
+                Step::Enrol => {
+                    enrols += 1;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn drive(
+        script: &[(bool, u16, Option<&'static str>)],
+        auto_enroll: bool,
+    ) -> (usize, usize, u16) {
+        drive_at(&origin_url(), script, auto_enroll)
+    }
+
+    /// THE BUG, measured on a real Android device (1.0.144 / a6be6d0) on EVERY
+    /// `/resolve-file`:
+    ///
+    /// ```text
+    /// wp request reset, retrying via fallback host {…short_code=YeNPEv…}
+    /// http_json failed {"error":null,"status":401,…}
+    /// resolve returned no file id {"message":"Sorry, you are not allowed to do that."}
+    /// download refused {"http_status":503,"stage":"ORIGIN_BUSY"}
+    /// ```
+    ///
+    /// The reset left `status == 0`, the auth branch was tested against that
+    /// first answer only, so it never matched: the 401 that came back from the
+    /// DPI fallback host went straight to the caller — no `wp auth refused …`, no
+    /// `enrol`, no retry. The ladder must now spend exactly ONE enrolment and ONE
+    /// retry on that refusal, whichever attempt carried it, and return the
+    /// retry's answer.
+    #[test]
+    fn a_401_on_the_fallback_retry_still_enrols_once_and_retries_once() {
+        let (sends, enrols, status) = drive(
+            &[(false, 0, RESET), (false, 401, None), (true, 200, None)],
+            true,
+        );
+        assert_eq!(enrols, 1, "the refusal must trigger exactly one enrolment");
+        assert_eq!(sends, 3, "origin, fallback, then one authenticated retry");
+        assert_eq!(status, 200, "and the retry's answer is what is returned");
+    }
+
+    /// The same path with a healthy origin: a reset that the fallback answers
+    /// with 200 costs one extra send and touches no credential.
+    #[test]
+    fn a_200_on_the_fallback_retry_never_enrols() {
+        let (sends, enrols, status) = drive(&[(false, 0, RESET), (true, 200, None)], true);
+        assert_eq!(sends, 2, "origin, then the fallback retry");
+        assert_eq!(enrols, 0, "a healthy answer must not clear the lease");
+        assert_eq!(status, 200);
+    }
+
+    /// The old single-retry path still works: a 401 on the FIRST attempt is one
+    /// enrolment and one retry, as before.
+    #[test]
+    fn a_401_on_the_first_attempt_enrols_once() {
+        assert_eq!(
+            drive(&[(false, 401, None), (true, 200, None)], true),
+            (2, 1, 200)
+        );
+    }
+
+    /// 426 is the same refusal wearing the retired X-API-Secret, and must take
+    /// the same ladder — otherwise the dead secret is resent forever.
+    #[test]
+    fn a_426_takes_the_same_ladder_as_a_401() {
+        assert_eq!(
+            drive(&[(false, 426, None), (true, 200, None)], true),
+            (2, 1, 200)
+        );
+    }
+
+    /// A revoked install refuses the retry too. The ladder stops there and
+    /// returns that refusal: one enrolment, no second round, no loop.
+    #[test]
+    fn a_refused_retry_stops_the_ladder() {
+        assert_eq!(
+            drive(&[(false, 401, None), (false, 401, None)], true),
+            (2, 1, 401)
+        );
+    }
+
+    /// The enrolment request itself. `http_json_h_status_no_enroll()` passes
+    /// `auto_enroll = false`, so a refusal there must never re-enrol — that is
+    /// the no-recursion guard, and it is the only caller that can hit it.
+    #[test]
+    fn the_enrolment_request_itself_never_re_enrols() {
+        assert_eq!(drive(&[(false, 401, None)], false), (1, 0, 401));
+    }
+
+    /// A third-party source host answers 401 BY DESIGN. Enrolling because of it
+    /// is what logged the engine out of the origin on Heroku (2026-11-07). The
+    /// predicate is pinned above; this pins the ladder that acts on it.
+    #[test]
+    fn a_third_party_401_never_enrols() {
+        assert_eq!(
+            drive_at("https://example.invalid/a/search?q=x", &[(false, 401, None)], true),
+            (1, 0, 401)
+        );
+    }
+
+    /// A reset against a host with no DPI fallback is reported as-is: no
+    /// fallback, no enrolment, no second attempt.
+    #[test]
+    fn a_reset_without_a_fallback_host_is_not_retried() {
+        assert_eq!(
+            drive_at("https://example.invalid/a/search?q=x", &[(false, 0, RESET)], true),
+            (1, 0, 0)
+        );
     }
 }

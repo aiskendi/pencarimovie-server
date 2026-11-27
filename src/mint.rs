@@ -591,6 +591,13 @@ fn remember(short_code: &str, bot_id: &str, file_id: &str) {
         mint_key(short_code, bot_id),
         (file_id.to_string(), now_ms()),
     );
+    drop(g);
+    // UPSERT the durable id. A `sendMedia` reply is the only id that works from
+    // OUR session, and until now it was persisted nowhere: the resolve row kept
+    // the origin's seed, so a restart re-sent the document for a pair this
+    // process had already minted. (The origin is upserted separately by
+    // [`report`]; this is the local side of the same fact.)
+    crate::resolve::upsert_minted_id(short_code, bot_id, file_id);
 }
 
 /* Ã¢â€â‚¬Ã¢â€â‚¬ the local re-send (CHANGE 1) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */

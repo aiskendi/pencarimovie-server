@@ -229,6 +229,42 @@ pub fn invalidate_resolve_cache(short_code: &str, bot_id: &str) {
     cache::invalidate("resolve_fresh", &key);
 }
 
+/// Upsert the id a local `sendMedia` produced into the PERSISTED resolve row.
+///
+/// [`save_resolve_cache`] stores the origin's answer, and for a lane that answer
+/// is the origin's SEED: bound to the origin's session, dead on our first part.
+/// The durable id this bot gets back from `sendMedia` used to live only in
+/// `mint`'s in-process map, so every restart (a Heroku dyno cycle, an app update)
+/// threw it away and the bot paid another relay send for a pair it had already
+/// minted. This writes it where a later Play — and a later PROCESS — reads it.
+///
+/// Only an EXISTING row is updated: an id with no size/title is exactly what
+/// [`resolve_shortcode_cached`] refuses to serve, so creating one here would be
+/// worse than a miss. Returns whether a row was updated.
+pub fn upsert_minted_id(short_code: &str, bot_id: &str, file_id: &str) -> bool {
+    if short_code.trim().is_empty() || bot_id.trim().is_empty() || file_id.trim().is_empty() {
+        return false;
+    }
+    let key = cache_key(short_code, bot_id);
+    let Some(cached_row) = cache::get("resolve", &key) else {
+        return false;
+    };
+    let mut row = (*cached_row).clone();
+    let at = now();
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("file_id".into(), serde_json::json!(file_id));
+        obj.insert("file_id_mt".into(), serde_json::json!(file_id));
+        obj.insert("minted_at".into(), serde_json::json!(at));
+        obj.insert("resolved_at".into(), serde_json::json!(at));
+    }
+    cache::put("resolve", &key, &row, RESOLVE_TTL, 0);
+    // The 10 s refresh memo holds the reference this mint just replaced; keeping
+    // it would make the next refresh hand the old one back.
+    cache::invalidate("resolve_fresh", &key);
+    cache::invalidate("resolve_miss", &key);
+    true
+}
+
 /// `fd_resolve_shortcode_fresh()`: one refresh per burst, memoised 10 s so the
 /// player's other in-flight Range requests reuse it instead of re-resolving.
 pub async fn resolve_shortcode_fresh(short_code: &str, bot_id: &str) -> Value {
@@ -507,7 +543,9 @@ enum Refresh {
     /// `minted_id` (this process minted it, so the bot can address it) or
     /// `caller_id` (the id the caller was streaming when Telegram refused it).
     Local(String, &'static str),
-    /// The origin's `fresh=1` mint, which returns an id minted for THIS bot.
+    /// The origin's `fresh=1` mint. Its answer is a Bot-API id for THIS bot and is
+    /// NOT read directly: this rung SENDs it once and answers with the reply's id.
+    /// (The `force=1&nocache=1` answer is the one that is used as-is.)
     OriginFresh,
 }
 
@@ -716,6 +754,22 @@ async fn refresh_before_origin(
             }
             Refresh::OriginFresh => {
                 if let Some(body) = origin_fresh(short_code, bot, held).await {
+                    // `fresh=1` is the ONE parameter whose answer must be SENT:
+                    // it hands back a Bot-API id for this bot, not a reference our
+                    // session can read, so this rung spends the single sendMedia
+                    // the refresh needs and answers with the id that send returned.
+                    // (`force=1&nocache=1` is the opposite rule anywhere it is
+                    // used: that answer is taken as-is.)
+                    let id = ["file_id_mt", "file_id_tmp", "file_id"]
+                        .iter()
+                        .map(|k| jstr(&body, k))
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    if let Some(new_id) = one_local(short_code, bot, &id, "fresh_id").await {
+                        return Some(id_body(short_code, bot, &new_id));
+                    }
+                    // The send was refused: the origin's id is still worth more
+                    // than nothing, and the caller's own refresh can retry it.
                     return Some(body);
                 }
             }

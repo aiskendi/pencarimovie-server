@@ -3399,19 +3399,29 @@ async fn send_lane_id(short_code: &str, bot: &str, source: &str) -> Option<Strin
     crate::mint::resend(short_code, bot, source, "origin_id").await
 }
 
-/// The origin's `force=1&nocache=1` answer, used AS-IS.
+/// The origin's `force=1&nocache=1` answer, converted into OUR reference.
 ///
-/// This is not the `fresh=1` mint. `force=1&nocache=1` makes the origin drop its
-/// caches and answer with a `file_id` that is directly usable, so no `sendMedia`
-/// is spent on it. `fresh=1` is the other parameter, and it is the only one that
-/// has to be sent: its durable id is the one in the `sendMedia` reply (see
-/// `resolve::refresh_before_origin`).
+/// The origin answers an id minted for this bot, but a `file_reference` is only
+/// readable from the session that produced it: measured 2026-11-28 on a cold
+/// title, using the raw answer made two lanes serve 0 bytes with 77/78
+/// `FILE_REFERENCE_EXPIRED` parts each. So the raw id is SENT once and the reply's
+/// reference is what the lane uses — the same rule as the `fresh=1` rung. A refused
+/// send keeps the raw id as the last resort; the warm-up probe converts it later.
 async fn forced_mint_id(short_code: &str, bot: &str, held: &str) -> Option<String> {
-    let id = origin_lane_id(short_code, bot, held, true).await;
-    if id.is_empty() {
+    let raw = origin_lane_id(short_code, bot, held, true).await;
+    if raw.is_empty() {
         return None;
     }
-    Some(id)
+    match send_lane_id(short_code, bot, &raw).await {
+        Some(ours) => Some(ours),
+        None => {
+            log(
+                "force mint answered but the send was refused - keeping the raw id to convert on probe",
+                &serde_json::json!({"bot_id": bot, "short_code": short_code}),
+            );
+            Some(raw)
+        }
+    }
 }
 
 /// One lane's file id.
@@ -3443,6 +3453,10 @@ async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
 /// One lane's file id for a MID-BODY refresh: never the cached `live` id (that is
 /// the reference that just died), always a `force=1&nocache=1` answer, and a busy
 /// origin is retried rather than allowed to fail the part.
+///
+/// The force answer is tried DIRECTLY first; a 400 on it means this session cannot
+/// read it, so ONE `sendMedia` converts it (see `lane_io_for`). Mid-body is the
+/// expensive path already, so the send is not worth probing for first.
 async fn refresh_lane_id(short_code: &str, bot: &str, held: &str) -> String {
     let mut id = String::new();
     for attempt in 0..LANE_MINT_ATTEMPTS {
@@ -3454,7 +3468,13 @@ async fn refresh_lane_id(short_code: &str, bot: &str, held: &str) -> String {
             );
             tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         }
-        id = forced_mint_id(short_code, bot, held).await.unwrap_or_default();
+        let raw = forced_mint_id(short_code, bot, held).await.unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        id = send_lane_id(short_code, bot, &raw)
+            .await
+            .unwrap_or(raw);
         if !id.is_empty() {
             break;
         }
@@ -3528,7 +3548,7 @@ async fn lane_io_for(
     // and right for the file: its first part answers 400, the refresh re-mints
     // through its own session, and it joins from there. Dropping the lane instead
     // is what made a busy origin turn a four-lane body into a one-lane body.
-    let start_id = if id.is_empty() {
+    let mut current_id = if id.is_empty() {
         log(
             "lane has no id of its own yet - starting from the body's reference to heal on first part",
             &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
@@ -3537,14 +3557,14 @@ async fn lane_io_for(
     } else {
         id
     };
-    if start_id.is_empty() {
+    if current_id.is_empty() {
         log(
             "lane has neither its own id nor a body reference to start from",
             &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
         );
         return None;
     }
-    let target = match crate::telegram::prepare_file_target(&start_id, size) {
+    let mut target = match crate::telegram::prepare_file_target(&current_id, size) {
         Ok(t) => t,
         Err(e) => {
             log(
@@ -3556,13 +3576,15 @@ async fn lane_io_for(
     };
     // WARM-UP, not a gate.
     //
-    // A bot that did not mint the reference answers 400 `FILE_REFERENCE_EXPIRED`,
-    // and the refresh re-mints it — the same self-heal a cold single-lane id gets.
-    // So a failed probe means "still cold", NOT "cannot serve". The lane must stay
-    // in the body: the parts that fail on it are what teach it the reference, and
-    // once it heals it catches up and takes its share
-    // (docs/port-stress-results.md: a bot that did not mint it gets 400, measured
-    // as a single request — one retry fixes it).
+    // A lane whose reference is not its own answers 400 `FILE_REFERENCE_EXPIRED`
+    // on the first probe. Measured 2026-11-28 on a cold title: `force=1&nocache=1`
+    // answers an id that this session cannot read, and using it directly made two
+    // lanes serve 0 bytes with 77/78 refused parts each while the refresh kept
+    // asking for another direct id. A refused probe is therefore answered with ONE
+    // `sendMedia` of the id the lane is HOLDING (not the body's id, which belongs
+    // to another bot and answers MEDIA_EMPTY): the reply's reference is ours, and
+    // it is cached and upserted like any other mint. A lane whose id is already
+    // ours (a stored/upserted row) passes this probe and never sends.
     let mut target = target;
     for attempt in 0..2u32 {
         let (client, gate) = entry.pick_slot();
@@ -3587,12 +3609,13 @@ async fn lane_io_for(
                     );
                     break;
                 }
-                match crate::mint::resend(short_code, &bot, held, "lane").await {
+                match crate::mint::resend(short_code, &bot, &current_id, "lane_direct").await {
                     Some(again) => match crate::telegram::prepare_file_target(&again, size) {
                         Ok(t) => {
                             target = t;
+                            current_id = again;
                             log(
-                                "lane re-minted its reference during warm-up",
+                                "lane converted its direct id with one send",
                                 &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
                             );
                         }

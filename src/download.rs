@@ -5769,10 +5769,63 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                         continue;
                                     }
                                 }
-                                // A flood belongs to ONE bot: cool that lane and
-                                // let the part fail over instead of stalling it.
+                                // A flood belongs to ONE bot: record it on that bot
+                                // (so the LOGIN gate honours it — the same record
+                                // `boot()` refuses a re-login with) and cool the
+                                // lane, so its parts fail over instead of stalling.
                                 if let Some(secs) = e.flood_wait {
+                                    crate::session::note_flood_seconds(
+                                        &io.bot,
+                                        secs as i64,
+                                        &e.message,
+                                    );
                                     io.lane.stats.cool_for(secs as i64, &e.message);
+                                }
+                                // A REJECTED AUTH KEY IS A DEAD BOT, exactly as on
+                                // the single-lane path (`mark_session_bad` +
+                                // eviction): every later part from it fails the same
+                                // way, and the lane must be re-leased rather than
+                                // quietly serving nothing. This was missing on the
+                                // lane path, which is why a quarantine never fired
+                                // for a lane bot.
+                                if is_auth_failure(&e.message) {
+                                    mark_session_bad(&io.bot, &e.message);
+                                    io.lane.pool.evict(&io.bot).await;
+                                    io.lane.set_bot_id("");
+                                    io.lane
+                                        .stats
+                                        .cool_for(60, "auth key rejected - bot retired");
+                                    log(
+                                        "lane bot retired (auth failure) - it needs a new bot",
+                                        &serde_json::json!({
+                                            "api_id": io.lane.api_id,
+                                            "bot_id": io.bot,
+                                            "error": e.message,
+                                        }),
+                                    );
+                                    // Re-lease in the background: an empty lane is
+                                    // simply excluded from candidates, and waiting
+                                    // for the next restart would cost this lane the
+                                    // whole session.
+                                    let lane_for_reprovision = io.lane.clone();
+                                    tokio::spawn(async move {
+                                        match crate::session::provision_lane(&lane_for_reprovision).await {
+                                            Ok(res) => log(
+                                                "lane re-leased a bot after retiring one",
+                                                &serde_json::json!({
+                                                    "api_id": lane_for_reprovision.api_id,
+                                                    "bot_id": res.bot_id,
+                                                }),
+                                            ),
+                                            Err(e) => log(
+                                                "lane could not re-lease a bot",
+                                                &serde_json::json!({
+                                                    "api_id": lane_for_reprovision.api_id,
+                                                    "error": e,
+                                                }),
+                                            ),
+                                        }
+                                    });
                                 }
                                 attempt += 1;
                                 let retryable =

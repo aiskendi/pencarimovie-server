@@ -917,7 +917,7 @@
             <div class="settings-gate__bots-container">
             <div class="settings-gate__bots-header">
               <span class="settings-gate__bots-title"
-                >Bot Pool (<span id="botPoolCount">1</span>)</span
+                >Your bots (<span id="botPoolCount">0</span>)</span
               >
               <div class="settings-gate__bots-actions">
                 <!-- Lives here, not beside #settingsTokenSection's copy: that
@@ -1009,6 +1009,21 @@
             </div>
 
             <div id="botPoolList" class="settings-gate__bots-list"></div>
+
+            <div
+              style="
+                font-size: 0.72rem;
+                line-height: 1.45;
+                color: var(--pm-text-secondary);
+                margin-top: 6px;
+              "
+            >
+              A bot signs in on <strong>one api_id</strong> and serves only that
+              lane, so your bots are spread across the lanes round-robin — one bot
+              per api_id is what makes a lane work. Bots leased by the server for
+              the pool are listed under <strong>API ID Pool</strong> below, not
+              here.
+            </div>
 
             <!-- The disclosure belongs HERE, above the pool that acts on it,
                  not buried in a policy page: adding a bot or an api_id publishes

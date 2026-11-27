@@ -1922,6 +1922,23 @@ async fn main() -> anyhow::Result<()> {
                                 &entry.identity.first_name,
                             );
                         }
+                        // Spread the operator's bots over the api_id lanes: one bot
+                        // per lane is what makes the lane useful, and a bot can only
+                        // serve the api_id it signed in with.
+                        let bound = lanes::bind_operator_bot(
+                            &entry.identity.id,
+                            &entry.identity.username,
+                            &entry.identity.first_name,
+                        );
+                        if bound > 0 {
+                            log::stderr_log(
+                                "env bot bound to an api_id lane",
+                                Some(&serde_json::json!({
+                                    "bot_id": entry.identity.id,
+                                    "api_id": bound,
+                                })),
+                            );
+                        }
                         log::stderr_log(
                             "env pool bot ready",
                             Some(&serde_json::json!({
@@ -1986,6 +2003,16 @@ async fn main() -> anyhow::Result<()> {
                     let lane = reg.default_lane();
                     lane.set_bot_id(&active);
                     reg.register_bot(&active, &lane);
+                    // Persist it as the lane's bot too: `api_ids.json` is what
+                    // decides the bot belongs to the api_id pool, and without this
+                    // the same bot kept appearing in BOTH lists.
+                    let meta = session::load_session_meta();
+                    lanes::set_lane_bot_identity(
+                        lane.api_id,
+                        &active,
+                        meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or(""),
+                        meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or(""),
+                    );
                 }
             }
             // Extra lanes, AFTER the default one: a lane lease is an origin

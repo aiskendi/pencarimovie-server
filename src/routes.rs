@@ -1403,6 +1403,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             .unwrap_or(0);
         let list: Vec<Value> = pool
             .iter()
+            .filter(|b| {
+                // Lane bots are leased BY the api_id pool and are listed there.
+                // Listing them here too made one bot look like two, and implied it
+                // could serve any lane — it cannot.
+                !crate::lanes::is_lane_bot(&jstr(b, "bot_id"))
+            })
             .map(|b| {
                 let id = jstr(b, "bot_id");
                 let mut out = b.clone();
@@ -1550,6 +1556,24 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                                 lane.set_bot_id(&entry.identity.id);
                                 reg.register_bot(&entry.identity.id, &lane);
                             }
+                        }
+                    } else if !crate::lanes::is_lane_bot(&entry.identity.id) {
+                        // NO explicit api_id: an operator bot is spread over the
+                        // lanes round-robin, because one bot on one api_id cannot
+                        // add throughput — a lane needs an application of its own.
+                        let bound = crate::lanes::bind_operator_bot(
+                            &entry.identity.id,
+                            &entry.identity.username,
+                            &entry.identity.first_name,
+                        );
+                        if bound > 0 {
+                            log(
+                                "operator bot bound to an api_id lane",
+                                &serde_json::json!({
+                                    "bot_id": entry.identity.id,
+                                    "api_id": bound,
+                                }),
+                            );
                         }
                     }
                     added.push(serde_json::json!({

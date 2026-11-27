@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
@@ -272,6 +272,64 @@ pub fn set_enabled(api_id: i32, enabled: bool) -> Result<bool, String> {
     }
     save_entries(&rows)?;
     Ok(true)
+}
+
+/// Is this bot owned by an api_id lane (leased for one) rather than supplied by
+/// the operator? A lane bot is listed in the API ID pool, so showing it in the
+/// Bot pool as well made the same bot appear twice and implied it was usable on
+/// any lane — it is not: a bot can only serve the api_id it signed in with.
+pub fn is_lane_bot(bot_id: &str) -> bool {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return false;
+    }
+    load_entries().iter().any(|e| e.bot_id == id)
+}
+
+/// Bind an OPERATOR-supplied bot to a lane, round-robin.
+///
+/// Lanes without a bot are filled first, then the rest are handed out in order,
+/// so adding three bots to a six-lane install fills three different lanes
+/// instead of stacking on one. Returns the api_id the bot now serves, or `0`
+/// when no lane exists.
+pub fn bind_operator_bot(bot_id: &str, username: &str, name: &str) -> i32 {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return 0;
+    }
+    let Some(reg) = registry() else {
+        return 0;
+    };
+    // A bot that already serves a lane stays where it is: re-binding would move a
+    // whole lane's identity on every restart.
+    if let Some(lane) = reg.lanes().into_iter().find(|l| l.bot_id() == id) {
+        return lane.api_id;
+    }
+    let mut lanes = reg.lanes();
+    // Prefer a lane with no bot, then the next lane in pool order.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    lanes.sort_by_key(|l| l.api_id);
+    let empty: Vec<usize> = (0..lanes.len())
+        .filter(|i| !lanes[*i].has_bot())
+        .collect();
+    let pick = if let Some(first_empty) = empty.first() {
+        *first_empty
+    } else if lanes.is_empty() {
+        0
+    } else {
+        NEXT.fetch_add(1, Ordering::Relaxed) % lanes.len()
+    };
+    let Some(lane) = lanes.get(pick) else {
+        return 0;
+    };
+    lane.set_bot_id(id);
+    set_lane_bot_identity(lane.api_id, id, username, name);
+    reg.register_bot(id, lane);
+    log(
+        "operator bot bound to an api_id lane",
+        &serde_json::json!({"bot_id": id, "api_id": lane.api_id}),
+    );
+    lane.api_id
 }
 
 /// Record which bot a lane signed in as. Best effort: a lane that cannot write

@@ -55,6 +55,8 @@ sha2 = "0.10"
 # `sodium_crypto_box_seal()` produces on the origin.
 blake2 = "0.10"
 crypto_box = "0.9"
+chacha20poly1305 = "0.10"
+zeroize = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 # PM-Auth (Option A): the install's identity is an Ed25519 key it never sends;
 # every request carries a signature instead of the fleet-wide api_secret.

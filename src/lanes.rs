@@ -94,8 +94,25 @@ pub fn masked_hash(hash: &str) -> String {
 
 fn entry_from_value(v: &Value) -> Option<ApiIdEntry> {
     let api_id = v.get("api_id").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-    let api_hash = v.get("api_hash").and_then(|x| x.as_str()).unwrap_or("");
-    let mut e = ApiIdEntry::new(api_id, api_hash, "file");
+    // `api_hash_enc` is the sealed form we write; a bare `api_hash` is a file
+    // written by an older build (or hand-edited), and is accepted so an upgrade
+    // does not lose the pool.
+    let api_hash = match v.get("api_hash_enc").and_then(|x| x.as_str()) {
+        Some(sealed) if !sealed.trim().is_empty() => {
+            match crate::secret::open(sealed, "api_ids") {
+                Some(h) => h,
+                None => {
+                    log(
+                        "api_id row could not be decrypted - check FD_API_SECRET",
+                        &serde_json::json!({"api_id": api_id}),
+                    );
+                    return None;
+                }
+            }
+        }
+        _ => v.get("api_hash").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    };
+    let mut e = ApiIdEntry::new(api_id, &api_hash, "file");
     if let Some(s) = v.get("source").and_then(|x| x.as_str()) {
         if !s.trim().is_empty() {
             e.source = s.trim().to_string();
@@ -127,17 +144,21 @@ fn entry_from_value(v: &Value) -> Option<ApiIdEntry> {
     Some(e)
 }
 
-pub fn value_from_entry(e: &ApiIdEntry) -> Value {
-    serde_json::json!({
+fn value_from_entry(e: &ApiIdEntry) -> Option<Value> {
+    // The hash is never written as text: `api_hash_enc` is the sealed form. A
+    // sealing failure returns None so the caller FAILS the write instead of
+    // falling back to plaintext.
+    let sealed = crate::secret::seal(&e.api_hash, "api_ids")?;
+    Some(serde_json::json!({
         "api_id": e.api_id,
-        "api_hash": e.api_hash,
+        "api_hash_enc": sealed,
         "source": e.source,
         "enabled": e.enabled,
         "added_at": e.added_at,
         "bot_id": e.bot_id,
         "bot_username": e.bot_username,
         "bot_name": e.bot_name,
-    })
+    }))
 }
 
 /// Parse a pool document. Accepts the documented object (`{"api_ids":[…]}`) and
@@ -172,19 +193,56 @@ pub fn parse_entries(text: &str) -> Vec<ApiIdEntry> {
 }
 
 /// The rows on disk only. `[]` when the file is absent or unreadable.
+///
+/// A file written by an older build holds `api_hash` as text; it is read, then
+/// REWRITTEN sealed here, so an upgrade migrates the pool on its first boot
+/// instead of leaving the hash readable in the file forever.
 pub fn read_entries() -> Vec<ApiIdEntry> {
-    std::fs::read_to_string(api_ids_path())
-        .ok()
-        .map(|t| parse_entries(&t))
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(api_ids_path()) else {
+        return Vec::new();
+    };
+    let rows = parse_entries(&text);
+    if text.contains("\"api_hash\"") && !rows.is_empty() {
+        match save_entries(&rows) {
+            Ok(()) => log(
+                "api_id pool migrated to encrypted storage",
+                &serde_json::json!({"rows": rows.len()}),
+            ),
+            Err(e) => log(
+                "api_id pool could not be re-sealed",
+                &serde_json::json!({"error": e}),
+            ),
+        }
+    }
+    rows
 }
 
 pub fn save_entries(entries: &[ApiIdEntry]) -> Result<(), String> {
-    let body = serde_json::json!({
-        "api_ids": entries.iter().map(value_from_entry).collect::<Vec<Value>>(),
-    });
-    std::fs::write(api_ids_path(), body.to_string())
-        .map_err(|e| format!("could not write {}: {}", api_ids_path().display(), e))
+    // FAIL CLOSED: if any hash cannot be sealed the file is left untouched, so a
+    // broken key can never turn the pool into plaintext.
+    let mut rows: Vec<Value> = Vec::with_capacity(entries.len());
+    for e in entries {
+        let row = value_from_entry(e).ok_or_else(|| {
+            format!(
+                "could not encrypt api_id {}: at-rest encryption is unavailable",
+                e.api_id
+            )
+        })?;
+        rows.push(row);
+    }
+    let body = serde_json::json!({ "api_ids": rows });
+    // ATOMIC: write beside the target and rename over it. A crash mid-write must
+    // not leave a truncated pool, which would read as "no api_ids" and take every
+    // lane down on the next boot.
+    let path = api_ids_path();
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body.to_string())
+        .map_err(|e| format!("could not write {}: {}", tmp.display(), e))?;
+    crate::secret::tighten(&tmp);
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("could not replace {}: {}", path.display(), e))?;
+    crate::secret::tighten(&path);
+    Ok(())
 }
 
 /// The pool the engine runs: the origin's `GET /api-ids` default pool, with the
@@ -441,11 +499,25 @@ pub async fn refresh_origin_cache() -> usize {
     if entries.is_empty() {
         return 0;
     }
-    let body = serde_json::json!({
-        "api_ids": entries.iter().map(value_from_entry).collect::<Vec<Value>>(),
-    });
+    // The cache holds only what the origin hands out (api_id + hash), and it is
+    // sealed on the same terms as the pool itself.
+    let mut rows: Vec<Value> = Vec::with_capacity(entries.len());
+    for e in &entries {
+        match value_from_entry(e) {
+            Some(v) => rows.push(v),
+            None => {
+                log(
+                    "origin api_id pool not cached - at-rest encryption is unavailable",
+                    &serde_json::json!({"api_id": e.api_id}),
+                );
+                return 0;
+            }
+        }
+    }
+    let body = serde_json::json!({ "api_ids": rows });
     let n = entries.len();
     let _ = std::fs::write(origin_cache_path(), body.to_string());
+    crate::secret::tighten(&origin_cache_path());
     log(
         "origin api_id pool cached",
         &serde_json::json!({"api_ids": n}),

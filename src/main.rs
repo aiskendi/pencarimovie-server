@@ -48,6 +48,7 @@ mod ratelimit;
 mod resolve;
 mod respond;
 mod routes;
+mod secret;
 mod session;
 mod split_index;
 mod split_remux;

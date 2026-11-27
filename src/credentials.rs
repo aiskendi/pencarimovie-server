@@ -54,11 +54,18 @@ pub fn load_cached_api_credentials() -> Option<(i32, String)> {
     if let Ok(text) = std::fs::read_to_string(creds_path()) {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             let api_id = v.get("api_id").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-            let api_hash = v
-                .get("api_hash")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
+            // Sealed on disk (`api_hash_enc`); a legacy file's plain `api_hash`
+            // is still accepted, and re-saved sealed by the next write.
+            let api_hash = match v.get("api_hash_enc").and_then(|x| x.as_str()) {
+                Some(sealed) if !sealed.trim().is_empty() => {
+                    crate::secret::open(sealed, "api_credentials").unwrap_or_default()
+                }
+                _ => v
+                    .get("api_hash")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            };
             if api_id > 0 && !api_hash.is_empty() {
                 return Some((api_id, api_hash));
             }
@@ -73,8 +80,25 @@ pub fn load_cached_api_credentials() -> Option<(i32, String)> {
 }
 
 pub fn save_cached_api_credentials(api_id: i32, api_hash: &str) {
-    let body = serde_json::json!({"api_id": api_id, "api_hash": api_hash});
-    let _ = std::fs::write(creds_path(), body.to_string());
+    // FAIL CLOSED: if sealing is unavailable we do not write the hash in the
+    // clear. The credential is re-fetched from the origin on the next boot, which
+    // is recoverable; a plaintext api_hash in a backup is not.
+    let Some(sealed) = crate::secret::seal(api_hash, "api_credentials") else {
+        log(
+            "api credentials NOT cached - at-rest encryption is unavailable",
+            &serde_json::json!({"api_id": api_id}),
+        );
+        return;
+    };
+    let body = serde_json::json!({"api_id": api_id, "api_hash_enc": sealed});
+    // Atomic: a crash mid-write must not leave a truncated credential file.
+    let path = creds_path();
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body.to_string()).is_ok() {
+        crate::secret::tighten(&tmp);
+        let _ = std::fs::rename(&tmp, &path);
+        crate::secret::tighten(&path);
+    }
 }
 
 fn decode_iv(iv: &str) -> Option<[u8; 16]> {

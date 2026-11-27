@@ -19,7 +19,7 @@
 //! `backfill::REQUEST_CAPTION`), so the peer list is the origin's userbot pool.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,13 +77,60 @@ fn peer_cache() -> &'static Mutex<Option<(i64, Vec<String>, u16, String)>> {
 /// Peers are tried round-robin so one relay account does not carry every send.
 static NEXT_PEER: AtomicUsize = AtomicUsize::new(0);
 
-/// Unix seconds before which NO mint is attempted (`0` = clear).
+/// Unix seconds before which NO mint is attempted, PER BOT.
 ///
-/// A `FLOOD_WAIT` is about the sending account, not the file, so retrying it for
-/// the next code would just stack more waits onto the same bot. The resolve path
-/// calls this module once per origin resolve, i.e. on the interactive path, where
-/// an unbounded retry loop is exactly what must not happen.
-static SUPPRESS_UNTIL: AtomicI64 = AtomicI64::new(0);
+/// A `FLOOD_WAIT` belongs to the sending account, not the file and not the
+/// process. This used to be ONE global deadline, so one `sendMedia` flood stopped
+/// every other bot's mint: MEASURED 2026-11-27 with four api_id lanes,
+/// `mint suppressed for another 1296s` refused all of them, every lane fell back
+/// to the origin's temporary id, and that id answered 400 on its first part.
+/// Keyed by bot, a flood costs that bot alone.
+static SUPPRESS: std::sync::OnceLock<Mutex<HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+
+fn suppress_map() -> &'static Mutex<HashMap<String, i64>> {
+    SUPPRESS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn suppressed_until(bot_id: &str) -> i64 {
+    let key = bot_id.trim();
+    match suppress_map().lock() {
+        Ok(m) => m.get(key).copied().unwrap_or(0),
+        Err(p) => p.into_inner().get(key).copied().unwrap_or(0),
+    }
+}
+
+fn suppress_for(bot_id: &str, until: i64) {    let key = bot_id.trim().to_string();
+    if key.is_empty() {
+        return;
+    }
+    let mut map = match suppress_map().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    // Bounded: only ids with a LIVE deadline matter, so a fleet that rotates bots
+    // cannot grow this without limit.
+    if map.len() >= 256 {
+        let now = crate::storage::now();
+        map.retain(|_, v| *v > now);
+    }
+    map.insert(key, until);
+}
+
+/// Can another relay DESTINATION plausibly fix this send error?
+///
+/// `MEDIA_EMPTY` / `CHAT_WRITE_FORBIDDEN` are about the chat the message targeted
+/// (this bot is not a member of it, or may not post there), not about the
+/// document or the sending bot — so the next destination is worth a try.
+fn another_destination_may_work(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("media_empty")
+        || m.contains("media empty")
+        || m.contains("chat_write_forbidden")
+        || m.contains("chat write forbidden")
+        || m.contains("peer_id_invalid")
+        || m.contains("channel_private")
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -335,7 +382,7 @@ fn send_reason(e: &telegram::GramErr) -> MintError {
 /// a chat that forbids deletion must not cost the id just minted.
 pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintError> {
     let now = crate::storage::now();
-    let until = SUPPRESS_UNTIL.load(Ordering::Relaxed);
+    let until = suppressed_until(bot_id);
     if now < until {
         return Err(MintError::new(
             "flood_wait",
@@ -381,55 +428,84 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
     }
     let start = NEXT_PEER.fetch_add(1, Ordering::Relaxed) % names.len();
     let mut tried = String::new();
-    let mut resolved: Option<(grammers_session::types::PeerRef, String)> = None;
+    // ONE SEND PER DESTINATION, and a FLOOD_WAIT moves to the NEXT destination.
+    //
+    // A flood belongs to the CHAT the send targeted, not to the bot and not to the
+    // file: the same bot can send to another relay chat immediately. This used to
+    // send once, park the whole PROCESS on the wait, and hand the caller a
+    // temporary id — MEASURED 2026-11-27: `mint suppressed for another 1296s` with
+    // four lanes, after ONE send flooded.
+    let mut message: Option<grammers_client::message::Message> = None;
+    let mut flood_wait: Option<u64> = None;
+    let mut sent_peer = String::new();
     for k in 0..names.len() {
         let name = &names[(start + k) % names.len()];
-        match telegram::resolve_peer(&client, name).await {
-            Ok(p) => {
-                resolved = Some((p, name.clone()));
+        let peer_ref = match telegram::resolve_peer(&client, name).await {
+            Ok(p) => p,
+            Err(e) => {
+                // `None` from `to_ref()` lands here too: the peer exists but this
+                // session has no `access_hash` for it (a bot cannot enumerate
+                // dialogs to find one).
+                tried.push_str(&format!("{name}: {}; ", e.message));
+                continue;
+            }
+        };
+        // No upload: the document already lives on Telegram, so this is a pure
+        // `messages.sendMedia`. `video_cover`/`video_timestamp` stay null because
+        // this is not editing a video's attributes.
+        let media = tl::types::InputMediaDocument {
+            spoiler: false,
+            id: tl::enums::InputDocument::Document(tl::types::InputDocument {
+                id: decoded.id,
+                access_hash: decoded.access_hash,
+                file_reference: decoded.file_reference.clone().unwrap_or_default(),
+            }),
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+            query: None,
+        };
+        match client
+            .send_message(peer_ref, InputMessage::new().media(media))
+            .await
+        {
+            Ok(m) => {
+                sent_peer = name.clone();
+                message = Some(m);
                 break;
             }
-            Err(e) => tried.push_str(&format!("{name}: {}; ", e.message)),
+            Err(e) => {
+                let err = telegram::map_invocation_error(e);
+                if err.flood_wait.is_some() {
+                    flood_wait = err.flood_wait.or(flood_wait);
+                    tried.push_str(&format!("{name}: {}; ", err.message));
+                    continue;
+                }
+                // A relay chat this bot cannot post to refuses with MEDIA_EMPTY
+                // (`send_failed`), which is about the DESTINATION, not the file:
+                // MEASURED 2026-11-27, the same id that answered MEDIA_EMPTY on one
+                // peer minted fine on the next (`refreshed the file reference
+                // locally … source: origin_id`). Try the next destination instead
+                // of handing the caller a temporary id.
+                if another_destination_may_work(&err.message) {
+                    tried.push_str(&format!("{name}: {}; ", err.message));
+                    continue;
+                }
+                return Err(send_reason(&err));
+            }
         }
     }
-    let Some((peer_ref, peer_name)) = resolved else {
-        // `None` from `to_ref()` lands here too: the peer exists but this session
-        // has no `access_hash` for it (a bot cannot enumerate dialogs to find one).
-        return Err(MintError::new("peer_unresolved", tried));
-    };
-
-    // No upload: the document already lives on Telegram, so this is a pure
-    // `messages.sendMedia`. `video_cover`/`video_timestamp` stay null because this
-    // is not editing a video's attributes.
-    let media = tl::types::InputMediaDocument {
-        spoiler: false,
-        id: tl::enums::InputDocument::Document(tl::types::InputDocument {
-            id: decoded.id,
-            access_hash: decoded.access_hash,
-            file_reference: decoded.file_reference.clone().unwrap_or_default(),
-        }),
-        video_cover: None,
-        video_timestamp: None,
-        ttl_seconds: None,
-        query: None,
-    };
-    let message = match client
-        .send_message(peer_ref, InputMessage::new().media(media))
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            let err = telegram::map_invocation_error(e);
-            if let Some(wait) = err.flood_wait {
-                // `wait` counts from Telegram's own answer; a missing value still
-                // deserves a short pause rather than an immediate retry storm.
-                SUPPRESS_UNTIL.store(
-                    crate::storage::now() + wait.max(5) as i64,
-                    Ordering::Relaxed,
-                );
-            }
-            return Err(send_reason(&err));
+    let Some(message) = message else {
+        if let Some(wait) = flood_wait {
+            // EVERY destination flooded: only now is it the account, so park THIS
+            // bot (never the process) for the wait Telegram named.
+            suppress_for(bot_id, crate::storage::now() + wait.max(5) as i64);
+            return Err(MintError::new(
+                "flood_wait",
+                format!("every relay destination is flood-waited: {}", tried),
+            ));
         }
+        return Err(MintError::new("peer_unresolved", tried));
     };
     let _kept_message_id = message.id();
 
@@ -478,7 +554,7 @@ pub async fn mint(bot_id: &str, source_file_id: &str) -> Result<Minted, MintErro
     }
     Ok(Minted {
         file_id,
-        peer: peer_name,
+        peer: sent_peer,
     })
 }
 

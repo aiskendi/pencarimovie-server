@@ -3346,34 +3346,16 @@ fn pick_lane(lanes: &[std::sync::Arc<LaneIo>], tried: &[usize]) -> Option<usize>
 /// instead of a body that runs single-lane.
 const LANE_MINT_ATTEMPTS: u32 = 3;
 
-/// One lane's file id: an id it already minted in this process, then a local
-/// re-send, then the origin's mint.
-///
-/// An empty answer means "ask again" (`lane_io_for` retries) — never that the
-/// lane is unusable.
-async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
-    if let Some(id) = crate::mint::live(short_code, bot) {
-        // Warmest possible: an id this bot already minted in this process. The
-        // probe still judges it, and a stale one is re-minted there.
-        return id;
-    }
-    if let Some(id) = crate::mint::resend(short_code, bot, held, "lane").await {
-        return id;
-    }
-    // No local re-send (a relay peer it cannot reach, or a source id this bot may
-    // not send): fall back to the origin's mint, which is the pre-lane path. It
-    // may be bound to the origin's session and answer 400 on the first part —
-    // that is the cold case the body's refresh heals.
-    log(
-        "lane local re-send gave nothing - using the origin's mint",
-        &serde_json::json!({"bot_id": bot}),
-    );
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        resolve_shortcode_fresh_from(short_code, bot, Some(held)),
-    )
-    .await
-    {
+/// The origin's minted id for this `(file, bot)`, bounded.
+async fn origin_lane_id(short_code: &str, bot: &str, held: &str, forced: bool) -> String {
+    let fut = async {
+        if forced {
+            resolve_shortcode_forced(short_code, bot, Some(held)).await
+        } else {
+            resolve_shortcode_fresh_from(short_code, bot, Some(held)).await
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(8), fut).await {
         Ok(v) => id_of(&v),
         Err(_) => {
             log(
@@ -3385,9 +3367,71 @@ async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
     }
 }
 
+/// SEND the origin's id from this bot, so the reference is genuinely its own.
+///
+/// `mint.rs::mint()` decodes the id, sends it with `messages.sendMedia`, and takes
+/// the `file_reference` off the REPLY document — that send is the step that makes
+/// the reference this session's. The origin's id is minted by ITS session and
+/// answers 400 `FILE_REFERENCE_EXPIRED` on our first part when used directly, and
+/// re-sending a DIFFERENT bot's id answers `MEDIA_EMPTY`. The origin's own id is
+/// therefore the only source a lane can send.
+async fn send_lane_id(short_code: &str, bot: &str, source: &str) -> Option<String> {
+    if source.trim().is_empty() {
+        return None;
+    }
+    crate::mint::resend(short_code, bot, source, "origin_id").await
+}
+
+/// Send a seed id, and on a refusal re-mint the seed with `force=1&nocache=1`.
+///
+/// `MEDIA_EMPTY` on `sendMedia` means the SEED is stale (its reference no longer
+/// resolves), not that the file is gone. The origin's forced answer is a new seed,
+/// and the send of that one is what produces the durable id — so the pair is
+/// seed -> send -> (refused) -> forced seed -> send.
+async fn send_seed(short_code: &str, bot: &str, seed: &str, held: &str) -> Option<String> {
+    if let Some(id) = send_lane_id(short_code, bot, seed).await {
+        return Some(id);
+    }
+    log(
+        "sendMedia refused the seed - re-minting it with force=1&nocache=1",
+        &serde_json::json!({"bot_id": bot}),
+    );
+    let fresh = origin_lane_id(short_code, bot, held, true).await;
+    if fresh.is_empty() {
+        return None;
+    }
+    send_lane_id(short_code, bot, &fresh).await
+}
+
+/// One lane's file id: an id it already minted in this process, then the origin's
+/// id SENT from this bot, then (only if the origin is silent) the body's id.
+///
+/// An empty answer means "ask again" (`lane_io_for` retries) — never that the lane
+/// is unusable.
+async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
+    if let Some(id) = crate::mint::live(short_code, bot) {
+        // Warmest possible: an id this bot already minted in this process.
+        return id;
+    }
+    let origin = origin_lane_id(short_code, bot, held, false).await;
+    if !origin.is_empty() {
+        // The origin's id is a SEED, never a reference: it is minted by the
+        // origin's session and dies on our first part. Only the id this bot gets
+        // back from `sendMedia` is durable, so a refused send re-mints the seed
+        // with `force=1&nocache=1` and sends that.
+        return send_seed(short_code, bot, &origin, held)
+            .await
+            .unwrap_or_default();
+    }
+    // No origin answer (busy): the body's own id is the only source left.
+    crate::mint::resend(short_code, bot, held, "lane")
+        .await
+        .unwrap_or_default()
+}
+
 /// One lane's file id for a MID-BODY refresh: never the cached `live` id (that is
-/// the reference that just died), and a busy origin is retried rather than
-/// allowed to fail the part.
+/// the reference that just died), always a freshly minted origin id SENT from this
+/// bot, and a busy origin is retried rather than allowed to fail the part.
 async fn refresh_lane_id(short_code: &str, bot: &str, held: &str) -> String {
     let mut id = String::new();
     for attempt in 0..LANE_MINT_ATTEMPTS {
@@ -3399,12 +3443,16 @@ async fn refresh_lane_id(short_code: &str, bot: &str, held: &str) -> String {
             );
             tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
         }
-        id = match crate::mint::resend(short_code, bot, held, "lane").await {
-            Some(id) => id,
-            None => id_of(
-                &resolve_shortcode_forced(short_code, bot, Some(held)).await,
-            ),
-        };
+        let origin = origin_lane_id(short_code, bot, held, true).await;
+        if origin.is_empty() {
+            continue;
+        }
+        // The origin's id seeds the send and is DISCARDED: only the reply's
+        // reference is ours. A refused send re-mints the seed with
+        // `force=1&nocache=1` and sends that.
+        id = send_seed(short_code, bot, &origin, held)
+            .await
+            .unwrap_or_default();
         if !id.is_empty() {
             break;
         }

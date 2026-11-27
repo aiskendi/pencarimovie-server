@@ -104,7 +104,13 @@ pub const DEFAULT_INFLIGHT: usize = 2;
 /// `danog/MadelineProto#1948` settles on 2 per socket, opening more instead).
 /// Measured on the LAN against a 2160p ZIP entry: 16 x 3 serves the same ~0.5 MB/s
 /// that 4 x 3 did, with zero stalls, so raising the socket count is free.
-pub const DEFAULT_WORKERS: usize = 16;
+/// 10, not 16: the per-bot part budget this feeds (`workers x inflight`) is also
+/// the ceiling the learned window may grow to, and MEASURED 2026-11-27 on the
+/// VPS that ceiling sets a bot's rate — 16 x 2 = 32 per bot over-subscribed the
+/// DC (parts stalled, p50 7.4 s, bodies 503) while the single-response peak came
+/// from ~16-20 parts per bot. 10 x 2 = 20 sits on the measured knee; `--workers`
+/// still overrides it, and `--lane-workers` does the same per api_id lane.
+pub const DEFAULT_WORKERS: usize = 10;
 
 pub struct AppState {
     pub port: u16,
@@ -1677,7 +1683,7 @@ async fn main() -> anyhow::Result<()> {
     // concurrent streams on the same bot). 20 is MadelineProto's
     // `downloadParallelChunks`; `1` is the sequential escape hatch and the A/B
     // baseline, and the value is printed in the banner so a report shows it.
-    let stream_prefetch: usize = arg_value("--stream-prefetch")
+    let mut stream_prefetch: usize = arg_value("--stream-prefetch")
         .or_else(|| storage::env("PM_STREAM_PREFETCH"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(download::DEFAULT_STREAM_PREFETCH)
@@ -1746,10 +1752,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(300);
 
-    // The per-response read-ahead, published for `download.rs` (which holds no
-    // state handle). Printed in the banner below, so a throughput report always
-    // names the depth it was measured at.
-    download::set_stream_prefetch(stream_prefetch);
+    // The per-response read-ahead is published AFTER the lane count is known —
+    // see the `set_stream_prefetch` call below. Printed in the banner below, so a
+    // throughput report always names the depth it was measured at.
 
     // ── api_id lanes ────────────────────────────────────────────────────────
     //
@@ -1765,10 +1770,10 @@ async fn main() -> anyhow::Result<()> {
     let lane_workers: usize = arg_value("--lane-workers")
         .or_else(|| storage::env("PM_LANE_WORKERS"))
         .and_then(|s| s.parse().ok())
-        // 8, not `workers`: 4 lanes x 16 would be 64 sockets, the width that
-        // already measured SLOWER than 4 x 8 (one lane saturates long before 16
-        // connections; the ceiling is the api_id).
-        .unwrap_or(8)
+        // 10 per bot, the same as `DEFAULT_WORKERS`: a lane IS a bot, and its
+        // `workers x inflight` (20) is the window ceiling the dispatcher relies
+        // on. 16 x 2 per lane over-subscribed the DC (measured 2026-11-27).
+        .unwrap_or(10)
         .max(1);
     let stream_lanes: Option<usize> = match arg_value("--stream-lanes")
         .or_else(|| storage::env("PM_STREAM_LANES"))
@@ -1826,6 +1831,20 @@ async fn main() -> anyhow::Result<()> {
     }
     let lane_count = 1 + extra_lanes.len();
     lanes::publish(lanes::LaneRegistry::new(default_lane, extra_lanes));
+
+    // Publish the read-ahead now that the lane count is known.
+    //
+    // The default is a depth PER LANE: one global 20 over four lanes is 5 parts
+    // each, below what a lane's learned window needs to grow (it only grows while
+    // FULL), so a multi-lane install would default to a shape that cannot use its
+    // lanes. An explicit `--stream-prefetch` / PM_STREAM_PREFETCH is left alone.
+    if lane_count > 1
+        && arg_value("--stream-prefetch").is_none()
+        && storage::env("PM_STREAM_PREFETCH").is_none()
+    {
+        stream_prefetch = download::DEFAULT_STREAM_PREFETCH.saturating_mul(lane_count);
+    }
+    download::set_stream_prefetch(stream_prefetch);
     if lane_count > 1 {
         log::stderr_log(
             "api_id lanes configured",

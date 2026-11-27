@@ -3272,10 +3272,14 @@ struct LaneIo {
 
 /// Mid-body reference refreshes allowed per lane per body.
 ///
-/// Four, not one: a cold lane's first window can fail every prefetched part
-/// before the re-mint lands, and the lane must be allowed to heal rather than
-/// being dropped after the second try.
-const LANE_REFRESH_MAX: u32 = 4;
+/// 32, not 4. A `file_reference` dies mid-body on a long read, and a lane whose
+/// reference is dead fails ONE PART per part until it re-mints — so a four-body
+/// budget let a 200 MB stream exhaust the three secondary lanes early and finish
+/// on lane 1 alone. MEASURED 2026-11-27, 200 MB: round 1 7.40 MB/s, round 2
+/// 2.65 MB/s with `2112408:399p` and `0p` on the other three. Each mint is
+/// ~100-390 ms, so 32 is still bounded, and the lane is only refreshed when a
+/// part actually answers 400.
+const LANE_REFRESH_MAX: u32 = 32;
 /// Times one part may wait for a refresh and retry on the SAME lane.
 const LANE_REFRESH_RETRIES: u32 = 2;
 
@@ -3379,6 +3383,33 @@ async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
             String::new()
         }
     }
+}
+
+/// One lane's file id for a MID-BODY refresh: never the cached `live` id (that is
+/// the reference that just died), and a busy origin is retried rather than
+/// allowed to fail the part.
+async fn refresh_lane_id(short_code: &str, bot: &str, held: &str) -> String {
+    let mut id = String::new();
+    for attempt in 0..LANE_MINT_ATTEMPTS {
+        if attempt > 0 {
+            let wait = 400 * u64::from(attempt);
+            log(
+                "lane refresh busy - retrying",
+                &serde_json::json!({"bot_id": bot, "attempt": attempt + 1, "wait_ms": wait}),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        }
+        id = match crate::mint::resend(short_code, bot, held, "lane").await {
+            Some(id) => id,
+            None => id_of(
+                &resolve_shortcode_forced(short_code, bot, Some(held)).await,
+            ),
+        };
+        if !id.is_empty() {
+            break;
+        }
+    }
+    id
 }
 
 /// Boot a lane's bot and mint ITS OWN reference for this file.
@@ -5561,10 +5592,31 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                 );
                                 // A DEAD REFERENCE MID-BODY IS RECOVERABLE: that
                                 // lane refreshes its OWN id and retries ITS part.
+                                //
+                                // BOUNDED WAIT on the lane's refresh lock. One part
+                                // mints while every other part on that lane queues
+                                // behind the lock; when the origin is busy a mint
+                                // can take seconds, and MEASURED 2026-11-27 a
+                                // 200 MB body then dribbled at 0.99 MB/s for 211 s
+                                // with 24 `lane refresh busy` retries and nothing
+                                // else wrong. A part that cannot get the lock in 2 s
+                                // now fails over to another lane instead of waiting.
                                 if e.file_reference && !code_for_refresh.is_empty() {
                                     let mut refreshed_now = false;
-                                    {
-                                        let _refresh_guard = io.refresh_lock.lock().await;
+                                    let refresh_guard = tokio::time::timeout(
+                                        std::time::Duration::from_secs(2),
+                                        io.refresh_lock.lock(),
+                                    )
+                                    .await;
+                                    match refresh_guard {
+                                        Err(_) => log(
+                                            "lane refresh is slow - failing this part over",
+                                            &serde_json::json!({
+                                                "api_id": io.lane.api_id,
+                                                "pos": p,
+                                            }),
+                                        ),
+                                        Ok(_refresh_guard) => {
                                         if io.generation.load(std::sync::atomic::Ordering::Relaxed)
                                             != generation
                                         {
@@ -5588,24 +5640,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                             // never reads the 10 s memo, which can
                                             // hand back the reference that just
                                             // died).
-                                            let new_id = match crate::mint::resend(
+                                            let new_id = refresh_lane_id(
                                                 &code_for_refresh,
                                                 &io.bot,
                                                 held_for_refresh.as_str(),
-                                                "lane",
                                             )
-                                            .await
-                                            {
-                                                Some(id) => id,
-                                                None => id_of(
-                                                    &resolve_shortcode_forced(
-                                                        &code_for_refresh,
-                                                        &io.bot,
-                                                        Some(held_for_refresh.as_str()),
-                                                    )
-                                                    .await,
-                                                ),
-                                            };
+                                            .await;
                                             if !new_id.is_empty() {
                                                 if let Ok(t) = crate::telegram::prepare_file_target(
                                                     &new_id,
@@ -5630,6 +5670,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                                     );
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                     if refreshed_now && refresh_retries < LANE_REFRESH_RETRIES {

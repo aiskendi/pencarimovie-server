@@ -47,6 +47,10 @@ pub struct ApiIdEntry {
     /// The guest bot this lane is using, if it has one. Empty means the lane is
     /// configured but has not been provisioned yet.
     pub bot_id: String,
+    /// What that bot looks like in Telegram, so the dashboard can show it
+    /// without booting anything.
+    pub bot_username: String,
+    pub bot_name: String,
 }
 
 impl ApiIdEntry {
@@ -58,6 +62,8 @@ impl ApiIdEntry {
             enabled: true,
             added_at: now(),
             bot_id: String::new(),
+            bot_username: String::new(),
+            bot_name: String::new(),
         }
     }
 
@@ -103,6 +109,18 @@ fn entry_from_value(v: &Value) -> Option<ApiIdEntry> {
         .unwrap_or("")
         .trim()
         .to_string();
+    e.bot_username = v
+        .get("bot_username")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    e.bot_name = v
+        .get("bot_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if !e.valid() {
         return None;
     }
@@ -117,12 +135,18 @@ pub fn value_from_entry(e: &ApiIdEntry) -> Value {
         "enabled": e.enabled,
         "added_at": e.added_at,
         "bot_id": e.bot_id,
+        "bot_username": e.bot_username,
+        "bot_name": e.bot_name,
     })
 }
 
 /// Parse a pool document. Accepts the documented object (`{"api_ids":[…]}`) and
 /// a bare array, because an operator hand-editing the file will try both.
 pub fn parse_entries(text: &str) -> Vec<ApiIdEntry> {
+    // A hand-edited file on Windows starts with a UTF-8 BOM (Notepad, PowerShell
+    // `Out-File`), and `serde_json` refuses the whole document over that one byte
+    // — which silently dropped the pool and fell back to the legacy credential.
+    let text = text.trim_start_matches('\u{feff}');
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return Vec::new();
     };
@@ -163,21 +187,40 @@ pub fn save_entries(entries: &[ApiIdEntry]) -> Result<(), String> {
         .map_err(|e| format!("could not write {}: {}", api_ids_path().display(), e))
 }
 
-/// The pool as the engine uses it: the file's rows, with the legacy single
-/// credential (`storage/api_credentials.json` or `FD_API_ID`) prepended as the
-/// default lane unless the file already names that api_id.
+/// The pool the engine runs: the origin's `GET /api-ids` default pool, with the
+/// operator's own `storage/api_ids.json` merged over it (same api_id = the local
+/// row wins, so a local disable is never undone by a refresh).
 ///
-/// This order is the compatibility promise: an install that never created
-/// `api_ids.json` behaves exactly like the single-api_id build, and an install
-/// that did keeps the operator's own credential as lane 1.
+/// There is deliberately NO third source. `storage/api_credentials.json` /
+/// `FD_API_ID` used to be prepended here as a lane, which meant an install could
+/// run a lane the origin had never issued and the dashboard could not explain;
+/// the origin's pool is the one list, and `TelegramPool::boot()` still falls back
+/// to the stored credential when this list is empty (a first boot, or an origin
+/// that has published nothing yet).
 pub fn load_entries() -> Vec<ApiIdEntry> {
-    let mut rows = read_entries();
-    if let Some((id, hash)) = crate::credentials::load_cached_api_credentials() {
-        if !rows.iter().any(|e| e.api_id == id) {
-            rows.insert(0, ApiIdEntry::new(id, &hash, "legacy"));
+    let mut rows = load_origin_cache();
+    for local in read_entries() {
+        match rows.iter_mut().find(|e| e.api_id == local.api_id) {
+            Some(slot) => *slot = local,
+            None => rows.push(local),
         }
     }
+    rows.sort_by_key(|e| e.api_id);
     rows
+}
+
+/// Is the cached origin pool young enough to trust without another fetch?
+pub fn origin_cache_fresh(ttl_secs: i64) -> bool {
+    let Ok(meta) = std::fs::metadata(origin_cache_path()) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    (age.as_secs() as i64) < ttl_secs
 }
 
 pub fn enabled_specs() -> Vec<(i32, String)> {
@@ -234,6 +277,12 @@ pub fn set_enabled(api_id: i32, enabled: bool) -> Result<bool, String> {
 /// Record which bot a lane signed in as. Best effort: a lane that cannot write
 /// this still works for the life of the process.
 pub fn set_lane_bot(api_id: i32, bot_id: &str) {
+    set_lane_bot_identity(api_id, bot_id, "", "")
+}
+
+/// [`set_lane_bot()`] that also keeps the bot's @username and display name, so
+/// the dashboard can list a lane's bot without logging it in.
+pub fn set_lane_bot_identity(api_id: i32, bot_id: &str, username: &str, name: &str) {
     let mut rows = read_entries();
     // A legacy row is not in the file yet; materialise it so the bot survives a
     // restart instead of being re-leased every boot.
@@ -243,6 +292,12 @@ pub fn set_lane_bot(api_id: i32, bot_id: &str) {
     let mut hit = false;
     for e in rows.iter_mut().filter(|e| e.api_id == api_id) {
         e.bot_id = bot_id.trim().to_string();
+        if !username.trim().is_empty() {
+            e.bot_username = username.trim().to_string();
+        }
+        if !name.trim().is_empty() {
+            e.bot_name = name.trim().to_string();
+        }
         hit = true;
     }
     if !hit {
@@ -251,7 +306,94 @@ pub fn set_lane_bot(api_id: i32, bot_id: &str) {
     let _ = save_entries(&rows);
 }
 
-/// Route shape: the hash is masked, the bot id is not a secret.
+/// Post a pair to the origin's SHARED pool, so other installs can use it later.
+///
+/// Best effort and never fatal: the operator already has the pair locally, and a
+/// contribution failing must not cost them the row. The hash is the secret — it
+/// is sent over the same authenticated channel as everything else and never
+/// logged, here or at the origin.
+pub async fn contribute_to_origin(api_id: i32, api_hash: &str) -> bool {
+    if api_id <= 0 || api_hash.trim().is_empty() {
+        return false;
+    }
+    // `params` is the POST body for this client, so the pair travels as form
+    // fields — no temp file, nothing left on disk, and the hash never logged.
+    let url = format!("{}/api-ids/contribute", crate::config::wp_api_base());
+    let params = vec![
+        ("api_id".to_string(), api_id.to_string()),
+        ("api_hash".to_string(), api_hash.trim().to_string()),
+    ];
+    let (resp, status) = crate::httpc::http_json_h_status_body(&url, &params, "POST", 8, &[]).await;
+    // The origin answers `{"ok":1}`; anything else is a silent no.
+    let ok = status == 200 && resp.get("ok").map(|v| truthy(Some(v))).unwrap_or(false);
+    log(
+        if ok {
+            "api_id contributed to the shared pool"
+        } else {
+            "api_id contribution failed - kept locally"
+        },
+        &serde_json::json!({"api_id": api_id, "status": status}),
+    );
+    ok
+}
+
+/// `{"ok":1}` is a NUMBER at the origin, not `true`.
+fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// The origin's DEFAULT pool, cached on disk so boot never waits on the network
+/// for more than one bounded call.
+pub fn origin_cache_path() -> PathBuf {
+    storage_path("api_ids_origin.json")
+}
+
+pub fn load_origin_cache() -> Vec<ApiIdEntry> {
+    std::fs::read_to_string(origin_cache_path())
+        .ok()
+        .map(|t| parse_entries(&t))
+        .unwrap_or_default()
+}
+
+/// Fetch `GET {wp}/api-ids` and cache it. Bounded and best effort: a failure
+/// leaves the previous cache in place.
+pub async fn refresh_origin_cache() -> usize {
+    let url = format!("{}/api-ids", crate::config::wp_api_base());
+    let (resp, status) = crate::httpc::http_json_h_status_body(&url, &[], "GET", 5, &[]).await;
+    if status != 200 {
+        return 0;
+    }
+    let rows = resp.get("api_ids").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return 0;
+    }
+    let entries: Vec<ApiIdEntry> = rows
+        .iter()
+        .filter_map(|v| entry_from_value(v))
+        .map(|mut e| {
+            e.source = "origin".to_string();
+            e
+        })
+        .collect();
+    if entries.is_empty() {
+        return 0;
+    }
+    let body = serde_json::json!({
+        "api_ids": entries.iter().map(value_from_entry).collect::<Vec<Value>>(),
+    });
+    let n = entries.len();
+    let _ = std::fs::write(origin_cache_path(), body.to_string());
+    log(
+        "origin api_id pool cached",
+        &serde_json::json!({"api_ids": n}),
+    );
+    n
+}
 pub fn public_rows() -> Vec<Value> {
     load_entries()
         .iter()
@@ -263,6 +405,8 @@ pub fn public_rows() -> Vec<Value> {
                 "enabled": e.enabled,
                 "added_at": e.added_at,
                 "bot_id": e.bot_id,
+                "bot_username": e.bot_username,
+                "bot_name": e.bot_name,
                 "has_bot": !e.bot_id.is_empty(),
             })
         })
@@ -559,7 +703,9 @@ impl Drop for LanePartGuard {
 }
 
 pub struct LaneRegistry {
-    lanes: Vec<Arc<Lane>>,
+    /// `RwLock`, not a plain `Vec`: an operator can add an api_id at runtime, and
+    /// the lane must be visible to the dispatcher the moment its bot signs in.
+    lanes: std::sync::RwLock<Vec<Arc<Lane>>>,
     default: Arc<Lane>,
     by_bot: Mutex<HashMap<String, Arc<Lane>>>,
 }
@@ -583,10 +729,23 @@ impl LaneRegistry {
             }
         }
         Arc::new(Self {
-            lanes,
+            lanes: std::sync::RwLock::new(lanes),
             default,
             by_bot: Mutex::new(by_bot),
         })
+    }
+
+    /// Open one more lane on a running process. `false` when that api_id already
+    /// has a lane (or the lock is poisoned).
+    pub fn add_lane(&self, lane: Arc<Lane>) -> bool {
+        let Ok(mut lanes) = self.lanes.write() else {
+            return false;
+        };
+        if lanes.iter().any(|l| l.api_id == lane.api_id) {
+            return false;
+        }
+        lanes.push(lane);
+        true
     }
 
     pub fn default_lane(&self) -> Arc<Lane> {
@@ -594,11 +753,14 @@ impl LaneRegistry {
     }
 
     pub fn lanes(&self) -> Vec<Arc<Lane>> {
-        self.lanes.clone()
+        self.lanes
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
     }
 
     pub fn lane_for_api_id(&self, api_id: i32) -> Option<Arc<Lane>> {
-        self.lanes.iter().find(|l| l.api_id == api_id).cloned()
+        self.lanes().into_iter().find(|l| l.api_id == api_id)
     }
 
     /// Which lane's connections a bot belongs to. `mint.rs` needs this: it is
@@ -615,7 +777,7 @@ impl LaneRegistry {
         }
         // The lane may know the bot by its real identity while the caller holds
         // the token-derived id (or the reverse): match on either.
-        for lane in &self.lanes {
+        for lane in self.lanes() {
             let known = lane.bot_id();
             if known == id {
                 return Some(lane.pool.clone());
@@ -636,7 +798,7 @@ impl LaneRegistry {
 
     /// Lanes that can take a part now, with their costs, in pool order.
     pub fn candidates(&self) -> Vec<(Arc<Lane>, f64)> {
-        let usable: Vec<Arc<Lane>> = self.lanes.iter().filter(|l| l.usable()).cloned().collect();
+        let usable: Vec<Arc<Lane>> = self.lanes().into_iter().filter(|l| l.usable()).collect();
         let ewm = usable.iter().map(|l| l.stats.ewma_mbps()).collect::<Vec<_>>();
         let med = median(&ewm);
         usable
@@ -662,8 +824,8 @@ impl LaneRegistry {
         // Only lanes that have actually carried a part: an unmeasured lane holds
         // the neutral starting EWMA, and summing those invented 24 MB/s on a
         // four-lane box whose only working lane was doing 5.6.
-        self.lanes
-            .iter()
+        self.lanes()
+            .into_iter()
             .filter(|l| l.usable() && l.stats.parts_ok() > 0)
             .map(|l| l.stats.ewma_mbps())
             .sum()

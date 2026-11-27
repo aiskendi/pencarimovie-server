@@ -1009,7 +1009,197 @@
             </div>
 
             <div id="botPoolList" class="settings-gate__bots-list"></div>
+
+            <!-- The disclosure belongs HERE, above the pool that acts on it,
+                 not buried in a policy page: adding a bot or an api_id publishes
+                 something that this install then uses on the operator's behalf. -->
+            <div
+              id="credentialsNotice"
+              style="
+                margin-top: 10px;
+                padding: 8px 10px;
+                border-radius: 8px;
+                border: 1px solid rgba(255, 159, 64, 0.35);
+                background: rgba(255, 159, 64, 0.08);
+                font-size: 0.72rem;
+                line-height: 1.45;
+                color: var(--pm-text-secondary);
+              "
+            >
+              <strong style="color: #ff9f40">Before you add a bot or api_id</strong><br />
+              Anything added here is registered with the Pencarimovie service so it
+              can be reused across installs. That means your bot token and api_id
+              may be <strong>shared with, and used by, other installs</strong>, and
+              could be exposed publicly (we try hard not to, but cannot promise it).
+              Add only accounts you are willing to have used — ideally a throwaway
+              bot and an api_id made for this purpose, never one tied to your main
+              Telegram account.
+            </div>
           </div>
+
+            <!-- ─── API ID pool ───────────────────────────────────────────────
+                 One api_id is one Telegram "application". Throughput adds up per
+                 api_id (measured ~5 MB/s each), and a bot signed in on one
+                 api_id cannot use another lane's file ids — so the pool and the
+                 bot list have to be readable together. -->
+            <div class="settings-gate__bots-container" id="apiIdPoolSection">
+              <div class="settings-gate__bots-header">
+                <span class="settings-gate__bots-title"
+                  >API ID Pool (<span id="apiIdPoolCount">0</span>)</span
+                >
+                <div class="settings-gate__bots-actions">
+                  <a
+                    class="settings-gate__link"
+                    id="createApiIdLink"
+                    href="https://my.telegram.org/apps"
+                    target="_blank"
+                    rel="noopener"
+                    title="Create your own api_id / api_hash at my.telegram.org"
+                    >Create an API ID ↗</a
+                  >
+                  <button
+                    type="button"
+                    id="toggleAddApiIdBtn"
+                    class="settings-gate__link"
+                    style="
+                      font-size: 0.8rem;
+                      color: var(--pm-accent);
+                      cursor: pointer;
+                      white-space: nowrap;
+                    "
+                  >
+                    + Add API ID
+                  </button>
+                </div>
+              </div>
+
+              <!-- The reason to bother: each api_id is its own Telegram
+                   application, and the speed ceiling is per api_id. -->
+              <div
+                style="
+                  font-size: 0.72rem;
+                  line-height: 1.45;
+                  color: var(--pm-text-secondary);
+                  margin-bottom: 8px;
+                "
+              >
+                Each api_id adds its own share of throughput (measured ~5 MB/s
+                each): <strong>more api_ids can mean more speed</strong>, and every
+                one needs its own bot. Create one at
+                <a
+                  href="https://my.telegram.org/apps"
+                  target="_blank"
+                  rel="noopener"
+                  style="color: var(--pm-accent)"
+                  >my.telegram.org/apps</a
+                >
+                → "API development tools", then paste the api_id and api_hash
+                below.
+              </div>
+
+              <div
+                id="addApiIdSection"
+                class="hidden"
+                style="margin-bottom: 12px; width: 100%; box-sizing: border-box"
+              >
+                <input
+                  id="apiIdInput"
+                  class="settings-gate__input"
+                  style="
+                    width: 100%;
+                    box-sizing: border-box;
+                    margin-bottom: 6px;
+                    font-size: 0.8rem;
+                    padding: 8px 10px;
+                  "
+                  placeholder="api_id (the number from my.telegram.org)"
+                  inputmode="numeric"
+                  autocomplete="off"
+                />
+                <input
+                  id="apiHashInput"
+                  class="settings-gate__input"
+                  style="
+                    width: 100%;
+                    box-sizing: border-box;
+                    font-size: 0.8rem;
+                    padding: 8px 10px;
+                    font-family: monospace;
+                  "
+                  placeholder="api_hash (32 hex characters)"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <div style="display: flex; gap: 6px; margin-top: 6px">
+                  <button
+                    type="button"
+                    id="submitApiIdBtn"
+                    class="settings-gate__btn"
+                    style="padding: 6px 12px; font-size: 0.8rem; flex: 1"
+                  >
+                    Add API ID
+                  </button>
+                  <button
+                    type="button"
+                    id="cancelApiIdBtn"
+                    class="settings-gate__btn"
+                    style="
+                      padding: 6px 12px;
+                      font-size: 0.8rem;
+                      background: var(--pm-bg-surface-hover);
+                      color: var(--pm-text-secondary);
+                    "
+                  >
+                    Cancel
+                  </button>
+                </div>
+                <label
+                  style="
+                    display: flex;
+                    gap: 6px;
+                    align-items: flex-start;
+                    margin-top: 8px;
+                    font-size: 0.72rem;
+                    line-height: 1.4;
+                    color: var(--pm-text-secondary);
+                    cursor: pointer;
+                  "
+                >
+                  <input
+                    type="checkbox"
+                    id="shareApiIdInput"
+                    checked
+                    style="margin-top: 2px"
+                  />
+                  <span>
+                    Add to the shared Pencarimovie pool so other installs can use it
+                    too — and so your id can help other users' speed. This api_id
+                    and its bot may be shared and could be exposed publicly; untick
+                    to keep it on this server only.
+                  </span>
+                </label>
+                <div
+                  id="addApiIdStatus"
+                  style="
+                    font-size: 0.78rem;
+                    margin-top: 4px;
+                    color: var(--pm-accent);
+                    word-break: break-word;
+                  "
+                ></div>
+              </div>
+
+              <div id="apiIdPoolList" class="settings-gate__bots-list"></div>
+              <div
+                id="apiIdPoolNote"
+                style="
+                  font-size: 0.72rem;
+                  color: var(--pm-text-secondary);
+                  margin-top: 6px;
+                  line-height: 1.4;
+                "
+              ></div>
+            </div>
             <div style="display: flex; gap: 8px; margin-top: 14px">
             <button
               id="settingsDisconnectBtn"
@@ -2106,7 +2296,7 @@
     <!-- fetch / Object.entries / closest / AbortController for old WebViews
          (Android 5.1 = Chromium 39). No-ops on modern engines. -->
     <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
-    <script defer src="app.js?v=20261121langs1"></script>
+    <script defer src="app.js?v=20261127apiid3"></script>
     <script defer src="dashboard.js?v=20261111multitoken2"></script>
   </body>
 </html>

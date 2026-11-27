@@ -2115,7 +2115,12 @@ pub async fn provision_lane(
                     entry.identity.id.clone()
                 };
                 lane.set_bot_id(&id);
-                crate::lanes::set_lane_bot(lane.api_id, &id);
+                crate::lanes::set_lane_bot_identity(
+                    lane.api_id,
+                    &id,
+                    &entry.identity.username,
+                    &entry.identity.first_name,
+                );
                 if let Some(reg) = crate::lanes::registry() {
                     reg.register_bot(&id, lane);
                 }
@@ -2146,7 +2151,12 @@ pub async fn provision_lane(
         ));
     }
     lane.set_bot_id(&id);
-    crate::lanes::set_lane_bot(lane.api_id, &id);
+    crate::lanes::set_lane_bot_identity(
+        lane.api_id,
+        &id,
+        &res.bot_username,
+        &res.bot_name,
+    );
     if let Some(reg) = crate::lanes::registry() {
         reg.register_bot(&id, lane);
     }

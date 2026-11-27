@@ -2658,12 +2658,17 @@ class PencariMovieApp {
           const bId = this.escapeHtml(String(b.bot_id || ""));
           const bUser = this.escapeHtml(String(b.bot_username || ""));
           const bName = this.escapeHtml(String(b.bot_name || bId));
+          // WHICH api_id this bot signs in with. A bot is bound to the api_id it
+          // logged in on; that is also the lane it can stream for, so it belongs
+          // on the row rather than in a tooltip nobody opens.
+          const bApi = Number(b.api_id || 0);
+          const apiChip = bApi > 0 ? '<span class="bot-pool-item__apiid" title="api_id this bot signed in with">api ' + this.escapeHtml(String(bApi)) + '</span>' : "";
           let actions = isAct ? '<span class="bot-pool-item__badge">Primary</span>' : "";
           if (!isAct) {
             actions += '<button type="button" class="set-active-bot-btn bot-pool-item__set-btn" data-bot-id="'.concat(bId, '">Set Primary</button>');
           }
           actions += '<button type="button" class="remove-bot-btn bot-pool-item__remove-btn" data-bot-id="'.concat(bId, '" title="Remove bot"><i class="fas fa-trash-alt"></i></button>');
-          return '\n          <div class="bot-pool-item">\n            <div class="bot-pool-item__info">\n              <span class="bot-pool-item__dot '.concat(isAct ? "bot-pool-item__dot--active" : "bot-pool-item__dot--inactive", '">\u25CF</span>\n              <div class="bot-pool-item__name-wrap">\n                <span class="bot-pool-item__name">').concat(bName, "</span>\n                ").concat(bUser ? '<span class="bot-pool-item__user">@'.concat(bUser, "</span>") : "", '\n              </div>\n            </div>\n            <div class="bot-pool-item__actions">\n              ').concat(actions, "\n            </div>\n          </div>\n        ");
+          return '\n          <div class="bot-pool-item">\n            <div class="bot-pool-item__info">\n              <span class="bot-pool-item__dot '.concat(isAct ? "bot-pool-item__dot--active" : "bot-pool-item__dot--inactive", '">\u25CF</span>\n              <div class="bot-pool-item__name-wrap">\n                <span class="bot-pool-item__name">').concat(bName, "</span>\n                ").concat(bUser ? '<span class="bot-pool-item__user">@'.concat(bUser, "</span>") : "", "\n                ").concat(apiChip, '\n              </div>\n            </div>\n            <div class="bot-pool-item__actions">\n              ').concat(actions, "\n            </div>\n          </div>\n        ");
         }).join("");
         listEl.querySelectorAll(".set-active-bot-btn").forEach(btn => {
           btn.addEventListener("click", () => __async(this, null, function* () {
@@ -2736,7 +2741,213 @@ class PencariMovieApp {
       } catch (e) {
         console.warn("loadBotPool failed:", e);
       }
+      // The two lists describe the same thing (a bot belongs to an api_id), so
+      // refreshing one refreshes the other: every path that reloads the bot pool
+      // — session status, add, remove, set-primary — keeps the pool view honest.
+      this.loadApiIdPool();
     });
+  }
+
+  /** The api_id pool: one row per Telegram application, with its bot and speed.
+   *
+   * Throughput is per api_id (~5 MB/s measured each), so this list is the
+   * throughput control as much as the identity one: adding a row adds a lane,
+   * and a lane whose bot is missing shows WHY it is not streaming.
+   */
+  loadApiIdPool() {
+    return __async(this, null, function* () {
+      const listEl = this.$("#apiIdPoolList");
+      const countEl = this.$("#apiIdPoolCount");
+      if (!listEl) return;
+      // Bind the add form here too: this loader runs on every bot-pool refresh,
+      // and `bindApiIdForm` is idempotent, so the form works on whichever path
+      // opened the settings gate first.
+      this.bindApiIdForm();
+      try {
+        const resp = yield this.requestJson("".concat(this.localApiBase, "/api/api-ids"));
+        if (!resp || !resp.ok) {
+          listEl.innerHTML = '<div style="font-size:0.75rem;color:#888;padding:4px 0;">API ID pool unavailable on this engine.</div>';
+          return;
+        }
+        const rows = Array.isArray(resp.api_ids) ? resp.api_ids : [];
+        // Speed + state come from the running lanes, keyed by api_id: a pool row
+        // that is enabled but has no lane (added since boot) says so instead of
+        // pretending it is serving.
+        const live = {};
+        (Array.isArray(resp.active_lanes) ? resp.active_lanes : []).forEach(l => {
+          live[Number(l.api_id)] = l;
+        });
+        if (countEl) countEl.textContent = String(rows.length);
+        const noteEl = this.$("#apiIdPoolNote");
+        if (noteEl) {
+          const total = Number(resp.lanes_total_mbps || 0);
+          const enabled = Number(resp.enabled || 0);
+          noteEl.textContent = rows.length === 0
+            ? "No api_id configured. The engine falls back to the credential it already holds (one lane)."
+            : enabled + " enabled, " + Object.keys(live).length + " lane(s) live in this process"
+              + (total > 0 ? ", " + total.toFixed(2) + " MB/s measured" : "")
+              + ". A new api_id is checked and opened immediately; enabling or disabling one takes effect on the next restart.";
+        }
+        if (rows.length === 0) {
+          listEl.innerHTML = '<div style="font-size:0.75rem;color:#888;padding:4px 0;">No api_id rows yet.</div>';
+          this._bindApiIdPoolEvents();
+          return;
+        }
+        listEl.innerHTML = rows.map(r => {
+          const apiId = Number(r.api_id || 0);
+          const masked = this.escapeHtml(String(r.api_hash || ""));
+          const enabled = r.enabled === true;
+          const lane = live[apiId];
+          const botUser = this.escapeHtml(String(r.bot_username || ""));
+          const botName = this.escapeHtml(String(r.bot_name || ""));
+          const botId = this.escapeHtml(String(r.bot_id || (lane && lane.bot_id) || ""));
+          const hasBot = r.has_bot === true || !!botUser || !!botId;
+          const state = lane ? String(lane.state || "") : "not running";
+          const mbps = lane && lane.ewma_mbps ? Number(lane.ewma_mbps).toFixed(2) : "";
+          const bits = [];
+          bits.push(
+            !enabled
+              ? (hasBot ? "disabled — its bot is kept" : "disabled — not verified yet")
+              : hasBot
+                ? "bot " + (botName || (botUser ? "@" + botUser : botId))
+                : "no bot yet — one is leased on the next start"
+          );
+          bits.push(state + (mbps ? " · " + mbps + " MB/s" : ""));
+          if (r.source === "origin") bits.push("from server pool");
+          return '\n        <div class="bot-pool-item">'
+            + '\n          <div class="bot-pool-item__info">'
+            + '\n            <span class="bot-pool-item__dot ' + (enabled ? "bot-pool-item__dot--active" : "bot-pool-item__dot--inactive") + '">\u25CF</span>'
+            + '\n            <div class="bot-pool-item__name-wrap">'
+            + '\n              <span class="bot-pool-item__name">api_id ' + this.escapeHtml(String(apiId)) + ' <span class="bot-pool-item__user">' + masked + '</span></span>'
+            + '\n              <span class="bot-pool-item__user">' + bits.map(b => this.escapeHtml(b)).join(" · ") + '</span>'
+            + '\n            </div>'
+            + '\n          </div>'
+            + '\n          <div class="bot-pool-item__actions">'
+            + '\n            <button type="button" class="apiid-toggle-btn bot-pool-item__set-btn" data-api-id="' + apiId + '" data-enabled="' + (enabled ? "1" : "0") + '">' + (enabled ? "Disable" : "Enable") + '</button>'
+            + '\n            <button type="button" class="apiid-remove-btn bot-pool-item__remove-btn" data-api-id="' + apiId + '" title="Remove api_id"><i class="fas fa-trash-alt"></i></button>'
+            + '\n          </div>'
+            + '\n        </div>\n      ';
+        }).join("");
+        this._bindApiIdPoolEvents();
+      } catch (e) {
+        console.warn("loadApiIdPool failed:", e);
+        listEl.innerHTML = '<div style="font-size:0.75rem;color:#888;padding:4px 0;">Could not read the API ID pool.</div>';
+      }
+    });
+  }
+
+  _bindApiIdPoolEvents() {
+    const listEl = this.$("#apiIdPoolList");
+    if (!listEl) return;
+    listEl.querySelectorAll(".apiid-toggle-btn").forEach(btn => {
+      btn.addEventListener("click", () => __async(this, null, function* () {
+        const apiId = Number(btn.getAttribute("data-api-id") || 0);
+        const enable = btn.getAttribute("data-enabled") !== "1";
+        if (!apiId) return;
+        try {
+          yield this.requestJson("".concat(this.localApiBase, "/api/api-ids/set-enabled"), {
+            method: "POST",
+            body: JSON.stringify({
+              api_id: apiId,
+              enabled: enable
+            })
+          });
+          yield this.loadApiIdPool();
+        } catch (e) {
+          console.error("Failed to toggle api_id:", e);
+        }
+      }));
+    });
+    listEl.querySelectorAll(".apiid-remove-btn").forEach(btn => {
+      btn.addEventListener("click", () => __async(this, null, function* () {
+        const apiId = Number(btn.getAttribute("data-api-id") || 0);
+        if (!apiId || !confirm("Remove api_id " + apiId + " from the pool?")) return;
+        try {
+          yield this.requestJson("".concat(this.localApiBase, "/api/api-ids/remove"), {
+            method: "POST",
+            body: JSON.stringify({
+              api_id: apiId
+            })
+          });
+          yield this.loadApiIdPool();
+        } catch (e) {
+          console.error("Failed to remove api_id:", e);
+        }
+      }));
+    });
+  }
+
+  /** Wire the "+ Add API ID" form once. */
+  bindApiIdForm() {
+    const toggle = this.$("#toggleAddApiIdBtn");
+    const section = this.$("#addApiIdSection");
+    const submit = this.$("#submitApiIdBtn");
+    const cancel = this.$("#cancelApiIdBtn");
+    const status = this.$("#addApiIdStatus");
+    const idInput = this.$("#apiIdInput");
+    const hashInput = this.$("#apiHashInput");
+    const setStatus = (text, color) => {
+      if (!status) return;
+      status.textContent = text || "";
+      status.style.color = color || "var(--pm-accent)";
+    };
+    if (toggle && section && !toggle.dataset.bound) {
+      toggle.dataset.bound = "1";
+      toggle.addEventListener("click", () => section.classList.toggle("hidden"));
+    }
+    if (cancel && section && !cancel.dataset.bound) {
+      cancel.dataset.bound = "1";
+      cancel.addEventListener("click", () => {
+        section.classList.add("hidden");
+        setStatus("");
+      });
+    }
+    if (submit && !submit.dataset.bound) {
+      submit.dataset.bound = "1";
+      submit.addEventListener("click", () => __async(this, null, function* () {
+        const apiId = String((idInput && idInput.value) || "").trim();
+        const apiHash = String((hashInput && hashInput.value) || "").trim();
+        if (!/^\d+$/.test(apiId)) {
+          setStatus("api_id must be the number Telegram issued.", "#ff6b6b");
+          return;
+        }
+        if (!/^[0-9a-fA-F]{32}$/.test(apiHash)) {
+          setStatus("api_hash must be 32 hex characters.", "#ff6b6b");
+          return;
+        }
+        setStatus("Saving...");
+        try {
+          const shareEl = this.$("#shareApiIdInput");
+          const share = !shareEl || shareEl.checked !== false;
+          const resp = yield this.requestJson("".concat(this.localApiBase, "/api/api-ids/add"), {
+            method: "POST",
+            body: JSON.stringify({
+              api_id: Number(apiId),
+              api_hash: apiHash,
+              share: share
+            })
+          });
+          if (!resp || !resp.ok) {
+            setStatus((resp && resp.message) || "Could not save that api_id.", "#ff6b6b");
+            yield this.loadApiIdPool();
+            return;
+          }
+          setStatus(
+            share && resp.shared === true
+              ? "Saved and added to the shared pool. Restart the server to open this lane."
+              : share
+                ? "Saved locally; the shared pool did not accept it. Restart the server to open this lane."
+                : "Saved on this server only. Restart the server to open this lane."
+          );
+          if (idInput) idInput.value = "";
+          if (hashInput) hashInput.value = "";
+          if (section) section.classList.add("hidden");
+          yield this.loadApiIdPool();
+        } catch (e) {
+          setStatus((e && e.message) || "Could not save that api_id.", "#ff6b6b");
+        }
+      }));
+    }
   }
   loadSessionStatus() {
     return __async(this, null, function* () {
@@ -3126,6 +3337,8 @@ class PencariMovieApp {
       if (connectedSection) connectedSection.classList.remove("hidden");
       if (closeBtn) closeBtn.style.display = "flex";
       this.loadBotPool();
+      this.loadApiIdPool();
+      this.bindApiIdForm();
       this.loadTunnelStatus();
       const nameEl = this.$("#settingsBotName");
       const usernameEl = this.$("#settingsBotUsername");

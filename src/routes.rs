@@ -109,6 +109,11 @@ fn header_json(req: &Request<Body>) -> HashMap<String, String> {
 fn diagnostics_payload(reports: Vec<Value>) -> Value {
     let streams = crate::download::active_streams();
     let preflights = crate::download::active_preflights();
+    // `+ 0.0` collapses a `-0.0` (the sum of no measured lanes) to `0.0`: a
+    // diagnostic that prints "-0.0 MB/s" reads like a fault.
+    let lanes_total_mbps = crate::lanes::registry()
+        .map(|r| ((r.total_mbps() * 100.0).round() / 100.0) + 0.0)
+        .unwrap_or(0.0);
     serde_json::json!({
         "ok": 1,
         "info": device_info(),
@@ -142,9 +147,7 @@ fn diagnostics_payload(reports: Vec<Value>) -> Value {
         "lanes": crate::lanes::registry()
             .map(|r| r.lanes().iter().map(|l| l.to_json()).collect::<Vec<Value>>())
             .unwrap_or_default(),
-        "lanes_total_mbps": crate::lanes::registry()
-            .map(|r| (r.total_mbps() * 100.0).round() / 100.0)
-            .unwrap_or(0.0),
+        "lanes_total_mbps": lanes_total_mbps,
     })
 }
 
@@ -1194,7 +1197,8 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                     .count(),
                 "api_ids": rows,
                 "active_lanes": lanes,
-                "lanes_total_mbps": (total * 100.0).round() / 100.0,
+                // `+ 0.0` collapses the `-0.0` a sum of no measured lanes produces.
+                "lanes_total_mbps": ((total * 100.0).round() / 100.0) + 0.0,
             }),
         );
     }
@@ -1213,22 +1217,102 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             })
             .unwrap_or(0);
         let api_hash = input.get("api_hash").and_then(|v| v.as_str()).unwrap_or("");
-        return match crate::lanes::add_entry(api_id, api_hash) {
-            Ok(e) => json_response(
-                200,
-                &serde_json::json!({
-                    "ok": 1,
-                    "api_id": e.api_id,
-                    "api_hash": crate::lanes::masked_hash(&e.api_hash),
-                    // The registry is built once, at boot: a lane added now would
-                    // otherwise look active while nothing opened a connection for
-                    // it. Say so instead of implying it took effect.
-                    "restart_required": true,
-                    "message": "Saved. This lane opens on the next start of the server.",
-                }),
-            ),
-            Err(e) => json_response(400, &serde_json::json!({"ok": 0, "message": e})),
+        // The UI asks for consent explicitly; `share: false` keeps the pair on
+        // this install only. A pair that IS shared is posted to the origin's
+        // pool, which is what lets other installs pick it up later.
+        let share = input.get("share").and_then(|v| v.as_bool()).unwrap_or(false);
+        let entry = match crate::lanes::add_entry(api_id, api_hash) {
+            Ok(e) => e,
+            Err(e) => return json_response(400, &serde_json::json!({"ok": 0, "message": e})),
         };
+        // OPEN THE LANE NOW, and let the lease be the validity test.
+        //
+        // A wrong api_id/api_hash cannot be detected by looking at it: the pair is
+        // only proven when Telegram accepts a login made with it. So the add
+        // endpoint opens the lane, leases one guest bot through it, and signs that
+        // bot in — success means the pair is valid AND the lane is already
+        // streaming-capable, with no restart.
+        let workers = crate::lanes::registry()
+            .map(|r| r.default_lane().pool.workers())
+            .unwrap_or(10);
+        let mut lane_state = serde_json::json!({
+            "live": false,
+            "bot_id": "",
+            "bot_username": "",
+            "api_valid": false,
+        });
+        let mut error: Option<String> = None;
+        if let Some(reg) = crate::lanes::registry() {
+            let pool = std::sync::Arc::new(crate::telegram::TelegramPool::for_lane(
+                entry.api_id,
+                &entry.api_hash,
+                workers,
+                2,
+            ));
+            let lane = crate::lanes::Lane::new(entry.api_id, pool, "");
+            if reg.add_lane(lane.clone()) {
+                // BOUNDED: proving a bad api_id costs a lease plus Telegram
+                // rejecting the login, and the lease retries. The operator gets a
+                // verdict in 20 s; past that the lane is parked, not left hanging
+                // on a request that can never succeed.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    crate::session::provision_lane(&lane),
+                )
+                .await
+                {
+                    Ok(Ok(res)) => {
+                        lane_state = serde_json::json!({
+                            "live": true,
+                            "bot_id": res.bot_id,
+                            "bot_username": res.bot_username,
+                            "api_valid": true,
+                            "workers": workers,
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        // The row is kept (the operator can retry once the origin
+                        // has a bot to lease) but it is NOT live, and the answer
+                        // says why instead of implying success.
+                        error = Some(e);
+                        let _ = crate::lanes::set_enabled(entry.api_id, false);
+                    }
+                    Err(_) => {
+                        error = Some(
+                            "no bot could be leased for this api_id within 20s - it may be invalid, or the server has no bot to hand out right now".to_string(),
+                        );
+                        let _ = crate::lanes::set_enabled(entry.api_id, false);
+                    }
+                }
+            }
+        } else {
+            error = Some("api_id lanes are not published in this process".to_string());
+        }
+        let live = lane_state.get("live").and_then(|v| v.as_bool()).unwrap_or(false);
+        let shared = if share {
+            crate::lanes::contribute_to_origin(entry.api_id, &entry.api_hash).await
+        } else {
+            false
+        };
+        return json_response(
+            if live { 200 } else { 400 },
+            &serde_json::json!({
+                "ok": if live { 1 } else { 0 },
+                "api_id": entry.api_id,
+                "api_hash": crate::lanes::masked_hash(&entry.api_hash),
+                "shared": shared,
+                "lane": lane_state,
+                "restart_required": false,
+                "message": if live {
+                    "API ID verified - a bot signed in on it and the lane is live now.".to_string()
+                } else {
+                    format!(
+                        "Saved, but not enabled: {}. Fix the api_id/api_hash and enable it again to retry.",
+                        error.unwrap_or_else(|| "unknown error".to_string())
+                    )
+                },
+            }),
+        );
     }
 
     if p == "/api/api-ids/remove" && m == "POST" {
@@ -1306,6 +1390,17 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         }
         let pool = get_bot_pool();
         let active = get_bot_id();
+        // Which api_id each bot belongs to. A bot signed in on a lane's api_id
+        // cannot serve the default lane's file ids, so the dashboard has to show
+        // this or an operator cannot tell why a bot never streams.
+        let lane_of: std::collections::HashMap<String, i32> = crate::lanes::load_entries()
+            .into_iter()
+            .filter(|e| !e.bot_id.is_empty())
+            .map(|e| (e.bot_id, e.api_id))
+            .collect();
+        let default_api_id = crate::lanes::registry()
+            .map(|r| r.default_lane().api_id)
+            .unwrap_or(0);
         let list: Vec<Value> = pool
             .iter()
             .map(|b| {
@@ -1314,6 +1409,14 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 if let Some(obj) = out.as_object_mut() {
                     obj.insert("has_session".into(), serde_json::json!(has_local_session(&id)));
                     obj.insert("is_active".into(), serde_json::json!(id == active));
+                    // A bot a lane owns reports that lane; everything else is the
+                    // default lane (and that is what a new bot gets).
+                    let api = lane_of.get(&id).copied().unwrap_or(default_api_id);
+                    obj.insert("api_id".into(), serde_json::json!(api));
+                    obj.insert(
+                        "lane".into(),
+                        serde_json::json!(if api == default_api_id { "default" } else { "extra" }),
+                    );
                 }
                 out
             })
@@ -1324,6 +1427,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "ok": 1,
                 "active_bot_id": active,
                 "total_bots": list.len(),
+                "default_api_id": default_api_id,
                 // How many of the entries above come from `BOT_TOKENS` (they are
                 // shared by every instance; the rest are this instance's disk
                 // state and are not visible to its siblings).
@@ -1367,6 +1471,52 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             );
         }
         let reserve = is_guest_provision_in_progress();
+        // WHICH api_id does an added bot sign in with?
+        //
+        //  * `api_id` in the body  -> that lane, if the process opened it;
+        //  * otherwise             -> the DEFAULT lane (the process pool).
+        //
+        // The default is what a single-api_id install has always done, so an
+        // operator who just pastes a token is not asked a new question. A bot that
+        // belongs to another lane is recorded in `api_ids.json` for it, because a
+        // bot signed in on one api_id cannot serve another lane's file ids.
+        let default_api_id = crate::lanes::registry()
+            .map(|r| r.default_lane().api_id)
+            .unwrap_or(0);
+        let requested_api_id: Option<i32> = input
+            .get("api_id")
+            .map(|v| match v {
+                Value::Number(n) => n.as_i64().unwrap_or(0) as i32,
+                Value::String(s) => s.trim().parse().unwrap_or(0),
+                _ => 0,
+            })
+            .filter(|v| *v > 0);
+        let mut target_api_id = default_api_id;
+        let mut target_pool = state.telegram.clone();
+        if let Some(want) = requested_api_id {
+            if want != default_api_id {
+                let Some(reg) = crate::lanes::registry() else {
+                    return json_response(
+                        400,
+                        &serde_json::json!({
+                            "ok": 0,
+                            "message": "api_id lanes are not published in this process",
+                        }),
+                    );
+                };
+                let Some(lane) = reg.lane_for_api_id(want) else {
+                    return json_response(
+                        400,
+                        &serde_json::json!({
+                            "ok": 0,
+                            "message": format!("api_id {} is not an enabled lane; add it to the pool first", want),
+                        }),
+                    );
+                };
+                target_api_id = want;
+                target_pool = lane.pool.clone();
+            }
+        }
         let mut added: Vec<Value> = Vec::new();
         let mut failed: Vec<Value> = Vec::new();
         for token in tokens {
@@ -1376,7 +1526,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             } else {
                 id_part.clone()
             };
-            match state.telegram.boot(&hint, Some(&token)).await {
+            match target_pool.boot(&hint, Some(&token)).await {
                 Ok(entry) => {
                     add_pool_bot(serde_json::json!({
                         "bot_id": entry.identity.id,
@@ -1386,10 +1536,27 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                         "is_active": true,
                         "updated_at": now(),
                     }));
+                    if target_api_id != default_api_id {
+                        // Bind it to its lane, so a restart resumes it there and
+                        // the dispatcher knows whose file ids it can use.
+                        crate::lanes::set_lane_bot_identity(
+                            target_api_id,
+                            &entry.identity.id,
+                            &entry.identity.username,
+                            &entry.identity.first_name,
+                        );
+                        if let Some(reg) = crate::lanes::registry() {
+                            if let Some(lane) = reg.lane_for_api_id(target_api_id) {
+                                lane.set_bot_id(&entry.identity.id);
+                                reg.register_bot(&entry.identity.id, &lane);
+                            }
+                        }
+                    }
                     added.push(serde_json::json!({
                         "bot_id": entry.identity.id,
                         "bot_username": entry.identity.username,
                         "bot_name": entry.identity.first_name,
+                        "api_id": target_api_id,
                     }));
                 }
                 Err(e) => failed.push(serde_json::json!({

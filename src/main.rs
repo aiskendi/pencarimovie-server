@@ -1781,6 +1781,20 @@ async fn main() -> anyhow::Result<()> {
         Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("auto") => v.parse::<usize>().ok(),
         _ => None,
     };
+    // The default api_id pool comes from the origin's `GET /api-ids`, and that is
+    // the ONLY source: one list, one authority, so an operator who disables an id
+    // in wp-admin sees it stop everywhere. The result is cached for 10 minutes, so
+    // a restart loop does not hammer the origin; a stale/unreachable origin keeps
+    // the previous cache. Bounded to 6 s and best effort — the listener must not
+    // wait on WordPress.
+    if !lanes::origin_cache_fresh(600) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            lanes::refresh_origin_cache(),
+        )
+        .await
+        .ok();
+    }
     let lane_entries = lanes::load_entries();
     let lane_specs: Vec<(i32, String)> = lane_entries
         .iter()

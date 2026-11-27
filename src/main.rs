@@ -1681,7 +1681,12 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| storage::env("PM_STREAM_PREFETCH"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(download::DEFAULT_STREAM_PREFETCH)
-        .clamp(1, download::MAX_STREAM_PREFETCH);
+        // NOT clamped to `MAX_STREAM_PREFETCH` here: that is ONE lane's budget,
+        // and `download` clamps at READ time against `MAX x lanes`, because the
+        // lane count is only known after the registry is published. Clamping
+        // here pinned every multi-lane body at 32 parts — 8 per lane — which is
+        // exactly where each lane's learned window stopped growing.
+        .clamp(1, download::MAX_STREAM_PREFETCH.saturating_mul(16));
     // Global cap on concurrent download responses: beyond it viewers get a
     // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.
     //

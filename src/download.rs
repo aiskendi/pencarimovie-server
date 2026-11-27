@@ -312,7 +312,17 @@ impl FileWindow {
     }
 
     fn with_cap(cap: u32) -> Self {
-        let cap = cap.clamp(1, FILE_WINDOW_MAX);
+        // The CALLER'S cap is the ceiling: `workers x inflight` (32 at the
+        // shipped 16 x 2).
+        //
+        // This used to clamp to `FILE_WINDOW_MAX` (8), which silently undid
+        // c11be34: `file_window_cap()` was raised from `min(8, inflight)` to
+        // `workers x inflight` so the window could reach the process' part
+        // budget, and the clamp then pinned it at 8 anyway. MEASURED 2026-11-27:
+        // 8 parts x 512 KB / ~0.7 s per part = 5.7 MB/s, which is exactly the
+        // number a single response kept hitting and which was being read as
+        // "Telegram's per-api_id ceiling". It is the window.
+        let cap = cap.max(1);
         let mut w = Self::new();
         w.cap = cap;
         w.limit = FILE_WINDOW_START.min(cap);
@@ -453,13 +463,31 @@ fn file_window_try(key: &str) -> bool {
 
 fn file_window_answer(bot_id: &str) {
     if let Some(w) = file_windows().get_mut(&file_window_key(bot_id)) {
+        let before = w.limit();
+        let in_flight = w.in_flight;
         w.on_answer();
+        if w.limit() != before {
+            log(
+                "part window grew",
+                &serde_json::json!({
+                    "bot_id": bot_id,
+                    "from": before,
+                    "to": w.limit(),
+                    "in_flight": in_flight,
+                }),
+            );
+        }
     }
 }
 
 fn file_window_reject(bot_id: &str) {
     if let Some(w) = file_windows().get_mut(&file_window_key(bot_id)) {
+        let before = w.limit();
         w.on_reject();
+        log(
+            "part window halved after a reject",
+            &serde_json::json!({"bot_id": bot_id, "from": before, "to": w.limit()}),
+        );
     }
 }
 
@@ -1167,29 +1195,48 @@ static STREAM_PREFETCH: OnceLock<usize> = OnceLock::new();
 /// The one place the accepted range is applied, so the flag, the environment and
 /// the tests cannot disagree about it.
 fn clamp_prefetch(parts: usize) -> usize {
-    parts.clamp(1, MAX_STREAM_PREFETCH)
+    parts.clamp(1, prefetch_ceiling())
+}
+
+/// How many parts one response may ask for.
+///
+/// One lane owns `workers x inflight` parts (32 at the defaults), and a response
+/// may ask for as many as the lanes it can use. Clamping every install at 32 was
+/// why a four-lane body stalled: `buffered(32)` spread over four lanes is 8 parts
+/// each — exactly where each lane's learned window stopped growing, because that
+/// window only grows while it is FULL. MEASURED 2026-11-27: at prefetch 32 the
+/// four lanes sat at windows of 8-18 and one response did 21-23 MB/s; the depth
+/// was capping the lanes, not Telegram.
+fn prefetch_ceiling() -> usize {
+    let lanes = crate::lanes::registry()
+        .map(|r| r.lanes().len())
+        .unwrap_or(1)
+        .max(1);
+    MAX_STREAM_PREFETCH.saturating_mul(lanes)
 }
 
 /// Publish `--stream-prefetch` from `main`, which parses the flag and
 /// `PM_STREAM_PREFETCH` once at boot (the banner prints what was accepted).
+///
+/// The value is stored UNCLAMPED: the ceiling depends on how many api_id lanes
+/// the process publishes, which happens after this call.
 pub fn set_stream_prefetch(parts: usize) {
-    let _ = STREAM_PREFETCH.set(clamp_prefetch(parts));
+    let _ = STREAM_PREFETCH.set(parts.max(1));
 }
 
-/// The read-ahead depth in PARTS, `1..=MAX_STREAM_PREFETCH`. Read per body, so a
-/// `--stream-prefetch 1` run and a default run can be compared without a rebuild.
+/// The read-ahead depth in PARTS. Read per body, so a `--stream-prefetch 1` run
+/// and a default run can be compared without a rebuild.
 fn stream_prefetch() -> usize {
-    if let Some(parts) = STREAM_PREFETCH.get() {
-        return *parts;
-    }
-    // No `main` (a unit test, a probe): the environment is the whole contract, and
-    // `PM_PIPELINE` keeps working as this knob's older name.
-    clamp_prefetch(
-        crate::storage::env("PM_STREAM_PREFETCH")
+    let asked = match STREAM_PREFETCH.get() {
+        Some(parts) => *parts,
+        // No `main` (a unit test, a probe): the environment is the whole
+        // contract, and `PM_PIPELINE` keeps working as this knob's older name.
+        None => crate::storage::env("PM_STREAM_PREFETCH")
             .or_else(|| crate::storage::env("PM_PIPELINE"))
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_STREAM_PREFETCH),
-    )
+    };
+    asked.clamp(1, prefetch_ceiling())
 }
 use crate::telegram::{DocTarget, prepare_file_target};
 use crate::AppState;
@@ -3217,10 +3264,18 @@ struct LaneIo {
     /// Refreshes spent on this lane for this body (bounded: a lane that keeps
     /// handing back dead references must fail over, not loop).
     refreshes: std::sync::atomic::AtomicU32,
+    /// Parts and bytes THIS body took through this lane, for the end-of-body
+    /// summary (the lane's own counters are process-wide).
+    parts_served: std::sync::atomic::AtomicU64,
+    bytes_served: std::sync::atomic::AtomicU64,
 }
 
 /// Mid-body reference refreshes allowed per lane per body.
-const LANE_REFRESH_MAX: u32 = 2;
+///
+/// Four, not one: a cold lane's first window can fail every prefetched part
+/// before the re-mint lands, and the lane must be allowed to heal rather than
+/// being dropped after the second try.
+const LANE_REFRESH_MAX: u32 = 4;
 /// Times one part may wait for a refresh and retry on the SAME lane.
 const LANE_REFRESH_RETRIES: u32 = 2;
 
@@ -3239,6 +3294,8 @@ impl LaneIo {
             refresh_lock: tokio::sync::Mutex::new(()),
             generation: std::sync::atomic::AtomicU32::new(0),
             refreshes: std::sync::atomic::AtomicU32::new(0),
+            parts_served: std::sync::atomic::AtomicU64::new(0),
+            bytes_served: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -3311,32 +3368,39 @@ async fn lane_io_for(
     // 2026-11-26, every lane, every request: origin mint 200, first body part
     // 400, at 512 KB (the primed head). `mint::resend` sends the same document
     // from OUR session (~100-390 ms) and returns a reference that is ours.
-    let id = match crate::mint::resend(short_code, &bot, held, "lane").await {
+    let id = match crate::mint::live(short_code, &bot) {
+        // Warmest possible: an id this bot already minted in this process. The
+        // probe below still judges it, and a stale one is re-minted there.
         Some(id) => id,
-        None => {
-            // No local re-send (a relay peer it cannot reach, or a source id this
-            // bot may not send): fall back to the origin's mint, which is the
-            // pre-lane path.
-            log(
-                "lane local re-send gave nothing - using the origin's mint",
-                &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
-            );
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(8),
-                resolve_shortcode_fresh_from(short_code, &bot, Some(held)),
-            )
-            .await
-            {
-                Ok(v) => id_of(&v),
-                Err(_) => {
-                    log(
-                        "lane file_id mint timed out",
-                        &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
-                    );
-                    String::new()
+        None => match crate::mint::resend(short_code, &bot, held, "lane").await {
+            Some(id) => id,
+            None => {
+                // No local re-send (a relay peer it cannot reach, or a source id
+                // this bot may not send): fall back to the origin's mint, which is
+                // the pre-lane path. It may be bound to the origin's session and
+                // answer 400 on the first part — that is the cold case the body's
+                // refresh heals.
+                log(
+                    "lane local re-send gave nothing - using the origin's mint",
+                    &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
+                );
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    resolve_shortcode_fresh_from(short_code, &bot, Some(held)),
+                )
+                .await
+                {
+                    Ok(v) => id_of(&v),
+                    Err(_) => {
+                        log(
+                            "lane file_id mint timed out",
+                            &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
+                        );
+                        String::new()
+                    }
                 }
             }
-        }
+        },
     };
     if id.is_empty() {
         log(
@@ -3355,14 +3419,15 @@ async fn lane_io_for(
             return None;
         }
     };
-    // VERIFY the reference before the body depends on it.
+    // WARM-UP, not a gate.
     //
-    // A freshly minted reference is not always accepted by the DC that serves
-    // this bot: MEASURED 2026-11-26, the first three body parts of a 2 MB body
-    // answered 400 FILE_REFERENCE_EXPIRED and only a second mint fixed it. One
-    // 4 KB probe here moves that recovery into the setup phase — in parallel
-    // across lanes and before the first body byte depends on it — instead of
-    // stalling the head of every response.
+    // A bot that did not mint the reference answers 400 `FILE_REFERENCE_EXPIRED`,
+    // and the refresh re-mints it — the same self-heal a cold single-lane id gets.
+    // So a failed probe means "still cold", NOT "cannot serve". The lane must stay
+    // in the body: the parts that fail on it are what teach it the reference, and
+    // once it heals it catches up and takes its share
+    // (docs/port-stress-results.md: a bot that did not mint it gets 400, measured
+    // as a single request — one retry fixes it).
     let mut target = target;
     for attempt in 0..2u32 {
         let (client, gate) = entry.pick_slot();
@@ -3370,7 +3435,7 @@ async fn lane_io_for(
             Ok(_) => break,
             Err(e) => {
                 log(
-                    "lane reference probe failed",
+                    "lane reference probe failed (warming)",
                     &serde_json::json!({
                         "api_id": lane.api_id,
                         "bot_id": bot,
@@ -3381,32 +3446,25 @@ async fn lane_io_for(
                     }),
                 );
                 if attempt == 1 {
-                    // Park the lane instead of paying a mint + probe on every
-                    // body: the reason is a real Telegram answer, and it shows in
-                    // `/api/diagnostics` as `state: "cooling"` + `last_error`.
-                    lane.stats.cool_for(
-                        30,
-                        &format!("lane reference did not verify: {}", e.message),
-                    );
                     log(
-                        "lane reference did not verify",
-                        &serde_json::json!({
-                            "api_id": lane.api_id,
-                            "bot_id": bot,
-                            "error": e.message,
-                        }),
+                        "lane still warming - keeping it in the body to heal on retry",
+                        &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
                     );
-                    return None;
+                    break;
                 }
-                let again = crate::mint::resend(short_code, &bot, held, "lane").await?;
-                target = match crate::telegram::prepare_file_target(&again, size) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                log(
-                    "lane re-minted its reference during verification",
-                    &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
-                );
+                match crate::mint::resend(short_code, &bot, held, "lane").await {
+                    Some(again) => match crate::telegram::prepare_file_target(&again, size) {
+                        Ok(t) => {
+                            target = t;
+                            log(
+                                "lane re-minted its reference during warm-up",
+                                &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
+                            );
+                        }
+                        Err(_) => break,
+                    },
+                    None => break,
+                }
             }
         }
     }
@@ -5411,6 +5469,26 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                 io.lane
                                     .stats
                                     .record_ok(v.len() as u64, started.elapsed().as_micros() as u64);
+                                io.parts_served
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                io.bytes_served
+                                    .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                // One line per part: the trace a throughput run is
+                                // read from — which api_id carried it, how long it
+                                // took, and the window that admitted it.
+                                log(
+                                    "download stream lane part",
+                                    &serde_json::json!({
+                                        "api_id": io.lane.api_id,
+                                        "pos": p,
+                                        "bytes": v.len(),
+                                        "ms": started.elapsed().as_millis() as u64,
+                                        "window": file_window_state(&io.bot),
+                                        "generation": io
+                                            .generation
+                                            .load(std::sync::atomic::Ordering::Relaxed),
+                                    }),
+                                );
                                 return (i, Ok(v));
                             }
                             Err(e) => {
@@ -5550,6 +5628,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 
 
         futures_util::pin_mut!(stream);
+        let body_started = std::time::Instant::now();
         loop {
             // A seek or a closed tab drops the receiver. Detecting it only when
             // the next PART is ready to send means up to `stream_prefetch()` parts
@@ -5627,6 +5706,39 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // its reference mid-stream must persist the refreshed one, or the next
         // Range reads the dead one back out of the cache and starts the whole
         // resolve-and-fail cycle again.
+        // One line per body that says which lane carried what: parts, bytes and
+        // learned window per api_id, plus the body's own rate. This is where a
+        // throughput report is read from.
+        {
+            let elapsed = body_started.elapsed().as_secs_f64().max(0.001);
+            let sent = total.saturating_sub(remaining);
+            let per_lane: Vec<serde_json::Value> = body_lanes
+                .iter()
+                .map(|io| {
+                    serde_json::json!({
+                        "api_id": io.lane.api_id,
+                        "bot_id": io.bot,
+                        "parts": io.parts_served.load(std::sync::atomic::Ordering::Relaxed),
+                        "bytes": io.bytes_served.load(std::sync::atomic::Ordering::Relaxed),
+                        "ewma_mbps": (io.lane.stats.ewma_mbps() * 100.0).round() / 100.0,
+                        "p50_ms": io.lane.stats.p50_part_ms(),
+                        "window": file_window_state(&io.bot),
+                        "window_cap": file_window_cap_for(&io.bot),
+                    })
+                })
+                .collect();
+            log(
+                "download stream lane summary",
+                &serde_json::json!({
+                    "short_code": short_code_for_task,
+                    "lanes": body_lanes.len(),
+                    "bytes_sent": sent,
+                    "elapsed_s": (elapsed * 10.0).round() / 10.0,
+                    "mbps": ((sent as f64 / 1_048_576.0) / elapsed * 100.0).round() / 100.0,
+                    "per_lane": per_lane,
+                }),
+            );
+        }
         if !short_code_for_task.is_empty() && !bot_for_task.is_empty() {
             let working_id = refreshed_id
                 .lock()

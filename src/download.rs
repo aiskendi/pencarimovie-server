@@ -3350,10 +3350,27 @@ const LANE_MINT_ATTEMPTS: u32 = 3;
 async fn origin_lane_id(short_code: &str, bot: &str, held: &str, forced: bool) -> String {
     let fut = async {
         if forced {
-            resolve_shortcode_forced(short_code, bot, Some(held)).await
-        } else {
-            resolve_shortcode_fresh_from(short_code, bot, Some(held)).await
+            return resolve_shortcode_forced(short_code, bot, Some(held)).await;
         }
+        // STORED ID FIRST.
+        //
+        // A lane used to open with `resolve_shortcode_fresh_from`, i.e.
+        // `force=1&nocache=1`: the origin re-mints the reference with a send of
+        // its own for every lane, on every body start. That is the call the origin
+        // answers `503 Server busy resolving file` to when six lanes ask at once
+        // (measured 2026-11-28: `wanted: 6`, `lanes: 2`), and it discards the row
+        // the list-time prewarm had just created for this bot. The plain resolve
+        // READS that row — a cached hit at the origin with no send — so the forced
+        // mint is demoted to the fallback for a row that is genuinely gone.
+        let plain = resolve_shortcode(short_code, bot, false).await;
+        if !id_of(&plain).is_empty() {
+            return plain;
+        }
+        log(
+            "lane has no stored id - re-minting it at the origin",
+            &serde_json::json!({"bot_id": bot, "short_code": short_code}),
+        );
+        resolve_shortcode_fresh_from(short_code, bot, Some(held)).await
     };
     match tokio::time::timeout(std::time::Duration::from_secs(8), fut).await {
         Ok(v) => id_of(&v),
@@ -3718,6 +3735,34 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let a = jstr(&payload, "bot_id");
         if a.is_empty() { ctx.first_param(&["bot_id"]) } else { a }
     };
+
+    // ── Start the lanes' cold start NOW, in parallel with the pre-flight ───────
+    //
+    // Lane setup is where a body lost lanes: measured 2026-11-28, the first Play
+    // of a cold title spent the pre-flight resolving, then started the lanes from
+    // cold and dropped every lane whose mint missed the 6 s setup window
+    // (`wanted: 6`, `lanes: 3`, 8.3 s to first byte). Widening that window is not
+    // the fix — it is first-byte latency for every viewer — so the work is
+    // OVERLAPPED: each non-primary lane starts minting here, and the body start
+    // awaits these handles with only the REMAINDER of the window.
+    let mut lane_premint: HashMap<i32, (std::time::Instant, tokio::task::JoinHandle<Option<LaneIo>>)> =
+        HashMap::new();
+    if !short_code.is_empty() && file_size > 0 && ctx.qs("lane").trim().is_empty() {
+        if let Some(reg) = crate::lanes::registry() {
+            let primary = reg.default_lane().api_id;
+            for lane in reg.lanes() {
+                if lane.api_id == primary || !lane.usable() {
+                    continue;
+                }
+                let api_id = lane.api_id;
+                let code = short_code.clone();
+                let size = file_size;
+                let started = std::time::Instant::now();
+                let handle = tokio::spawn(async move { lane_io_for(lane, &code, size, "").await });
+                lane_premint.insert(api_id, (started, handle));
+            }
+        }
+    }
 
     if !short_code.is_empty() && crate::cache::get("flagged_malware", &short_code).is_some() {
         record_refusal(
@@ -5501,24 +5546,41 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // to explain it. MEASURED 2026-11-27: a six-lane body delivered
                 // exactly the primed 512 KB and then hung for 60 s with an empty
                 // error log, while the same body pinned to lane 1 ran at 3 MB/s.
+                //
+                // A lane whose mint was started with the pre-flight gets the
+                // window's REMAINDER, not a fresh 6 s: its work is already done or
+                // nearly done, so awaiting it is cheap and it is never dropped for
+                // time it spent serving the body's first byte.
+                let mut preminted: HashMap<i32, (std::time::Instant, tokio::task::JoinHandle<Option<LaneIo>>)> =
+                    lane_premint.drain().collect();
                 let futures = selected.into_iter().map(|lane| {
-                    let fut = body_lane(
-                        lane,
-                        short_code_for_task.clone(),
-                        file_size_for_task,
-                        held_id.clone(),
-                        primary_api_id,
-                        bot_for_task.clone(),
-                        entry_for_task.clone(),
-                        target_for_task.clone(),
-                    );
+                    let pre = preminted.remove(&lane.api_id);
+                    let code = short_code_for_task.clone();
+                    let held = held_id.clone();
+                    let bot = bot_for_task.clone();
+                    let entry = entry_for_task.clone();
+                    let target = target_for_task.clone();
                     async move {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(6),
-                            fut,
-                        )
-                        .await
-                        {
+                        if let Some((started, handle)) = pre {
+                            let budget = std::time::Duration::from_secs(6)
+                                .saturating_sub(started.elapsed())
+                                .max(std::time::Duration::from_millis(750));
+                            return match tokio::time::timeout(budget, handle).await {
+                                Ok(Ok(v)) => v,
+                                _ => None,
+                            };
+                        }
+                        let fut = body_lane(
+                            lane,
+                            code,
+                            file_size_for_task,
+                            held,
+                            primary_api_id,
+                            bot,
+                            entry,
+                            target,
+                        );
+                        match tokio::time::timeout(std::time::Duration::from_secs(6), fut).await {
                             Ok(v) => v,
                             Err(_) => None,
                         }

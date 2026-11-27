@@ -1344,6 +1344,134 @@ fn note_resolve_rate_limit(msg: &str) -> bool {
     hit
 }
 
+/// How many codes of a list are warmed per LANE bot (`PM_LANE_WARM_CODES`).
+///
+/// A Telegram `file_id` is per bot, so a row warmed for the bot that rendered the
+/// list is a COLD row for every lane bot. Measured 2026-11-28: a title whose rows
+/// existed for all six lane bots started on 6 lanes at ~500 ms TTFB; a title with
+/// no lane rows started on ONE lane at 8.3 s, because each lane's first mint
+/// exceeded the body's 6 s setup window and was dropped.
+///
+/// The origin cannot do this for us: its batch endpoint warms exactly one
+/// `bot_id`, and the background drain that is supposed to finish the job is
+/// `disabled` + inactive on the box, so a queued code never becomes a row. The
+/// only thing that creates a lane's row is a resolve addressed to that lane's
+/// bot, which is what this does — ahead of time, for the codes at the top of the
+/// list (the ones a viewer actually taps).
+///
+/// Small on purpose: every code × lane is one origin mint (a Telegram send on the
+/// origin's side), so this trades list-time work for play-time latency and must
+/// stay a handful, not a list. `0` disables the pass.
+pub fn lane_warm_code_cap() -> usize {
+    crate::storage::env("PM_LANE_WARM_CODES")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(PREWARM_HARD_CAP)
+}
+
+/// Gap between lane-warm resolves. The origin relay is per bot and the box runs
+/// hot; firing six lanes at one code simultaneously is what turns a warm pass
+/// into a burst of `503 Server busy resolving file`.
+fn lane_warm_gap_ms() -> u64 {
+    crate::storage::env("PM_LANE_WARM_GAP_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(250)
+}
+
+/// Every bot a body could be served by right now: the primary first, then each
+/// lane whose bot has a session. Deduped, so a single-lane install yields just
+/// the primary and the pass is the identity.
+pub fn lane_warm_targets(primary: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let primary = primary.trim();
+    if !primary.is_empty() {
+        out.push(primary.to_string());
+    }
+    if let Some(reg) = crate::lanes::registry() {
+        for lane in reg.lanes() {
+            let bot = lane.bot_id();
+            if bot.is_empty() || !crate::telegram::has_session_file(&bot) {
+                continue;
+            }
+            if !out.iter().any(|b| b == &bot) {
+                out.push(bot);
+            }
+        }
+    }
+    out
+}
+
+/// Give every LANE bot its own row for the first codes of a list.
+///
+/// Returns `(lanes_warmed, resolves_sent)`. Skips the primary (the caller already
+/// warmed it) and any code this process already holds a full resolve for.
+pub async fn warm_lane_bots(codes: &[String], primary: &str) -> (usize, usize) {
+    let cap = lane_warm_code_cap();
+    if cap == 0 {
+        return (0, 0);
+    }
+    let targets = lane_warm_targets(primary);
+    if targets.len() < 2 {
+        return (0, 0);
+    }
+    let wanted: Vec<String> = codes
+        .iter()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .take(cap)
+        .collect();
+    if wanted.is_empty() {
+        return (0, 0);
+    }
+    let mut lanes = 0usize;
+    let mut sent = 0usize;
+    for bot in targets.iter().skip(1) {
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|c| {
+                resolve_shortcode_cached(c, bot).is_none()
+                    && cache::get("resolve_miss", &miss_key(c, bot)).is_none()
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        lanes += 1;
+        for code in missing {
+            // A viewer pressing Play outranks a speculative warm-up: the pass is
+            // minutes of origin work at this size, and the origin relay is the same
+            // budget the stream needs. Measured 2026-11-28: a Play that landed
+            // mid-pass waited 9.1 s for its first byte.
+            if crate::download::active_streams() > 0 {
+                log(
+                    "lane warm-up abandoned - a stream started",
+                    &serde_json::json!({"bot_id": bot, "lanes_done": lanes}),
+                );
+                return (lanes, sent);
+            }
+            tokio::time::sleep(Duration::from_millis(lane_warm_gap_ms())).await;
+            // `resolve_shortcode` is the byte-path resolve: it reads the origin's
+            // stored row for this bot, or makes the origin mint one. Either way
+            // the row exists afterwards, which is the point of the pass.
+            let res = tokio::time::timeout(
+                Duration::from_secs(15),
+                resolve_shortcode(&code, bot, false),
+            )
+            .await;
+            match res {
+                Ok(v) if has_id(&v) => sent += 1,
+                Ok(_) => {}
+                Err(_) => log(
+                    "lane warm resolve timed out",
+                    &serde_json::json!({"bot_id": bot, "short_code": code}),
+                ),
+            }
+        }
+    }
+    (lanes, sent)
+}
+
 /// `fd_prewarm_streams_batch()` (backend.php:3701) and the Kotlin twin.
 ///
 /// A stream list is built from file METADATA only; the Bot API `file_id` is
@@ -1386,6 +1514,8 @@ pub fn prewarm_streams_batch_limited(
     if effective.is_empty() {
         return 0;
     }
+    // Kept whole for the lane pass below: the loop consumes `codes`.
+    let all_codes: Vec<String> = codes.clone();
     let mut missing: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for c in codes {
@@ -1476,6 +1606,7 @@ pub fn prewarm_streams_batch_limited(
         // suppressed. Reporting it unconditionally made a wholly-queued pass read
         // as "5 codes suppressed for 60 s" when in fact ZERO were — the exact
         // misreading that hid the queued-vs-missing bug in the first place.
+        let ctx_label = ctx.clone();
         let mut ctx = serde_json::json!({
             "context": ctx,
             "resolved": res.resolved,
@@ -1486,6 +1617,28 @@ pub fn prewarm_streams_batch_limited(
             ctx["suppressed_for_secs"] = serde_json::json!(RESOLVE_MISS_TTL);
         }
         log("prewarm streams batch finished", &ctx);
+
+        // Then the LANE bots. The pass above warmed the bot that rendered the
+        // list; every lane bot still has no row for these codes, so its first
+        // Play mint exceeds the body's 6 s lane-setup window and the lane is
+        // dropped (`wanted: 6`, `lanes: 1`, 8.3 s TTFB — measured). This is the
+        // only place the work can happen: the origin's own warm queue is a
+        // disabled service, and its batch endpoint warms a single bot_id.
+        let targets = lane_warm_targets(&effective);
+        if targets.len() > 1 {
+            let t0 = std::time::Instant::now();
+            let (lanes, resolves) = warm_lane_bots(&all_codes, &effective).await;
+            log(
+                "prewarm spread over lane bots",
+                &serde_json::json!({
+                    "context": ctx_label,
+                    "lane_bots": targets.len() - 1,
+                    "lanes_warmed": lanes,
+                    "resolves": resolves,
+                    "ms": t0.elapsed().as_millis() as u64,
+                }),
+            );
+        }
     });
     n
 }
@@ -1563,6 +1716,16 @@ pub async fn warmup_resolve_batch(short_codes: &[String], bot_id: &str) -> Warmu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No lane registry is published in a test binary, so the lane warm-up pass
+    /// must collapse to the bot that already rendered the list — never to nothing,
+    /// and never to a phantom bot.
+    #[test]
+    fn lane_warm_targets_keep_only_bots_that_can_serve() {
+        assert_eq!(lane_warm_targets("bot_a"), vec!["bot_a".to_string()]);
+        assert_eq!(lane_warm_targets("  bot_a  "), vec!["bot_a".to_string()]);
+        assert!(lane_warm_targets("").is_empty());
+    }
 
     /// The real `/resolve-files` row shape (measured against the origin): an id
     /// and nothing else. Caching it as a resolve is what made `/eclipse/stream`

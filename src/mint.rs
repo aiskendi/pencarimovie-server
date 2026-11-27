@@ -130,6 +130,14 @@ fn another_destination_may_work(message: &str) -> bool {
         || m.contains("chat write forbidden")
         || m.contains("peer_id_invalid")
         || m.contains("channel_private")
+        // The origin's relay list is not pure userbots any more: it carries bot
+        // accounts too, and Telegram refuses bot→bot with this. It is a fact about
+        // the DESTINATION, not about the document or our session, so the next peer
+        // is worth a try — and NOT trying it is what killed cold lane mints
+        // (measured 2026-11-28: every lane answered this, then the 6 s lane-setup
+        // window expired and the body ran on one lane).
+        || m.contains("user_bot_to_bot_disabled")
+        || m.contains("user bot to bot disabled")
 }
 
 fn now_ms() -> i64 {

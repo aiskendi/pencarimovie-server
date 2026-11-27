@@ -124,6 +124,49 @@ pub fn log(message: &str, ctx: &Value) {
     if !is_debug_enabled() {
         return;
     }
+    write_debug_line(message, ctx);
+}
+
+/// Per-PART tracing, OFF unless `PM_TRACE_PARTS` says otherwise.
+///
+/// These lines are one per 512 KB part — dozens per second per lane — and each
+/// one is a synchronous append on the streaming path. MEASURED 2026-11-27 on this
+/// workstation, same URL and build: `debug-mode` on gave 1.9-2.4 MB/s, off gave
+/// 4.7 MB/s, and the difference was entirely this loop's log calls. Debug mode is
+/// the first thing support asks a user to enable, so it must not halve their
+/// stream: the part-level trace is its own switch.
+///
+/// Enable with `PM_TRACE_PARTS=1` (or `--trace-parts`), which is what a
+/// throughput investigation actually wants.
+pub fn trace_enabled() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| {
+        if std::env::args().any(|a| a == "--trace-parts") {
+            return true;
+        }
+        for k in ["PM_TRACE_PARTS", "TRACE_PARTS"] {
+            if let Some(v) = crate::storage::env(k) {
+                let s = v.trim().to_ascii_lowercase();
+                if s == "1" || s == "true" || s == "on" || s == "yes" {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// [`log()`] for a line that only matters when tracing parts. Never writes unless
+/// `debug-mode` AND `trace_enabled()` are both on, so a support session keeps the
+/// cheap log.
+pub fn trace_log(message: &str, ctx: &Value) {
+    if !trace_enabled() || !is_debug_enabled() {
+        return;
+    }
+    write_debug_line(message, ctx);
+}
+
+fn write_debug_line(message: &str, ctx: &Value) {
     let empty = ctx.as_object().map(|o| o.is_empty()).unwrap_or(true);
     let suffix = if empty {
         String::new()

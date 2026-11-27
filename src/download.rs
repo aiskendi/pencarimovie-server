@@ -5606,10 +5606,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 io.bytes_served
                                     .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                // One line per part: the trace a throughput run is
-                                // read from — which api_id carried it, how long it
-                                // took, and the window that admitted it.
-                                log(
+                                // One line per part — for a throughput
+                                // investigation, not for a support session: at
+                                // 30 parts/s this is the call that halved the
+                                // measured rate (see `log::trace_log`).
+                                crate::log::trace_log(
                                     "download stream lane part",
                                     &serde_json::json!({
                                         "api_id": io.lane.api_id,

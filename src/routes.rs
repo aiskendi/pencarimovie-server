@@ -1819,14 +1819,34 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         if m == "POST" {
             let input: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
             set_debug_enabled(input.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false));
-            return json_response(200, &serde_json::json!({"ok": 1, "enabled": is_debug_enabled()}));
+            return json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "enabled": is_debug_enabled(),
+                    "trace_parts": crate::log::trace_enabled(),
+                }),
+            );
         }
         if m == "GET" {
             if ctx.has_q("enable") {
                 let v = ctx.qs("enable").to_ascii_lowercase();
                 set_debug_enabled(v == "1" || v == "true" || v == "on");
             }
-            return json_response(200, &serde_json::json!({"ok": 1, "enabled": is_debug_enabled()}));
+            return json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "enabled": is_debug_enabled(),
+                    // Per-part tracing is a SEPARATE, opt-in switch
+                    // (`--trace-parts` / PM_TRACE_PARTS): it is one synchronous
+                    // append per 512 KB part, and leaving it on `debug-mode` cost
+                    // half the measured throughput. Reported so a support session
+                    // can see which of the two is on.
+                    "trace_parts": crate::log::trace_enabled(),
+                    "note": "debug-mode writes one line per request; per-part tracing (which can halve throughput) is only on with PM_TRACE_PARTS / --trace-parts.",
+                }),
+            );
         }
     }
 

@@ -1788,6 +1788,16 @@ async fn main() -> anyhow::Result<()> {
     // a restart loop does not hammer the origin; a stale/unreachable origin keeps
     // the previous cache. Bounded to 6 s and best effort — the listener must not
     // wait on WordPress.
+    // THE LISTENER RACES ENROLMENT ON A PAAS. The api_id pool is served by an
+    // authenticated origin call, and on a fresh dyno `ensure_enrolled()` may still
+    // be in flight when this runs — the fetch is then deferred, returns nothing,
+    // and the process comes up with ONE lane (api_id 0) instead of the pool.
+    // MEASURED 2026-11-27 on Heroku: `lanes=0:ready` after a restart, so every
+    // stream ran single-lane until the dyno was recycled again. Wait for the boot
+    // enrolment (bounded) before deciding there is no pool.
+    if crate::credentials::auth_token().is_empty() {
+        let _ = crate::credentials::wait_for_enrolment(10).await;
+    }
     if !lanes::origin_cache_fresh(600) {
         tokio::time::timeout(
             std::time::Duration::from_secs(6),

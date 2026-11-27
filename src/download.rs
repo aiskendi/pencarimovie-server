@@ -5494,8 +5494,15 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 // The id this body already holds: each new lane re-sends it
                 // locally, so its reference is minted by its OWN session.
                 let held_id = persist_id.clone();
+                // BOUNDED, PER LANE. A lane that cannot boot its bot or mint a
+                // reference must cost this body nothing: the primed head has
+                // already been sent, so a `join_all` that waits on one wedged
+                // lane stops the body dead after its first 512 KB — with no error
+                // to explain it. MEASURED 2026-11-27: a six-lane body delivered
+                // exactly the primed 512 KB and then hung for 60 s with an empty
+                // error log, while the same body pinned to lane 1 ran at 3 MB/s.
                 let futures = selected.into_iter().map(|lane| {
-                    body_lane(
+                    let fut = body_lane(
                         lane,
                         short_code_for_task.clone(),
                         file_size_for_task,
@@ -5504,7 +5511,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         bot_for_task.clone(),
                         entry_for_task.clone(),
                         target_for_task.clone(),
-                    )
+                    );
+                    async move {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(6),
+                            fut,
+                        )
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => None,
+                        }
+                    }
                 });
                 body_lanes = futures_util::future::join_all(futures)
                     .await
@@ -5597,7 +5615,30 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         let generation = io.generation.load(std::sync::atomic::Ordering::Relaxed);
                         let target = io.target.read().await.clone();
                         let started = std::time::Instant::now();
-                        match fetch_part_windowed(&io.entry, &io.bot, &target, p, w).await {
+                        // A part that never returns must not hold the body: the
+                        // order is strict (`buffered`), so one wedged fetch is a
+                        // frozen stream with an empty error log. Bounded, then the
+                        // ladder below fails it over.
+                        let fetched = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            fetch_part_windowed(&io.entry, &io.bot, &target, p, w),
+                        )
+                        .await;
+                        let fetched = match fetched {
+                            Ok(r) => r,
+                            Err(_) => {
+                                log(
+                                    "lane part timed out - failing it over",
+                                    &serde_json::json!({"api_id": io.lane.api_id, "pos": p}),
+                                );
+                                Err(crate::telegram::GramErr {
+                                    message: "part timed out after 30s".to_string(),
+                                    transport: true,
+                                    ..Default::default()
+                                })
+                            }
+                        };
+                        match fetched {
                             Ok(v) => {
                                 io.lane
                                     .stats

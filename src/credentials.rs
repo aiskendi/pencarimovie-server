@@ -617,6 +617,17 @@ static LAST_ENROLL_ATTEMPT: std::sync::atomic::AtomicI64 = std::sync::atomic::At
 /// made a restart the obvious way out. Hence the bounded backoff: 5 s, 10, 20, 40,
 /// then the steady 60.
 static ENROLL_DELAY_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Unix time before which NO enrolment attempt is made, taken from the origin's
+/// own `retry_after` when it answers 429.
+///
+/// MEASURED 2026-11-27 on a Heroku dyno: `/auth-enroll` is capped per client
+/// ADDRESS (60/hour at the origin), a PaaS shares egress addresses, and every
+/// restart mints fresh install keys — so the cap was hit, every `resolve-file`
+/// and `provision-session` was deferred locally, no bot could be leased, and the
+/// engine kept retrying every 60 s and spending more of the budget. One hour of
+/// silence is what actually recovers it.
+static ENROLL_COOLDOWN_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// When the last attempt failed because the origin could not be reached (`0` = the
 /// last attempt did not fail that way). Surfaces through [`auth_token_reason()`], so
 /// a renewal outage reads as connectivity instead of as a clock or storage fault.
@@ -645,6 +656,13 @@ fn next_transport_delay(current: i64) -> i64 {
 /// `(seconds since the last attempt, seconds required before the next one)`.
 fn enrol_wait(now: i64) -> (i64, i64) {
     use std::sync::atomic::Ordering;
+    // The origin can name its own wait (`retry_after` on 429). Honouring it is not
+    // politeness: the room is a per-ADDRESS enrolment budget, and retrying every
+    // 60 s keeps spending against it, so the install never gets back in.
+    let until = ENROLL_COOLDOWN_UNTIL.load(Ordering::SeqCst);
+    if until > now {
+        return (0, until - now);
+    }
     let last = LAST_ENROLL_ATTEMPT.load(Ordering::SeqCst);
     let delay = match ENROLL_DELAY_SECS.load(Ordering::SeqCst) {
         0 => 60,
@@ -859,15 +877,31 @@ pub async fn ensure_enrolled() -> EnrolOutcome {
         // are worth another attempt in seconds. Anything else is a decision by the
         // origin (revoked install, bad install key) and keeps the minute delay.
         let transport = status == 0 || status >= 500;
+        // A 429 is a BUDGET, not a decision: honour the origin's own wait so the
+        // engine stops spending the budget it is waiting on.
+        if status == 429 {
+            let wait = resp
+                .get("retry_after")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v > 0)
+                .unwrap_or(3600);
+            ENROLL_COOLDOWN_UNTIL.store(
+                crate::storage::now() + wait.clamp(30, 7200),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         crate::log::stderr_log(
             if transport {
                 "pm-auth enrol could not reach the origin - retrying with backoff"
+            } else if status == 429 {
+                "pm-auth enrol rate limited - waiting out the origin's window"
             } else {
                 "pm-auth enrol failed"
             },
             Some(&serde_json::json!({
                 "status": status,
                 "status_ok": ok,
+                "retry_after": resp.get("retry_after").cloned().unwrap_or(serde_json::Value::Null),
                 "message": resp.get("message").cloned().unwrap_or(serde_json::Value::Null),
             })),
         );

@@ -2646,13 +2646,17 @@ class PencariMovieApp {
         const resp = yield this.requestJson("".concat(this.localApiBase, "/api/bots"));
         if (!resp || !resp.ok) return;
         const countEl = this.$("#botPoolCount");
-        if (countEl) countEl.textContent = String(resp.total_bots || 1);
+        if (countEl) countEl.textContent = String(Number(resp.total_bots) || 0);
         const listEl = this.$("#botPoolList");
         if (!listEl) return;
         if (!resp.bots || resp.bots.length === 0) {
-          listEl.innerHTML = '<div style="font-size:0.75rem;color:#888;padding:4px 0;">No extra bots connected yet.</div>';
-          return;
-        }
+          // NOT an early return: the api_id pool loader runs at the end of this
+          // function, and an install whose bots are all leased by the api_id pool
+          // has an EMPTY bot list — the normal state, not an error. Returning here
+          // left the whole Pool panel blank until something else triggered it,
+          // which is why a refresh looked like it did nothing.
+          listEl.innerHTML = '<div style="font-size:0.75rem;color:#888;padding:4px 0;">No bots added here yet — the api_id pool leases its own below.</div>';
+        } else {
         listEl.innerHTML = resp.bots.map(b => {
           const isAct = b.is_active;
           const bId = this.escapeHtml(String(b.bot_id || ""));
@@ -2738,6 +2742,7 @@ class PencariMovieApp {
             }
           }));
         });
+        }
       } catch (e) {
         console.warn("loadBotPool failed:", e);
       }

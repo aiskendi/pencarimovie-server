@@ -232,6 +232,16 @@ pub fn has_local_session(bot_id: &str) -> bool {
             return true;
         }
     }
+    // A LANE bot is a session too. Without this the download pre-flight saw "no
+    // session" on a lane-only install and started its own guest provision on every
+    // request, competing with the lane leasing (Heroku: "Connecting guest bot in
+    // progress" on every Play while the lanes were already signed in).
+    if let Some(lane) = crate::lanes::registry().map(|r| r.default_lane()) {
+        let bid = lane.bot_id();
+        if !bid.is_empty() && !is_bot_dead(&bid) && crate::telegram::has_session_file(&bid) {
+            return true;
+        }
+    }
     false
 }
 

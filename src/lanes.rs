@@ -789,8 +789,16 @@ impl Lane {
     }
 
     /// Ready to receive a part right now.
+    ///
+    /// A bot ID is not enough: the SESSION FILE is what a part is actually served
+    /// with, and on a PaaS with ephemeral storage the id survives in
+    /// `api_ids.json` while the session does not. Reporting such a lane `ready`
+    /// sent parts to a bot that could not answer, and the dashboard showed a
+    /// healthy lane that served nothing.
     pub fn usable(&self) -> bool {
-        self.has_bot() && self.stats.cooling_remaining() == 0
+        self.has_bot()
+            && self.stats.cooling_remaining() == 0
+            && crate::telegram::has_session_file(&self.bot_id())
     }
 
     pub fn begin_part(self: &Arc<Self>) -> LanePartGuard {
@@ -801,6 +809,10 @@ impl Lane {
     pub fn state(&self) -> &'static str {
         if !self.has_bot() {
             "no_bot"
+        } else if !crate::telegram::has_session_file(&self.bot_id()) {
+            // The id is known but its login is gone (ephemeral disk, wiped
+            // storage): the lane needs provisioning, not a cooldown.
+            "no_session"
         } else if self.stats.cooling_remaining() > 0 {
             "cooling"
         } else if self.stats.congested() {
@@ -1138,9 +1150,12 @@ mod tests {
         let reg = LaneRegistry::new(d, vec![]);
         assert!(reg.candidates().is_empty());
         assert_eq!(reg.lanes()[0].state(), "no_bot");
+        // A bot ID alone is not a session: with ephemeral storage the id survives
+        // in `api_ids.json` while the login does not, and the lane must say so
+        // instead of advertising `ready` and serving nothing.
         reg.lanes()[0].set_bot_id("77");
-        assert_eq!(reg.candidates().len(), 1);
-        assert_eq!(reg.lanes()[0].state(), "ready");
+        assert_eq!(reg.lanes()[0].state(), "no_session");
+        assert!(reg.candidates().is_empty(), "no session file => not a candidate");
     }
 
     #[test]

@@ -3333,6 +3333,54 @@ fn pick_lane(lanes: &[std::sync::Arc<LaneIo>], tried: &[usize]) -> Option<usize>
     crate::lanes::choose_lane(&costs)
 }
 
+/// How many times a lane's mint is retried while the origin is busy.
+///
+/// `503 Server busy resolving file` is the origin queueing, not refusing —
+/// measured 2026-11-27: after a few back-to-back 100 MB bodies every
+/// `resolve-file` answered it for a minute, and the lane was dropped for the
+/// whole body. Three tries over ~1.2 s turns that into a lane that joins late
+/// instead of a body that runs single-lane.
+const LANE_MINT_ATTEMPTS: u32 = 3;
+
+/// One lane's file id: an id it already minted in this process, then a local
+/// re-send, then the origin's mint.
+///
+/// An empty answer means "ask again" (`lane_io_for` retries) — never that the
+/// lane is unusable.
+async fn mint_lane_id(short_code: &str, bot: &str, held: &str) -> String {
+    if let Some(id) = crate::mint::live(short_code, bot) {
+        // Warmest possible: an id this bot already minted in this process. The
+        // probe still judges it, and a stale one is re-minted there.
+        return id;
+    }
+    if let Some(id) = crate::mint::resend(short_code, bot, held, "lane").await {
+        return id;
+    }
+    // No local re-send (a relay peer it cannot reach, or a source id this bot may
+    // not send): fall back to the origin's mint, which is the pre-lane path. It
+    // may be bound to the origin's session and answer 400 on the first part —
+    // that is the cold case the body's refresh heals.
+    log(
+        "lane local re-send gave nothing - using the origin's mint",
+        &serde_json::json!({"bot_id": bot}),
+    );
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        resolve_shortcode_fresh_from(short_code, bot, Some(held)),
+    )
+    .await
+    {
+        Ok(v) => id_of(&v),
+        Err(_) => {
+            log(
+                "lane file_id mint timed out",
+                &serde_json::json!({"bot_id": bot, "short_code": short_code}),
+            );
+            String::new()
+        }
+    }
+}
+
 /// Boot a lane's bot and mint ITS OWN reference for this file.
 ///
 /// Bounded: a cold lane's mint is a resolve plus a send, and a lane that cannot
@@ -3368,48 +3416,54 @@ async fn lane_io_for(
     // 2026-11-26, every lane, every request: origin mint 200, first body part
     // 400, at 512 KB (the primed head). `mint::resend` sends the same document
     // from OUR session (~100-390 ms) and returns a reference that is ours.
-    let id = match crate::mint::live(short_code, &bot) {
-        // Warmest possible: an id this bot already minted in this process. The
-        // probe below still judges it, and a stale one is re-minted there.
-        Some(id) => id,
-        None => match crate::mint::resend(short_code, &bot, held, "lane").await {
-            Some(id) => id,
-            None => {
-                // No local re-send (a relay peer it cannot reach, or a source id
-                // this bot may not send): fall back to the origin's mint, which is
-                // the pre-lane path. It may be bound to the origin's session and
-                // answer 400 on the first part — that is the cold case the body's
-                // refresh heals.
-                log(
-                    "lane local re-send gave nothing - using the origin's mint",
-                    &serde_json::json!({"api_id": lane.api_id, "bot_id": bot}),
-                );
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    resolve_shortcode_fresh_from(short_code, &bot, Some(held)),
-                )
-                .await
-                {
-                    Ok(v) => id_of(&v),
-                    Err(_) => {
-                        log(
-                            "lane file_id mint timed out",
-                            &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
-                        );
-                        String::new()
-                    }
-                }
-            }
-        },
-    };
-    if id.is_empty() {
+    // The origin answers `503 Server busy resolving file` under load. That is a
+    // QUEUE signal, not a failure: the retry is what heals it. An empty mint is
+    // therefore retried here instead of costing the body this lane.
+    let mut id = String::new();
+    for attempt in 0..LANE_MINT_ATTEMPTS {
+        if attempt > 0 {
+            let wait = 400 * u64::from(attempt);
+            log(
+                "lane mint busy - retrying",
+                &serde_json::json!({
+                    "api_id": lane.api_id,
+                    "bot_id": bot,
+                    "attempt": attempt + 1,
+                    "wait_ms": wait,
+                }),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+        }
+        id = mint_lane_id(short_code, &bot, held).await;
+        if !id.is_empty() {
+            break;
+        }
+    }
+    // A lane is NEVER dropped for a reference it could not mint.
+    //
+    // The shortcode resolves for the install, so it resolves for every lane — the
+    // only thing a lane lacks is a reference minted by ITS session. Starting from
+    // the id the body already holds gives the lane a target that is wrong for it
+    // and right for the file: its first part answers 400, the refresh re-mints
+    // through its own session, and it joins from there. Dropping the lane instead
+    // is what made a busy origin turn a four-lane body into a one-lane body.
+    let start_id = if id.is_empty() {
         log(
-            "lane could not mint a file id for this file",
+            "lane has no id of its own yet - starting from the body's reference to heal on first part",
+            &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
+        );
+        held.to_string()
+    } else {
+        id
+    };
+    if start_id.is_empty() {
+        log(
+            "lane has neither its own id nor a body reference to start from",
             &serde_json::json!({"api_id": lane.api_id, "short_code": short_code}),
         );
         return None;
     }
-    let target = match crate::telegram::prepare_file_target(&id, size) {
+    let target = match crate::telegram::prepare_file_target(&start_id, size) {
         Ok(t) => t,
         Err(e) => {
             log(
